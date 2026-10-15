@@ -65,7 +65,10 @@ With `autoupdate on --fix claude`, Claude Code ports the patches unattended when
 breaks them. Without it you get a notification and run `t3code-customize --fix claude` yourself.
 
 Differences from stock: passkey sign-in (needs T3's Apple team entitlements) is unavailable,
-and macOS may ask once for keychain and privacy permissions because the signature differs.
+and macOS asks once for keychain and privacy permissions because the signature differs.
+Choose **Always Allow**: the copy is signed with a certificate made for your Mac on the
+first build (in a keychain of its own at `~/.config/t3code-customize/signing.keychain-db`),
+so the answer holds for every later build.
 
 ## T3 server (Linux, headless)
 

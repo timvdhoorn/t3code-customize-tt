@@ -19,6 +19,7 @@ import os
 import plistlib
 from pathlib import Path
 import re
+import secrets
 import shlex
 import shutil
 import socket
@@ -26,6 +27,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import urllib.request
@@ -692,6 +694,72 @@ def pull_latest():
         os.execv(sys.executable, [sys.executable, str(REPO / NAME), *sys.argv[1:], '--no-pull'])
 
 
+# A self-signed code signing identity of this tool's own, one per Mac, in a keychain only it
+# uses. macOS remembers "Always Allow" for T3's keychain item ("t3code Safe Storage") per
+# signing identity; an ad-hoc signature differs with every build, so it would ask after
+# every update.
+SIGNING_NAME = 't3code-customize local signing'
+SIGNING_KEYCHAIN = CONFIG / 'signing.keychain-db'
+SIGNING_SECRET = CONFIG / 'signing.secret'
+SIGNING_CONFIG = f"""[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = {SIGNING_NAME}
+[ext]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature
+extendedKeyUsage = critical,codeSigning
+"""
+
+
+def create_signing_keychain():
+    CONFIG.mkdir(parents=True, exist_ok=True)
+    password = secrets.token_hex(24)
+    SIGNING_SECRET.touch(mode=0o600)
+    SIGNING_SECRET.write_text(password + '\n')
+    work = Path(tempfile.mkdtemp(dir=CONFIG))
+    keychain = str(SIGNING_KEYCHAIN)
+    try:
+        os.chmod(work, 0o700)
+        (work / 'openssl.cnf').write_text(SIGNING_CONFIG)
+        transfer = secrets.token_hex(12)
+        quiet = dict(capture_output=True, check=True)
+        subprocess.run(['/usr/bin/openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '7300',
+             '-keyout', str(work / 'key.pem'), '-out', str(work / 'cert.pem'), '-config', str(work / 'openssl.cnf')], **quiet)
+        subprocess.run(['/usr/bin/openssl', 'pkcs12', '-export', '-inkey', str(work / 'key.pem'), '-in', str(work / 'cert.pem'),
+             '-out', str(work / 'identity.p12'), '-passout', 'pass:' + transfer, '-name', SIGNING_NAME], **quiet)
+        run(['security', 'create-keychain', '-p', password, keychain], capture=True)
+        run(['security', 'set-keychain-settings', keychain], capture=True)  # never locks itself
+        run(['security', 'unlock-keychain', '-p', password, keychain], capture=True)
+        run(['security', 'import', str(work / 'identity.p12'), '-k', keychain, '-P', transfer,
+             '-T', '/usr/bin/codesign'], capture=True)
+        # Lets codesign use the key without a dialog.
+        run(['security', 'set-key-partition-list', '-S', 'apple-tool:,apple:', '-s', '-k', password, keychain], capture=True)
+    except BaseException:
+        subprocess.run(['security', 'delete-keychain', keychain], capture_output=True)
+        SIGNING_SECRET.unlink(missing_ok=True)
+        raise
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def signing_identity():
+    """SHA-1 of this Mac's local signing certificate, made on first use; None to sign ad hoc."""
+    try:
+        if not (SIGNING_KEYCHAIN.exists() and SIGNING_SECRET.exists()):
+            step('Creating a local code signing identity (one time, so macOS remembers keychain access)...')
+            create_signing_keychain()
+        run(['security', 'unlock-keychain', '-p', SIGNING_SECRET.read_text().strip(), str(SIGNING_KEYCHAIN)], capture=True)
+        found = run(['security', 'find-certificate', '-c', SIGNING_NAME, '-Z', str(SIGNING_KEYCHAIN)], capture=True)
+        return re.search(r'SHA-1 hash: ([0-9A-F]{40})', found).group(1)
+    except (Stop, OSError, AttributeError, subprocess.CalledProcessError) as error:
+        say(f'    Note: signing ad hoc ({str(error).splitlines()[0][:120]}); macOS may ask for keychain'
+            ' access after each update.')
+        return None
+
+
 def finish_mac_app(app, asar):
     """Record the new archive in Info.plist and sign the copy for this Mac only."""
     info_path = app / 'Contents/Info.plist'
@@ -704,8 +772,10 @@ def finish_mac_app(app, asar):
     info.setdefault('LSEnvironment', {})['T3CODE_DISABLE_AUTO_UPDATE'] = 'true'
     info_path.write_bytes(plistlib.dumps(info))
     run(['xattr', '-cr', str(app)])
-    # Ad-hoc signing drops T3's team entitlements (passkeys, keychain group); nothing else needs them.
-    run(['codesign', '--force', '--deep', '--sign', '-', str(app)], capture=True)
+    # Local signing drops T3's team entitlements (passkeys, keychain group); nothing else needs them.
+    identity = signing_identity()
+    sign = ['--sign', identity, '--keychain', str(SIGNING_KEYCHAIN)] if identity else ['--sign', '-']
+    run(['codesign', '--force', '--deep', *sign, str(app)], capture=True)
     if run(['codesign', '--verify', '--deep', '--strict', str(app)], check=False).returncode:
         raise Stop('The customized app failed its code signature check.')
 
@@ -1471,6 +1541,7 @@ def cmd_uninstall(args):
         if app_running(MAC_APP):
             raise Stop(f'Quit "{LAUNCHER_NAME}" first.')
         shutil.rmtree(MAC_APP, ignore_errors=True)
+        subprocess.run(['security', 'delete-keychain', str(SIGNING_KEYCHAIN)], capture_output=True)
     for folder in (DATA, CACHE, CONFIG):
         shutil.rmtree(folder, ignore_errors=True)
     tail = '' if DATA in REPO.parents else f' You can delete {REPO} too.'
