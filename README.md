@@ -91,7 +91,7 @@ t3code-customize uninstall   remove it, its launcher, builds and caches
 
 - **Bugs:** before reporting anything to T3 Code, run `t3code-customize off`, reopen and check it happens on stock too. Report customization problems here.
 - **Windows:** not supported yet. The patches are platform independent; only the packaging differs.
-- **Fork:** this is a fork of [btsouth/t3code-customize](https://github.com/btsouth/t3code-customize). With an `upstream` remote, every run merges newer patches from there when they merge cleanly. Own changes to T3 Code live in `patches-tt/` (checks in `checks-tt.json`) and go on top of the shared patches; see "Fork changes" in [AGENTS.md](AGENTS.md).
+- **Fork:** this is a fork of [btsouth/t3code-customize](https://github.com/btsouth/t3code-customize). With an `upstream` remote, every run merges newer patches from there when they merge cleanly. Own changes to T3 Code live in `patches-tt/` (checks in `checks-tt.json`) and go on top of the shared patches; ports of the shared patches go to `patches-port/` until upstream catches up; see "Fork changes" in [AGENTS.md](AGENTS.md).
 - **Files:** builds live in `~/.local/share/t3code-customize`, the source checkout and logs in `~/.cache/t3code-customize`.
 
 ## License

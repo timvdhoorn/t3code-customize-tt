@@ -1,0 +1,585 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler South <tsouth2@gmail.com>
+Date: Sat, 10 Oct 2026 12:40:14 -0400
+Subject: [PATCH 3/4] fix(web): show compaction settings and add a stats
+ compact action
+
+---
+ apps/web/src/components/ChatView.tsx          | 54 +++++++++--
+ .../chat/ComposerStats.logic.test.ts          | 96 +++++++++++++++++++
+ .../components/chat/ComposerStats.logic.ts    | 52 ++++++++++
+ .../web/src/components/chat/ComposerStats.tsx | 73 ++++++++++++--
+ apps/web/src/lib/contextWindow.test.ts        | 56 ++++++++++-
+ apps/web/src/lib/contextWindow.ts             | 12 +--
+ 6 files changed, 317 insertions(+), 26 deletions(-)
+
+diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
+index 7e68bc8f3..2223919c2 100644
+--- a/apps/web/src/components/ChatView.tsx
++++ b/apps/web/src/components/ChatView.tsx
+@@ -3656,23 +3656,49 @@ export default function ChatView(props: ChatViewProps) {
+     const usageLimits = activeUsageLimits
+       ? { limits: activeUsageLimits, providerName: activeProviderName }
+       : null;
+-    if (!serverProjection) return { turn: null, compactions: [], context: null, usageLimits };
++    if (!serverProjection)
++      return {
++        turn: null,
++        compactions: [],
++        context: null,
++        usageLimits,
++        contextDriver: undefined,
++        configuredClaudeThreshold: undefined,
++      };
+     const turns = selectComposerStatsTurns(serverProjection);
+     const contextUsage = turns.findLast((turn) => turn.tokenUsage !== undefined)?.tokenUsage;
++    const providerThread = serverProjection.providerThreads.find(
++      (thread) => thread.id === serverProjection.thread.activeProviderThreadId,
++    );
++    const providerConfig = providerThread
++      ? settings.providerInstances[providerThread.providerInstanceId]?.config
++      : undefined;
++    const configuredClaudeThreshold =
++      providerConfig !== null &&
++      typeof providerConfig === "object" &&
++      "autoCompactWindow" in providerConfig
++        ? providerConfig.autoCompactWindow
++        : undefined;
+     const compactions = selectRecordedCompactions(serverProjection.turnItems, turns);
+     return {
+       turn: turns.at(-1) ?? null,
+       compactions,
+       usageLimits,
++      contextDriver: providerThread?.driver,
++      configuredClaudeThreshold,
+       context: deriveLatestContextWindowSnapshot(
+         compactions.map((item) => ({ item })),
+         contextUsage,
+-        serverProjection.providerThreads.find(
+-          (thread) => thread.id === serverProjection.thread.activeProviderThreadId,
+-        ),
++        providerThread,
+       ),
+     };
+-  }, [settings.statsForNerdsEnabled, serverProjection, activeUsageLimits, activeProviderName]);
++  }, [
++    settings.statsForNerdsEnabled,
++    settings.providerInstances,
++    serverProjection,
++    activeUsageLimits,
++    activeProviderName,
++  ]);
+   const pendingBackgroundTasks = useMemo(() => {
+     if (serverProjection === null || serverProjection === undefined) {
+       return [];
+@@ -12030,7 +12056,23 @@ export default function ChatView(props: ChatViewProps) {
+                     </ComposerSurface.Shell>
+                     {/* Opaque so timeline content scrolling under the overlay can't show through the stats line. */}
+                     <div className={composerStats !== null ? "bg-background" : undefined}>
+-                      {composerStats !== null && <ComposerStats {...composerStats} />}
++                      {composerStats !== null && (
++                        <ComposerStats
++                          {...composerStats}
++                          onCompact={() => composerRef.current?.compactContext()}
++                          compactDisabled={compactDisabled}
++                          compactDisabledReason={
++                            pendingApprovals.length > 0
++                              ? "Resolve the pending approval first."
++                              : pendingUserInputs.length > 0
++                                ? "Answer the pending question first."
++                                : isWorking
++                                  ? "Wait for the current turn to finish."
++                                  : compactDisabledReason
++                          }
++                          isCompacting={isCompacting}
++                        />
++                      )}
+                       <div
+                         aria-hidden
+                         className="h-[calc(env(safe-area-inset-bottom)+1rem)] sm:h-[calc(env(safe-area-inset-bottom)+1.25rem)]"
+diff --git a/apps/web/src/components/chat/ComposerStats.logic.test.ts b/apps/web/src/components/chat/ComposerStats.logic.test.ts
+index 479e94b19..79b01fd80 100644
+--- a/apps/web/src/components/chat/ComposerStats.logic.test.ts
++++ b/apps/web/src/components/chat/ComposerStats.logic.test.ts
+@@ -14,6 +14,7 @@ import { describe, expect, it } from "vite-plus/test";
+ import {
+   composerLimitDisplay,
+   composerLimitsFreshness,
++  deriveContextCompaction,
+   deriveResponseRate,
+   deriveTurnCachePercentage,
+   formatCachePercentage,
+@@ -437,3 +438,98 @@ describe("composer limit display", () => {
+     expect(display.dimmed).toBe(true);
+   });
+ });
++
++describe("context compaction pressure", () => {
++  const context = {
++    usedTokens: 360_000,
++    usedPercentage: 36,
++    autoCompactThreshold: null,
++    compactsAutomatically: null,
++  };
++
++  it("keeps window fullness separate from Claude's configured 400k limit", () => {
++    expect(deriveContextCompaction(context, "claudeAgent", "400000")).toMatchObject({
++      threshold: 400_000,
++      source: "configured",
++      remainingTokens: 40_000,
++      thresholdPercentage: 90,
++      pressurePercentage: 90,
++      status: "Claude setting",
++    });
++    expect(context.usedPercentage).toBe(36);
++  });
++
++  it("prefers an actual provider threshold over a newly configured limit", () => {
++    expect(
++      deriveContextCompaction(
++        { ...context, autoCompactThreshold: 500_000 },
++        "claudeAgent",
++        "400000",
++      ),
++    ).toMatchObject({ threshold: 500_000, source: "reported", remainingTokens: 140_000 });
++  });
++
++  it("does not apply Claude's configuration to Codex or another driver", () => {
++    for (const driver of ["codex", "opencode", undefined]) {
++      expect(deriveContextCompaction(context, driver, "400000")).toMatchObject({
++        threshold: null,
++        source: null,
++        remainingTokens: null,
++        pressurePercentage: 36,
++      });
++    }
++    expect(deriveContextCompaction(context, "codex", "400000").status).toContain(
++      "Managed by Codex",
++    );
++  });
++
++  it("does not invent a default threshold or accept invalid settings", () => {
++    for (const value of [
++      undefined,
++      "",
++      "NaN",
++      "Infinity",
++      "99999",
++      "1000001",
++      "400000oops",
++      400000,
++    ]) {
++      expect(deriveContextCompaction(context, "claudeAgent", value)).toMatchObject({
++        threshold: null,
++        source: null,
++      });
++    }
++  });
++
++  it("honors a provider report that automatic compaction is off", () => {
++    expect(
++      deriveContextCompaction(
++        { ...context, compactsAutomatically: false, autoCompactThreshold: 300_000 },
++        "claudeAgent",
++        "400000",
++      ),
++    ).toMatchObject({ status: "Reported off", threshold: null, pressurePercentage: 36 });
++  });
++
++  it("shows a setting without inventing occupancy", () => {
++    expect(deriveContextCompaction(null, "claudeAgent", "400000")).toMatchObject({
++      threshold: 400_000,
++      source: "configured",
++      remainingTokens: null,
++      thresholdPercentage: null,
++    });
++  });
++
++  it("clamps remaining tokens and warns at the smaller window limit", () => {
++    expect(
++      deriveContextCompaction({ ...context, usedTokens: 420_000 }, "claudeAgent", "400000"),
++    ).toMatchObject({ remainingTokens: 0, pressurePercentage: 105 });
++    expect(
++      deriveContextCompaction(
++        { ...context, usedTokens: 180_000, usedPercentage: 90 },
++        "claudeAgent",
++        "400000",
++      ),
++    ).toMatchObject({ remainingTokens: 220_000, pressurePercentage: 90 });
++  });
++});
+diff --git a/apps/web/src/components/chat/ComposerStats.logic.ts b/apps/web/src/components/chat/ComposerStats.logic.ts
+index b4f72291f..8c8236a63 100644
+--- a/apps/web/src/components/chat/ComposerStats.logic.ts
++++ b/apps/web/src/components/chat/ComposerStats.logic.ts
+@@ -7,6 +7,7 @@ import type {
+   TurnTokenUsage,
+ } from "@t3tools/contracts";
+ import * as DateTime from "effect/DateTime";
++import type { ContextWindowSnapshot } from "~/lib/contextWindow";
+ 
+ /** Provider turn ordinals are scoped to a provider thread; children have their own nodes. */
+ export function selectComposerStatsTurns(projection: {
+@@ -248,3 +249,54 @@ export function composerLimitDisplay(
+     dimmed: freshness.status !== "fresh",
+   };
+ }
++
++/** A configured limit is a launch setting, not proof of the running query's limit. */
++export function deriveContextCompaction(
++  context: Pick<
++    ContextWindowSnapshot,
++    "usedTokens" | "usedPercentage" | "autoCompactThreshold" | "compactsAutomatically"
++  > | null,
++  driver: string | undefined,
++  configuredClaudeThreshold: unknown,
++) {
++  const configured =
++    driver === "claudeAgent" &&
++    typeof configuredClaudeThreshold === "string" &&
++    /^\d+$/.test(configuredClaudeThreshold.trim())
++      ? Number(configuredClaudeThreshold)
++      : null;
++  const validConfigured =
++    configured !== null && configured >= 100_000 && configured <= 1_000_000 ? configured : null;
++  const reported = context?.autoCompactThreshold;
++  const validReported =
++    context?.compactsAutomatically !== false &&
++    typeof reported === "number" &&
++    Number.isFinite(reported) &&
++    reported > 0
++      ? reported
++      : null;
++  const threshold =
++    context?.compactsAutomatically === false ? null : (validReported ?? validConfigured);
++  const source = threshold === null ? null : validReported !== null ? "reported" : "configured";
++  const usedTokens = context?.usedTokens;
++  const remainingTokens =
++    threshold !== null && usedTokens !== undefined ? Math.max(0, threshold - usedTokens) : null;
++  const thresholdPercentage =
++    threshold !== null && usedTokens !== undefined ? (usedTokens / threshold) * 100 : null;
++  const pressurePercentage = Math.max(context?.usedPercentage ?? 0, thresholdPercentage ?? 0);
++  const status =
++    context?.compactsAutomatically === false
++      ? "Reported off"
++      : threshold !== null
++        ? source === "reported"
++          ? "Provider reported"
++          : "Claude setting"
++        : driver === "claudeAgent"
++          ? "Claude default (threshold not reported)"
++          : driver === "codex"
++            ? "Managed by Codex (threshold not reported)"
++            : context?.compactsAutomatically === true
++              ? "On (threshold not reported)"
++              : "Not reported";
++  return { threshold, source, remainingTokens, thresholdPercentage, pressurePercentage, status };
++}
+diff --git a/apps/web/src/components/chat/ComposerStats.tsx b/apps/web/src/components/chat/ComposerStats.tsx
+index 025f57253..53b81a83a 100644
+--- a/apps/web/src/components/chat/ComposerStats.tsx
++++ b/apps/web/src/components/chat/ComposerStats.tsx
+@@ -10,6 +10,7 @@ import * as DateTime from "effect/DateTime";
+ import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
+ 
+ import { type ContextWindowSnapshot, formatContextWindowTokens } from "~/lib/contextWindow";
++import { Button } from "../ui/button";
+ import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
+ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+ import { composerFloatingLayerProps } from "./composerEventScope";
+@@ -18,6 +19,7 @@ import {
+   composerLimitDisplay,
+   composerLimitSourceLabel,
+   composerLimitsFreshness,
++  deriveContextCompaction,
+   deriveResponseRate,
+   deriveTurnCachePercentage,
+   formatCachePercentage,
+@@ -234,7 +236,7 @@ function UsageLimitsSummary({
+           <button
+             type="button"
+             aria-label="Usage limit details"
+-            className="inline-flex flex-wrap items-center gap-x-4 rounded-sm text-left outline-offset-2"
++            className="inline-flex flex-wrap items-center gap-x-4 rounded-sm text-left -outline-offset-2"
+           />
+         }
+       >
+@@ -278,12 +280,25 @@ export function ComposerStats({
+   turn,
+   compactions,
+   usageLimits,
++  contextDriver,
++  configuredClaudeThreshold,
++  onCompact,
++  compactDisabled,
++  compactDisabledReason,
++  isCompacting,
+ }: {
+   context: ContextWindowSnapshot | null;
+   turn: OrchestrationV2ProviderTurn | null;
+   compactions: ReadonlyArray<Extract<OrchestrationV2TurnItem, { type: "compaction" }>>;
+   usageLimits: { limits: ServerProviderUsageLimits; providerName: string } | null;
++  contextDriver: string | undefined;
++  configuredClaudeThreshold: unknown;
++  onCompact: () => void;
++  compactDisabled: boolean;
++  compactDisabledReason: string | null;
++  isCompacting: boolean;
+ }) {
++  const compaction = deriveContextCompaction(context, contextDriver, configuredClaudeThreshold);
+   const responseRate = deriveResponseRate(turn);
+   const estimated = turn?.responseThroughput?.basis === "codex_active_windows_estimate";
+   const usage = turn?.turnTokenUsage;
+@@ -301,7 +316,8 @@ export function ComposerStats({
+     !hasTokens &&
+     responseRate === null &&
+     compactions.length === 0 &&
+-    selectComposerLimitWindows(usageLimits?.limits).length === 0
++    selectComposerLimitWindows(usageLimits?.limits).length === 0 &&
++    compactDisabled
+   )
+     return null;
+   const count = (value: number | undefined) =>
+@@ -327,7 +343,7 @@ export function ComposerStats({
+               <button
+                 type="button"
+                 aria-label="Turn token details"
+-                className="inline-flex items-center gap-1 rounded-sm text-left outline-offset-2"
++                className="inline-flex items-center gap-1 rounded-sm text-left -outline-offset-2"
+               />
+             }
+           >
+@@ -392,7 +408,7 @@ export function ComposerStats({
+             render={
+               <span
+                 tabIndex={0}
+-                className="inline-flex items-center gap-1 rounded-sm outline-offset-2"
++                className="inline-flex items-center gap-1 rounded-sm -outline-offset-2"
+               />
+             }
+           >
+@@ -410,7 +426,7 @@ export function ComposerStats({
+   }
+ 
+   // Context is per thread, so it sits with the turn stats; the left side is account limits.
+-  if (context !== null || compactions.length > 0) {
++  if (context !== null || compactions.length > 0 || !compactDisabled || isCompacting) {
+     stats.unshift({
+       key: "context",
+       node: (
+@@ -423,13 +439,13 @@ export function ComposerStats({
+               <button
+                 type="button"
+                 aria-label="Context usage details"
+-                className="inline-flex items-center rounded-sm text-left outline-offset-2"
++                className="inline-flex items-center rounded-sm text-left -outline-offset-2"
+               />
+             }
+           >
+             <span className="inline-flex items-center gap-1">
+               {context?.usedPercentage != null ? (
+-                <span className={TONE_TEXT[toneOf(context.usedPercentage)]}>
++                <span className={TONE_TEXT[toneOf(compaction.pressurePercentage)]}>
+                   {Math.round(context.usedPercentage)}%
+                 </span>
+               ) : (
+@@ -444,7 +460,7 @@ export function ComposerStats({
+                 <h3 className="font-medium">Context usage</h3>
+                 <span className="text-muted-foreground tabular-nums">
+                   {context?.usedPercentage != null
+-                    ? `${Math.round(context.usedPercentage)}% full`
++                    ? `${Math.round(context.usedPercentage)}% of window`
+                     : "Not reported"}
+                 </span>
+               </div>
+@@ -456,11 +472,37 @@ export function ComposerStats({
+                   {context ? count(context.usedTokens) : "Not reported"}
+                 </Detail>
+                 <Detail label="Window size">{count(context?.maxTokens ?? undefined)}</Detail>
+-                <Detail label="Remaining tokens">
++                <Detail label="Window remaining">
+                   {count(context?.remainingTokens ?? undefined)}
+                 </Detail>
++                <Detail label="Auto-compact">{compaction.status}</Detail>
++                {compaction.threshold !== null && (
++                  <>
++                    <Detail
++                      label={
++                        compaction.source === "configured"
++                          ? "Configured threshold"
++                          : "Reported threshold"
++                      }
++                    >
++                      {count(compaction.threshold)} tokens
++                    </Detail>
++                    <Detail label="Tokens to threshold">
++                      {compaction.remainingTokens === null
++                        ? "Not reported"
++                        : count(compaction.remainingTokens)}
++                    </Detail>
++                  </>
++                )}
+                 <Detail label="Recorded compactions">{compactions.length}</Detail>
+               </dl>
++              {compaction.source === "configured" && (
++                <p className="text-muted-foreground">
++                  Claude's current setting applies when a query starts. A running query may use an
++                  earlier setting. Tokens to threshold use the latest context report, not a
++                  countdown.
++                </p>
++              )}
+               {compactions.length > 0 && (
+                 <div className="space-y-1.5">
+                   <p className="font-medium">Recent compactions</p>
+@@ -498,6 +540,19 @@ export function ComposerStats({
+                 Compactions count completed events in the loaded main-agent history for this
+                 provider session.
+               </p>
++              <div className="flex flex-col gap-1.5">
++                <Button
++                  size="xs"
++                  variant="outline"
++                  disabled={compactDisabled || isCompacting}
++                  onClick={onCompact}
++                >
++                  {isCompacting ? "Compacting…" : "Compact now"}
++                </Button>
++                {compactDisabled && !isCompacting && compactDisabledReason && (
++                  <p className="text-muted-foreground">{compactDisabledReason}</p>
++                )}
++              </div>
+               {context && (
+                 <p className="text-muted-foreground">
+                   Reported{" "}
+diff --git a/apps/web/src/lib/contextWindow.test.ts b/apps/web/src/lib/contextWindow.test.ts
+index 2847b23ca..d32601f98 100644
+--- a/apps/web/src/lib/contextWindow.test.ts
++++ b/apps/web/src/lib/contextWindow.test.ts
+@@ -8,7 +8,7 @@ import {
+ 
+ describe("V2 context window presentation", () => {
+   it("uses retained compaction token data when available", () => {
+-    const snapshot = deriveLatestContextWindowSnapshot([
++    const entries = [
+       {
+         item: {
+           id: "compaction-1" as never,
+@@ -22,8 +22,8 @@ describe("V2 context window presentation", () => {
+           ordinal: 1,
+           status: "completed",
+           title: null,
+-          startedAt: null,
+-          completedAt: null,
++          startedAt: DateTime.makeUnsafe("2026-06-19T23:59:00.000Z"),
++          completedAt: DateTime.makeUnsafe("2026-06-20T00:00:00.000Z"),
+           updatedAt: DateTime.makeUnsafe("2026-06-20T00:00:00.000Z"),
+           type: "compaction",
+           driver: null,
+@@ -31,9 +31,19 @@ describe("V2 context window presentation", () => {
+           afterTokenCount: 2_000,
+         },
+       },
+-    ]);
++    ] as const;
++    const snapshot = deriveLatestContextWindowSnapshot(entries);
++    expect(snapshot?.updatedAt).toBe("2026-06-20T00:00:00.000Z");
++    for (const status of ["running", "failed"] as const) {
++      expect(
++        deriveLatestContextWindowSnapshot(
++          entries.map((entry) => ({ item: { ...entry.item, status } })),
++        ),
++      ).toBeNull();
++    }
+     expect(snapshot?.usedTokens).toBe(2_000);
+-    expect(snapshot?.totalProcessedTokens).toBe(10_000);
++    expect(snapshot?.totalProcessedTokens).toBeNull();
++    expect(snapshot?.compactsAutomatically).toBeNull();
+   });
+ 
+   it("prefers current provider usage and preserves ACP cost", () => {
+@@ -110,3 +120,39 @@ describe("latestProviderTurnTokenUsage", () => {
+     expect(latest?.usedTokens).toBe(300_000);
+   });
+ });
++
++describe("compaction policy metadata", () => {
++  it("preserves reported policy alongside newer turn occupancy", () => {
++    const snapshot = deriveLatestContextWindowSnapshot(
++      [],
++      {
++        usedTokens: 360_000,
++        maxTokens: 1_000_000,
++        updatedAt: "2026-10-10T12:00:00.000Z",
++      },
++      {
++        contextUsage: {
++          usedTokens: 300_000,
++          autoCompactThreshold: 400_000,
++          compactsAutomatically: true,
++        },
++        updatedAt: DateTime.makeUnsafe("2026-10-10T11:00:00.000Z"),
++      },
++    );
++    expect(snapshot).toMatchObject({
++      usedTokens: 360_000,
++      usedPercentage: 36,
++      autoCompactThreshold: 400_000,
++      compactsAutomatically: true,
++    });
++  });
++
++  it("does not assume automatic compaction from a usage report", () => {
++    expect(
++      deriveLatestContextWindowSnapshot([], {
++        usedTokens: 42_000,
++        updatedAt: "2026-10-10T12:00:00.000Z",
++      }),
++    ).toMatchObject({ compactsAutomatically: null, autoCompactThreshold: null });
++  });
++});
+diff --git a/apps/web/src/lib/contextWindow.ts b/apps/web/src/lib/contextWindow.ts
+index 33f59c3ea..1eca0df91 100644
+--- a/apps/web/src/lib/contextWindow.ts
++++ b/apps/web/src/lib/contextWindow.ts
+@@ -74,8 +74,8 @@ export function deriveLatestContextWindowSnapshot(
+       lastReasoningOutputTokens: null,
+       toolUses: null,
+       durationMs: null,
+-      compactsAutomatically: true,
+-      autoCompactThreshold: null,
++      compactsAutomatically: providerThread?.contextUsage?.compactsAutomatically ?? null,
++      autoCompactThreshold: providerThread?.contextUsage?.autoCompactThreshold ?? null,
+       cost: null,
+       updatedAt: liveUsage.updatedAt,
+     };
+@@ -117,7 +117,7 @@ export function deriveLatestContextWindowSnapshot(
+   }
+   for (let index = entries.length - 1; index >= 0; index -= 1) {
+     const entry = entries[index];
+-    if (!entry || entry.item.type !== "compaction") {
++    if (!entry || entry.item.type !== "compaction" || entry.item.status !== "completed") {
+       continue;
+     }
+     const payload = entry.item;
+@@ -135,7 +135,7 @@ export function deriveLatestContextWindowSnapshot(
+ 
+     return {
+       usedTokens,
+-      totalProcessedTokens: asFiniteNumber(payload.beforeTokenCount),
++      totalProcessedTokens: null,
+       maxTokens,
+       remainingTokens,
+       usedPercentage,
+@@ -151,10 +151,10 @@ export function deriveLatestContextWindowSnapshot(
+       lastReasoningOutputTokens: null,
+       toolUses: null,
+       durationMs: null,
+-      compactsAutomatically: true,
++      compactsAutomatically: null,
+       autoCompactThreshold: null,
+       cost: null,
+-      updatedAt: DateTime.formatIso(payload.startedAt ?? payload.updatedAt),
++      updatedAt: DateTime.formatIso(payload.completedAt ?? payload.updatedAt),
+     };
+   }
+ 

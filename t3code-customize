@@ -124,8 +124,36 @@ def save(path, value):
     os.replace(temporary, path)
 
 
+# The fork's own port of the shared patches. It is used while it targets a newer nightly
+# than upstream's patches/, and ignored once upstream catches up; see choose_shared.
+PORT = REPO / 'patches-port'
+SHARED = REPO / 'patches'
+
+
 def patches():
-    return sorted((REPO / 'patches').glob('*.patch'))
+    return sorted(SHARED.glob('*.patch'))
+
+
+def shared_base():
+    return (SHARED / 'base.txt').read_text().strip()
+
+
+def choose_shared(log):
+    """Use patches-port/ when it is a port to a newer nightly than upstream's patches/."""
+    global SHARED
+    SHARED = REPO / 'patches'
+    if not (PORT / 'base.txt').exists():
+        return
+    upstream_base = (REPO / 'patches/base.txt').read_text().strip()
+    port_base = (PORT / 'base.txt').read_text().strip()
+    ensure_commit(upstream_base, None, log)
+    ensure_commit(port_base, None, log)
+    if port_base != upstream_base and git('merge-base', '--is-ancestor', upstream_base, port_base,
+                                          check=False, capture=False).returncode == 0:
+        SHARED = PORT
+        say(f'    Using the fork\'s port of the shared patches ({PORT.name}/, nightly {port_base[:12]})')
+    else:
+        say(f'    Upstream\'s patches caught up with {PORT.name}/; it is unused. Delete it and commit.')
 
 
 # Your own patches, kept apart from the shared ones in patches/ so upstream updates never
@@ -140,7 +168,8 @@ def own_patches():
 
 def recipe_hash():
     digest = hashlib.sha256()
-    for path in patches() + own_patches() + [REPO / 'patches/base.txt', REPO / 'checks.json'] + ([OWN_CHECKS] if OWN_CHECKS.exists() else []):
+    shared = sorted((REPO / 'patches').glob('*')) + sorted(PORT.glob('*'))
+    for path in shared + own_patches() + [REPO / 'checks.json'] + ([OWN_CHECKS] if OWN_CHECKS.exists() else []):
         digest.update(path.name.encode() + path.read_bytes())
     return digest.hexdigest()[:12]
 
@@ -432,7 +461,7 @@ def ensure_commit(commit, version, log):
 
 def prepare(target, log, resume=False):
     """Leave SOURCE with the patches as commits on top of target."""
-    base = (REPO / 'patches/base.txt').read_text().strip()
+    base = shared_base()
     if not resume:
         if rebase_in_progress():
             # Start over from the repo's patches; a fresh build never continues an old port.
@@ -558,7 +587,7 @@ def agent_fix(agent, problem, target, version, log):
 
 
 def older_than_patches(target):
-    base = (REPO / 'patches/base.txt').read_text().strip()
+    base = shared_base()
     return target != base and git('merge-base', '--is-ancestor', target, base, check=False, capture=False).returncode == 0
 
 
@@ -758,6 +787,7 @@ def cmd_build(args):
         node_bin = ensure_node(log)
         env = build_env(node_bin)
         target = ensure_commit(commit, version, log)
+        choose_shared(log)
         step('Applying the patches...')
         attempts = 2
         resume = ported = args.resume
@@ -803,7 +833,7 @@ def cmd_build(args):
     minutes = max(1, round((time.time() - started) / 60))
     say(f'\nDone in {minutes} min: T3 Code {version} with the stats bar.')
     if ported:
-        say(f'The ported patches were saved to {REPO / "patches"}.')
+        say(f'The ported patches were saved to {PORT} and {OWN_PATCHES}; commit them.')
     if MAC:
         if PENDING.exists():
             # Swap the build in as soon as the open app quits.
@@ -840,15 +870,16 @@ def install_linux_build(stock_root, version, job):
 def export_patches(target):
     """Keep a port that an agent or you finished, so the next build starts from it.
 
-    The shared patches go back to patches/ (uncommitted, until upstream ships its own port);
-    the commits after them go to patches-tt/, which you commit.
+    The shared patches go to patches-port/ (upstream's patches/ is never changed); the
+    commits after them go to patches-tt/. Commit both.
     """
     commits = git('rev-list', '--reverse', target + '..HEAD').split()
     shared = len(patches())
     split = commits[shared - 1] if shared else target
-    for path in patches() + own_patches():
+    for path in sorted(PORT.glob('*.patch')) + own_patches():
         path.unlink()
-    out = REPO / 'patches'
+    out = PORT
+    out.mkdir(exist_ok=True)
     git('format-patch', '--quiet', '--no-signature', '--zero-commit', '-o', str(out), target + '..' + split, capture=False)
     if len(commits) > shared:
         OWN_PATCHES.mkdir(exist_ok=True)
@@ -869,10 +900,12 @@ def cmd_verify(args):
     """Apply the patches to their base and run the checks. No AppImage needed (used by CI)."""
     logs = CACHE / 'logs'
     logs.mkdir(parents=True, exist_ok=True)
-    base = (REPO / 'patches/base.txt').read_text().strip()
     with (logs / ('verify-' + time.strftime('%Y%m%d-%H%M%S') + '.log')).open('w') as log:
         say('Log: ' + log.name)
         env = build_env(ensure_node(log))
+        ensure_commit((REPO / 'patches/base.txt').read_text().strip(), None, log)
+        choose_shared(log)
+        base = shared_base()
         target = ensure_commit(base, None, log)
         prepare(target, log)
         install_dependencies(env, log)

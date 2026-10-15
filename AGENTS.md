@@ -55,11 +55,13 @@ upstream did not break or duplicate them. This section says how.
 
 | Upstream owns (never commit changes) | The fork owns (commit changes) |
 | --- | --- |
-| `patches/*.patch`, `patches/base.txt`, `checks.json` | `patches-tt/*.patch`, `checks-tt.json`, this section |
+| `patches/*.patch`, `patches/base.txt`, `checks.json` | `patches-port/`, `patches-tt/`, `checks-tt.json`, this section, `CLAUDE.md` |
 | the Linux code paths in `t3code-customize` | macOS and update code in `t3code-customize`, `README.md` macOS section |
 
-- A port of the shared patches in `patches/` stays uncommitted. Upstream's next port replaces
-  it; the tool keeps a backup in `~/.local/share/t3code-customize/patches.bak-*`.
+- A port of the shared patches goes to `patches-port/` (with its own `base.txt`), never to
+  `patches/`; the tool writes it there. Builds use it while it targets a newer nightly than
+  `patches/base.txt`. Once upstream catches up, the tool says `patches-port/` is unused:
+  delete it in a commit.
 - Every change to T3 Code itself is one commit in `patches-tt/`, with its tests in
   `checks-tt.json` and a row in the table below. Never fold it into a shared patch.
 
@@ -82,7 +84,7 @@ reporting done:
    itself, stop and propose dropping the own patch rather than applying both.
 3. Run the checks (`checks.json` plus `checks-tt.json`; the tool runs both) and the row's
    check.
-4. Commit a changed `patches-tt/` as `chore: port own patches to nightly <version>`.
+4. Commit changed `patches-port/` and `patches-tt/` as `chore: port patches to nightly <version>`.
 5. Report per row: unaffected, ported (what changed), or needs a decision.
 
 When upstream changes `t3code-customize`, merge it by hand if `pull_latest` could not:
