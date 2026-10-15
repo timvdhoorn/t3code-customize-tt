@@ -70,6 +70,39 @@ Choose **Always Allow**: the copy is signed with a certificate made for your Mac
 first build (in a keychain of its own at `~/.config/t3code-customize/signing.keychain-db`),
 so the answer holds for every later build.
 
+## iOS app (TestFlight)
+
+`t3code-customize ios` builds upstream's Expo app (`apps/mobile`) with the patches, signed with
+your own Apple team and bundle identifier, and uploads it to TestFlight. It uses the nightly
+commit of the T3 Code installed on the Mac, so the app matches your servers. Run it on a Mac
+with Xcode, CocoaPods and [asc-cli](https://github.com/tddworks/asc-cli) (`brew install asccli`).
+
+```sh
+t3code-customize ios             build and upload when the nightly or the patches changed
+t3code-customize ios --force     build and upload anyway
+```
+
+`ios.json` holds the identity (bundle identifier, team, app name), the App Store Connect API key
+ID and issuer ID, and the internal TestFlight group with its testers. The `.p8` key lives in
+`~/.asc/keys/AuthKey_<key id>.p8` (mode 600) and in 1Password ("App Store Connect API key
+t3code-customize"). The first run creates the App Store Connect app through asc-cli's private
+API, which reads your App Store Connect session from the browser, so sign in there first. Xcode
+registers the extension identifiers, app group and profiles itself with the API key.
+
+Internal testers must be members of the App Store Connect team; accept the invitation before
+the tool can add you to the group. Install the build from the TestFlight app.
+
+Patches only the iOS app needs live in `patches-ios/` (checks in `checks-ios.json`); only this
+command applies them. The build takes T3 Connect's public config from the installed Mac app, as the
+official build has it. Differences from the official app: no passkeys, Sign in with Apple or
+Google sign-in, and no over-the-air updates (all are bound to T3's team or bundle identifier). Pair
+the app with your servers directly, over Tailscale, or sign in to T3 Connect.
+
+Push notifications and Live Activity updates come from your own servers instead of T3's relay
+(`patches-tt/0004`, `patches-ios/0005`). Each server needs your team's APNs key as
+`~/.t3/userdata/secrets/direct-push-apns.bin` (JSON with `teamId`, `keyId`, `privateKey`, `bundleId` and `environment`, mode 600; the 1Password item "T3 Code TT APNs key", field `serverconfig`, holds it);
+without it the server behaves as upstream.
+
 ## T3 server (Linux, headless)
 
 On a box that runs T3 as a server (`npm install -g t3@nightly` with the `t3code.service`
@@ -134,6 +167,7 @@ Everything runs on your machine. Your AppImage and your T3 data are never modifi
 ```
 t3code-customize             update the patches and build for your installed T3 Code
 t3code-customize status      show what the next launch opens
+t3code-customize ios         macOS: build the patched iOS app and upload it to TestFlight
 t3code-customize off | on    switch between stock and the customized build
 t3code-customize uninstall   remove it, its launcher, builds and caches
 ```

@@ -179,15 +179,35 @@ OWN_PATCHES = REPO / 'patches-tt'
 OWN_CHECKS = REPO / 'checks-tt.json'
 
 
+# Patches only the iOS app needs, applied after patches-tt/ by the ios command alone, so the
+# desktop app and the server never carry them.
+IOS_PATCHES = REPO / 'patches-ios'
+IOS_CHECKS = REPO / 'checks-ios.json'
+WITH_IOS = False
+
+
+def own_layers():
+    """The own patch folders this build applies, in order."""
+    return [OWN_PATCHES] + ([IOS_PATCHES] if WITH_IOS else [])
+
+
+def layer_patches(folder):
+    return sorted(folder.glob('*.patch'))
+
+
 def own_patches():
-    return sorted(OWN_PATCHES.glob('*.patch'))
+    return [p for folder in own_layers() for p in layer_patches(folder)]
+
+
+def own_checks():
+    return [OWN_CHECKS] + ([IOS_CHECKS] if WITH_IOS else [])
 
 
 def recipe_hash():
     digest = hashlib.sha256()
     # Only real files: sync tools leave hidden temporary files beside the patches.
     shared = [p for p in sorted((REPO / 'patches').glob('*')) + sorted(PORT.glob('*')) if not p.name.startswith('.')]
-    for path in shared + own_patches() + [REPO / 'checks.json'] + ([OWN_CHECKS] if OWN_CHECKS.exists() else []):
+    for path in shared + own_patches() + [REPO / 'checks.json'] + [c for c in own_checks() if c.exists()]:
         digest.update(path.name.encode() + path.read_bytes())
     return digest.hexdigest()[:12]
 
@@ -521,15 +541,21 @@ def prepare(target, log, resume=False):
     if git('merge-base', '--is-ancestor', target, 'HEAD', check=False, capture=False).returncode:
         raise NeedsFix('The patch commits are not on top of the nightly commit ' + target[:12] + '.')
     applied = int(git('rev-list', '--count', target + '..HEAD').strip())
-    if own_patches() and applied == len(patches()):
-        # The shared patches are on the nightly; now your own, three-way so moved context still applies.
-        if git('am', '--quiet', '--3way', '--committer-date-is-author-date', *map(str, own_patches()),
-               check=False, capture=False, log=log).returncode:
-            conflicted = git('diff', '--name-only', '--diff-filter=U').split()
-            raise NeedsFix(f'Your own patches in {OWN_PATCHES.name}/ conflict with this nightly'
-                           + (' in:\n' + '\n'.join('  ' + f for f in conflicted) if conflicted else '.')
-                           + '\nResolve, git add, then git am --continue (see "Fork changes" in AGENTS.md).')
-    elif applied != len(patches()) + len(own_patches()):
+    expected = len(patches())
+    for folder in own_layers():
+        layer = layer_patches(folder)
+        if layer and applied == expected:
+            # The patches before this folder are on the nightly; now this folder's, three-way so
+            # moved context still applies.
+            if git('am', '--quiet', '--3way', '--committer-date-is-author-date', *map(str, layer),
+                   check=False, capture=False, log=log).returncode:
+                conflicted = git('diff', '--name-only', '--diff-filter=U').split()
+                raise NeedsFix(f'Your own patches in {folder.name}/ conflict with this nightly'
+                               + (' in:\n' + '\n'.join('  ' + f for f in conflicted) if conflicted else '.')
+                               + '\nResolve, git add, then git am --continue (see "Fork changes" in AGENTS.md).')
+            applied += len(layer)
+        expected += len(layer)
+    if applied != expected:
         raise NeedsFix(f'Expected one commit per patch on top of the nightly ({len(patches())} shared,'
                        f' {len(own_patches())} own), found {applied}.')
 
@@ -543,8 +569,9 @@ def install_dependencies(env, log):
 
 def checks(env, log):
     spec = json.loads((REPO / 'checks.json').read_text())
-    own = load(OWN_CHECKS, {})
-    spec = {key: list(dict.fromkeys(spec.get(key, []) + own.get(key, []))) for key in ('tests', 'typecheck')}
+    for path in own_checks():
+        own = load(path, {})
+        spec = {key: list(dict.fromkeys(spec.get(key, []) + own.get(key, []))) for key in ('tests', 'typecheck')}
     missing = [t for t in spec['tests'] if not (SOURCE / t).exists()]
     if missing:
         raise NeedsFix('Test files listed in checks.json no longer exist (moved upstream?):\n' + '\n'.join('  ' + t for t in missing))
@@ -649,10 +676,13 @@ def stuck_message(problem, target):
     if older_than_patches(target):
         return (f'{problem}\n\nYour T3 Code is older than these patches. Update T3 Code, then run {NAME} again.\n'
                 'Your current T3 Code is untouched.')
+    # An iOS port carries patches-ios/, which only the ios command applies.
+    command = f'{NAME} ios' if WITH_IOS else NAME
     return (f'{problem}\n\nThis nightly changed code the patches touch. Any of these works:\n'
-            f'  - wait for the repo to catch up (usually within a day), then run {NAME} again\n'
-            f'  - let an agent port them now: {NAME} --fix claude  (or --fix codex)\n'
-            f'  - or ask your coding agent to follow {REPO}/AGENTS.md\n'
+            f'  - wait for the repo to catch up (usually within a day), then run {command} again\n'
+            f'  - let an agent port them now: {command} --fix claude  (or --fix codex)\n'
+            f'  - or ask your coding agent to follow {REPO}/AGENTS.md'
+            + (f', then finish with {command} --resume' if WITH_IOS else '') + '\n'
             'Your current T3 Code is untouched and still opens normally.')
 
 
@@ -999,19 +1029,27 @@ def export_patches(target):
     """Keep a port that an agent or you finished, so the next build starts from it.
 
     The shared patches go to patches-port/ (upstream's patches/ is never changed); the
-    commits after them go to patches-tt/. Commit both.
+    commits after them go to patches-tt/ (and, for the iOS app, patches-ios/). Commit them.
     """
     commits = git('rev-list', '--reverse', target + '..HEAD').split()
     shared = len(patches())
     split = commits[shared - 1] if shared else target
+    # Each own folder keeps as many commits as it had patches; the last folder takes any extra.
+    layers = own_layers()
+    sizes = [len(layer_patches(folder)) for folder in layers]
+    sizes[-1] = len(commits) - shared - sum(sizes[:-1])
     for path in sorted(PORT.glob('*.patch')) + own_patches():
         path.unlink()
     out = PORT
     out.mkdir(exist_ok=True)
     git('format-patch', '--quiet', '--no-signature', '--zero-commit', '-o', str(out), target + '..' + split, capture=False)
-    if len(commits) > shared:
-        OWN_PATCHES.mkdir(exist_ok=True)
-        git('format-patch', '--quiet', '--no-signature', '--zero-commit', '-o', str(OWN_PATCHES), split + '..HEAD', capture=False)
+    start = shared
+    for folder, size in zip(layers, sizes):
+        if size > 0:
+            folder.mkdir(exist_ok=True)
+            git('format-patch', '--quiet', '--no-signature', '--zero-commit', '-o', str(folder),
+                f'{commits[start - 1] if start else target}..{commits[start + size - 1]}', capture=False)
+        start += size
     (out / 'base.txt').write_text(target + '\n')
 
 
@@ -1514,6 +1552,12 @@ def cmd_status(args):
         say('Background updates: ' + ('on' if AUTOUPDATE_PLIST.exists() else f'off ({NAME} autoupdate on)'))
         if notice:
             say(f'Your T3 Code is newer than the customized build. Run {NAME} to rebuild.')
+        ios_state = load(IOS_STATE)
+        if ios_state:
+            behind = (ios_state.get('recipe') != ios_recipe_hash()
+                      or ios_state.get('version') != bundle_version(appimage))
+            say(f"iOS app:            build {ios_state['buildNumber']} for {ios_state['version']}"
+                + (f' (behind; run {NAME} ios)' if behind else ''))
         return
     say('Switched:           ' + ('off' if DISABLED.exists() else 'on'))
     say('Next launch opens:  ' + ('customized build' if target != appimage else 'stock T3 Code'))
@@ -1688,6 +1732,218 @@ def cmd_fleet(args):
         raise Stop('Not every machine is up to date.')
 
 
+# --- iOS app ------------------------------------------------------------------------
+# `ios` builds upstream's Expo app (apps/mobile) with the patches under your own Apple team and
+# bundle identifier and uploads it to TestFlight. It uses the nightly commit of the T3 Code
+# installed on this Mac, so the app and your servers speak the same protocol. Identity and
+# App Store Connect settings are in ios.json; the API key itself stays in ~/.asc/keys.
+
+IOS_CONFIG = REPO / 'ios.json'
+IOS_STATE = DATA / 'ios-state.json'
+
+
+def ios_config():
+    config = load(IOS_CONFIG)
+    if not config:
+        raise Stop(f'No {IOS_CONFIG.name} in {REPO}; it names the bundle identifier, team and API key.')
+    key = Path(config.get('ascKeyPath') or HOME / '.asc/keys' / f"AuthKey_{config['ascKeyId']}.p8").expanduser()
+    if not key.is_file():
+        raise Stop(f'App Store Connect API key {key} is missing. It is in 1Password'
+                   f' ("App Store Connect API key {NAME}"); put it there with mode 600.')
+    if not config.get('ascIssuerId'):
+        raise Stop(f'ascIssuerId is empty in {IOS_CONFIG.name} (App Store Connect > Users and Access > Integrations).')
+    return dict(config, ascKeyPath=str(key))
+
+
+def asc(config, *args, log=None, check=True):
+    """Run asc-cli and return its JSON output."""
+    env = dict(os.environ, ASC_KEY_ID=config['ascKeyId'], ASC_ISSUER_ID=config['ascIssuerId'],
+               ASC_PRIVATE_KEY_PATH=config['ascKeyPath'])
+    result = subprocess.run(['asccli', *args], env=env, capture_output=True, text=True)
+    if log:
+        log.write(f'$ asccli {" ".join(args)}\n{result.stdout}{result.stderr}\n')
+        log.flush()
+    if result.returncode:
+        if not check:
+            return None
+        raise Stop(f'asccli {" ".join(args[:2])} failed: {(result.stderr or result.stdout).strip()[:500]}')
+    try:
+        return json.loads(result.stdout or '{}')
+    except ValueError:
+        return {}
+
+
+def ios_app_id(config, log):
+    """The App Store Connect app for the bundle identifier, created the first time."""
+    def find():
+        apps = asc(config, 'apps', 'list', log=log).get('data', [])
+        return next((a['id'] for a in apps if a.get('bundleId') == config['bundleId']), None)
+    app_id = find()
+    if app_id:
+        return app_id
+    step(f'Creating the App Store Connect app {config["appName"]}...')
+    ids = asc(config, 'bundle-ids', 'list', '--identifier', config['bundleId'], log=log, check=False) or {}
+    if not ids.get('data'):
+        asc(config, 'bundle-ids', 'create', '--name', config['appName'], '--identifier', config['bundleId'],
+            '--platform', 'ios', log=log)
+    # Only the private API (an Apple ID session from your browser) can create an app.
+    created = asc(config, 'iris', 'apps', 'create', '--name', config['appName'], '--bundle-id', config['bundleId'],
+                  '--sku', config.get('sku') or config['bundleId'], log=log, check=False)
+    if not created or not created.get('data'):
+        raise Stop('Could not create the app in App Store Connect. Sign in at https://appstoreconnect.apple.com'
+                   ' in your browser (asc-cli reads its session) and run again.')
+    # The public API lists a new app only after a short delay.
+    return created['data'][0]['id']
+
+
+def ios_testers(config, app_id, log):
+    """An internal TestFlight group that gets every build, with the testers from ios.json."""
+    name = config.get('betaGroup') or 'Internal'
+    groups = asc(config, 'testflight', 'groups', 'list', '--app-id', app_id, log=log).get('data', [])
+    group = next((g for g in groups if g.get('name') == name), None)
+    if not group:
+        group = asc(config, 'testflight', 'groups', 'create', '--app-id', app_id, '--name', name,
+                    '--internal', log=log)['data'][0]
+    present = {t.get('email', '').lower() for t in
+               (asc(config, 'testflight', 'testers', 'list', '--beta-group-id', group['id'], log=log, check=False) or {}).get('data', [])}
+    for email in config.get('testers', []):
+        if email.lower() in present:
+            continue
+        if asc(config, 'testflight', 'testers', 'add', '--beta-group-id', group['id'], '--email', email,
+               log=log, check=False) is None:
+            say(f'    Could not add {email} to "{name}": internal testers must be members of the'
+                ' App Store Connect team (accept the invitation first).')
+    return group
+
+
+def ios_marketing_version():
+    found = re.search(r'^\s*version:\s*"([\d.]+)"', (SOURCE / 'apps/mobile/app.config.ts').read_text(), re.M)
+    if not found:
+        raise Stop('apps/mobile/app.config.ts no longer sets version; update ios_marketing_version in ' + NAME + '.')
+    return found.group(1)
+
+
+def xcode_auth(config):
+    return ['-allowProvisioningUpdates', '-authenticationKeyPath', config['ascKeyPath'],
+            '-authenticationKeyID', config['ascKeyId'], '-authenticationKeyIssuerID', config['ascIssuerId']]
+
+
+def build_ios(env, config, public, build_number, job, log):
+    mobile = SOURCE / 'apps/mobile'
+    # public: T3 Connect's public config from the installed app, as the official build has it.
+    # Xcode's IPA step needs the system rsync; Homebrew's rsync 3.x fails it with "Copy failed".
+    env = dict(env, **public, PATH=os.pathsep.join(['/usr/bin', env.get('PATH', os.environ['PATH'])]),
+               APP_VARIANT='production', EXPO_NO_GIT_STATUS='1', CI='1',
+               T3CODE_IOS_BUNDLE_ID=config['bundleId'], T3CODE_IOS_TEAM_ID=config['teamId'],
+               T3CODE_IOS_APP_NAME=config['appName'])
+    step('Generating the iOS project...')
+    run([*pnpm(env), 'exec', 'expo', 'prebuild', '--clean', '--platform', 'ios'], cwd=mobile, env=env, log=log)
+    workspace = next((mobile / 'ios').glob('*.xcworkspace'), None)
+    if not workspace:
+        raise Stop('expo prebuild produced no Xcode workspace in apps/mobile/ios.')
+    # Prebuild writes a literal CFBundleVersion of 1 into the app and widget plists (EAS
+    # numbers builds remotely); every target must carry this build's number.
+    for info in (mobile / 'ios').glob('*/Info.plist'):
+        plist = plistlib.loads(info.read_bytes())
+        if not str(plist.get('CFBundleVersion', '')).startswith('$('):
+            plist['CFBundleVersion'] = build_number
+            info.write_bytes(plistlib.dumps(plist))
+    step('Archiving the app (10-20 min)...')
+    archive = job / 'app.xcarchive'
+    run(['xcodebuild', '-workspace', str(workspace), '-scheme', workspace.stem, '-configuration', 'Release',
+         '-destination', 'generic/platform=iOS', '-archivePath', str(archive),
+         '-derivedDataPath', str(CACHE / 'ios-derived'), *xcode_auth(config),
+         f'DEVELOPMENT_TEAM={config["teamId"]}', f'CURRENT_PROJECT_VERSION={build_number}', 'archive'], cwd=mobile / 'ios', env=env, log=log)
+    options = job / 'ExportOptions.plist'
+    options.write_bytes(plistlib.dumps({'method': 'app-store-connect', 'teamID': config['teamId'],
+                                        'signingStyle': 'automatic', 'destination': 'export',
+                                        'uploadSymbols': True, 'manageAppVersionAndBuildNumber': False}))
+    step('Signing the app for TestFlight...')
+    export = job / 'export'
+    run(['xcodebuild', '-exportArchive', '-archivePath', str(archive), '-exportPath', str(export),
+         '-exportOptionsPlist', str(options), *xcode_auth(config)], env=env, log=log)
+    ipa = next(export.glob('*.ipa'), None)
+    if not ipa:
+        raise Stop('xcodebuild exported no .ipa.')
+    return ipa
+
+
+def ios_recipe_hash():
+    global WITH_IOS
+    previous, WITH_IOS = WITH_IOS, True
+    try:
+        return recipe_hash()
+    finally:
+        WITH_IOS = previous
+
+
+def cmd_ios(args):
+    """Build the patched iOS app for the nightly installed on this Mac and upload it to TestFlight."""
+    global WITH_IOS
+    WITH_IOS = True
+    if not MAC:
+        raise Stop('ios builds with Xcode; run it on a Mac.')
+    for tool in ('xcodebuild', 'pod', 'asccli'):
+        if not shutil.which(tool):
+            raise Stop(f'{tool} is required (asccli: brew install asccli; pod: brew install cocoapods).')
+    config = ios_config()
+    if not args.no_pull and not args.resume:
+        pull_latest()
+    app = find_mac_app(args.appimage)
+    archive = Archive(app / 'Contents/Resources/app.asar')
+    try:
+        metadata = json.loads(archive.read('package.json'))
+        public = read_public_config(archive)
+    finally:
+        archive.close()
+    version, commit = metadata['version'], metadata.get('t3codeCommitHash', '')
+    if not re.fullmatch(r'[0-9a-f]{7,40}', commit):
+        raise Stop(f'{app.name} does not record its source commit.')
+    if len(public) != len(PUBLIC_CONFIG):
+        say('    Note: could not read T3 Connect config from your app; sign-in will not work in this build.')
+    say(f'T3 Code {version} ({app.name}), upstream commit {commit[:12]}')
+    state = load(IOS_STATE, {})
+    recipe = recipe_hash()
+    if (not args.force and not args.resume and state.get('commit', '').startswith(commit)
+            and state.get('recipe') == recipe and state.get('bundleId') == config['bundleId']):
+        say(f"Already up to date: build {state['buildNumber']} of {config['appName']} is on TestFlight.")
+        return False
+    started = time.time()
+    logs = CACHE / 'logs'
+    logs.mkdir(parents=True, exist_ok=True)
+    job = CACHE / 'work' / ('ios-' + time.strftime('%Y%m%d-%H%M%S'))
+    job.mkdir(parents=True)
+    with (logs / (job.name + '.log')).open('w') as log:
+        say('Log: ' + log.name)
+        step('Checking App Store Connect...')
+        app_id = ios_app_id(config, log)
+        env = build_env(ensure_node(log))
+        target = ensure_commit(commit, version, log)
+        ported = apply_patches(args, target, version, env, log)
+        head = git('rev-parse', 'HEAD').strip()
+        build_number = time.strftime('%Y%m%d%H%M')
+        marketing = ios_marketing_version()
+        ipa = build_ios(env, config, public, build_number, job, log)
+        if git('rev-parse', 'HEAD').strip() != head:
+            raise Stop('The source checkout changed during the build.')
+        if ported:
+            export_patches(target)
+        step(f'Uploading build {build_number} to TestFlight and waiting for processing...')
+        asc(config, 'builds', 'upload', '--app-id', app_id, '--file', str(ipa), '--version', marketing,
+            '--build-number', build_number, '--wait', '--timeout', '60m', log=log)
+        group = ios_testers(config, app_id, log)
+        save(IOS_STATE, {'commit': target, 'version': version, 'recipe': recipe_hash() if ported else recipe,
+                         'bundleId': config['bundleId'], 'appId': app_id, 'buildNumber': build_number,
+                         'marketingVersion': marketing, 'uploadedAt': time.strftime('%Y-%m-%dT%H:%M:%S')})
+    shutil.rmtree(job, ignore_errors=True)
+    minutes = max(1, round((time.time() - started) / 60))
+    say(f'\nDone in {minutes} min: {config["appName"]} {marketing} ({build_number}) for nightly {version}'
+        f' is on TestFlight in "{group.get("name")}". Update it from the TestFlight app on your iPhone.')
+    if ported:
+        say(f'The ported patches were saved to {PORT}, {OWN_PATCHES} and {IOS_PATCHES}; commit them.')
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(prog=NAME, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                      epilog='With no command, it updates the patches and builds for your installed T3 Code'
@@ -1728,6 +1984,8 @@ def main():
     fleet.add_argument('--fix', choices=sorted(AGENTS), help='let this agent port broken patches on each machine')
     fleet.add_argument('--force', action='store_true', help='rebuild even if nothing changed')
     fleet.add_argument('--no-pull', action='store_true', help='do not fetch newer patches first')
+    ios = sub.add_parser('ios', help='macOS: build the patched iOS app and upload it to TestFlight (see ios.json)')
+    build_options(ios)
     sub.add_parser('install-pending')
     sub.add_parser('identity')
     argv = sys.argv[1:]

@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: timvdhoorn <timvdhoorn@gmail.com>
+Date: Thu, 15 Oct 2026 20:09:23 +0200
+Subject: [PATCH] feat(mobile): use the iOS system font for UI text
+
+---
+ apps/mobile/app.config.ts                     |  4 +-
+ apps/mobile/global.css                        | 12 +++
+ .../ios/T3ComposerEditorView.swift            |  8 +-
+ apps/mobile/src/lib/system-font.test.ts       | 83 +++++++++++++++++++
+ .../lib/uniwind-platform-variants.fixture.cjs |  1 +
+ apps/mobile/src/lib/useFontFamily.ts          | 12 +--
+ .../src/native/EnrichedMarkdownText.tsx       |  7 +-
+ 7 files changed, 113 insertions(+), 14 deletions(-)
+ create mode 100644 apps/mobile/src/lib/system-font.test.ts
+
+diff --git a/apps/mobile/app.config.ts b/apps/mobile/app.config.ts
+index c416b5503..22b021fe9 100644
+--- a/apps/mobile/app.config.ts
++++ b/apps/mobile/app.config.ts
+@@ -354,9 +354,7 @@ const config: ExpoConfig = {
+     [
+       "expo-font",
+       {
+-        ios: {
+-          fonts: [dmSansFonts.regular, dmSansFonts.medium, dmSansFonts.bold],
+-        },
++        // iOS uses the system font, so DM Sans ships to Android only.
+         android: {
+           fonts: [
+             {
+diff --git a/apps/mobile/global.css b/apps/mobile/global.css
+index 730b9e1a9..42d28e7b9 100644
+--- a/apps/mobile/global.css
++++ b/apps/mobile/global.css
+@@ -5,6 +5,12 @@
+ /* ─── Theme tokens ──────────────────────────────────────────────────── */
+ @layer theme {
+   :root {
++    /* iOS uses the system font (SF Pro); weights come from font-weight below. */
++    @variant ios {
++      --font-sans: "System";
++      --font-medium: "System";
++      --font-bold: "System";
++    }
+     @variant android {
+       --font-mono: "monospace";
+     }
+@@ -42,10 +48,16 @@
+ /* ─── Custom utilities ──────────────────────────────────────────────── */
+ @utility font-t3-medium {
+   font-family: var(--font-medium);
++  @variant ios {
++    font-weight: 500;
++  }
+ }
+ 
+ @utility font-t3-bold {
+   font-family: var(--font-bold);
++  @variant ios {
++    font-weight: 700;
++  }
+ }
+ 
+ @utility font-t3-extrabold {
+diff --git a/apps/mobile/modules/t3-composer-editor/ios/T3ComposerEditorView.swift b/apps/mobile/modules/t3-composer-editor/ios/T3ComposerEditorView.swift
+index 33150993f..a7bc74105 100644
+--- a/apps/mobile/modules/t3-composer-editor/ios/T3ComposerEditorView.swift
++++ b/apps/mobile/modules/t3-composer-editor/ios/T3ComposerEditorView.swift
+@@ -455,7 +455,7 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
+     skillText: "#a21caf",
+     fileTint: "#737373"
+   )
+-  private var fontFamily = "DMSans-Regular"
++  private var fontFamily = "System"
+   private var fontSize: CGFloat = 14
+   private var lineHeight: CGFloat = 20
+   private var contentInsetVertical: CGFloat = 0
+@@ -976,8 +976,7 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
+     // Kept in step with `T3ContextChipVectorIcon` in the markdown module: a chip drawn here and
+     // the same chip drawn in a sent message have to be the same picture.
+     let chipFontSize = fontSize * 0.86
+-    let font = UIFont(name: "DMSans-Medium", size: chipFontSize)
+-      ?? UIFont.systemFont(ofSize: chipFontSize, weight: .medium)
++    let font = UIFont.systemFont(ofSize: chipFontSize, weight: .medium)
+     let fallbackIcon = Self.vectorIcon(named: iconName, size: 14, color: style.textColor)
+       ?? UIImage(
+         systemName: iconName,
+@@ -988,8 +987,7 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
+     // label the way the web chip does.
+     let paragraph = NSMutableParagraphStyle()
+     paragraph.alignment = .left
+-    let detailFont = UIFont(name: "DMSans-Medium", size: chipFontSize * 0.84)
+-      ?? UIFont.systemFont(ofSize: chipFontSize * 0.84, weight: .medium)
++    let detailFont = UIFont.systemFont(ofSize: chipFontSize * 0.84, weight: .medium)
+     let attributedLabel = NSMutableAttributedString(
+       string: label,
+       attributes: [.font: font, .foregroundColor: style.textColor, .paragraphStyle: paragraph]
+diff --git a/apps/mobile/src/lib/system-font.test.ts b/apps/mobile/src/lib/system-font.test.ts
+new file mode 100644
+index 000000000..ae71ee157
+--- /dev/null
++++ b/apps/mobile/src/lib/system-font.test.ts
+@@ -0,0 +1,83 @@
++import * as NodeChildProcess from "node:child_process";
++import * as NodeFS from "node:fs";
++import * as NodeOS from "node:os";
++import * as NodePath from "node:path";
++import * as NodeURL from "node:url";
++import { beforeAll, describe, expect, it } from "vite-plus/test";
++
++// iOS renders UI text in the system font (SF Pro). The family is "System" for every weight,
++// so the weight utilities must carry a font-weight on iOS, while Android keeps DM Sans,
++// whose weights live in the family names.
++
++interface FixtureOutput {
++  platforms: Record<
++    string,
++    { styles: Record<string, { native: boolean }[] | undefined>; payload: string }
++  >;
++}
++
++const runFixture = (globalCss: string, probeSource: string): FixtureOutput => {
++  const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "uniwind-system-font-"));
++  try {
++    NodeFS.symlinkSync(
++      NodeFS.realpathSync(new URL("../../node_modules", import.meta.url)),
++      NodePath.join(tempDir, "node_modules"),
++      "dir",
++    );
++    NodeFS.writeFileSync(NodePath.join(tempDir, "global.css"), globalCss);
++    NodeFS.writeFileSync(NodePath.join(tempDir, "Probe.tsx"), probeSource);
++    const fixture = NodeURL.fileURLToPath(
++      new URL("./uniwind-platform-variants.fixture.cjs", import.meta.url),
++    );
++    const stdout = NodeChildProcess.execFileSync(process.execPath, [fixture, tempDir], {
++      encoding: "utf8",
++      maxBuffer: 32 * 1024 * 1024,
++      timeout: 60_000,
++    });
++    const start = stdout.indexOf('{"tailwindChecks"');
++    if (start === -1) {
++      throw new Error(`Fixture produced no JSON:\n${stdout}`);
++    }
++    return JSON.parse(stdout.slice(start)) as FixtureOutput;
++  } finally {
++    NodeFS.rmSync(tempDir, { recursive: true, force: true });
++  }
++};
++
++describe("the app typography uses the iOS system font", () => {
++  let output: FixtureOutput;
++
++  beforeAll(() => {
++    // The app's real global.css, minus the generated theme file whose custom variants need
++    // the app's theme config.
++    const globalCss = NodeFS.readFileSync(new URL("../../global.css", import.meta.url), "utf8")
++      .split("\n")
++      .filter((line) => !line.includes("generated-uniwind-themes"))
++      .join("\n");
++    output = runFixture(
++      globalCss,
++      'export const Probe = () => <div className="font-sans font-t3-medium font-t3-bold" />;\n',
++    );
++  }, 60_000);
++
++  it("resolves every sans family to System on iOS only", () => {
++    const ios = output.platforms.ios?.payload ?? "";
++    const iosVars = /"__uniwind-platform-ios": \(\{([^}]*)\}\)/.exec(ios)?.[1] ?? "";
++    for (const variable of ["--font-sans", "--font-medium", "--font-bold"]) {
++      expect(iosVars).toContain(`"${variable}": vars => "System"`);
++    }
++    const android = output.platforms.android?.payload ?? "";
++    const androidVars = /"__uniwind-platform-android": \(\{([^}]*)\}\)/.exec(android)?.[1] ?? "";
++    expect(androidVars).not.toContain("System");
++    expect(android).toContain('"--font-bold": vars => "DMSans-Bold"');
++  });
++
++  it("gives the weight utilities an iOS-only font weight", () => {
++    for (const className of ["font-t3-medium", "font-t3-bold"]) {
++      expect(output.platforms.ios?.styles[className]?.some((style) => style.native)).toBe(true);
++      expect(output.platforms.android?.styles[className]?.some((style) => style.native)).toBe(
++        false,
++      );
++    }
++  });
++});
+diff --git a/apps/mobile/src/lib/uniwind-platform-variants.fixture.cjs b/apps/mobile/src/lib/uniwind-platform-variants.fixture.cjs
+index 8d8017f28..4ebe782b9 100644
+--- a/apps/mobile/src/lib/uniwind-platform-variants.fixture.cjs
++++ b/apps/mobile/src/lib/uniwind-platform-variants.fixture.cjs
+@@ -125,6 +125,7 @@ async function main() {
+     }
+     platforms[platform] = {
+       styles,
++      payload,
+       payloadIncludesAllCompiled: Object.keys(compiled).every((className) =>
+         payload.includes(`"${className}"`),
+       ),
+diff --git a/apps/mobile/src/lib/useFontFamily.ts b/apps/mobile/src/lib/useFontFamily.ts
+index 4f845753b..c73ebc770 100644
+--- a/apps/mobile/src/lib/useFontFamily.ts
++++ b/apps/mobile/src/lib/useFontFamily.ts
+@@ -1,8 +1,10 @@
+-const FONT_FAMILIES = {
+-  regular: "DMSans-Regular",
+-  medium: "DMSans-Medium",
+-  bold: "DMSans-Bold",
+-} as const;
++import { Platform } from "react-native";
++
++// iOS uses the system font (SF Pro): the family stays "System" and callers set the weight.
++const FONT_FAMILIES =
++  Platform.OS === "ios"
++    ? { regular: "System", medium: "System", bold: "System" }
++    : { regular: "DMSans-Regular", medium: "DMSans-Medium", bold: "DMSans-Bold" };
+ 
+ /**
+  * Resolves a font family for APIs that require a style object or native prop.
+diff --git a/apps/mobile/src/native/EnrichedMarkdownText.tsx b/apps/mobile/src/native/EnrichedMarkdownText.tsx
+index d77c94919..faac29aac 100644
+--- a/apps/mobile/src/native/EnrichedMarkdownText.tsx
++++ b/apps/mobile/src/native/EnrichedMarkdownText.tsx
+@@ -65,7 +65,12 @@ function enrichedStyle(
+     h4: heading(4),
+     h5: heading(5),
+     h6: heading(6),
+-    strong: { color: style.strongColor, fontFamily: style.boldFontFamily, fontWeight: "normal" },
++    strong: {
++      color: style.strongColor,
++      fontFamily: style.boldFontFamily,
++      // The iOS system family carries no weight of its own.
++      fontWeight: Platform.OS === "ios" ? "bold" : "normal",
++    },
+     link: { color: style.linkColor, underline: false },
+     code: {
+       fontFamily: monospace,

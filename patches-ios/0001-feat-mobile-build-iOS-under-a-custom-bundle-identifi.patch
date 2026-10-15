@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: timvdhoorn <timvdhoorn@gmail.com>
+Date: Thu, 15 Oct 2026 19:48:05 +0200
+Subject: [PATCH] feat(mobile): build iOS under a custom bundle identifier and
+ team
+
+T3CODE_IOS_BUNDLE_ID, T3CODE_IOS_TEAM_ID and T3CODE_IOS_APP_NAME sign a full-capability build (widgets, share extension, app group, push entitlement) with your own paid Apple team. Features bound to the T3 Tools identity are switched off: OTA updates from the T3 Expo project, Clerk associated domains and native Sign in with Apple.
+---
+ apps/mobile/app.config.test.ts | 67 ++++++++++++++++++++++++++++++++++
+ apps/mobile/app.config.ts      | 55 +++++++++++++++++++++++-----
+ 2 files changed, 112 insertions(+), 10 deletions(-)
+ create mode 100644 apps/mobile/app.config.test.ts
+
+diff --git a/apps/mobile/app.config.test.ts b/apps/mobile/app.config.test.ts
+new file mode 100644
+index 000000000..12d618cf0
+--- /dev/null
++++ b/apps/mobile/app.config.test.ts
+@@ -0,0 +1,67 @@
++import type { ExpoConfig } from "expo/config";
++import { afterEach, describe, expect, it, vi } from "vite-plus/test";
++
++async function loadConfig(env: Record<string, string>): Promise<ExpoConfig> {
++  vi.resetModules();
++  for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
++  return (await import("./app.config.ts")).default;
++}
++
++function pluginOptions(config: ExpoConfig, name: string): Record<string, unknown> | undefined {
++  const entry = config.plugins?.find((plugin) => Array.isArray(plugin) && plugin[0] === name);
++  return Array.isArray(entry) ? (entry[1] as Record<string, unknown>) : undefined;
++}
++
++const customIdentity = {
++  APP_VARIANT: "production",
++  T3CODE_IOS_BUNDLE_ID: "nl.example.t3code",
++  T3CODE_IOS_TEAM_ID: "ABCDE12345",
++  T3CODE_IOS_APP_NAME: "T3 Code Custom",
++};
++
++describe("app config iOS identity", () => {
++  afterEach(() => {
++    vi.unstubAllEnvs();
++  });
++
++  it("keeps the T3 Tools identity by default", async () => {
++    const config = await loadConfig({ APP_VARIANT: "production", T3CODE_IOS_BUNDLE_ID: "" });
++
++    expect(config.name).toBe("T3 Code");
++    expect(config.ios?.bundleIdentifier).toBe("com.t3tools.t3code");
++    expect(config.ios?.appleTeamId).toBe("ARK85ZXQ4Z");
++    expect(config.ios?.associatedDomains).toEqual([
++      "applinks:clerk.t3.codes",
++      "webcredentials:clerk.t3.codes",
++    ]);
++    expect(pluginOptions(config, "@clerk/expo")?.appleSignIn).toBe(true);
++  });
++
++  it("signs a custom identity with its own team and drops T3 Tools-bound features", async () => {
++    const config = await loadConfig(customIdentity);
++
++    expect(config.name).toBe("T3 Code Custom");
++    expect(config.ios?.bundleIdentifier).toBe("nl.example.t3code");
++    expect(config.ios?.appleTeamId).toBe("ABCDE12345");
++    expect(config.ios?.associatedDomains).toBeUndefined();
++    expect(config.ios?.entitlements?.["keychain-access-groups"]).toEqual([
++      "$(AppIdentifierPrefix)nl.example.t3code",
++    ]);
++    expect(config.updates?.enabled).toBe(false);
++    expect(pluginOptions(config, "@clerk/expo")?.appleSignIn).toBe(false);
++    expect(pluginOptions(config, "expo-sharing")?.ios).toMatchObject({
++      enabled: true,
++      extensionBundleIdentifier: "nl.example.t3code.sharing",
++      appGroupId: "group.nl.example.t3code",
++    });
++    expect(pluginOptions(config, "expo-widgets")?.bundleIdentifier).toBe(
++      "nl.example.t3code.widgets",
++    );
++  });
++
++  it("requires a valid team ID with a custom bundle identifier", async () => {
++    await expect(loadConfig({ ...customIdentity, T3CODE_IOS_TEAM_ID: "" })).rejects.toThrow(
++      "T3CODE_IOS_TEAM_ID",
++    );
++  });
++});
+diff --git a/apps/mobile/app.config.ts b/apps/mobile/app.config.ts
+index 57717d2d8..c416b5503 100644
+--- a/apps/mobile/app.config.ts
++++ b/apps/mobile/app.config.ts
+@@ -16,6 +16,15 @@ const runtimeVersionPolicy =
+ 
+ const personalTeamBundleIdentifier = repoEnv.T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID?.trim();
+ const IOS_BUNDLE_IDENTIFIER_PATTERN = /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/;
++const APPLE_TEAM_ID_PATTERN = /^[A-Z0-9]{10}$/;
++
++// A custom identity signs a full-capability build with your own paid team and
++// bundle identifier. Features tied to the T3 Tools identity (relay push, Clerk
++// passkeys and Sign in with Apple, OTA updates from the T3 Expo project) are
++// switched off, because they cannot work under another bundle identifier.
++const customBundleIdentifier = repoEnv.T3CODE_IOS_BUNDLE_ID?.trim() || undefined;
++const customTeamId = repoEnv.T3CODE_IOS_TEAM_ID?.trim() || undefined;
++const isIosCustomIdentityBuild = customBundleIdentifier !== undefined;
+ 
+ const fromRepoRoot = (relativePath: string) => `../../${relativePath}`;
+ // Android layers are rendered by scripts/export-android-icons.ts from the Icon Composer sources.
+@@ -32,6 +41,22 @@ if (
+   );
+ }
+ 
++if (isIosCustomIdentityBuild) {
++  if (isIosPersonalTeamBuild) {
++    throw new Error("T3CODE_IOS_BUNDLE_ID cannot be combined with T3CODE_IOS_PERSONAL_TEAM=1.");
++  }
++  if (!IOS_BUNDLE_IDENTIFIER_PATTERN.test(customBundleIdentifier)) {
++    throw new Error(
++      "T3CODE_IOS_BUNDLE_ID must be a reverse-DNS identifier such as com.example.t3code.",
++    );
++  }
++  if (!customTeamId || !APPLE_TEAM_ID_PATTERN.test(customTeamId)) {
++    throw new Error(
++      "T3CODE_IOS_TEAM_ID must be a 10-character Apple team ID when T3CODE_IOS_BUNDLE_ID is set.",
++    );
++  }
++}
++
+ const DEVELOPMENT_ASSETS = {
+   appIcon: fromRepoRoot(BRAND_ASSET_PATHS.developmentIosIconPng),
+   iosIcon: fromRepoRoot(BRAND_ASSET_PATHS.developmentIconComposerProject),
+@@ -112,7 +137,9 @@ function resolveAppVariant(value: string | undefined): AppVariant {
+ const variant = VARIANT_CONFIG[APP_VARIANT];
+ const iosBundleIdentifier = isIosPersonalTeamBuild
+   ? personalTeamBundleIdentifier!
+-  : variant.iosBundleIdentifier;
++  : (customBundleIdentifier ?? variant.iosBundleIdentifier);
++const appName =
++  (isIosCustomIdentityBuild && repoEnv.T3CODE_IOS_APP_NAME?.trim()) || variant.appName;
+ 
+ const dmSansFonts = {
+   regular: "@expo-google-fonts/dm-sans/400Regular/DMSans_400Regular.ttf",
+@@ -225,7 +252,7 @@ const sharingPlugin: NonNullable<ExpoConfig["plugins"]>[number] = [
+ // family names without waiting for runtime font loading.
+ 
+ const config: ExpoConfig = {
+-  name: variant.appName,
++  name: appName,
+   slug: "t3-code",
+   platforms: ["ios", "android"],
+   scheme: variant.scheme,
+@@ -240,7 +267,7 @@ const config: ExpoConfig = {
+   icon: variant.assets.appIcon,
+   userInterfaceStyle: "automatic",
+   updates: {
+-    enabled: repoEnv.T3CODE_MOBILE_UPDATES_ENABLED !== "0",
++    enabled: !isIosCustomIdentityBuild && repoEnv.T3CODE_MOBILE_UPDATES_ENABLED !== "0",
+     url: "https://u.expo.dev/d763fcb8-d37c-41ea-a773-b54a0ab4a454",
+     checkAutomatically: "ON_LOAD",
+     fallbackToCacheTimeout: 0,
+@@ -255,13 +282,15 @@ const config: ExpoConfig = {
+     // Pin code signing to the T3 Tools team so non-interactive `expo run:ios`
+     // does not fall back to a personal team (which cannot sign app groups,
+     // Sign in with Apple, or push notification entitlements).
+-    appleTeamId: "ARK85ZXQ4Z",
+-    associatedDomains: [
+-      `applinks:${variant.relyingParty}`,
+-      `webcredentials:${variant.relyingParty}`,
+-    ],
++    appleTeamId: customTeamId ?? "ARK85ZXQ4Z",
++    // An empty list still emits the entitlement, which the custom App ID lacks.
++    associatedDomains: isIosCustomIdentityBuild
++      ? undefined
++      : [`applinks:${variant.relyingParty}`, `webcredentials:${variant.relyingParty}`],
+     entitlements: {
+-      "keychain-access-groups": [`$(AppIdentifierPrefix)${variant.iosBundleIdentifier}`],
++      "keychain-access-groups": [
++        `$(AppIdentifierPrefix)${isIosCustomIdentityBuild ? iosBundleIdentifier : variant.iosBundleIdentifier}`,
++      ],
+     },
+     infoPlist: {
+       UISupportedInterfaceOrientations: [
+@@ -361,7 +390,13 @@ const config: ExpoConfig = {
+     ],
+     // appleSignIn must be gated here: withoutIosPersonalTeamCapabilities.cjs runs before
+     // plugins earlier in this array, so it cannot strip the entitlement Clerk would add.
+-    ["@clerk/expo", { theme: "./clerk-theme.json", appleSignIn: !isIosPersonalTeamBuild }],
++    [
++      "@clerk/expo",
++      {
++        theme: "./clerk-theme.json",
++        appleSignIn: !isIosPersonalTeamBuild && !isIosCustomIdentityBuild,
++      },
++    ],
+     "expo-web-browser",
+     [
+       "expo-quick-actions",
