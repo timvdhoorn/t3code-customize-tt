@@ -1,0 +1,1009 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: timvdhoorn <timvdhoorn@gmail.com>
+Date: Thu, 15 Oct 2026 14:33:02 +0200
+Subject: [PATCH 3/3] feat: nest agent-opened child threads under their opener
+ in the sidebar
+
+Ports the server side of pingdotgg/t3code#16699 (openedByThreadId on
+t3_thread_launch and create_threads) and renders families like Claude.app:
+a child nests under its opener only within the same inbox section, with a
+guide line, context-menu collapse and a summary stub.
+---
+ apps/server/src/mcp/OrchestratorMcpService.ts |   1 +
+ .../src/mcp/toolkits/project/handlers.test.ts |   6 +-
+ .../src/mcp/toolkits/project/handlers.ts      |   1 +
+ .../src/orchestration-v2/Orchestrator.ts      |   3 +
+ .../src/orchestration-v2/ProjectionStore.ts   |   6 +
+ .../ThreadLaunchService.test.ts               |  19 ++
+ .../orchestration-v2/ThreadLaunchService.ts   |   5 +
+ .../src/components/Sidebar.families.test.ts   | 118 ++++++++
+ apps/web/src/components/Sidebar.families.ts   | 112 +++++++
+ apps/web/src/components/Sidebar.tsx           | 278 ++++++++++++++----
+ .../components/threadActionMenu.logic.test.ts |  11 +
+ .../src/components/threadActionMenu.logic.ts  |  13 +
+ apps/web/src/contextMenuFallback.ts           |   7 +
+ packages/client-runtime/src/state/models.ts   |   5 +
+ packages/contracts/src/orchestrationV2.ts     |  15 +
+ 15 files changed, 549 insertions(+), 51 deletions(-)
+ create mode 100644 apps/web/src/components/Sidebar.families.test.ts
+ create mode 100644 apps/web/src/components/Sidebar.families.ts
+
+diff --git a/apps/server/src/mcp/OrchestratorMcpService.ts b/apps/server/src/mcp/OrchestratorMcpService.ts
+index 5c0a93cb1..2425f29cc 100644
+--- a/apps/server/src/mcp/OrchestratorMcpService.ts
++++ b/apps/server/src/mcp/OrchestratorMcpService.ts
+@@ -2369,6 +2369,7 @@ const make = Effect.gen(function* () {
+                   interactionMode,
+                   branch: parent.thread.branch,
+                   worktreePath: parent.thread.worktreePath,
++                  openedByThreadId: parent.thread.id,
+                 })
+                 .pipe(
+                   Effect.mapError((error) =>
+diff --git a/apps/server/src/mcp/toolkits/project/handlers.test.ts b/apps/server/src/mcp/toolkits/project/handlers.test.ts
+index 7b045ae6b..e2c9eff60 100644
+--- a/apps/server/src/mcp/toolkits/project/handlers.test.ts
++++ b/apps/server/src/mcp/toolkits/project/handlers.test.ts
+@@ -29,7 +29,7 @@ import * as McpToolAccess from "../../McpToolAccess.ts";
+ import * as ProjectHandlers from "./handlers.ts";
+ import { ProjectToolkit } from "./tools.ts";
+ 
+-it.effect("attributes a launched thread's first message to the calling thread", () =>
++it.effect("attributes a launched thread and its first message to the calling thread", () =>
+   Effect.gen(function* () {
+     const sourceThreadId = ThreadId.make("source-thread");
+     const projectId = ProjectId.make("project");
+@@ -47,6 +47,7 @@ it.effect("attributes a launched thread's first message to the calling thread",
+       deletedAt: null,
+     } as OrchestrationV2ThreadShell;
+     let launchedSender: ThreadId | undefined;
++    let launchedOpener: ThreadId | undefined;
+     const layerDependencies = Layer.mergeAll(
+       ServerSettings.layerTest(),
+       NodeCrypto.layer,
+@@ -68,6 +69,7 @@ it.effect("attributes a launched thread's first message to the calling thread",
+       Layer.mock(ThreadLaunch.ThreadLaunchService)({
+         launch: (input) => {
+           launchedSender = input.initialMessage?.senderThreadId;
++          launchedOpener = input.openedByThreadId;
+           return Effect.succeed({
+             threadId: input.threadId,
+             projection: {
+@@ -98,6 +100,7 @@ it.effect("attributes a launched thread's first message to the calling thread",
+       .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(layerDependencies));
+     expect(result.at(-1)?.result).toMatchObject({ projectId, modelSelection });
+     expect(launchedSender).toBe(sourceThreadId);
++    expect(launchedOpener).toBe(sourceThreadId);
+   }),
+ );
+ 
+@@ -397,6 +400,7 @@ it.effect("a client launches at its ceiling with the project's default model", (
+     expect(result.at(-1)?.result).toMatchObject({ projectId, modelSelection });
+     expect(launched[0]?.runtimeMode).toBe("auto-accept-edits");
+     expect(launched[0]?.initialMessage?.senderThreadId).toBeUndefined();
++    expect(launched[0]?.openedByThreadId).toBeUndefined();
+ 
+     const escalated = yield* handle({ title: "Fix", projectId, runtimeMode: "full-access" });
+     expect(escalated.at(-1)?.result).toMatchObject({ code: "runtime_mode_escalation_denied" });
+diff --git a/apps/server/src/mcp/toolkits/project/handlers.ts b/apps/server/src/mcp/toolkits/project/handlers.ts
+index c346ad620..0c01a4a6f 100644
+--- a/apps/server/src/mcp/toolkits/project/handlers.ts
++++ b/apps/server/src/mcp/toolkits/project/handlers.ts
+@@ -154,6 +154,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
+                   attachments,
+                 },
+               }),
++          ...(caller === undefined ? {} : { openedByThreadId: caller.id }),
+           createdBy: "agent",
+           creationSource: "mcp",
+         }).pipe(
+diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
+index 6b723e860..2cdce0746 100644
+--- a/apps/server/src/orchestration-v2/Orchestrator.ts
++++ b/apps/server/src/orchestration-v2/Orchestrator.ts
+@@ -2270,6 +2270,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+         relationshipToParent: null,
+         rootThreadId: command.threadId,
+       },
++      ...(command.openedByThreadId === undefined
++        ? {}
++        : { openedByThreadId: command.openedByThreadId }),
+       forkedFrom: null,
+       createdAt: now,
+       updatedAt: now,
+diff --git a/apps/server/src/orchestration-v2/ProjectionStore.ts b/apps/server/src/orchestration-v2/ProjectionStore.ts
+index 48ead899e..f208faa4a 100644
+--- a/apps/server/src/orchestration-v2/ProjectionStore.ts
++++ b/apps/server/src/orchestration-v2/ProjectionStore.ts
+@@ -1540,6 +1540,9 @@ export function threadShellFromProjection(
+       ? {}
+       : { activeOrderKey: projection.thread.activeOrderKey }),
+     lineage: projection.thread.lineage,
++    ...(projection.thread.openedByThreadId === undefined
++      ? {}
++      : { openedByThreadId: projection.thread.openedByThreadId }),
+     forkedFrom: projection.thread.forkedFrom,
+     activeProviderThreadId: projection.thread.activeProviderThreadId,
+     ...(projection.thread.historyOrigin === undefined
+@@ -1808,6 +1811,9 @@ function shellFromState(input: {
+       ? {}
+       : { activeOrderKey: input.state.thread.activeOrderKey }),
+     lineage: input.state.thread.lineage,
++    ...(input.state.thread.openedByThreadId === undefined
++      ? {}
++      : { openedByThreadId: input.state.thread.openedByThreadId }),
+     forkedFrom: input.state.thread.forkedFrom,
+     activeProviderThreadId: input.state.thread.activeProviderThreadId,
+     ...(input.state.thread.historyOrigin === undefined
+diff --git a/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts b/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
+index 26e9b8c8d..31462f4e8 100644
+--- a/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
++++ b/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
+@@ -409,6 +409,25 @@ it.effect("retains automation and sender attribution while a message waits in th
+   }).pipe(Effect.provide(harness.layer));
+ });
+ 
++it.effect("records the launching thread on the new thread and its shell", () => {
++  const harness = makeHarness();
++  return Effect.gen(function* () {
++    const launches = yield* ThreadLaunch.ThreadLaunchService;
++    const threads = yield* ThreadManagement.ThreadManagementService;
++    const openedByThreadId = ThreadId.make("thread:launcher");
++    const launched = yield* launches.launch({
++      ...launchInput({ command: "command:opened-by", thread: "thread:opened-by" }),
++      openedByThreadId,
++      createdBy: "agent",
++      creationSource: "mcp",
++    });
++    const projection = yield* threads.getThreadProjection(launched.threadId);
++    assert.equal(projection.thread.openedByThreadId, openedByThreadId);
++    const shell = yield* threads.getThreadShell(launched.threadId);
++    assert.equal(shell?.openedByThreadId, openedByThreadId);
++  }).pipe(Effect.provide(harness.layer));
++});
++
+ it.effect("returns a visible preparing message while provisioning is still blocked", () =>
+   Effect.gen(function* () {
+     const worktreeEntered = yield* Deferred.make<void>();
+diff --git a/apps/server/src/orchestration-v2/ThreadLaunchService.ts b/apps/server/src/orchestration-v2/ThreadLaunchService.ts
+index a4d949770..d0b77ef36 100644
+--- a/apps/server/src/orchestration-v2/ThreadLaunchService.ts
++++ b/apps/server/src/orchestration-v2/ThreadLaunchService.ts
+@@ -85,6 +85,8 @@ export interface ThreadLaunchInput {
+   readonly interactionMode: ProviderInteractionMode;
+   readonly workspaceStrategy: ThreadLaunchWorkspaceStrategy;
+   readonly initialMessage?: ThreadLaunchInitialMessage;
++  /** Thread whose agent launched this one, recorded on the new thread. */
++  readonly openedByThreadId?: ThreadId;
+   readonly importedNativeThread?: {
+     readonly ref: {
+       readonly driver: ProviderDriverKind;
+@@ -894,6 +896,9 @@ const make = Effect.gen(function* () {
+                 interactionMode: input.interactionMode,
+                 branch: initialBranch,
+                 worktreePath: initialWorktreePath,
++                ...(input.openedByThreadId === undefined
++                  ? {}
++                  : { openedByThreadId: input.openedByThreadId }),
+                 ...(input.importedNativeThread === undefined
+                   ? {}
+                   : { importedNativeThread: input.importedNativeThread }),
+diff --git a/apps/web/src/components/Sidebar.families.test.ts b/apps/web/src/components/Sidebar.families.test.ts
+new file mode 100644
+index 000000000..673da9a7f
+--- /dev/null
++++ b/apps/web/src/components/Sidebar.families.test.ts
+@@ -0,0 +1,118 @@
++import { describe, expect, it } from "vite-plus/test";
++import {
++  buildSidebarThreadFamilies,
++  childThreadNeedsUser,
++  flattenSidebarThreadFamilies,
++  foldSidebarThreadFamily,
++  formatHiddenChildThreadsLabel,
++} from "./Sidebar.families";
++
++interface Row {
++  readonly key: string;
++  readonly openedBy: string | null;
++}
++
++const row = (key: string, openedBy: string | null = null): Row => ({ key, openedBy });
++const families = (rows: readonly Row[]) =>
++  buildSidebarThreadFamilies(
++    rows,
++    (thread) => thread.key,
++    (thread) => thread.openedBy,
++  ).map((family) => [family.head.key, family.children.map((child) => child.key)]);
++
++describe("buildSidebarThreadFamilies", () => {
++  it("puts children after their head in section order", () => {
++    expect(families([row("c1", "p"), row("x"), row("p"), row("c2", "p")])).toEqual([
++      ["x", []],
++      ["p", ["c1", "c2"]],
++    ]);
++  });
++
++  it("keeps a child on its own when its opener is not in the section", () => {
++    expect(families([row("child", "settled-parent"), row("other")])).toEqual([
++      ["child", []],
++      ["other", []],
++    ]);
++  });
++
++  it("flattens grandchildren under the topmost ancestor in the section", () => {
++    expect(families([row("root"), row("child", "root"), row("grandchild", "child")])).toEqual([
++      ["root", ["child", "grandchild"]],
++    ]);
++  });
++
++  it("stops at the topmost ancestor that is in the section", () => {
++    // The root sits in another section, so the child heads its own family.
++    expect(families([row("child", "root"), row("grandchild", "child")])).toEqual([
++      ["child", ["grandchild"]],
++    ]);
++  });
++
++  it("leaves threads in an opener cycle on their own", () => {
++    expect(families([row("a", "b"), row("b", "a"), row("c", "a")])).toEqual([
++      ["a", []],
++      ["b", []],
++      ["c", []],
++    ]);
++  });
++
++  it("flattens families back to render order", () => {
++    const built = buildSidebarThreadFamilies(
++      [row("c", "p"), row("p"), row("x")],
++      (thread) => thread.key,
++      (thread) => thread.openedBy,
++    );
++    expect(flattenSidebarThreadFamilies(built).map((thread) => thread.key)).toEqual([
++      "p",
++      "c",
++      "x",
++    ]);
++  });
++});
++
++describe("foldSidebarThreadFamily", () => {
++  const children = [row("working"), row("asks"), row("open")];
++  const keepVisible = (thread: Row) => thread.key === "asks" || thread.key === "open";
++
++  it("shows every child while the family is open", () => {
++    expect(foldSidebarThreadFamily(children, { collapsed: false, keepVisible })).toEqual({
++      shown: children,
++      hidden: [],
++    });
++  });
++
++  it("keeps only children that need the user or are open when collapsed", () => {
++    const folded = foldSidebarThreadFamily(children, { collapsed: true, keepVisible });
++    expect(folded.shown.map((thread) => thread.key)).toEqual(["asks", "open"]);
++    expect(folded.hidden.map((thread) => thread.key)).toEqual(["working"]);
++  });
++
++  it("treats approvals and questions as needing the user, not working", () => {
++    expect(childThreadNeedsUser("approval")).toBe(true);
++    expect(childThreadNeedsUser("input")).toBe(true);
++    expect(childThreadNeedsUser("working")).toBe(false);
++    expect(childThreadNeedsUser("ready")).toBe(false);
++  });
++});
++
++describe("formatHiddenChildThreadsLabel", () => {
++  it("counts hidden children and their news", () => {
++    expect(
++      formatHiddenChildThreadsLabel(
++        [
++          { status: "failed", isUnread: true },
++          { status: "ready", isUnread: true },
++          { status: "working", isUnread: false },
++          { status: "waiting", isUnread: false },
++        ],
++        { someShown: false },
++      ),
++    ).toBe("4 child threads · 1 failed · 1 new · 2 working");
++  });
++
++  it("says more when some children still show", () => {
++    expect(
++      formatHiddenChildThreadsLabel([{ status: "ready", isUnread: false }], { someShown: true }),
++    ).toBe("1 more child thread");
++  });
++});
+diff --git a/apps/web/src/components/Sidebar.families.ts b/apps/web/src/components/Sidebar.families.ts
+new file mode 100644
+index 000000000..0d113740d
+--- /dev/null
++++ b/apps/web/src/components/Sidebar.families.ts
+@@ -0,0 +1,112 @@
++// Child threads in the sidebar, after Claude.app's nested sessions: a thread
++// an agent opened through T3 tools renders under the thread that opened it.
++// Nesting is a view inside one section. Every thread keeps the section its
++// own state puts it in; a child whose opener sits in another section (or is
++// archived, hidden, or paged out) renders on its own there. Families are one
++// level deep: a grandchild hangs under the topmost ancestor in its section.
++
++import type { SidebarThreadStatus } from "./Sidebar.logic";
++
++/** Upper bound on opener chains, so corrupt data can never spin. */
++const MAX_FAMILY_DEPTH = 32;
++
++export interface SidebarThreadFamily<T> {
++  readonly head: T;
++  readonly children: readonly T[];
++}
++
++/**
++ * Group one section's threads, in display order, into families. Heads keep
++ * their place; children follow their head in the order the section lists
++ * them. `parentKeyOf` names the thread that opened a thread, or null.
++ */
++export function buildSidebarThreadFamilies<T>(
++  threads: readonly T[],
++  keyOf: (thread: T) => string,
++  parentKeyOf: (thread: T) => string | null,
++): SidebarThreadFamily<T>[] {
++  const byKey = new Map(threads.map((thread) => [keyOf(thread), thread] as const));
++  const headKeyOf = (thread: T): string => {
++    const ownKey = keyOf(thread);
++    const seen = new Set([ownKey]);
++    let currentKey = ownKey;
++    let current = thread;
++    for (let depth = 0; depth < MAX_FAMILY_DEPTH; depth += 1) {
++      const parentKey = parentKeyOf(current);
++      const parent = parentKey === null ? undefined : byKey.get(parentKey);
++      if (parentKey === null || parent === undefined) return currentKey;
++      // A cycle has no head, so its threads stay on their own.
++      if (seen.has(parentKey)) return ownKey;
++      seen.add(parentKey);
++      currentKey = parentKey;
++      current = parent;
++    }
++    return ownKey;
++  };
++
++  const childrenByHead = new Map<string, T[]>();
++  const heads: T[] = [];
++  for (const thread of threads) {
++    const headKey = headKeyOf(thread);
++    if (headKey === keyOf(thread)) {
++      heads.push(thread);
++      continue;
++    }
++    const children = childrenByHead.get(headKey);
++    if (children === undefined) childrenByHead.set(headKey, [thread]);
++    else children.push(thread);
++  }
++  return heads.map((head) => ({ head, children: childrenByHead.get(keyOf(head)) ?? [] }));
++}
++
++/** Heads then their shown children, the order rows render and keys traverse. */
++export function flattenSidebarThreadFamilies<T>(
++  families: readonly SidebarThreadFamily<T>[],
++): T[] {
++  return families.flatMap((family) => [family.head, ...family.children]);
++}
++
++/**
++ * A collapsed family still shows a child that needs the user (an approval or
++ * a question) and the open thread. A child that is only working stays hidden:
++ * its status shows on the stub instead.
++ */
++export function foldSidebarThreadFamily<T>(
++  children: readonly T[],
++  input: {
++    readonly collapsed: boolean;
++    readonly keepVisible: (thread: T) => boolean;
++  },
++): { readonly shown: readonly T[]; readonly hidden: readonly T[] } {
++  if (!input.collapsed) return { shown: children, hidden: [] };
++  const shown: T[] = [];
++  const hidden: T[] = [];
++  for (const child of children) (input.keepVisible(child) ? shown : hidden).push(child);
++  return { shown, hidden };
++}
++
++export function childThreadNeedsUser(status: SidebarThreadStatus): boolean {
++  return status === "approval" || status === "input";
++}
++
++/** The collapsed family's stub: "3 child threads · 1 failed · 2 working". */
++export function formatHiddenChildThreadsLabel(
++  hidden: readonly { readonly status: SidebarThreadStatus; readonly isUnread: boolean }[],
++  options: { readonly someShown: boolean },
++): string {
++  let failed = 0;
++  let unread = 0;
++  let working = 0;
++  for (const child of hidden) {
++    if (child.status === "failed" || child.status === "limited") failed += 1;
++    else if (child.isUnread) unread += 1;
++    else if (child.status === "working" || child.status === "waiting") working += 1;
++  }
++  const noun = hidden.length === 1 ? "child thread" : "child threads";
++  return [
++    `${hidden.length} ${options.someShown ? "more " : ""}${noun}`,
++    ...(failed > 0 ? [`${failed} failed`] : []),
++    ...(unread > 0 ? [`${unread} new`] : []),
++    ...(working > 0 ? [`${working} working`] : []),
++  ].join(" · ");
++}
+diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
+index 246a075bf..777111407 100644
+--- a/apps/web/src/components/Sidebar.tsx
++++ b/apps/web/src/components/Sidebar.tsx
+@@ -234,6 +234,14 @@ import {
+   type SidebarListMarker,
+   type SidebarSection,
+ } from "./Sidebar.logic";
++import {
++  buildSidebarThreadFamilies,
++  childThreadNeedsUser,
++  flattenSidebarThreadFamilies,
++  foldSidebarThreadFamily,
++  formatHiddenChildThreadsLabel,
++  type SidebarThreadFamily,
++} from "./Sidebar.families";
+ import { resolveLocalCheckoutBranchMismatch } from "./BranchToolbar.logic";
+ import {
+   createSidebarCollisionDetection,
+@@ -308,6 +316,23 @@ const SETTLED_TAIL_PAGE_COUNT = 25;
+ const SETTLED_SHELF_EXPANDED_KEY = "t3code:sidebar:settled-expanded";
+ const SNOOZED_SHELF_EXPANDED_KEY = "t3code:sidebar:snoozed-expanded";
+ const WORKING_SHELF_EXPANDED_KEY = "t3code:sidebar:working-expanded";
++// Families the user hid from the sidebar, by their head's scoped key.
++const COLLAPSED_CHILD_THREADS_KEY = "t3code:sidebar:collapsed-child-threads";
++const CollapsedChildThreadKeys = Schema.Array(Schema.String);
++const EMPTY_KEYS: readonly string[] = [];
++
++/** A family as rendered: `children` drops what a collapsed family hides. */
++interface RenderedChildThreadFamily extends SidebarThreadFamily<EnvironmentThreadShell> {
++  readonly hidden: readonly EnvironmentThreadShell[];
++  readonly hasChildren: boolean;
++}
++
++const threadKeyOf = (thread: EnvironmentThreadShell) =>
++  scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
++const openerKeyOf = (thread: EnvironmentThreadShell) =>
++  thread.openedByThreadId === undefined
++    ? null
++    : scopedThreadKey(scopeThreadRef(thread.environmentId, thread.openedByThreadId));
+ 
+ // Working beta: when this client saw each thread leave the Working shelf.
+ // Module scope keeps the inbox order across routes that unmount the sidebar.
+@@ -1110,9 +1135,72 @@ const dropVerbBadge: Record<SidebarDropVerb, ReactNode> = {
+   ),
+ };
+ 
++// A family's children under their head, after Claude.app's nested sessions:
++// one hairline that runs down from the head's favicon and curves into the
++// last row. No frame and no fold strip; a collapsed family ends in a stub
++// that counts what it hides and opens the first hidden child.
++function SidebarChildThreads(props: {
++  hidden: readonly EnvironmentThreadShell[];
++  someShown: boolean;
++  onOpenHidden: (threadRef: ScopedThreadRef) => void;
++  children: ReactNode;
++}) {
++  const { hidden, someShown, onOpenHidden } = props;
++  const lastVisitedAtById = useUiStateStore((state) => state.threadLastVisitedAtById);
++  const stubLabel =
++    hidden.length === 0
++      ? null
++      : formatHiddenChildThreadsLabel(
++          hidden.map((thread) => ({
++            status: resolveSidebarThreadStatus(thread),
++            isUnread: hasUnseenCompletion({
++              ...thread,
++              lastVisitedAt: resolveThreadLastVisitedAt(
++                thread.lastVisitedAt,
++                lastVisitedAtById[threadKeyOf(thread)],
++              ),
++            }),
++          })),
++          { someShown },
++        );
++  const firstHidden = hidden[0];
++  return (
++    <li className="list-none">
++      <ul
++        role="presentation"
++        data-testid="sidebar-child-threads"
++        className={cn(
++          "relative flex flex-col gap-px",
++          "after:pointer-events-none after:absolute after:start-[17px] after:top-1 after:w-2.5 after:rounded-es-md after:border-s after:border-b after:border-foreground/20 after:content-['']",
++          // The curve lands on the middle of the last row: a slim row or the stub.
++          stubLabel === null ? "after:bottom-[18px]" : "after:bottom-4",
++        )}
++      >
++        {props.children}
++        {stubLabel !== null && firstHidden !== undefined ? (
++          <li className="list-none">
++            <button
++              type="button"
++              data-testid="sidebar-child-threads-stub"
++              className="flex h-8 w-full min-w-0 items-center rounded-md ps-9 pe-2.5 text-left text-xs text-muted-foreground hover:bg-sidebar-row-hover hover:text-sidebar-foreground focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
++              onClick={() =>
++                onOpenHidden(scopeThreadRef(firstHidden.environmentId, firstHidden.id))
++              }
++            >
++              <span className="truncate">{stubLabel}</span>
++            </button>
++          </li>
++        ) : null}
++      </ul>
++    </li>
++  );
++}
++
+ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
+   thread: SidebarThreadSummary;
+   variant: "card" | "slim";
++  // A child thread under its head: indented past the family line, no favicon.
++  nested?: boolean;
+   // Settled rows un-settle, snoozed rows wake, and cards settle.
+   variantAction: SidebarSweepAction;
+   // False on environments whose server predates thread.settle/unsettle:
+@@ -1814,7 +1902,11 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
+                 aria-current={accessibility.current}
+                 data-testid="sidebar-row-slim"
+                 aria-busy={isRegeneratingTitle || undefined}
+-                className={cn(rowSurfaceClassName, "flex h-9 items-center gap-2.5 px-2.5")}
++                className={cn(
++                  rowSurfaceClassName,
++                  "flex h-9 items-center gap-2.5 px-2.5",
++                  props.nested && "ps-9",
++                )}
+                 onClick={handleClick}
+                 onDoubleClick={handleDoubleClick}
+                 onKeyDown={handleKeyDown}
+@@ -1825,15 +1917,19 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
+             {accessibleTitle}
+             {/* Settled history recedes: dimmed favicon at rest, restored on
+               hover so the tail stays scannable when you're hunting. */}
+-            <span
+-              className={cn(
+-                "flex shrink-0 items-center transition-opacity",
+-                (!props.isActive || variantAction === "unsettle") &&
+-                  "opacity-40 grayscale group-focus-within/sidebar-row:opacity-100 group-focus-within/sidebar-row:grayscale-0 group-hover/sidebar-row:opacity-100 group-hover/sidebar-row:grayscale-0",
+-              )}
+-            >
+-              {props.project ? <ProjectFavicon project={props.project} className="size-4" /> : null}
+-            </span>
++            {props.nested ? null : (
++              <span
++                className={cn(
++                  "flex shrink-0 items-center transition-opacity",
++                  (!props.isActive || variantAction === "unsettle") &&
++                    "opacity-40 grayscale group-focus-within/sidebar-row:opacity-100 group-focus-within/sidebar-row:grayscale-0 group-hover/sidebar-row:opacity-100 group-hover/sidebar-row:grayscale-0",
++                )}
++              >
++                {props.project ? (
++                  <ProjectFavicon project={props.project} className="size-4" />
++                ) : null}
++              </span>
++            )}
+             {draftIndicator}
+             {title}
+             {pinIndicator}
+@@ -3093,21 +3189,79 @@ export default function Sidebar() {
+     return routeThread === undefined ? EMPTY_THREADS : [routeThread];
+   }, [routeThreadKey, workingShelfExpanded, workingThreads]);
+ 
++  // Child threads (Sidebar.families.ts): a thread an agent opened renders
++  // under its opener when both sit in the same section. A collapsed family
++  // keeps only children that need the user, plus the open thread.
++  const [collapsedChildThreadKeys, setCollapsedChildThreadKeys] = useLocalStorage(
++    COLLAPSED_CHILD_THREADS_KEY,
++    EMPTY_KEYS,
++    CollapsedChildThreadKeys,
++  );
++  const toggleChildThreadsCollapsed = useCallback(
++    (headKey: string) =>
++      setCollapsedChildThreadKeys((keys) =>
++        keys.includes(headKey) ? keys.filter((key) => key !== headKey) : [...keys, headKey],
++      ),
++    [setCollapsedChildThreadKeys],
++  );
++  const sectionFamilies = useMemo(() => {
++    const collapsed = new Set(collapsedChildThreadKeys);
++    const familiesOf = (
++      threads: readonly EnvironmentThreadShell[],
++    ): readonly RenderedChildThreadFamily[] =>
++      buildSidebarThreadFamilies(threads, threadKeyOf, openerKeyOf).map((family) => {
++        const { shown, hidden } = foldSidebarThreadFamily(family.children, {
++          collapsed: collapsed.has(threadKeyOf(family.head)),
++          keepVisible: (child) =>
++            threadKeyOf(child) === routeThreadKey ||
++            childThreadNeedsUser(resolveSidebarThreadStatus(child)),
++        });
++        return {
++          head: family.head,
++          children: shown,
++          hidden,
++          hasChildren: family.children.length > 0,
++        };
++      });
++    return {
++      pinned: familiesOf(pinnedThreads),
++      active: familiesOf(activeThreads),
++      working: familiesOf(visibleWorkingThreads),
++      snoozed: familiesOf(visibleSnoozedThreads),
++      settled: familiesOf(renderedSettledThreads),
++    };
++  }, [
++    collapsedChildThreadKeys,
++    routeThreadKey,
++    pinnedThreads,
++    activeThreads,
++    visibleWorkingThreads,
++    visibleSnoozedThreads,
++    renderedSettledThreads,
++  ]);
++  const familyByHeadKey = useMemo(
++    () =>
++      new Map(
++        Object.values(sectionFamilies).flatMap((families) =>
++          families.map((family) => [threadKeyOf(family.head), family] as const),
++        ),
++      ),
++    [sectionFamilies],
++  );
++  const familyByHeadKeyRef = useRef(familyByHeadKey);
++  familyByHeadKeyRef.current = familyByHeadKey;
++  const collapsedChildThreadKeysRef = useRef(collapsedChildThreadKeys);
++  collapsedChildThreadKeysRef.current = collapsedChildThreadKeys;
+   const orderedThreads = useMemo(
+-    () => [
+-      ...pinnedThreads,
+-      ...activeThreads,
+-      ...visibleWorkingThreads,
+-      ...visibleSnoozedThreads,
+-      ...renderedSettledThreads,
+-    ],
+-    [
+-      pinnedThreads,
+-      activeThreads,
+-      visibleWorkingThreads,
+-      visibleSnoozedThreads,
+-      renderedSettledThreads,
+-    ],
++    () =>
++      [
++        sectionFamilies.pinned,
++        sectionFamilies.active,
++        sectionFamilies.working,
++        sectionFamilies.snoozed,
++        sectionFamilies.settled,
++      ].flatMap(flattenSidebarThreadFamilies),
++    [sectionFamilies],
+   );
+   const orderedThreadKeys = useMemo(
+     () =>
+@@ -3663,19 +3817,14 @@ export default function Sidebar() {
+     },
+     [attemptUnsettle, attemptUnsnooze, serverConfigs, settleThreads],
+   );
++  // Children move with their head, so drop orders list heads only.
+   const pinnedKeys = useMemo(
+-    () =>
+-      pinnedThreads.map((thread) =>
+-        scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
+-      ),
+-    [pinnedThreads],
++    () => sectionFamilies.pinned.map((family) => threadKeyOf(family.head)),
++    [sectionFamilies.pinned],
+   );
+   const activeKeys = useMemo(
+-    () =>
+-      activeThreads.map((thread) =>
+-        scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
+-      ),
+-    [activeThreads],
++    () => sectionFamilies.active.map((family) => threadKeyOf(family.head)),
++    [sectionFamilies.active],
+   );
+   useEffect(() => {
+     if (optimisticDrop === null) return;
+@@ -3820,14 +3969,13 @@ export default function Sidebar() {
+   // Include every visible row in the measured order. Older servers disable
+   // pickup on their rows without changing where those rows render.
+   const sidebarListItems = useMemo((): readonly SidebarListItem[] => {
++    // Only family heads are list items: children render with their head
++    // and never take a drop slot of their own.
+     const rowsOf = (
+-      list: readonly EnvironmentThreadShell[],
++      families: readonly RenderedChildThreadFamily[],
+       section: SidebarSection,
+     ): SidebarListItem[] =>
+-      list.map((thread) => {
+-        const key = scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
+-        return { kind: "thread", key, section };
+-      });
++      families.map((family) => ({ kind: "thread", key: threadKeyOf(family.head), section }));
+     if (
+       pinnedThreads.length +
+         activeThreads.length +
+@@ -3839,33 +3987,31 @@ export default function Sidebar() {
+       return [];
+     }
+     const items: SidebarListItem[] = [{ kind: "marker", marker: "pinned-header" }];
+-    const pinnedRows = rowsOf(pinnedThreads, "pinned");
++    const pinnedRows = rowsOf(sectionFamilies.pinned, "pinned");
+     items.push(...pinnedRows);
+     items.push({ kind: "marker", marker: "pinned-divider" });
+-    const activeRows = rowsOf(activeThreads, "active");
++    const activeRows = rowsOf(sectionFamilies.active, "active");
+     items.push({ kind: "marker", marker: "active-placeholder" });
+     items.push(...activeRows);
+     if (workingThreads.length > 0) {
+       items.push({ kind: "marker", marker: "working-header" });
+-      items.push(...rowsOf(visibleWorkingThreads, "working"));
++      items.push(...rowsOf(sectionFamilies.working, "working"));
+     }
+     if (snoozedThreads.length > 0) {
+       items.push({ kind: "marker", marker: "snoozed-header" });
+-      items.push(...rowsOf(visibleSnoozedThreads, "snoozed"));
++      items.push(...rowsOf(sectionFamilies.snoozed, "snoozed"));
+     }
+     items.push({ kind: "marker", marker: "settled-header" });
+-    const settledRows = rowsOf(renderedSettledThreads, "settled");
++    const settledRows = rowsOf(sectionFamilies.settled, "settled");
+     items.push({ kind: "marker", marker: "settled-placeholder" });
+     items.push(...settledRows);
+     return items;
+   }, [
+-    activeThreads,
+-    pinnedThreads,
+-    renderedSettledThreads,
++    activeThreads.length,
++    pinnedThreads.length,
++    sectionFamilies,
+     settledThreads.length,
+     snoozedThreads.length,
+-    visibleSnoozedThreads,
+-    visibleWorkingThreads,
+     workingThreads.length,
+   ]);
+   useEffect(() => {
+@@ -4684,6 +4830,9 @@ export default function Sidebar() {
+                 titleRegeneration: supportsTitleRegeneration,
+               },
+               snoozePresets,
++              childThreads: familyByHeadKeyRef.current.get(threadKey)?.hasChildren
++                ? { collapsed: collapsedChildThreadKeysRef.current.includes(threadKey) }
++                : null,
+             }),
+             position,
+           ),
+@@ -4797,6 +4946,10 @@ export default function Sidebar() {
+           case "mark-unread":
+             markThreadUnread(threadRef);
+             return;
++          case "hide-child-threads":
++          case "show-child-threads":
++            toggleChildThreadsCollapsed(threadKey);
++            return;
+           case "copy-path":
+             if (!threadWorkspacePath) {
+               toastManager.add(
+@@ -4901,6 +5054,7 @@ export default function Sidebar() {
+       setProjectScopeKey,
+       setThreadAutoSettle,
+       startThreadRename,
++      toggleChildThreadsCollapsed,
+       updateThreadMetadata,
+       timestampFormat,
+     ],
+@@ -5301,6 +5455,7 @@ export default function Sidebar() {
+                         thread: EnvironmentThreadShell,
+                         section: SidebarSection,
+                         sortable?: SortableThreadRowBag,
++                        nested = false,
+                       ) => {
+                         const threadKey = scopedThreadKey(
+                           scopeThreadRef(thread.environmentId, thread.id),
+@@ -5310,8 +5465,10 @@ export default function Sidebar() {
+                         // from users (or the auto rules) actually parking work,
+                         // not from the sidebar second-guessing what still matters.
+                         // Working rows stay cards so their live status shows.
++                        // Child threads are always slim rows under their head.
+                         const isCard =
+-                          section === "active" || section === "pinned" || section === "working";
++                          !nested &&
++                          (section === "active" || section === "pinned" || section === "working");
+                         const rowVariant = isCard ? "card" : "slim";
+                         return (
+                           <SidebarThreadRow
+@@ -5320,6 +5477,7 @@ export default function Sidebar() {
+                             key={`${threadKey}:${rowVariant}`}
+                             thread={thread}
+                             variant={rowVariant}
++                            nested={nested}
+                             // Snoozed rows wake, settled rows un-settle, and cards settle.
+                             variantAction={
+                               section === "snoozed"
+@@ -5455,6 +5613,26 @@ export default function Sidebar() {
+                       for (const item of sidebarListItems) {
+                         if (item.kind === "thread") {
+                           items.push(renderThreadRow(threadByKey.get(item.key)!, item.section));
++                          const family = familyByHeadKey.get(item.key);
++                          // A dragged head leaves its children in place until it lands.
++                          if (
++                            family !== undefined &&
++                            dragState?.activeKey !== item.key &&
++                            (family.children.length > 0 || family.hidden.length > 0)
++                          ) {
++                            items.push(
++                              <SidebarChildThreads
++                                key={`children:${item.key}`}
++                                hidden={family.hidden}
++                                someShown={family.children.length > 0}
++                                onOpenHidden={navigateToThread}
++                              >
++                                {family.children.map((child) =>
++                                  renderThreadRowInner(child, item.section, undefined, true),
++                                )}
++                              </SidebarChildThreads>,
++                            );
++                          }
+                           continue;
+                         }
+                         switch (item.marker) {
+diff --git a/apps/web/src/components/threadActionMenu.logic.test.ts b/apps/web/src/components/threadActionMenu.logic.test.ts
+index 6bae63cff..0c471be2d 100644
+--- a/apps/web/src/components/threadActionMenu.logic.test.ts
++++ b/apps/web/src/components/threadActionMenu.logic.test.ts
+@@ -40,6 +40,17 @@ function allIds(state: ThreadActionMenuState): string[] {
+ }
+ 
+ describe("buildThreadActionMenuItems", () => {
++  it("offers hiding and showing child threads only on a family head", () => {
++    expect(ids(baseState)).not.toContain("hide-child-threads");
++    expect(ids({ ...baseState, childThreads: null })).not.toContain("hide-child-threads");
++    const hide = ids({ ...baseState, childThreads: { collapsed: false } });
++    expect(hide).toContain("hide-child-threads");
++    expect(hide.indexOf("hide-child-threads")).toBe(hide.indexOf("mark-unread") + 1);
++    expect(ids({ ...baseState, childThreads: { collapsed: true } })).toContain(
++      "show-child-threads",
++    );
++  });
++
+   it.each([false, true])(
+     "disables both lifecycle directions without permission (reversed: %s)",
+     (reversed) => {
+diff --git a/apps/web/src/components/threadActionMenu.logic.ts b/apps/web/src/components/threadActionMenu.logic.ts
+index f51328266..84206d3c2 100644
+--- a/apps/web/src/components/threadActionMenu.logic.ts
++++ b/apps/web/src/components/threadActionMenu.logic.ts
+@@ -23,6 +23,8 @@ export type ThreadActionMenuId =
+   | "rename"
+   | "regenerate-title"
+   | "mark-unread"
++  | "hide-child-threads"
++  | "show-child-threads"
+   | "copy"
+   | "copy-path"
+   | "copy-branch"
+@@ -99,6 +101,8 @@ export interface ThreadActionMenuState {
+     readonly titleRegeneration: boolean;
+   };
+   readonly snoozePresets: ReadonlyArray<SnoozePreset>;
++  /** Set when the thread heads a family of child threads in the sidebar. */
++  readonly childThreads?: { readonly collapsed: boolean } | null;
+ }
+ 
+ /** Local navigation, read markers, and copying remain available to read-only clients. */
+@@ -107,6 +111,8 @@ export function threadActionRequiresOperate(action: ThreadActionMenuId): boolean
+     "new-thread-on-branch",
+     "project-settings",
+     "mark-unread",
++    "hide-child-threads",
++    "show-child-threads",
+     "copy",
+     "copy-path",
+     "copy-branch",
+@@ -180,6 +186,13 @@ export function buildThreadActionMenuItems(
+         ]
+       : []),
+     { id: "mark-unread", label: "Mark unread", icon: "mail-open" },
++    ...(state.childThreads
++      ? [
++          state.childThreads.collapsed
++            ? { id: "show-child-threads" as const, label: "Show child threads", icon: "list-tree" }
++            : { id: "hide-child-threads" as const, label: "Hide child threads", icon: "list-tree" },
++        ]
++      : []),
+     ...(state.projectFilter
+       ? [
+           {
+diff --git a/apps/web/src/contextMenuFallback.ts b/apps/web/src/contextMenuFallback.ts
+index 1ba2be270..3864d0317 100644
+--- a/apps/web/src/contextMenuFallback.ts
++++ b/apps/web/src/contextMenuFallback.ts
+@@ -111,6 +111,13 @@ const ICON_PATHS: Record<string, ReadonlyArray<{ tag: string; attrs: Record<stri
+     },
+     { tag: "circle", attrs: { cx: "12", cy: "12", r: "3" } },
+   ],
++  "list-tree": [
++    { tag: "path", attrs: { d: "M21 12h-8" } },
++    { tag: "path", attrs: { d: "M21 6H8" } },
++    { tag: "path", attrs: { d: "M21 18h-8" } },
++    { tag: "path", attrs: { d: "M3 6v4c0 1.1.9 2 2 2h3" } },
++    { tag: "path", attrs: { d: "M3 10v6c0 1.1.9 2 2 2h3" } },
++  ],
+   "folder-tree": [
+     {
+       tag: "path",
+diff --git a/packages/client-runtime/src/state/models.ts b/packages/client-runtime/src/state/models.ts
+index f5d6df4f0..6351d36f9 100644
+--- a/packages/client-runtime/src/state/models.ts
++++ b/packages/client-runtime/src/state/models.ts
+@@ -101,6 +101,8 @@ export interface EnvironmentThreadShell {
+   readonly worktreePath: string | null;
+   readonly lineage: OrchestrationV2ThreadShell["lineage"];
+   readonly forkedFrom: OrchestrationV2ThreadShell["forkedFrom"];
++  /** Thread whose agent opened this one through T3 tools; absent otherwise. */
++  readonly openedByThreadId?: ThreadId;
+   readonly activeProviderThreadId: OrchestrationV2ThreadShell["activeProviderThreadId"];
+   readonly latestRun: ThreadRunSummary | null;
+   readonly runtime: ThreadRuntimeSummary | null;
+@@ -253,6 +255,9 @@ export function presentThreadShell(
+     branchPullRequest: thread.branchPullRequest ?? null,
+     lineage: thread.lineage,
+     forkedFrom: thread.forkedFrom,
++    ...(thread.openedByThreadId === undefined
++      ? {}
++      : { openedByThreadId: thread.openedByThreadId }),
+     activeProviderThreadId: thread.activeProviderThreadId,
+     latestRun,
+     runtime: shellRuntime(thread),
+diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
+index a04832fc4..1948345c1 100644
+--- a/packages/contracts/src/orchestrationV2.ts
++++ b/packages/contracts/src/orchestrationV2.ts
+@@ -381,6 +381,8 @@ export const OrchestrationV2AppThread = Schema.Struct({
+   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
+   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
+   lineage: OrchestrationV2AppThreadLineage,
++  /** Thread whose agent opened this one through T3 tools; absent otherwise. */
++  openedByThreadId: Schema.optional(ThreadId),
+   forkedFrom: Schema.NullOr(
+     Schema.Union([
+       Schema.Struct({ type: Schema.Literal("run"), threadId: ThreadId, runId: RunId }),
+@@ -452,6 +454,17 @@ export function isProviderNativeSubagentThread(
+   return thread.lineage.relationshipToParent === "subagent" && thread.creationSource === "provider";
+ }
+ 
++/**
++ * A top-level thread an agent opened through T3 tools (t3_thread_launch,
++ * create_threads, or a task an agent scheduled). Subagents and forks are
++ * excluded because their lineage already names the parent.
++ */
++export function isAgentOpenedThread(
++  thread: Pick<OrchestrationV2AppThread, "createdBy" | "lineage">,
++): boolean {
++  return thread.createdBy === "agent" && thread.lineage.relationshipToParent === null;
++}
++
+ export const OrchestrationV2RunStatus = Schema.Literals([
+   "preparing",
+   "queued",
+@@ -1964,6 +1977,7 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
+   /** Pull request discovered from the thread's current branch. */
+   branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
+   lineage: OrchestrationV2AppThreadLineage,
++  openedByThreadId: OrchestrationV2AppThread.fields.openedByThreadId,
+   forkedFrom: Schema.NullOr(OrchestrationV2AppThread.fields.forkedFrom),
+   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
+   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
+@@ -2741,6 +2755,7 @@ export const OrchestrationV2Command = Schema.Union([
+     interactionMode: ProviderInteractionMode,
+     branch: Schema.NullOr(TrimmedNonEmptyString),
+     worktreePath: Schema.NullOr(TrimmedNonEmptyString),
++    openedByThreadId: Schema.optional(ThreadId),
+     importedNativeThread: Schema.optional(
+       Schema.Struct({
+         ref: Schema.Struct({
