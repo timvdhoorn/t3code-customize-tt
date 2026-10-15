@@ -44,3 +44,56 @@ left it, builds, installs the result and writes the ported commits back to
 
 End with a short report: what changed upstream, what you changed and in which files,
 and whether the final build succeeded.
+
+## Fork changes
+
+This repo is Tim's fork of [btsouth/t3code-customize](https://github.com/btsouth/t3code-customize).
+Every update must carry the fork's own changes forward, and an agent must confirm that
+upstream did not break or duplicate them. This section says how.
+
+### Ownership
+
+| Upstream owns (never commit changes) | The fork owns (commit changes) |
+| --- | --- |
+| `patches/*.patch`, `patches/base.txt`, `checks.json` | `patches-tt/*.patch`, `checks-tt.json`, this section |
+| the Linux code paths in `t3code-customize` | macOS and update code in `t3code-customize`, `README.md` macOS section |
+
+- A port of the shared patches in `patches/` stays uncommitted. Upstream's next port replaces
+  it; the tool keeps a backup in `~/.local/share/t3code-customize/patches.bak-*`.
+- Every change to T3 Code itself is one commit in `patches-tt/`, with its tests in
+  `checks-tt.json` and a row in the table below. Never fold it into a shared patch.
+
+### Porting own patches
+
+The tool applies the shared patches, rebases them onto the nightly, then applies
+`patches-tt/` with `git am --3way`. When an own patch conflicts, a `git am` is stopped in
+the source checkout: resolve each file, `git add` it, then `git am --continue`. Keep
+upstream's change and carry the intent from the table onto it. The rules in "Fix" above
+apply (one commit per patch, no weakened tests).
+
+### Checking that an update did not break a fork change
+
+After every port, upstream merge or nightly that touches files in the table, and before
+reporting done:
+
+1. For each row, read what upstream changed in its files:
+   `git -C ~/.cache/t3code-customize/t3code log -p <previous nightly>..<new nightly> -- <files>`.
+2. Confirm the intent still holds on the new code. If upstream now does the same thing
+   itself, stop and propose dropping the own patch rather than applying both.
+3. Run the checks (`checks.json` plus `checks-tt.json`; the tool runs both) and the row's
+   check.
+4. Commit a changed `patches-tt/` as `chore: port own patches to nightly <version>`.
+5. Report per row: unaffected, ported (what changed), or needs a decision.
+
+When upstream changes `t3code-customize`, merge it by hand if `pull_latest` could not:
+keep every `MAC` branch and the `update`, `autoupdate`, `install-pending` and own-patch
+code, then run `python3 -m py_compile t3code-customize` and `./t3code-customize status`.
+
+### Fork changes and their checks
+
+| Change | Files | Intent | Check |
+| --- | --- | --- | --- |
+| Claude context window (`patches-tt/0001`) | `apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts`, `apps/server/src/provider/Drivers/ClaudeSkills.ts`, `apps/web/src/components/chat/ComposerStats.logic.ts` | Claude context is measured against the smaller of the model window and `autoCompactWindow` (T3's "Auto-compact after", else Claude's user, project and local settings files, read once per session, as the CLI does). Label "Managed by Claude". | Tests in `checks-tt.json`. In the app, with `"autoCompactWindow": 300000` in `~/.claude/settings.json`, the context popover shows a window of 300,000. |
+| macOS build | `t3code-customize` (`find_mac_app`, `finish_mac_app`, `stage_mac_build`, `install_pending`) | Copy of the installed `.app` at `~/Applications/T3 Code (Customized).app`: rebuilt `app.asar`, matching `ElectronAsarIntegrity`, `T3CODE_DISABLE_AUTO_UPDATE` in `LSEnvironment`, ad-hoc signature. Swapped in only while closed. | `./t3code-customize status`; `codesign --verify --deep --strict` on the copy. |
+| macOS updates | `t3code-customize` (`update_stock`, `cmd_update`, `cmd_autoupdate`, `cmd_install_pending`) | Installs newer releases the way T3's updater does: feed from the app's `app-update.yml`, a zip T3 already downloaded when it matches, sha512 from the feed, the installed app's designated requirement, swap only while closed. | `./t3code-customize` reports "Already up to date" or installs; a foreign or ad-hoc signed app must fail the requirement check. |
+| Upstream merge | `t3code-customize` (`pull_latest`) | Each run merges `upstream/main` when it merges cleanly, else continues with the patches it has. | `git log upstream/main..HEAD` shows only fork commits after a run. |

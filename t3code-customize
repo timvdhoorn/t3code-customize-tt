@@ -128,9 +128,19 @@ def patches():
     return sorted((REPO / 'patches').glob('*.patch'))
 
 
+# Your own patches, kept apart from the shared ones in patches/ so upstream updates never
+# conflict with them. They go on top of the shared patches, after those are on the nightly.
+OWN_PATCHES = REPO / 'patches-tt'
+OWN_CHECKS = REPO / 'checks-tt.json'
+
+
+def own_patches():
+    return sorted(OWN_PATCHES.glob('*.patch'))
+
+
 def recipe_hash():
     digest = hashlib.sha256()
-    for path in patches() + [REPO / 'patches/base.txt', REPO / 'checks.json']:
+    for path in patches() + own_patches() + [REPO / 'patches/base.txt', REPO / 'checks.json'] + ([OWN_CHECKS] if OWN_CHECKS.exists() else []):
         digest.update(path.name.encode() + path.read_bytes())
     return digest.hexdigest()[:12]
 
@@ -443,6 +453,18 @@ def prepare(target, log, resume=False):
         raise NeedsFix('The source checkout has uncommitted changes in ' + str(SOURCE) + '.')
     if git('merge-base', '--is-ancestor', target, 'HEAD', check=False, capture=False).returncode:
         raise NeedsFix('The patch commits are not on top of the nightly commit ' + target[:12] + '.')
+    applied = int(git('rev-list', '--count', target + '..HEAD').strip())
+    if own_patches() and applied == len(patches()):
+        # The shared patches are on the nightly; now your own, three-way so moved context still applies.
+        if git('am', '--quiet', '--3way', '--committer-date-is-author-date', *map(str, own_patches()),
+               check=False, capture=False, log=log).returncode:
+            conflicted = git('diff', '--name-only', '--diff-filter=U').split()
+            raise NeedsFix(f'Your own patches in {OWN_PATCHES.name}/ conflict with this nightly'
+                           + (' in:\n' + '\n'.join('  ' + f for f in conflicted) if conflicted else '.')
+                           + '\nResolve, git add, then git am --continue (see "Fork changes" in AGENTS.md).')
+    elif applied != len(patches()) + len(own_patches()):
+        raise NeedsFix(f'Expected one commit per patch on top of the nightly ({len(patches())} shared,'
+                       f' {len(own_patches())} own), found {applied}.')
 
 
 def install_dependencies(env, log):
@@ -454,6 +476,8 @@ def install_dependencies(env, log):
 
 def checks(env, log):
     spec = json.loads((REPO / 'checks.json').read_text())
+    own = load(OWN_CHECKS, {})
+    spec = {key: list(dict.fromkeys(spec.get(key, []) + own.get(key, []))) for key in ('tests', 'typecheck')}
     missing = [t for t in spec['tests'] if not (SOURCE / t).exists()]
     if missing:
         raise NeedsFix('Test files listed in checks.json no longer exist (moved upstream?):\n' + '\n'.join('  ' + t for t in missing))
@@ -521,7 +545,7 @@ def choose_agent(requested):
 
 
 def agent_fix(agent, problem, target, version, log):
-    prompt = (f'Follow {REPO}/AGENTS.md to port the T3 Code customization patches.\n\n'
+    prompt = (f'Follow {REPO}/AGENTS.md, including "Fork changes", to port the T3 Code customization patches.\n\n'
               f'Source checkout: {SOURCE}\nNightly: {version} at commit {target}\n'
               f'Patch repo: {REPO}\n\nThe build stopped with:\n\n{problem}\n\n'
               f'When the checks pass, stop. Do not run the build yourself; {NAME} continues it.\n')
@@ -814,11 +838,21 @@ def install_linux_build(stock_root, version, job):
 
 
 def export_patches(target):
-    """Keep a port that an agent or you finished, so the next build starts from it."""
-    out = REPO / 'patches'
-    for path in patches():
+    """Keep a port that an agent or you finished, so the next build starts from it.
+
+    The shared patches go back to patches/ (uncommitted, until upstream ships its own port);
+    the commits after them go to patches-tt/, which you commit.
+    """
+    commits = git('rev-list', '--reverse', target + '..HEAD').split()
+    shared = len(patches())
+    split = commits[shared - 1] if shared else target
+    for path in patches() + own_patches():
         path.unlink()
-    git('format-patch', '--quiet', '--no-signature', '--zero-commit', '-o', str(out), target + '..HEAD', capture=False)
+    out = REPO / 'patches'
+    git('format-patch', '--quiet', '--no-signature', '--zero-commit', '-o', str(out), target + '..' + split, capture=False)
+    if len(commits) > shared:
+        OWN_PATCHES.mkdir(exist_ok=True)
+        git('format-patch', '--quiet', '--no-signature', '--zero-commit', '-o', str(OWN_PATCHES), split + '..HEAD', capture=False)
     (out / 'base.txt').write_text(target + '\n')
 
 
