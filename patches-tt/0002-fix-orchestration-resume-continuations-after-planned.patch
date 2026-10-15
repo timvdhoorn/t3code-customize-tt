@@ -1,0 +1,1504 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jake Leventhal <jakeleventhal@me.com>
+Date: Thu, 15 Oct 2026 13:05:36 +0200
+Subject: [PATCH] fix(orchestration): resume continuations after planned
+ worktree handoffs
+
+Port of pingdotgg/t3code#15203 (head 897a617d2b5c) until it is merged upstream. Fixes #15136.
+---
+ .../server/src/mcp/WorktreeMcpService.test.ts | 134 ++--
+ apps/server/src/mcp/WorktreeMcpService.ts     |  60 +-
+ .../src/orchestration-v2/EffectOutbox.ts      |   1 +
+ .../src/orchestration-v2/EffectWorker.ts      |   1 +
+ .../src/orchestration-v2/Orchestrator.ts      |  43 +-
+ .../ProviderSessionManager.ts                 |  29 +-
+ .../RunExecutionService.test.ts               |  61 +-
+ .../orchestration-v2/RunExecutionService.ts   |  81 ++-
+ .../SelectionRestart.integration.test.ts      | 624 +++++++++++++++++-
+ docs/internals/overview.md                    |   7 +
+ docs/user/composer.md                         |   4 +
+ packages/contracts/src/orchestrationV2.ts     |   4 +
+ .../src/server/ProviderAdapter.ts             |  12 +
+ 13 files changed, 966 insertions(+), 95 deletions(-)
+
+diff --git a/apps/server/src/mcp/WorktreeMcpService.test.ts b/apps/server/src/mcp/WorktreeMcpService.test.ts
+index a2c259a5e..cdcdc4d94 100644
+--- a/apps/server/src/mcp/WorktreeMcpService.test.ts
++++ b/apps/server/src/mcp/WorktreeMcpService.test.ts
+@@ -3,7 +3,10 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
+ import {
+   CommandId,
+   EnvironmentId,
++  EventId,
++  RunId,
+   type OrchestrationV2ThreadProjection,
++  type OrchestrationV2ServerCommand,
+   type Project,
+   ProjectId,
+   ProviderInstanceId,
+@@ -11,6 +14,7 @@ import {
+   WorktreeMcpHandoffInput,
+ } from "@t3tools/contracts";
+ import * as Cause from "effect/Cause";
++import * as DateTime from "effect/DateTime";
+ import * as Deferred from "effect/Deferred";
+ import * as Effect from "effect/Effect";
+ import * as Exit from "effect/Exit";
+@@ -24,6 +28,7 @@ import * as GitWorkflowService from "../git/GitWorkflowService.ts";
+ import {
+   OrchestratorDispatchError,
+   OrchestratorProjectionError,
++  type OrchestratorV2DispatchResult,
+ } from "../orchestration-v2/Orchestrator.ts";
+ import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+ import * as ProjectService from "../project/ProjectService.ts";
+@@ -100,7 +105,7 @@ interface HarnessOptions {
+   readonly threadAttachedOnRecheck?: boolean;
+   readonly threadArchivedOnRecheck?: boolean;
+   readonly threadReadFailsOnRecheck?: boolean;
+-  readonly continuation?: "queued" | "fails" | "dies";
++  readonly continuation?: "queued" | "started";
+   readonly projectMissing?: boolean;
+   readonly projectReadFails?: boolean;
+   readonly existingBranchWorktreePath?: string | null;
+@@ -116,7 +121,7 @@ interface HarnessOptions {
+ const makeHarness = (options: HarnessOptions = {}) => {
+   const thread = options.thread === undefined ? {} : options.thread;
+   const scope = makeScope(options.capabilities ?? new Set(["preview", "worktree"]));
+-  const dispatch = vi.fn((_: unknown) =>
++  const dispatch = vi.fn((command: OrchestrationV2ServerCommand) =>
+     (options.dispatchGate ?? Effect.void).pipe(
+       Effect.andThen(
+         options.dispatchInterrupts
+@@ -125,7 +130,45 @@ const makeHarness = (options: HarnessOptions = {}) => {
+             ? Effect.die(new Error("dispatch defect"))
+             : options.dispatchFails
+               ? (Effect.fail("simulated dispatch failure") as never)
+-              : Effect.succeed({ sequence: 1, storedEvents: [] }),
++              : Effect.succeed({
++                  sequence: 1,
++                  storedEvents:
++                    command.type !== "thread.metadata.update" ||
++                    command.worktreeContinuation === undefined
++                      ? []
++                      : [
++                          {
++                            sequence: 1,
++                            commandId: command.commandId,
++                            event: {
++                              id: EventId.make("event-worktree-continuation"),
++                              type: "run.created",
++                              threadId,
++                              occurredAt: DateTime.makeUnsafe("2026-01-01T00:00:00.000Z"),
++                              payload: {
++                                id: RunId.make("run-worktree-continuation"),
++                                threadId,
++                                ordinal: 2,
++                                providerInstanceId: ProviderInstanceId.make("provider-test"),
++                                modelSelection: {
++                                  instanceId: ProviderInstanceId.make("provider-test"),
++                                  model: "test-model",
++                                },
++                                providerThreadId: null,
++                                userMessageId: command.worktreeContinuation.messageId,
++                                rootNodeId: null,
++                                activeAttemptId: null,
++                                status: options.continuation === "started" ? "starting" : "queued",
++                                requestedAt: DateTime.makeUnsafe("2026-01-01T00:00:00.000Z"),
++                                startedAt: null,
++                                completedAt: null,
++                                checkpointId: null,
++                                contextHandoffId: null,
++                              },
++                            },
++                          },
++                        ],
++                } satisfies OrchestratorV2DispatchResult),
+       ),
+     ),
+   );
+@@ -173,22 +216,9 @@ const makeHarness = (options: HarnessOptions = {}) => {
+       ? Effect.succeed(makeProjection(thread))
+       : Effect.fail(new OrchestratorProjectionError({ threadId: id }));
+   });
+-  const sendToThread = vi.fn((_: unknown) => {
+-    switch (options.continuation ?? "queued") {
+-      case "fails":
+-        return Effect.fail(
+-          new ThreadManagementService.ThreadManagementThreadArchivedError({
+-            threadId,
+-          }),
+-        );
+-      case "dies":
+-        return Effect.die(new Error("send defect"));
+-      default:
+-        return Effect.succeed({
+-          delivery: "queued",
+-        } as ThreadManagementService.ThreadManagementSendResult);
+-    }
+-  });
++  const sendToThread = vi.fn(() =>
++    Effect.die(new Error("Standalone continuation dispatch is unsafe")),
++  );
+   const getById = vi.fn((id: ProjectId) =>
+     options.projectReadFails
+       ? (Effect.fail("simulated project read failure") as never)
+@@ -448,47 +478,58 @@ describe("t3_worktree_handoff", () => {
+       });
+ 
+       expect(result.continuation).toEqual({ status: "scheduled", delivery: "queued" });
+-      expect(harness.sendToThread).toHaveBeenCalledWith(
++      expect(harness.dispatch).toHaveBeenCalledExactlyOnceWith(
+         expect.objectContaining({
+-          projectId,
++          type: "thread.metadata.update",
+           threadId,
+-          text: "Keep fixing the login bug in the new worktree.",
+-          mode: "queue",
+-          createdBy: "agent",
+-          creationSource: "mcp",
++          worktreePath: result.worktreePath,
++          expectedWorktreePath: null,
++          worktreeContinuation: {
++            messageId: expect.stringContaining("worktree-continuation"),
++            text: "Keep fixing the login bug in the new worktree.",
++          },
+         }),
+       );
++      expect(harness.sendToThread).not.toHaveBeenCalled();
+       // The continuation must be durably queued before anything slower runs.
+-      expect(harness.sendToThread.mock.invocationCallOrder[0]).toBeLessThan(
++      expect(harness.dispatch.mock.invocationCallOrder[0]).toBeLessThan(
+         harness.runForThread.mock.invocationCallOrder[0]!,
+       );
+     });
+   });
+ 
+-  it.effect("reports a continuation failure without failing the handoff", () => {
+-    const harness = makeHarness({ continuation: "fails" });
++  it.effect("reports a continuation started when no run was blocking the handoff", () => {
++    const harness = makeHarness({ continuation: "started" });
+     return Effect.gen(function* () {
+       const result = yield* runHandoff(harness, {
+-        branch: "feature/continue-fails",
++        branch: "feature/continue-idle",
+         continuationPrompt: "Keep going.",
+       });
+-      expect(result.continuation).toMatchObject({ status: "failed" });
+-      expect(result.worktreePath).toBe("/worktrees/project/feature/continue-fails");
+-      expect(harness.dispatch).toHaveBeenCalled();
++      expect(result.continuation).toEqual({ status: "scheduled", delivery: "started" });
++      expect(harness.dispatch).toHaveBeenCalledTimes(1);
++      expect(harness.sendToThread).not.toHaveBeenCalled();
+     });
+   });
+ 
+-  it.effect("reports a continuation defect without failing the handoff", () => {
+-    const harness = makeHarness({ continuation: "dies" });
+-    return Effect.gen(function* () {
+-      const result = yield* runHandoff(harness, {
+-        branch: "feature/continue-dies",
+-        continuationPrompt: "Keep going.",
++  it.effect(
++    "rolls back the worktree when the atomic bind and continuation dispatch defects",
++    () => {
++      const harness = makeHarness({ dispatchDies: true });
++      return Effect.gen(function* () {
++        const exit = yield* Effect.exit(
++          runHandoff(harness, {
++            branch: "feature/continue-dies",
++            continuationPrompt: "Keep going.",
++          }),
++        );
++        expectTypedFailure(exit, { _tag: "WorktreeMcpFailure", code: "operation_failed" });
++        expect(harness.removeWorktree).toHaveBeenCalledTimes(1);
++        expect(harness.deleteLocalBranch).toHaveBeenCalledTimes(1);
++        expect(harness.runForThread).not.toHaveBeenCalled();
++        expect(harness.sendToThread).not.toHaveBeenCalled();
+       });
+-      expect(result.continuation).toEqual({ status: "failed", detail: "send defect" });
+-      expect(result.setupScript).toMatchObject({ status: "started" });
+-    });
+-  });
++    },
++  );
+ 
+   it.effect("does not queue a continuation when the thread update fails", () => {
+     const harness = makeHarness({ dispatchFails: true });
+@@ -793,7 +834,7 @@ describe("t3_worktree_handoff", () => {
+ 
+       // Interrupt arrives while the metadata dispatch is in flight; the
+       // binding-plus-continuation section must run to completion anyway so the
+-      // continuation is never lost between the commit and the queue.
++      // atomic binding and continuation commit survives the pending interruption.
+       const fiber = yield* Effect.forkChild(
+         runHandoff(harness, {
+           branch: "feature/interrupted",
+@@ -808,7 +849,12 @@ describe("t3_worktree_handoff", () => {
+       yield* Fiber.join(interruption);
+ 
+       expect(harness.dispatch).toHaveBeenCalledTimes(1);
+-      expect(harness.sendToThread).toHaveBeenCalledTimes(1);
++      expect(harness.dispatch).toHaveBeenCalledWith(
++        expect.objectContaining({
++          worktreeContinuation: expect.objectContaining({ text: "Keep going in the worktree." }),
++        }),
++      );
++      expect(harness.sendToThread).not.toHaveBeenCalled();
+       // The setup script must also survive the pending interrupt; otherwise
+       // the continuation run starts in a worktree that was never set up.
+       expect(harness.runForThread).toHaveBeenCalledTimes(1);
+diff --git a/apps/server/src/mcp/WorktreeMcpService.ts b/apps/server/src/mcp/WorktreeMcpService.ts
+index 6c471249c..f4d7cde1c 100644
+--- a/apps/server/src/mcp/WorktreeMcpService.ts
++++ b/apps/server/src/mcp/WorktreeMcpService.ts
+@@ -135,7 +135,6 @@ const make = Effect.gen(function* () {
+           );
+         return {
+           commandId: CommandId.make(part("command", "worktree-handoff")),
+-          continuationCommandId: CommandId.make(part("command", "worktree-continuation")),
+           continuationMessageId: MessageId.make(part("message", "worktree-continuation")),
+         };
+       }),
+@@ -270,8 +269,7 @@ const make = Effect.gen(function* () {
+         );
+         const worktreePath = worktree.worktree.path;
+ 
+-        // Shared shape for "the handoff already succeeded, so report the failure
+-        // in the result instead of failing the call" (continuation, setup script).
++        // Setup errors are reported after the handoff has already committed.
+         const reportFailed = (logMessage: string) =>
+           Effect.catchCause((cause: Cause.Cause<unknown>) => {
+             const detail = errorMessage(Cause.squash(cause));
+@@ -317,7 +315,7 @@ const make = Effect.gen(function* () {
+               `Thread '${scope.thread.threadId}' was archived while the worktree was being created; the handoff was rolled back.`,
+             );
+           }
+-          yield* threadManagement
++          return yield* threadManagement
+             .dispatch({
+               type: "thread.metadata.update",
+               commandId: ids.commandId,
+@@ -325,6 +323,14 @@ const make = Effect.gen(function* () {
+               branch: worktree.worktree.refName,
+               worktreePath,
+               expectedWorktreePath: null,
++              ...(input.continuationPrompt === undefined
++                ? {}
++                : {
++                    worktreeContinuation: {
++                      messageId: ids.continuationMessageId,
++                      text: input.continuationPrompt,
++                    },
++                  }),
+             })
+             .pipe(
+               Effect.catchCause((cause) =>
+@@ -354,42 +360,16 @@ const make = Effect.gen(function* () {
+           ),
+         );
+ 
+-        // Queue the continuation right after the binding commits: the detach
+-        // that the metadata update schedules will terminate the calling
+-        // session, and a durably queued message is what guarantees the thread
+-        // re-launches inside the worktree. When the dying run reaches a
+-        // terminal state the orchestrator promotes the queued run, which
+-        // derives its cwd from the updated projection.
+-        // suspend: build the send effect only when the binding has succeeded,
+-        // so a failed dispatch never even constructs the continuation call.
+-        const queueContinuation: Effect.Effect<WorktreeMcpContinuationStatus, WorktreeMcpFailure> =
+-          Effect.suspend(() =>
+-            input.continuationPrompt === undefined
+-              ? Effect.succeed<WorktreeMcpContinuationStatus>({ status: "skipped" })
+-              : threadManagement
+-                  .sendToThread({
+-                    projectId: projection.thread.projectId,
+-                    commandId: ids.continuationCommandId,
+-                    threadId: scope.thread.threadId,
+-                    messageId: ids.continuationMessageId,
+-                    text: input.continuationPrompt,
+-                    attachments: [],
+-                    mode: "queue",
+-                    createdBy: "agent",
+-                    creationSource: "mcp",
+-                  })
+-                  .pipe(
+-                    Effect.map((sendResult): WorktreeMcpContinuationStatus => ({
+-                      status: "scheduled",
+-                      delivery: sendResult.delivery,
+-                    })),
+-                    // catchCause via reportFailed: the binding is already recorded,
+-                    // so a failed continuation must be reported, not fail the handoff.
+-                    reportFailed("worktree handoff continuation failed to queue"),
+-                  ),
+-          );
+-
+-        const continuation = yield* recheckAndBind.pipe(Effect.andThen(queueContinuation));
++        // Binding and continuation events share the detach effect's commit, so
++        // even an immediately executing detach sees the durable queued message.
++        const bound = yield* recheckAndBind;
++        const queued = bound.storedEvents.some(
++          ({ event }) => event.type === "run.created" && event.payload.status === "queued",
++        );
++        const continuation: WorktreeMcpContinuationStatus =
++          input.continuationPrompt === undefined
++            ? { status: "skipped" }
++            : { status: "scheduled", delivery: queued ? "queued" : "started" };
+ 
+         yield* vcsStatusBroadcaster
+           .refreshStatus(worktreePath)
+diff --git a/apps/server/src/orchestration-v2/EffectOutbox.ts b/apps/server/src/orchestration-v2/EffectOutbox.ts
+index c50429f3e..d7fe9c474 100644
+--- a/apps/server/src/orchestration-v2/EffectOutbox.ts
++++ b/apps/server/src/orchestration-v2/EffectOutbox.ts
+@@ -37,6 +37,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
+     type: Schema.Literal("provider-session.detach"),
+     providerSessionId: ProviderSessionId,
+     detail: Schema.optional(Schema.String),
++    reason: Schema.optional(Schema.Literal("workspace_changed")),
+     /** Set on terminal detaches (thread archive/delete): revoke the thread's MCP credentials. */
+     revokeMcpCredential: Schema.optional(Schema.Boolean),
+   }),
+diff --git a/apps/server/src/orchestration-v2/EffectWorker.ts b/apps/server/src/orchestration-v2/EffectWorker.ts
+index aaf4507ca..085a6b568 100644
+--- a/apps/server/src/orchestration-v2/EffectWorker.ts
++++ b/apps/server/src/orchestration-v2/EffectWorker.ts
+@@ -135,6 +135,7 @@ export const layerExecutor: Layer.Layer<
+                 providerSessionId: effect.request.providerSessionId,
+                 threadId: effect.threadId,
+                 ...(effect.request.detail === undefined ? {} : { detail: effect.request.detail }),
++                ...(effect.request.reason === undefined ? {} : { reason: effect.request.reason }),
+                 ...(effect.request.revokeMcpCredential === undefined
+                   ? {}
+                   : { revokeMcpCredential: effect.request.revokeMcpCredential }),
+diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
+index c7b322f2c..6b723e860 100644
+--- a/apps/server/src/orchestration-v2/Orchestrator.ts
++++ b/apps/server/src/orchestration-v2/Orchestrator.ts
+@@ -2539,6 +2539,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+         cause: `Thread ${command.threadId} worktree changed before the metadata update could be applied.`,
+       });
+     }
++    if (command.type === "thread.metadata.update" && command.worktreeContinuation !== undefined) {
++      if (isProviderNativeSubagentThread(thread)) {
++        return yield* new OrchestratorSubagentThreadReadOnlyError({
++          commandId: command.commandId,
++          threadId: command.threadId,
++        });
++      }
++      if (
++        command.worktreePath == null ||
++        command.worktreePath === thread.worktreePath ||
++        thread.archivedAt !== null
++      ) {
++        return yield* new OrchestratorDispatchError({
++          commandId: command.commandId,
++          commandType: command.type,
++          cause:
++            "A worktree continuation requires an active thread and a changed worktree binding.",
++        });
++      }
++    }
+     if (command.type === "thread.metadata.update" && command.expectedEmpty === true) {
+       const records = yield* projectionStore
+         .getThreadRecords(command.threadId, ["runs"])
+@@ -3493,6 +3513,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+                 // Terminal detaches revoke the thread's MCP credentials; other
+                 // detach reasons keep them so a re-attaching provider process
+                 // stays authorized.
++                ...(command.type === "thread.metadata.update"
++                  ? { reason: "workspace_changed" as const }
++                  : {}),
+                 ...(command.type === "thread.archive" ? { revokeMcpCredential: true } : {}),
+               },
+             } satisfies PendingOrchestrationEffectV2;
+@@ -10892,7 +10915,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+       case "thread.pin.reorder":
+       case "thread.active.reorder":
+       case "thread.mark-unread":
+-      case "thread.metadata.update":
+       case "thread.pull-request.link":
+       case "thread.pull-request.unlink":
+       case "thread.pull-request-link.sync":
+@@ -10905,6 +10927,25 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+       case "provider.switch":
+         yield* dispatchThreadMutation(command, events, effects);
+         break;
++      case "thread.metadata.update":
++        yield* dispatchThreadMutation(command, events, effects);
++        if (command.worktreeContinuation !== undefined) {
++          yield* dispatchMessage(
++            {
++              type: "message.dispatch",
++              commandId: command.commandId,
++              threadId: command.threadId,
++              ...command.worktreeContinuation,
++              attachments: [],
++              createdBy: "agent",
++              creationSource: "mcp",
++              dispatchMode: { type: "queue_after_active" },
++            },
++            events,
++            effects,
++          );
++        }
++        break;
+       case "thread.pull-request-watch.sync":
+         yield* dispatchPullRequestWatchSync(command, events, effects);
+         break;
+diff --git a/apps/server/src/orchestration-v2/ProviderSessionManager.ts b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
+index cf0afa6b9..726d98894 100644
+--- a/apps/server/src/orchestration-v2/ProviderSessionManager.ts
++++ b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
+@@ -187,6 +187,7 @@ export interface ProviderSessionManagerV2Shape {
+     readonly providerSessionId: ProviderSessionId;
+     readonly threadId: ThreadId;
+     readonly detail?: string;
++    readonly reason?: "workspace_changed";
+     /**
+      * True for terminal detaches (thread archived or deleted): the thread's
+      * MCP credentials are revoked immediately instead of surviving for a
+@@ -574,13 +575,24 @@ export const layerWithOptions = (
+           ),
+         );
+ 
+-      const failSubscribers = (entry: LiveSessionEntry, detail: string) =>
++      const failSubscribers = (
++        entry: LiveSessionEntry,
++        detail: string,
++        expectedDetach?: Pick<ProviderAdapter.ProviderAdapterSessionDetached, "threadId" | "reason">,
++      ) =>
+         Effect.gen(function* () {
+-          const error = new ProviderAdapter.ProviderAdapterEventStreamError({
+-            driver: entry.runtime.driver,
+-            providerSessionId: entry.runtime.providerSessionId,
+-            cause: detail,
+-          });
++          const error =
++            expectedDetach === undefined
++              ? new ProviderAdapter.ProviderAdapterEventStreamError({
++                  driver: entry.runtime.driver,
++                  providerSessionId: entry.runtime.providerSessionId,
++                  cause: detail,
++                })
++              : new ProviderAdapter.ProviderAdapterSessionDetached({
++                  driver: entry.runtime.driver,
++                  providerSessionId: entry.runtime.providerSessionId,
++                  ...expectedDetach,
++                });
+           const subscribers = yield* Ref.getAndSet(entry.eventSubscribers, new Map());
+           yield* Effect.forEach(
+             subscribers.values(),
+@@ -1057,6 +1069,7 @@ export const layerWithOptions = (
+         readonly cancelIdleFiber?: boolean;
+         readonly onlyIfIdleGeneration?: number;
+         readonly gracefulSubscribers?: boolean;
++        readonly expectedDetach?: Pick<ProviderAdapter.ProviderAdapterSessionDetached, "threadId" | "reason">;
+       }) =>
+         Effect.acquireUseRelease(
+           removeLiveEntry(input),
+@@ -1083,6 +1096,7 @@ export const layerWithOptions = (
+                     yield* failSubscribers(
+                       entry,
+                       input.detail ?? `Provider session released: ${input.reason}.`,
++                      input.expectedDetach,
+                     );
+                   }
+                   const closeExit = yield* closeScopeWithin(entry.scope, {
+@@ -2536,6 +2550,9 @@ export const layerWithOptions = (
+                 reason: "manual_shutdown",
+                 ...(input.detail === undefined ? {} : { detail: input.detail }),
+                 detachedThreadId: input.threadId,
++                ...(input.reason === undefined
++                  ? {}
++                  : { expectedDetach: { threadId: input.threadId, reason: input.reason } }),
+               });
+               return;
+             }
+diff --git a/apps/server/src/orchestration-v2/RunExecutionService.test.ts b/apps/server/src/orchestration-v2/RunExecutionService.test.ts
+index d877922a6..b03301c97 100644
+--- a/apps/server/src/orchestration-v2/RunExecutionService.test.ts
++++ b/apps/server/src/orchestration-v2/RunExecutionService.test.ts
+@@ -3748,6 +3748,62 @@ it.effect("does not refresh pull requests for auxiliary or stale provider termin
+   }),
+ );
+ 
++it.effect("finalizes a planned workspace detach before the provider announces its first turn", () =>
++  Effect.gen(function* () {
++    const key = "workspace-detach-before-turn";
++    const { written, observed } = yield* captureRootRunTermination({
++      key,
++      knownProviderTurn: false,
++      shouldFinalizeRun: () => Effect.succeed(true),
++      events: (ids) =>
++        Stream.fail(
++          new ProviderAdapter.ProviderAdapterSessionDetached({
++            driver,
++            providerSessionId: ProviderSessionId.make(`session:${key}`),
++            threadId: ids.threadId,
++            reason: "workspace_changed",
++          }),
++        ),
++    });
++    assert.deepEqual(observed, ["run:interrupted", "pull-requests-refreshed"]);
++    assert.deepEqual(
++      written.map((item) => item.type),
++      ["run_interrupt_result"],
++    );
++    const interruption = written.find((item) => item.type === "run_interrupt_result");
++    assert.equal(interruption?.message, "Run interrupted because the workspace changed");
++  }),
++);
++
++it.effect.each(["thread", "session"] as const)(
++  "fails rather than treating another %s's planned detach as this run's interruption",
++  (mismatch) =>
++    Effect.gen(function* () {
++      const key = `workspace-detach-mismatched-${mismatch}`;
++      const { written, observed } = yield* captureRootRunTermination({
++        key,
++        knownProviderTurn: false,
++        shouldFinalizeRun: () => Effect.succeed(true),
++        events: (ids) =>
++          Stream.fail(
++            new ProviderAdapter.ProviderAdapterSessionDetached({
++              driver,
++              providerSessionId: ProviderSessionId.make(
++                mismatch === "session" ? "session:other" : `session:${key}`,
++              ),
++              threadId: mismatch === "thread" ? ThreadId.make("thread:other") : ids.threadId,
++              reason: "workspace_changed",
++            }),
++          ),
++      });
++      assert.deepEqual(observed, ["run:failed", "pull-requests-refreshed"]);
++      assert.deepEqual(
++        written.map((item) => item.type),
++        ["error"],
++      );
++    }),
++);
++
+ it.effect("refreshes pull requests after a provider stream exits with an error", () =>
+   Effect.gen(function* () {
+     const { written, observed } = yield* captureRootRunTermination({
+@@ -3820,6 +3876,7 @@ function captureRootRunTermination(input: {
+   readonly rejectTerminalWrite?: boolean;
+   readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
+   readonly seedOpenSubagent?: boolean;
++  readonly knownProviderTurn?: boolean;
+   readonly events?: (
+     ids: BackgroundScenarioIds,
+   ) => Stream.Stream<
+@@ -3954,7 +4011,7 @@ function captureRootRunTermination(input: {
+         } as OrchestrationV2Run,
+         rootNode: {
+           id: ids.rootNodeId,
+-          providerTurnId: ids.rootProviderTurnId,
++          providerTurnId: input.knownProviderTurn === false ? null : ids.rootProviderTurnId,
+         } as OrchestrationV2ExecutionNode,
+         checkpointScope: {
+           id: CheckpointScopeId.make(`checkpoint-scope:${input.key}`),
+@@ -3965,7 +4022,7 @@ function captureRootRunTermination(input: {
+         } as OrchestrationV2ProviderThread,
+         attempt: {
+           id: ids.attemptId,
+-          providerTurnId: ids.rootProviderTurnId,
++          providerTurnId: input.knownProviderTurn === false ? null : ids.rootProviderTurnId,
+         } as OrchestrationV2RunAttempt,
+         attemptId: ids.attemptId,
+         providerTurnOrdinal: 1,
+diff --git a/apps/server/src/orchestration-v2/RunExecutionService.ts b/apps/server/src/orchestration-v2/RunExecutionService.ts
+index b2fe77f6c..f2afd54a3 100644
+--- a/apps/server/src/orchestration-v2/RunExecutionService.ts
++++ b/apps/server/src/orchestration-v2/RunExecutionService.ts
+@@ -590,6 +590,7 @@ export const layer: Layer.Layer<
+       readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
+       readonly openRunOwnedSubagents?: OpenRunOwnedSubagentProjection;
+       readonly terminal: ProviderTerminalEvent;
++      readonly interruptionMessage?: string;
+       readonly failureItemPersisted: boolean;
+       readonly refreshAfterTurn: Effect.Effect<void>;
+       readonly writeIfRunCurrent?: {
+@@ -743,6 +744,9 @@ export const layer: Layer.Layer<
+                       rootNode: input.rootNode,
+                       providerThread: input.providerThread,
+                       completedAt,
++                      ...(input.interruptionMessage === undefined
++                        ? {}
++                        : { message: input.interruptionMessage }),
+                     }),
+                   },
+                 ]
+@@ -934,6 +938,7 @@ export const layer: Layer.Layer<
+           const terminalEvent = yield* Ref.make<ProviderTerminalEvent | null>(null);
+           const latestTurnItemOrdinal = yield* Ref.make(input.providerTurnOrdinal * 100);
+           const latestProviderThread = yield* Ref.make(input.providerThread);
++          const latestRootProviderTurn = yield* Ref.make<OrchestrationV2ProviderTurn | null>(null);
+           const routeIdentity: ProviderEventRouteIdentity = {
+             threadId: input.run.threadId,
+             runId: input.run.id,
+@@ -975,6 +980,7 @@ export const layer: Layer.Layer<
+           );
+           const rootTerminalSeen = yield* Ref.make(false);
+           const rootRunFinalized = yield* Ref.make(false);
++          const interruptionMessage = yield* Ref.make<string | undefined>(undefined);
+           const providerThreadOwnerLost = yield* Ref.make(false);
+           const activeChildProviderTurns = yield* Ref.make<ReadonlySet<ProviderTurnId>>(new Set());
+           const activeChildSubagents = yield* Ref.make<ReadonlySet<NodeId>>(new Set());
+@@ -989,6 +995,7 @@ export const layer: Layer.Layer<
+               }
+               const providerThread = yield* Ref.get(latestProviderThread);
+               const openSubagents = yield* Ref.get(openRunOwnedSubagents);
++              const message = yield* Ref.get(interruptionMessage);
+               yield* writeFinalRunEvents({
+                 run: input.run,
+                 rootNode: input.rootNode,
+@@ -1013,6 +1020,7 @@ export const layer: Layer.Layer<
+                     }),
+                 openRunOwnedSubagents: openSubagents,
+                 terminal,
++                ...(message === undefined ? {} : { interruptionMessage: message }),
+                 failureItemPersisted: terminal.status === "failed",
+                 refreshAfterTurn,
+               }).pipe(
+@@ -1225,6 +1233,69 @@ export const layer: Layer.Layer<
+           });
+           const filterAssistantEvent = makeAssistantStreamingFilter(responseStreamingMode);
+           const providerEventFiber = yield* eventSubscription.events.pipe(
++            Stream.catchTag("ProviderAdapterSessionDetached", (detached) =>
++              detached.providerSessionId !== input.providerSessionId ||
++              detached.threadId !== input.run.threadId
++                ? Stream.fail(detached)
++                : Stream.unwrap(
++                    Effect.gen(function* () {
++                      if (yield* Ref.get(rootRunFinalized)) return Stream.empty;
++                      yield* Ref.set(
++                        interruptionMessage,
++                        "Run interrupted because the workspace changed",
++                      );
++                      const routing = yield* Ref.get(eventRouting);
++                      const providerTurn = yield* Ref.get(latestRootProviderTurn);
++                      const completedAt = yield* DateTime.now;
++                      const terminal = {
++                        type: "turn.terminal",
++                        driver: input.providerThread.driver,
++                        providerThreadId: input.providerThread.id,
++                        providerTurnId:
++                          routing.rootProviderTurnId ??
++                          input.attempt.providerTurnId ??
++                          idAllocator.derive.providerTurn({
++                            driver: input.providerThread.driver,
++                            nativeTurnId: `detached:${input.attempt.id}`,
++                          }),
++                        runOrdinal: input.run.ordinal,
++                        status: "interrupted",
++                        failure: null,
++                        threadDisposition: "reusable",
++                      } satisfies ProviderTerminalEvent;
++                      // Before the provider's first turn event, the planned
++                      // detach supplies this run's root identity for routing.
++                      yield* Ref.update(eventRouting, (state) =>
++                        state.rootProviderTurnId === null
++                          ? {
++                              ...state,
++                              rootProviderTurnId: terminal.providerTurnId,
++                              ownedProviderTurnIds: new Set([
++                                ...state.ownedProviderTurnIds,
++                                terminal.providerTurnId,
++                              ]),
++                            }
++                          : state,
++                      );
++                      return Stream.fromIterable<ProviderAdapter.ProviderAdapterV2Event>([
++                        ...(providerTurn?.status === "running" || providerTurn?.status === "pending"
++                          ? [
++                              {
++                                type: "provider_turn.updated" as const,
++                                driver: input.providerThread.driver,
++                                providerTurn: {
++                                  ...providerTurn,
++                                  status: "interrupted" as const,
++                                  completedAt,
++                                },
++                              },
++                            ]
++                          : []),
++                        terminal,
++                      ]);
++                    }),
++                  ),
++            ),
+             Stream.filterEffect((event) =>
+               Ref.modify(eventRouting, (state) => routeProviderEvent(event, routeIdentity, state)),
+             ),
+@@ -1292,6 +1363,13 @@ export const layer: Layer.Layer<
+                     yield* Ref.set(latestProviderThread, event.providerThread);
+                   }
+                 }
++                if (
++                  event.type === "provider_turn.updated" &&
++                  (event.providerTurn.runAttemptId === input.attempt.id ||
++                    event.providerTurn.id === (yield* Ref.get(eventRouting)).rootProviderTurnId)
++                ) {
++                  yield* Ref.set(latestRootProviderTurn, event.providerTurn);
++                }
+                 if (
+                   event.type === "turn_item.updated" &&
+                   event.turnItem.providerTurnId ===
+@@ -1515,6 +1593,7 @@ export function makeInterruptResultTurnItem(input: {
+   readonly rootNode: OrchestrationV2ExecutionNode;
+   readonly providerThread: OrchestrationV2ProviderThread;
+   readonly completedAt: DateTime.Utc;
++  readonly message?: string;
+ }): OrchestrationV2TurnItem {
+   return {
+     id: input.idAllocator.derive.runSignalTurnItem({
+@@ -1538,6 +1617,6 @@ export function makeInterruptResultTurnItem(input: {
+     completedAt: input.completedAt,
+     updatedAt: input.completedAt,
+     type: "run_interrupt_result",
+-    message: "Run interrupted by user",
++    message: input.message ?? "Run interrupted by user",
+   };
+ }
+diff --git a/apps/server/src/orchestration-v2/SelectionRestart.integration.test.ts b/apps/server/src/orchestration-v2/SelectionRestart.integration.test.ts
+index 03fbfa593..124b3714d 100644
+--- a/apps/server/src/orchestration-v2/SelectionRestart.integration.test.ts
++++ b/apps/server/src/orchestration-v2/SelectionRestart.integration.test.ts
+@@ -15,8 +15,10 @@ import {
+   ProviderTurnId,
+   type RunId,
+   ThreadId,
++  TurnItemId,
+ } from "@t3tools/contracts";
+ import * as DateTime from "effect/DateTime";
++import * as Deferred from "effect/Deferred";
+ import * as Effect from "effect/Effect";
+ import * as Fiber from "effect/Fiber";
+ import * as Layer from "effect/Layer";
+@@ -87,6 +89,7 @@ function makeRestartAdapter(
+   state: Ref.Ref<RestartAdapterState>,
+   sessionCapabilities: OrchestrationV2ProviderCapabilities = pooledCapabilities,
+   providerInstanceId = initialSelection.instanceId,
++  completeContinuation: Effect.Effect<void> = Effect.void,
+ ): ProviderAdapter.ProviderAdapterV2["Service"] {
+   return {
+     instanceId: providerInstanceId,
+@@ -231,7 +234,10 @@ function makeRestartAdapter(
+                 input,
+                 providerTurnId: ProviderTurnId.make(`provider-turn:${input.attemptId}`),
+               } satisfies ActiveTurn;
+-              if (input.modelSelection.model === initialSelection.model) {
++              if (
++                input.modelSelection.model === initialSelection.model &&
++                !input.message.text.endsWith("handoff continuation")
++              ) {
+                 const occurredAt = yield* DateTime.now;
+                 yield* Ref.update(state, (current) => ({ ...current, activeTurn: active }));
+                 yield* Queue.offer(events, {
+@@ -255,6 +261,73 @@ function makeRestartAdapter(
+                 });
+                 return;
+               }
++              if (input.message.text.endsWith("handoff continuation")) {
++                const startedAt = yield* DateTime.now;
++                yield* Queue.offer(events, {
++                  type: "provider_turn.updated",
++                  driver,
++                  providerTurn: {
++                    id: active.providerTurnId,
++                    providerThreadId: input.providerThread.id,
++                    nodeId: input.rootNodeId,
++                    runAttemptId: input.attemptId,
++                    nativeTurnRef: {
++                      driver,
++                      nativeId: `native:${active.providerTurnId}`,
++                      strength: "strong",
++                    },
++                    ordinal: input.providerTurnOrdinal,
++                    status: "running",
++                    startedAt,
++                    completedAt: null,
++                  },
++                });
++                yield* completeContinuation;
++                const completedAt = yield* DateTime.now;
++                yield* Queue.offer(events, {
++                  type: "turn_item.updated",
++                  driver,
++                  turnItem: {
++                    id: TurnItemId.make(`turn-item:${input.attemptId}:result`),
++                    threadId: input.threadId,
++                    runId: input.runId,
++                    nodeId: input.rootNodeId,
++                    providerThreadId: input.providerThread.id,
++                    providerTurnId: active.providerTurnId,
++                    nativeItemRef: null,
++                    parentItemId: null,
++                    ordinal: input.providerTurnOrdinal * 100 + 2,
++                    status: "completed",
++                    title: null,
++                    startedAt,
++                    completedAt,
++                    updatedAt: completedAt,
++                    type: "assistant_message",
++                    messageId: MessageId.make(`message:${input.attemptId}:result`),
++                    text: "Completed inside the new worktree",
++                    attachments: [],
++                    streaming: false,
++                  },
++                });
++                yield* Queue.offer(events, {
++                  type: "message.updated",
++                  driver,
++                  message: {
++                    id: MessageId.make(`message:${input.attemptId}:result`),
++                    threadId: input.threadId,
++                    runId: input.runId,
++                    nodeId: input.rootNodeId,
++                    role: "assistant",
++                    text: "Completed inside the new worktree",
++                    attachments: [],
++                    streaming: false,
++                    createdBy: "agent",
++                    creationSource: "provider",
++                    createdAt: completedAt,
++                    updatedAt: completedAt,
++                  },
++                });
++              }
+               yield* publishTerminal(active, "completed");
+             }),
+           steerTurn: () => Effect.void,
+@@ -1006,3 +1079,552 @@ it.live.each(["active", "idle", "selection-command", "pooled", "separate-home"]
+       }),
+     ),
+ );
++
++it.live.each(["before-detach", "after-detach"] as const)(
++  "starts a workspace handoff continuation %s without holding its queue",
++  (continuationOrder) =>
++    Effect.scoped(
++      Effect.gen(function* () {
++        const name = `workspace-handoff-${continuationOrder}`;
++        const sourceCwd = yield* checkpointWorkspace(`${name}-source`);
++        const targetCwd = yield* checkpointWorkspace(`${name}-target`);
++        const threadId = ThreadId.make(`thread:${name}`);
++        const state = yield* Ref.make<RestartAdapterState>({
++          activeTurn: null,
++          opened: [],
++          started: [],
++          closedSessionCount: 0,
++          failedReplacementOpen: false,
++        });
++        const registry = ProviderAdapterRegistry.layerSingle(
++          makeRestartAdapter(state, exclusiveCapabilities),
++        );
++        yield* Effect.gen(function* () {
++          const orchestrator = yield* Orchestrator.OrchestratorV2;
++          const sink = yield* EventSink.EventSinkV2;
++          const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
++          yield* orchestrator.dispatch({
++            type: "thread.create",
++            createdBy: "agent",
++            creationSource: "mcp",
++            commandId: CommandId.make(`${name}:create`),
++            threadId,
++            projectId: ProjectId.make(`project:${name}`),
++            title: name,
++            modelSelection: initialSelection,
++            runtimeMode: "full-access",
++            interactionMode: "default",
++            branch: null,
++            worktreePath: sourceCwd,
++          });
++          const startSequence = yield* sink.latestSequence();
++          const started = yield* sink.stream({ afterSequence: startSequence, threadId }).pipe(
++            Stream.filter(
++              (stored) =>
++                stored.event.type === "provider-turn.updated" &&
++                stored.event.payload.status === "running",
++            ),
++            Stream.take(1),
++            Stream.runDrain,
++            Effect.forkScoped,
++          );
++          yield* orchestrator.dispatch({
++            type: "message.dispatch",
++            createdBy: "agent",
++            creationSource: "mcp",
++            commandId: CommandId.make(`${name}:first`),
++            threadId,
++            messageId: MessageId.make(`${name}:first`),
++            text: "bind my workspace",
++            attachments: [],
++            dispatchMode: { type: "start_immediately" },
++          });
++          yield* worker.drain();
++          yield* Fiber.join(started);
++          const first = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
++          const beforeDetach = yield* sink.latestSequence();
++          const ended = yield* sink.stream({ afterSequence: beforeDetach, threadId }).pipe(
++            Stream.filter(
++              (stored) =>
++                stored.event.type === "run.updated" &&
++                stored.event.payload.id === first.id &&
++                ["interrupted", "failed", "cancelled", "completed"].includes(
++                  stored.event.payload.status,
++                ),
++            ),
++            Stream.take(1),
++            Stream.runDrain,
++            Effect.forkScoped,
++          );
++          yield* orchestrator.dispatch({
++            type: "thread.metadata.update",
++            commandId: CommandId.make(`${name}:bind`),
++            threadId,
++            worktreePath: targetCwd,
++          });
++          if (continuationOrder === "after-detach") {
++            yield* EffectWorker.runDaemon.pipe(Effect.forkScoped);
++            yield* worker.drain();
++            yield* Fiber.join(ended);
++            assert.equal(
++              (yield* orchestrator.getThreadProjection(threadId)).runs[0]?.status,
++              "interrupted",
++            );
++          }
++          const beforeContinuation = yield* sink.latestSequence();
++          const continuation = yield* orchestrator.dispatch({
++            type: "message.dispatch",
++            createdBy: "agent",
++            creationSource: "mcp",
++            commandId: CommandId.make(`${name}:continue`),
++            threadId,
++            messageId: MessageId.make(`${name}:continue`),
++            text: "handoff continuation",
++            attachments: [],
++            dispatchMode: { type: "queue_after_active" },
++          });
++          const queued = (yield* orchestrator.getThreadProjection(threadId)).runs[1]!;
++          if (continuationOrder === "before-detach") {
++            yield* EffectWorker.runDaemon.pipe(Effect.forkScoped);
++          }
++          if (queued.status === "queued") {
++            const promoted = yield* sink
++              .stream({ afterSequence: beforeContinuation, threadId })
++              .pipe(
++                Stream.filter(
++                  (stored) =>
++                    stored.event.type === "run.updated" &&
++                    stored.event.payload.id === queued.id &&
++                    (stored.event.payload.status === "starting" ||
++                      stored.event.payload.queueHeld === true),
++                ),
++                Stream.take(1),
++                Stream.runDrain,
++                Effect.forkScoped,
++              );
++            yield* worker.drain();
++            yield* Fiber.join(ended);
++            yield* Fiber.join(promoted);
++            const progress = yield* orchestrator.getThreadProjection(threadId);
++            assert.equal(progress.runs[1]?.queueHeld ?? false, false);
++            assert.equal(progress.runs[0]?.status, "interrupted");
++          }
++          const completed = yield* sink
++            .stream({ afterSequence: continuation.sequence, threadId })
++            .pipe(
++              Stream.filter(
++                (stored) =>
++                  stored.event.type === "run.updated" &&
++                  stored.event.payload.id === queued.id &&
++                  stored.event.payload.status === "completed",
++              ),
++              Stream.take(1),
++              Stream.runDrain,
++              Effect.forkScoped,
++            );
++          yield* worker.drain();
++          yield* Fiber.join(completed);
++          const settled = yield* orchestrator.getThreadProjection(threadId);
++          assert.deepEqual(
++            settled.runs.map((run) => run.status),
++            ["interrupted", "completed"],
++          );
++          assert.equal(settled.providerTurns[0]?.status, "interrupted");
++          assert.equal(
++            settled.turnItems.find((item) => item.type === "run_interrupt_result")?.message,
++            "Run interrupted because the workspace changed",
++          );
++          assert.isFalse(settled.runs.some((run) => run.queueHeld === true));
++          assert.isFalse(settled.turnItems.some((item) => item.type === "error"));
++          const captured = yield* Ref.get(state);
++          assert.deepEqual(
++            captured.started.map((turn) => turn.cwd),
++            [sourceCwd, targetCwd],
++          );
++          assert.equal(captured.closedSessionCount, 1);
++        }).pipe(
++          Effect.provide(
++            ProviderReplayHarness.layerWithRegistry({ name }, registry, {
++              runEffectWorker: false,
++            }),
++          ),
++        );
++      }),
++    ),
++);
++
++it.live("keeps a delegated workspace handoff pending until its atomic continuation completes", () =>
++  Effect.scoped(
++    Effect.gen(function* () {
++      const name = "delegated-workspace-handoff";
++      const sourceCwd = yield* checkpointWorkspace(`${name}-source`);
++      const targetCwd = yield* checkpointWorkspace(`${name}-target`);
++      const parentId = ThreadId.make(`thread:${name}:parent`);
++      const continuationStarted = yield* Deferred.make<void>();
++      const finishContinuation = yield* Deferred.make<void>();
++      const state = yield* Ref.make<RestartAdapterState>({
++        activeTurn: null,
++        opened: [],
++        started: [],
++        closedSessionCount: 0,
++        failedReplacementOpen: false,
++      });
++      const registry = ProviderAdapterRegistry.layerSingle(
++        makeRestartAdapter(
++          state,
++          exclusiveCapabilities,
++          providerInstanceId,
++          Deferred.succeed(continuationStarted, undefined).pipe(
++            Effect.andThen(Deferred.await(finishContinuation)),
++          ),
++        ),
++      );
++      yield* Effect.gen(function* () {
++        const orchestrator = yield* Orchestrator.OrchestratorV2;
++        const sink = yield* EventSink.EventSinkV2;
++        yield* orchestrator.dispatch({
++          type: "thread.create",
++          createdBy: "user",
++          creationSource: "web",
++          commandId: CommandId.make(`${name}:parent:create`),
++          threadId: parentId,
++          projectId: ProjectId.make(`project:${name}`),
++          title: name,
++          modelSelection: initialSelection,
++          runtimeMode: "full-access",
++          interactionMode: "default",
++          branch: null,
++          worktreePath: sourceCwd,
++        });
++        const beforeStart = yield* sink.latestSequence();
++        yield* orchestrator.dispatch({
++          type: "message.dispatch",
++          createdBy: "user",
++          creationSource: "web",
++          commandId: CommandId.make(`${name}:parent:start`),
++          threadId: parentId,
++          messageId: MessageId.make(`${name}:parent:start`),
++          text: "delegate the work",
++          attachments: [],
++          dispatchMode: { type: "start_immediately" },
++        });
++        yield* sink.stream({ afterSequence: beforeStart, threadId: parentId }).pipe(
++          Stream.filter(
++            (stored) =>
++              stored.event.type === "provider-turn.updated" &&
++              stored.event.payload.status === "running",
++          ),
++          Stream.take(1),
++          Stream.runDrain,
++        );
++        const parentRun = (yield* orchestrator.getThreadProjection(parentId)).runs[0]!;
++        const delegated = yield* orchestrator.dispatch({
++          type: "delegated_task.request",
++          createdBy: "agent",
++          creationSource: "mcp",
++          commandId: CommandId.make(`${name}:delegate`),
++          parentThreadId: parentId,
++          parentRunId: parentRun.id,
++          parentNodeId: parentRun.rootNodeId!,
++          task: "bind my workspace",
++          modelSelection: initialSelection,
++          runtimeMode: "full-access",
++          interactionMode: "default",
++        });
++        const task = (yield* orchestrator.getThreadProjection(parentId)).subagents[0]!;
++        const childId = task.childThreadId!;
++        yield* sink.stream({ afterSequence: delegated.sequence, threadId: childId }).pipe(
++          Stream.filter(
++            (stored) =>
++              stored.event.type === "provider-turn.updated" &&
++              stored.event.payload.status === "running",
++          ),
++          Stream.take(1),
++          Stream.runDrain,
++        );
++        const binding = {
++          type: "thread.metadata.update" as const,
++          commandId: CommandId.make(`${name}:bind`),
++          threadId: childId,
++          worktreePath: targetCwd,
++          expectedWorktreePath: sourceCwd,
++          worktreeContinuation: {
++            messageId: MessageId.make(`${name}:continue`),
++            text: "handoff continuation",
++          },
++        };
++        const bound = yield* orchestrator.dispatch(binding);
++        assert.lengthOf(
++          bound.storedEvents.filter((stored) => stored.event.type === "run.created"),
++          1,
++        );
++        assert.lengthOf(
++          bound.storedEvents.filter((stored) => stored.event.type === "message.updated"),
++          1,
++        );
++        // Repeating the exact handoff cannot enqueue another continuation.
++        yield* orchestrator.dispatch(binding);
++        const unchangedBinding = yield* orchestrator
++          .dispatch({
++            ...binding,
++            commandId: CommandId.make(`${name}:unchanged-bind`),
++            expectedWorktreePath: targetCwd,
++            worktreeContinuation: {
++              messageId: MessageId.make(`${name}:unchanged-continue`),
++              text: "unexpected duplicate continuation",
++            },
++          })
++          .pipe(Effect.flip);
++        assert.include(String(unchangedBinding.cause), "changed worktree binding");
++        yield* Deferred.await(continuationStarted);
++        const beforeCompletion = yield* orchestrator.getThreadProjection(parentId);
++        assert.isNull(beforeCompletion.subagents[0]?.result);
++        assert.isNull(beforeCompletion.subagents[0]?.completionDelivery ?? null);
++        assert.isFalse(
++          beforeCompletion.contextTransfers.some((transfer) => transfer.type === "subagent_result"),
++        );
++        const continuing = yield* orchestrator.getThreadProjection(childId);
++        assert.deepEqual(
++          continuing.runs.map((run) => run.status),
++          ["interrupted", "running"],
++        );
++        assert.isFalse(continuing.runs.some((run) => run.queueHeld));
++        const beforeFinish = yield* sink.latestSequence();
++        yield* Deferred.succeed(finishContinuation, undefined);
++        yield* sink.stream({ afterSequence: beforeFinish, threadId: parentId }).pipe(
++          Stream.filter(
++            (stored) =>
++              stored.event.type === "subagent.updated" &&
++              stored.event.payload.id === task.id &&
++              stored.event.payload.status === "completed",
++          ),
++          Stream.take(1),
++          Stream.runDrain,
++        );
++        const finished = yield* orchestrator.getThreadProjection(parentId);
++        assert.equal(finished.subagents[0]?.status, "completed");
++        assert.equal(finished.subagents[0]?.result, "Completed inside the new worktree");
++        assert.lengthOf(
++          finished.contextTransfers.filter((transfer) => transfer.type === "subagent_result"),
++          1,
++        );
++        const childFinished = yield* orchestrator.getThreadProjection(childId);
++        assert.deepEqual(
++          childFinished.runs.map((run) => run.status),
++          ["interrupted", "completed"],
++        );
++        assert.lengthOf(
++          childFinished.messages.filter((message) => message.text === "handoff continuation"),
++          1,
++        );
++        assert.isFalse(
++          childFinished.messages.some(
++            (message) => message.text === "unexpected duplicate continuation",
++          ),
++        );
++        assert.isFalse(childFinished.turnItems.some((item) => item.type === "error"));
++        const assistantItems = childFinished.visibleTurnItems.flatMap((row) =>
++          row.item.type === "assistant_message" ? [row.item] : [],
++        );
++        assert.lengthOf(assistantItems, 1);
++        assert.equal(assistantItems[0]?.text, "Completed inside the new worktree");
++        const assistantMessage = childFinished.messages.find(
++          (message) => message.role === "assistant",
++        );
++        assert.equal(assistantItems[0]?.messageId, assistantMessage?.id);
++        assert.equal(assistantItems[0]?.text, assistantMessage?.text);
++
++        assert.deepEqual(
++          (yield* Ref.get(state)).started.map((turn) => turn.cwd),
++          [sourceCwd, sourceCwd, targetCwd],
++        );
++      }).pipe(Effect.provide(ProviderReplayHarness.layerWithRegistry({ name }, registry)));
++    }),
++  ),
++);
++
++it.live.each(["provider-crash", "explicit-stop"] as const)(
++  "preserves real queued input until explicitly resumed after %s",
++  (termination) =>
++    Effect.scoped(
++      Effect.gen(function* () {
++        const name = `queued-control-${termination}`;
++        const cwd = yield* checkpointWorkspace(name);
++        const threadId = ThreadId.make(`thread:${name}`);
++        const crash = yield* Deferred.make<void>();
++        const firstSession = yield* Ref.make(true);
++        const state = yield* Ref.make<RestartAdapterState>({
++          activeTurn: null,
++          opened: [],
++          started: [],
++          closedSessionCount: 0,
++          failedReplacementOpen: false,
++        });
++        const base = makeRestartAdapter(state, exclusiveCapabilities);
++        const adapter: ProviderAdapter.ProviderAdapterV2["Service"] = {
++          ...base,
++          openSession: (input) =>
++            base.openSession(input).pipe(
++              Effect.flatMap((session) =>
++                Ref.getAndSet(firstSession, false).pipe(
++                  Effect.map((isFirst) => ({
++                    ...session,
++                    events:
++                      termination === "explicit-stop" || !isFirst
++                        ? session.events
++                        : Stream.merge(
++                            session.events,
++                            Stream.fromEffect(
++                              Deferred.await(crash).pipe(
++                                Effect.andThen(
++                                  Effect.fail(
++                                    new ProviderAdapter.ProviderAdapterEventStreamError({
++                                      driver,
++                                      providerSessionId: input.providerSessionId,
++                                      cause: "Simulated provider crash",
++                                    }),
++                                  ),
++                                ),
++                              ),
++                            ),
++                          ),
++                  })),
++                ),
++              ),
++            ),
++        };
++        yield* Effect.gen(function* () {
++          const orchestrator = yield* Orchestrator.OrchestratorV2;
++          const sink = yield* EventSink.EventSinkV2;
++          yield* orchestrator.dispatch({
++            type: "thread.create",
++            commandId: CommandId.make(`${name}:create`),
++            threadId,
++            projectId: ProjectId.make(`project:${name}`),
++            title: name,
++            modelSelection: initialSelection,
++            createdBy: "user",
++            creationSource: "web",
++            runtimeMode: "full-access",
++            interactionMode: "default",
++            branch: null,
++            worktreePath: cwd,
++          });
++          const beforeStart = yield* sink.latestSequence();
++          yield* orchestrator.dispatch({
++            type: "message.dispatch",
++            commandId: CommandId.make(`${name}:first`),
++            threadId,
++            messageId: MessageId.make(`${name}:first`),
++            createdBy: "user",
++            creationSource: "web",
++            text: "keep working",
++            attachments: [],
++            dispatchMode: { type: "start_immediately" },
++          });
++          yield* sink.stream({ threadId, afterSequence: beforeStart }).pipe(
++            Stream.filter(
++              (stored) =>
++                stored.event.type === "provider-turn.updated" &&
++                stored.event.payload.status === "running",
++            ),
++            Stream.take(1),
++            Stream.runDrain,
++          );
++          const queuedCommand = {
++            type: "message.dispatch" as const,
++            commandId: CommandId.make(`${name}:queue`),
++            threadId,
++            messageId: MessageId.make(`${name}:queue`),
++            createdBy: "user" as const,
++            creationSource: "web" as const,
++            text: "handoff continuation",
++            attachments: [],
++            dispatchMode: { type: "queue_after_active" as const },
++          };
++          const queuedReceipt = yield* orchestrator.dispatch(queuedCommand);
++          const queuedState = yield* orchestrator.getThreadProjection(threadId);
++          assert.deepEqual(
++            queuedState.runs.map((run) => run.status),
++            ["running", "queued"],
++          );
++          const originalRun = queuedState.runs[0]!;
++          const queuedRun = queuedState.runs[1]!;
++          if (termination === "provider-crash") yield* Deferred.succeed(crash, undefined);
++          else
++            yield* orchestrator.dispatch({
++              type: "run.interrupt",
++              commandId: CommandId.make(`${name}:stop`),
++              threadId,
++              runId: originalRun.id,
++              holdQueue: true,
++            });
++          yield* sink.stream({ threadId, afterSequence: queuedReceipt.sequence }).pipe(
++            Stream.filter(
++              (stored) =>
++                stored.event.type === "run.updated" &&
++                stored.event.payload.id === queuedRun.id &&
++                stored.event.payload.queueHeld === true,
++            ),
++            Stream.take(1),
++            Stream.runDrain,
++          );
++          const held = yield* orchestrator.getThreadProjection(threadId);
++          assert.equal(held.runs[1]?.status, "queued");
++          assert.equal(
++            held.messages.find((message) => message.id === queuedCommand.messageId)?.text,
++            queuedCommand.text,
++          );
++          assert.lengthOf((yield* Ref.get(state)).started, 1);
++          const resumed = yield* orchestrator.dispatch({
++            type: "queue.resume",
++            commandId: CommandId.make(`${name}:resume`),
++            threadId,
++          });
++          yield* sink.stream({ threadId, afterSequence: resumed.sequence }).pipe(
++            Stream.filter(
++              (stored) =>
++                stored.event.type === "run.updated" &&
++                stored.event.payload.id === queuedRun.id &&
++                stored.event.payload.status === "completed",
++            ),
++            Stream.take(1),
++            Stream.runDrain,
++          );
++          const completed = yield* orchestrator.getThreadProjection(threadId);
++          assert.deepEqual(
++            completed.runs.map((run) => run.status),
++            [termination === "provider-crash" ? "failed" : "interrupted", "completed"],
++          );
++          assert.isFalse(completed.runs.some((run) => run.queueHeld));
++          assert.lengthOf(
++            completed.messages.filter((message) => message.id === queuedCommand.messageId),
++            1,
++          );
++          assert.lengthOf((yield* Ref.get(state)).started, 2);
++          assert.equal(
++            completed.messages.find((message) => message.role === "assistant")?.text,
++            "Completed inside the new worktree",
++          );
++          if (termination === "provider-crash")
++            assert.isTrue(
++              completed.turnItems.some(
++                (item) => item.type === "error" && item.runId === originalRun.id,
++              ),
++            );
++          else
++            assert.equal(
++              completed.turnItems.find((item) => item.type === "run_interrupt_result")?.message,
++              "Run interrupted by user",
++            );
++        }).pipe(
++          Effect.provide(
++            ProviderReplayHarness.layerWithRegistry(
++              { name },
++              ProviderAdapterRegistry.layerSingle(adapter),
++            ),
++          ),
++        );
++      }),
++    ),
++);
+diff --git a/docs/internals/overview.md b/docs/internals/overview.md
+index 149bcf57d..ca7442bab 100644
+--- a/docs/internals/overview.md
++++ b/docs/internals/overview.md
+@@ -66,6 +66,13 @@ therefore means the intent committed, not that the provider, checkpoint, or othe
+ finished. Keep external I/O out of command decisions and the database transaction. Effects tied to
+ a lost provider process cannot simply replay; recovery retires them before admitting new work.
+ 
++A worktree handoff with a continuation records the workspace binding, continuation message and
++run, and provider detach effect in the same command transaction. The detach can execute immediately
++after commit, so recording the continuation afterward would let a delegated child publish its result
++too early. A planned exclusive workspace detach interrupts the old turn without a provider failure;
++the queued continuation can then start in the new workspace. Unexpected provider failures and
++explicit Stop retain queued messages until the user resumes them.
++
+ Persisted events must remain decodable on replay. Changing a schema affects old environments at
+ startup as well as live RPC traffic. Compatibility work must account for stored history, not just
+ what the newest client sends.
+diff --git a/docs/user/composer.md b/docs/user/composer.md
+index 3492e1612..d27aa04de 100644
+--- a/docs/user/composer.md
++++ b/docs/user/composer.md
+@@ -58,6 +58,10 @@ are saved on the server and can be edited, reordered, or removed above the compo
+ `Cmd+Enter` on macOS or `Ctrl+Enter` on Windows and Linux uses the opposite action:
+ it steers when your default is Queue and queues when your default is Steer.
+ 
++When an agent moves its thread into a worktree with a continuation message, work resumes
++automatically in that worktree. An explicit Stop or a provider failure pauses queued messages
++until you resume the queue; the messages stay saved.
++
+ Use `Cmd+Shift+Enter` on macOS or `Ctrl+Shift+Enter` on Windows and Linux to send
+ the oldest queued message as a steer. This leaves the current draft intact and
+ requires an active turn that supports steering. Change
+diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
+index 70cbde81b..a04832fc4 100644
+--- a/packages/contracts/src/orchestrationV2.ts
++++ b/packages/contracts/src/orchestrationV2.ts
+@@ -2866,6 +2866,10 @@ export const OrchestrationV2Command = Schema.Union([
+     branch: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+     worktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+     expectedWorktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
++    /** Record the next message atomically with a worktree handoff, before session detach. */
++    worktreeContinuation: Schema.optional(
++      Schema.Struct({ messageId: MessageId, text: TrimmedNonEmptyString }),
++    ),
+     /** Reject unless no message or run has landed on this thread. */
+     expectedEmpty: Schema.optional(Schema.Boolean),
+     limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecoveryUpdate)),
+diff --git a/packages/provider-core/src/server/ProviderAdapter.ts b/packages/provider-core/src/server/ProviderAdapter.ts
+index 48d569137..2d04507d7 100644
+--- a/packages/provider-core/src/server/ProviderAdapter.ts
++++ b/packages/provider-core/src/server/ProviderAdapter.ts
+@@ -347,6 +347,17 @@ export class ProviderAdapterEventStreamError extends Schema.TaggedError<Provider
+   }
+ }
+ 
++/** The app deliberately closed an exclusive session to move its thread's workspace. */
++export class ProviderAdapterSessionDetached extends Schema.TaggedError<ProviderAdapterSessionDetached>()(
++  "ProviderAdapterSessionDetached",
++  {
++    driver: ProviderDriverKind,
++    providerSessionId: ProviderSessionId,
++    threadId: ThreadId,
++    reason: Schema.Literal("workspace_changed"),
++  },
++) {}
++
+ export class ProviderAdapterProtocolError extends Schema.TaggedError<ProviderAdapterProtocolError>()(
+   "ProviderAdapterProtocolError",
+   {
+@@ -376,6 +387,7 @@ export const ProviderAdapterV2Error = Schema.Union([
+   ProviderAdapterInterruptError,
+   ProviderAdapterRuntimeRequestResponseError,
+   ProviderAdapterEventStreamError,
++  ProviderAdapterSessionDetached,
+   ProviderAdapterProtocolError,
+ ]);
+ export type ProviderAdapterV2Error = typeof ProviderAdapterV2Error.Type;
