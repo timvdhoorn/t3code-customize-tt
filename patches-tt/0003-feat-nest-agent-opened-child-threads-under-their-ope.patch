@@ -16,15 +16,15 @@ guide line, context-menu collapse and a summary stub.
  .../src/orchestration-v2/ProjectionStore.ts   |   6 +
  .../ThreadLaunchService.test.ts               |  19 ++
  .../orchestration-v2/ThreadLaunchService.ts   |   5 +
- .../src/components/Sidebar.families.test.ts   | 118 ++++++++
- apps/web/src/components/Sidebar.families.ts   | 112 +++++++
- apps/web/src/components/Sidebar.tsx           | 278 ++++++++++++++----
+ .../src/components/Sidebar.families.test.ts   | 165 ++++++++++
+ apps/web/src/components/Sidebar.families.ts   | 150 +++++++++
+ apps/web/src/components/Sidebar.tsx           | 293 +++++++++++++++---
  .../components/threadActionMenu.logic.test.ts |  11 +
  .../src/components/threadActionMenu.logic.ts  |  13 +
  apps/web/src/contextMenuFallback.ts           |   7 +
  packages/client-runtime/src/state/models.ts   |   5 +
  packages/contracts/src/orchestrationV2.ts     |  15 +
- 15 files changed, 549 insertions(+), 51 deletions(-)
+ 15 files changed, 649 insertions(+), 51 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.families.test.ts
  create mode 100644 apps/web/src/components/Sidebar.families.ts
 
@@ -190,10 +190,10 @@ index a4d949770..d0b77ef36 100644
                    : { importedNativeThread: input.importedNativeThread }),
 diff --git a/apps/web/src/components/Sidebar.families.test.ts b/apps/web/src/components/Sidebar.families.test.ts
 new file mode 100644
-index 000000000..673da9a7f
+index 000000000..91b0b5da7
 --- /dev/null
 +++ b/apps/web/src/components/Sidebar.families.test.ts
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,165 @@
 +import { describe, expect, it } from "vite-plus/test";
 +import {
 +  buildSidebarThreadFamilies,
@@ -201,6 +201,7 @@ index 000000000..673da9a7f
 +  flattenSidebarThreadFamilies,
 +  foldSidebarThreadFamily,
 +  formatHiddenChildThreadsLabel,
++  placeSettledChildThreads,
 +} from "./Sidebar.families";
 +
 +interface Row {
@@ -266,6 +267,52 @@ index 000000000..673da9a7f
 +  });
 +});
 +
++describe("placeSettledChildThreads", () => {
++  const place = (settled: readonly Row[], live: Record<string, "active" | "working">) => {
++    const placed = placeSettledChildThreads(
++      settled,
++      (thread) => thread.key,
++      (thread) => thread.openedBy,
++      (key) => live[key] ?? null,
++    );
++    return {
++      settled: placed.settled.map((thread) => thread.key),
++      moved: placed.moved.map(({ thread, section }) => [thread.key, section]),
++    };
++  };
++
++  it("moves a finished child to its live opener's section", () => {
++    expect(place([row("done", "parent"), row("old")], { parent: "working" })).toEqual({
++      settled: ["old"],
++      moved: [["done", "working"]],
++    });
++  });
++
++  it("follows settled openers up to the live root", () => {
++    expect(place([row("child", "root"), row("grandchild", "child")], { root: "active" })).toEqual({
++      settled: [],
++      moved: [
++        ["child", "active"],
++        ["grandchild", "active"],
++      ],
++    });
++  });
++
++  it("keeps a child settled when no opener is live", () => {
++    expect(place([row("child", "parent"), row("parent"), row("orphan", "gone")], {})).toEqual({
++      settled: ["child", "parent", "orphan"],
++      moved: [],
++    });
++  });
++
++  it("stops on an opener cycle", () => {
++    expect(place([row("a", "b"), row("b", "a")], {})).toEqual({
++      settled: ["a", "b"],
++      moved: [],
++    });
++  });
++});
++
 +describe("foldSidebarThreadFamily", () => {
 +  const children = [row("working"), row("asks"), row("open")];
 +  const keepVisible = (thread: Row) => thread.key === "asks" || thread.key === "open";
@@ -314,16 +361,19 @@ index 000000000..673da9a7f
 +});
 diff --git a/apps/web/src/components/Sidebar.families.ts b/apps/web/src/components/Sidebar.families.ts
 new file mode 100644
-index 000000000..0d113740d
+index 000000000..0dd731af7
 --- /dev/null
 +++ b/apps/web/src/components/Sidebar.families.ts
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,150 @@
 +// Child threads in the sidebar, after Claude.app's nested sessions: a thread
 +// an agent opened through T3 tools renders under the thread that opened it.
-+// Nesting is a view inside one section. Every thread keeps the section its
-+// own state puts it in; a child whose opener sits in another section (or is
-+// archived, hidden, or paged out) renders on its own there. Families are one
-+// level deep: a grandchild hangs under the topmost ancestor in its section.
++// Nesting is a view inside one section. A settled child follows an opener
++// that is still live (pinned, active, working), so finished children stay
++// under the thread that runs them. Otherwise every thread keeps the section
++// its own state puts it in: a live child under a settled opener stays live on
++// its own, and a child whose opener is archived, hidden, or paged out renders
++// on its own. Families are one level deep: a grandchild hangs under the
++// topmost ancestor in its section.
 +
 +import type { SidebarThreadStatus } from "./Sidebar.logic";
 +
@@ -379,6 +429,41 @@ index 000000000..0d113740d
 +  return heads.map((head) => ({ head, children: childrenByHead.get(keyOf(head)) ?? [] }));
 +}
 +
++/**
++ * Settled threads whose opener chain reaches a live thread move to that
++ * thread's section. The walk passes through settled openers only, so a
++ * settled grandchild follows its settled parent up to the live root, and a
++ * snoozed or missing opener keeps the child settled.
++ */
++export function placeSettledChildThreads<T, S>(
++  settled: readonly T[],
++  keyOf: (thread: T) => string,
++  parentKeyOf: (thread: T) => string | null,
++  liveSectionOf: (key: string) => S | null,
++): { readonly settled: T[]; readonly moved: { readonly thread: T; readonly section: S }[] } {
++  const settledByKey = new Map(settled.map((thread) => [keyOf(thread), thread] as const));
++  const stay: T[] = [];
++  const moved: { thread: T; section: S }[] = [];
++  for (const thread of settled) {
++    let section: S | null = null;
++    let current = thread;
++    const seen = new Set([keyOf(thread)]);
++    for (let depth = 0; depth < MAX_FAMILY_DEPTH; depth += 1) {
++      const parentKey = parentKeyOf(current);
++      if (parentKey === null || seen.has(parentKey)) break;
++      section = liveSectionOf(parentKey);
++      if (section !== null) break;
++      const parent = settledByKey.get(parentKey);
++      if (parent === undefined) break;
++      seen.add(parentKey);
++      current = parent;
++    }
++    if (section === null) stay.push(thread);
++    else moved.push({ thread, section });
++  }
++  return { settled: stay, moved };
++}
++
 +/** Heads then their shown children, the order rows render and keys traverse. */
 +export function flattenSidebarThreadFamilies<T>(
 +  families: readonly SidebarThreadFamily<T>[],
@@ -431,10 +516,10 @@ index 000000000..0d113740d
 +  ].join(" · ");
 +}
 diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
-index 246a075bf..777111407 100644
+index 246a075bf..a6b882d4f 100644
 --- a/apps/web/src/components/Sidebar.tsx
 +++ b/apps/web/src/components/Sidebar.tsx
-@@ -234,6 +234,14 @@ import {
+@@ -234,6 +234,15 @@ import {
    type SidebarListMarker,
    type SidebarSection,
  } from "./Sidebar.logic";
@@ -444,12 +529,13 @@ index 246a075bf..777111407 100644
 +  flattenSidebarThreadFamilies,
 +  foldSidebarThreadFamily,
 +  formatHiddenChildThreadsLabel,
++  placeSettledChildThreads,
 +  type SidebarThreadFamily,
 +} from "./Sidebar.families";
  import { resolveLocalCheckoutBranchMismatch } from "./BranchToolbar.logic";
  import {
    createSidebarCollisionDetection,
-@@ -308,6 +316,23 @@ const SETTLED_TAIL_PAGE_COUNT = 25;
+@@ -308,6 +317,23 @@ const SETTLED_TAIL_PAGE_COUNT = 25;
  const SETTLED_SHELF_EXPANDED_KEY = "t3code:sidebar:settled-expanded";
  const SNOOZED_SHELF_EXPANDED_KEY = "t3code:sidebar:snoozed-expanded";
  const WORKING_SHELF_EXPANDED_KEY = "t3code:sidebar:working-expanded";
@@ -473,7 +559,7 @@ index 246a075bf..777111407 100644
  
  // Working beta: when this client saw each thread leave the Working shelf.
  // Module scope keeps the inbox order across routes that unmount the sidebar.
-@@ -1110,9 +1135,72 @@ const dropVerbBadge: Record<SidebarDropVerb, ReactNode> = {
+@@ -1110,9 +1136,72 @@ const dropVerbBadge: Record<SidebarDropVerb, ReactNode> = {
    ),
  };
  
@@ -546,7 +632,7 @@ index 246a075bf..777111407 100644
    // Settled rows un-settle, snoozed rows wake, and cards settle.
    variantAction: SidebarSweepAction;
    // False on environments whose server predates thread.settle/unsettle:
-@@ -1814,7 +1902,11 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
+@@ -1814,7 +1903,11 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                  aria-current={accessibility.current}
                  data-testid="sidebar-row-slim"
                  aria-busy={isRegeneratingTitle || undefined}
@@ -559,7 +645,7 @@ index 246a075bf..777111407 100644
                  onClick={handleClick}
                  onDoubleClick={handleDoubleClick}
                  onKeyDown={handleKeyDown}
-@@ -1825,15 +1917,19 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
+@@ -1825,15 +1918,19 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
              {accessibleTitle}
              {/* Settled history recedes: dimmed favicon at rest, restored on
                hover so the tail stays scannable when you're hunting. */}
@@ -588,7 +674,28 @@ index 246a075bf..777111407 100644
              {draftIndicator}
              {title}
              {pinIndicator}
-@@ -3093,21 +3189,79 @@ export default function Sidebar() {
+@@ -2880,6 +2977,20 @@ export default function Sidebar() {
+         ).push(thread);
+       }
+     }
++    // A finished child stays under an opener that is still live
++    // (Sidebar.families.ts); a live child under a settled opener stays live.
++    const liveSectionByKey = new Map<string, EnvironmentThreadShell[]>();
++    for (const list of [pinned, active, working]) {
++      for (const thread of list) liveSectionByKey.set(threadKeyOf(thread), list);
++    }
++    const placed = placeSettledChildThreads(
++      settled,
++      threadKeyOf,
++      openerKeyOf,
++      (key) => liveSectionByKey.get(key) ?? null,
++    );
++    settled.splice(0, settled.length, ...placed.settled);
++    for (const { thread, section } of placed.moved) section.push(thread);
+     // One shared rule on every platform (see sortPinnedThreadsByOrderKey):
+     // user-arranged keys first, keyless threads in creation order below.
+     // Server capability only gates DRAGGING — it must not influence the
+@@ -3093,21 +3204,79 @@ export default function Sidebar() {
      return routeThread === undefined ? EMPTY_THREADS : [routeThread];
    }, [routeThreadKey, workingShelfExpanded, workingThreads]);
  
@@ -682,7 +789,7 @@ index 246a075bf..777111407 100644
    );
    const orderedThreadKeys = useMemo(
      () =>
-@@ -3663,19 +3817,14 @@ export default function Sidebar() {
+@@ -3663,19 +3832,14 @@ export default function Sidebar() {
      },
      [attemptUnsettle, attemptUnsnooze, serverConfigs, settleThreads],
    );
@@ -707,7 +814,7 @@ index 246a075bf..777111407 100644
    );
    useEffect(() => {
      if (optimisticDrop === null) return;
-@@ -3820,14 +3969,13 @@ export default function Sidebar() {
+@@ -3820,14 +3984,13 @@ export default function Sidebar() {
    // Include every visible row in the measured order. Older servers disable
    // pickup on their rows without changing where those rows render.
    const sidebarListItems = useMemo((): readonly SidebarListItem[] => {
@@ -726,7 +833,7 @@ index 246a075bf..777111407 100644
      if (
        pinnedThreads.length +
          activeThreads.length +
-@@ -3839,33 +3987,31 @@ export default function Sidebar() {
+@@ -3839,33 +4002,31 @@ export default function Sidebar() {
        return [];
      }
      const items: SidebarListItem[] = [{ kind: "marker", marker: "pinned-header" }];
@@ -768,7 +875,7 @@ index 246a075bf..777111407 100644
      workingThreads.length,
    ]);
    useEffect(() => {
-@@ -4684,6 +4830,9 @@ export default function Sidebar() {
+@@ -4684,6 +4845,9 @@ export default function Sidebar() {
                  titleRegeneration: supportsTitleRegeneration,
                },
                snoozePresets,
@@ -778,7 +885,7 @@ index 246a075bf..777111407 100644
              }),
              position,
            ),
-@@ -4797,6 +4946,10 @@ export default function Sidebar() {
+@@ -4797,6 +4961,10 @@ export default function Sidebar() {
            case "mark-unread":
              markThreadUnread(threadRef);
              return;
@@ -789,7 +896,7 @@ index 246a075bf..777111407 100644
            case "copy-path":
              if (!threadWorkspacePath) {
                toastManager.add(
-@@ -4901,6 +5054,7 @@ export default function Sidebar() {
+@@ -4901,6 +5069,7 @@ export default function Sidebar() {
        setProjectScopeKey,
        setThreadAutoSettle,
        startThreadRename,
@@ -797,7 +904,7 @@ index 246a075bf..777111407 100644
        updateThreadMetadata,
        timestampFormat,
      ],
-@@ -5301,6 +5455,7 @@ export default function Sidebar() {
+@@ -5301,6 +5470,7 @@ export default function Sidebar() {
                          thread: EnvironmentThreadShell,
                          section: SidebarSection,
                          sortable?: SortableThreadRowBag,
@@ -805,7 +912,7 @@ index 246a075bf..777111407 100644
                        ) => {
                          const threadKey = scopedThreadKey(
                            scopeThreadRef(thread.environmentId, thread.id),
-@@ -5310,8 +5465,10 @@ export default function Sidebar() {
+@@ -5310,8 +5480,10 @@ export default function Sidebar() {
                          // from users (or the auto rules) actually parking work,
                          // not from the sidebar second-guessing what still matters.
                          // Working rows stay cards so their live status shows.
@@ -817,7 +924,7 @@ index 246a075bf..777111407 100644
                          const rowVariant = isCard ? "card" : "slim";
                          return (
                            <SidebarThreadRow
-@@ -5320,6 +5477,7 @@ export default function Sidebar() {
+@@ -5320,6 +5492,7 @@ export default function Sidebar() {
                              key={`${threadKey}:${rowVariant}`}
                              thread={thread}
                              variant={rowVariant}
@@ -825,7 +932,7 @@ index 246a075bf..777111407 100644
                              // Snoozed rows wake, settled rows un-settle, and cards settle.
                              variantAction={
                                section === "snoozed"
-@@ -5455,6 +5613,26 @@ export default function Sidebar() {
+@@ -5455,6 +5628,26 @@ export default function Sidebar() {
                        for (const item of sidebarListItems) {
                          if (item.kind === "thread") {
                            items.push(renderThreadRow(threadByKey.get(item.key)!, item.section));
