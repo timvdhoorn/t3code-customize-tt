@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: timvdhoorn <timvdhoorn@gmail.com>
 Date: Thu, 15 Oct 2026 14:33:02 +0200
-Subject: [PATCH 3/3] feat: nest agent-opened child threads under their opener
- in the sidebar
+Subject: [PATCH] feat: nest agent-opened child threads under their opener in
+ the sidebar
 
 Ports the server side of pingdotgg/t3code#16699 (openedByThreadId on
 t3_thread_launch and create_threads) and renders families like Claude.app:
@@ -14,14 +14,14 @@ guide line, context-menu collapse and a summary stub.
  .../src/mcp/toolkits/project/handlers.ts      |   1 +
  .../src/orchestration-v2/Orchestrator.ts      |  10 +-
  .../src/orchestration-v2/ProjectionStore.ts   |  12 +
- .../ThreadLaunchService.test.ts               |  19 ++
+ .../ThreadLaunchService.test.ts               |  19 +
  .../orchestration-v2/ThreadLaunchService.ts   |   5 +
  .../ThreadManagementService.test.ts           |   9 +-
  .../ThreadManagementService.ts                |   2 +
  .../src/orchestration-v2/runtimeLayer.test.ts |  15 +
- .../src/components/Sidebar.families.test.ts   | 232 +++++++++++++
- apps/web/src/components/Sidebar.families.ts   | 194 +++++++++++
- apps/web/src/components/Sidebar.tsx           | 320 +++++++++++++++---
+ .../src/components/Sidebar.families.test.ts   | 232 +++++++++++
+ apps/web/src/components/Sidebar.families.ts   | 194 +++++++++
+ apps/web/src/components/Sidebar.tsx           | 373 +++++++++++++++---
  .../components/threadActionMenu.logic.test.ts |  11 +
  .../src/components/threadActionMenu.logic.ts  |  13 +
  apps/web/src/contextMenuFallback.ts           |   7 +
@@ -29,7 +29,7 @@ guide line, context-menu collapse and a summary stub.
  .../src/state/threadCommands.ts               |  10 +-
  .../src/state/threadShell.test.ts             |  37 ++
  packages/contracts/src/orchestrationV2.ts     |  23 ++
- 20 files changed, 886 insertions(+), 56 deletions(-)
+ 20 files changed, 926 insertions(+), 69 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.families.test.ts
  create mode 100644 apps/web/src/components/Sidebar.families.ts
 
@@ -739,7 +739,7 @@ index 000000000..6e34c3f71
 +  ].join(" · ");
 +}
 diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
-index 65c00d70e..adf76ef81 100644
+index 65c00d70e..b9a34facd 100644
 --- a/apps/web/src/components/Sidebar.tsx
 +++ b/apps/web/src/components/Sidebar.tsx
 @@ -234,6 +234,16 @@ import {
@@ -789,12 +789,33 @@ index 65c00d70e..adf76ef81 100644
  
  // Working beta: when this client saw each thread leave the Working shelf.
  // Module scope keeps the inbox order across routes that unmount the sidebar.
-@@ -1111,9 +1144,72 @@ const dropVerbBadge: Record<SidebarDropVerb, ReactNode> = {
+@@ -1111,9 +1144,93 @@ const dropVerbBadge: Record<SidebarDropVerb, ReactNode> = {
    ),
  };
  
++function SidebarStatusIcon(props: {
++  icon: "working" | "waiting" | "input" | "approval" | "failed" | "done" | "woke";
++}) {
++  switch (props.icon) {
++    case "working":
++      return <CircleDashedIcon aria-hidden className="size-4 shrink-0" />;
++    case "waiting":
++      return <CircleDotDashedIcon aria-hidden className="size-4 shrink-0" />;
++    case "input":
++      return <MessageCircleQuestionIcon aria-hidden className="size-4 shrink-0" />;
++    case "approval":
++      return <ShieldQuestionIcon aria-hidden className="size-4 shrink-0" />;
++    case "failed":
++      return <CircleAlertIcon aria-hidden className="size-4 shrink-0" />;
++    case "done":
++      return <CircleCheckIcon aria-hidden className="size-4 shrink-0" />;
++    case "woke":
++      return null;
++  }
++}
++
 +// A family's children under their head, after Claude.app's nested sessions:
-+// one hairline that runs down from the head's favicon and curves into the
++// one hairline near the left edge (leaving the titles room) that curves into the
 +// last row. No frame and no fold strip; a collapsed family ends in a stub
 +// that counts what it hides and opens the first hidden child.
 +function SidebarChildThreads(props: {
@@ -829,7 +850,7 @@ index 65c00d70e..adf76ef81 100644
 +        data-testid="sidebar-child-threads"
 +        className={cn(
 +          "relative flex flex-col gap-px",
-+          "after:pointer-events-none after:absolute after:start-[17px] after:top-1 after:w-2.5 after:rounded-es-md after:border-s after:border-b after:border-foreground/20 after:content-['']",
++          "after:pointer-events-none after:absolute after:start-2 after:top-1 after:w-2.5 after:rounded-es-md after:border-s after:border-b after:border-foreground/20 after:content-['']",
 +          // The curve lands on the middle of the last row: a slim row or the stub.
 +          stubLabel === null ? "after:bottom-[18px]" : "after:bottom-4",
 +        )}
@@ -840,7 +861,7 @@ index 65c00d70e..adf76ef81 100644
 +            <button
 +              type="button"
 +              data-testid="sidebar-child-threads-stub"
-+              className="flex h-8 w-full min-w-0 items-center rounded-md ps-9 pe-2.5 text-left text-xs text-muted-foreground hover:bg-sidebar-row-hover hover:text-sidebar-foreground focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
++              className="flex h-8 w-full min-w-0 items-center rounded-md ps-6 pe-2.5 text-left text-xs text-muted-foreground hover:bg-sidebar-row-hover hover:text-sidebar-foreground focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
 +              onClick={() =>
 +                onOpenHidden(scopeThreadRef(firstHidden.environmentId, firstHidden.id))
 +              }
@@ -862,7 +883,7 @@ index 65c00d70e..adf76ef81 100644
    // Settled rows un-settle, snoozed rows wake, and cards settle.
    variantAction: SidebarSweepAction;
    // False on environments whose server predates thread.settle/unsettle:
-@@ -1815,7 +1911,11 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
+@@ -1815,7 +1932,11 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                  aria-current={accessibility.current}
                  data-testid="sidebar-row-slim"
                  aria-busy={isRegeneratingTitle || undefined}
@@ -870,12 +891,12 @@ index 65c00d70e..adf76ef81 100644
 +                className={cn(
 +                  rowSurfaceClassName,
 +                  "flex h-9 items-center gap-2.5 px-2.5",
-+                  props.nested && "ps-9",
++                  props.nested && "ps-6",
 +                )}
                  onClick={handleClick}
                  onDoubleClick={handleDoubleClick}
                  onKeyDown={handleKeyDown}
-@@ -1826,15 +1926,19 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
+@@ -1826,15 +1947,19 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
              {accessibleTitle}
              {/* Settled history recedes: dimmed favicon at rest, restored on
                hover so the tail stays scannable when you're hunting. */}
@@ -904,7 +925,53 @@ index 65c00d70e..adf76ef81 100644
              {draftIndicator}
              {title}
              {pinIndicator}
-@@ -2816,7 +2920,8 @@ export default function Sidebar() {
+@@ -1888,6 +2013,24 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
+                       />
+                       <TooltipPopup side="top">Dismiss Woke notification</TooltipPopup>
+                     </Tooltip>
++                  ) : props.nested && topStatus !== null ? (
++                    // A child row has no room for the card's status label;
++                    // the colored icon alone shows what each child is doing.
++                    <Tooltip>
++                      <TooltipTrigger
++                        render={
++                          <span
++                            role="img"
++                            aria-label={topStatus.label}
++                            data-testid="sidebar-child-thread-status"
++                            className={cn("inline-flex items-center", topStatus.className)}
++                          />
++                        }
++                      >
++                        <SidebarStatusIcon icon={topStatus.icon} />
++                      </TooltipTrigger>
++                      <TooltipPopup side="top">{topStatus.label}</TooltipPopup>
++                    </Tooltip>
+                   ) : (
+                     <span className="text-xs">
+                       {variantAction === "unsettle"
+@@ -2061,19 +2204,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
+                             topStatus.className,
+                           )}
+                         >
+-                          {topStatus.icon === "working" ? (
+-                            <CircleDashedIcon aria-hidden className="size-4 shrink-0" />
+-                          ) : topStatus.icon === "waiting" ? (
+-                            <CircleDotDashedIcon aria-hidden className="size-4 shrink-0" />
+-                          ) : topStatus.icon === "input" ? (
+-                            <MessageCircleQuestionIcon aria-hidden className="size-4 shrink-0" />
+-                          ) : topStatus.icon === "approval" ? (
+-                            <ShieldQuestionIcon aria-hidden className="size-4 shrink-0" />
+-                          ) : topStatus.icon === "failed" ? (
+-                            <CircleAlertIcon aria-hidden className="size-4 shrink-0" />
+-                          ) : topStatus.icon === "done" ? (
+-                            <CircleCheckIcon aria-hidden className="size-4 shrink-0" />
+-                          ) : null}
++                          <SidebarStatusIcon icon={topStatus.icon} />
+                           {/* The label alone is the live region: a role="status"
+                             wrapper around the ticking duration would make
+                             screen readers announce every second. */}
+@@ -2816,7 +2947,8 @@ export default function Sidebar() {
      void snoozeWakeTick;
      const preciseNow = new Date().toISOString();
      // Subagent child threads live in the parent's Agents surface, not the
@@ -914,7 +981,7 @@ index 65c00d70e..adf76ef81 100644
      const visible = filterSidebarV2VisibleThreads(threads, scopedProjectKeys);
      inboxReturns.observe(workingShelfEnabled ? threads : null);
      const pinned: EnvironmentThreadShell[] = [];
-@@ -2878,6 +2983,42 @@ export default function Sidebar() {
+@@ -2878,6 +3010,42 @@ export default function Sidebar() {
          ).push(thread);
        }
      }
@@ -957,7 +1024,7 @@ index 65c00d70e..adf76ef81 100644
      // One shared rule on every platform (see sortPinnedThreadsByOrderKey):
      // user-arranged keys first, keyless threads in creation order below.
      // Server capability only gates DRAGGING — it must not influence the
-@@ -3091,21 +3232,75 @@ export default function Sidebar() {
+@@ -3091,21 +3259,75 @@ export default function Sidebar() {
      return routeThread === undefined ? EMPTY_THREADS : [routeThread];
    }, [routeThreadKey, workingShelfExpanded, workingThreads]);
  
@@ -1047,7 +1114,7 @@ index 65c00d70e..adf76ef81 100644
    );
    const orderedThreadKeys = useMemo(
      () =>
-@@ -3660,19 +3855,14 @@ export default function Sidebar() {
+@@ -3660,19 +3882,14 @@ export default function Sidebar() {
        });
      },
    );
@@ -1072,7 +1139,7 @@ index 65c00d70e..adf76ef81 100644
    );
    useEffect(() => {
      if (optimisticDrop === null) return;
-@@ -3817,14 +4007,13 @@ export default function Sidebar() {
+@@ -3817,14 +4034,13 @@ export default function Sidebar() {
    // Include every visible row in the measured order. Older servers disable
    // pickup on their rows without changing where those rows render.
    const sidebarListItems = useMemo((): readonly SidebarListItem[] => {
@@ -1091,7 +1158,7 @@ index 65c00d70e..adf76ef81 100644
      if (
        pinnedThreads.length +
          activeThreads.length +
-@@ -3836,33 +4025,31 @@ export default function Sidebar() {
+@@ -3836,33 +4052,31 @@ export default function Sidebar() {
        return [];
      }
      const items: SidebarListItem[] = [{ kind: "marker", marker: "pinned-header" }];
@@ -1133,7 +1200,7 @@ index 65c00d70e..adf76ef81 100644
      workingThreads.length,
    ]);
    useEffect(() => {
-@@ -4667,6 +4854,9 @@ export default function Sidebar() {
+@@ -4667,6 +4881,9 @@ export default function Sidebar() {
                  titleRegeneration: supportsTitleRegeneration,
                },
                snoozePresets,
@@ -1143,7 +1210,7 @@ index 65c00d70e..adf76ef81 100644
              }),
              position,
            ),
-@@ -4780,6 +4970,10 @@ export default function Sidebar() {
+@@ -4780,6 +4997,10 @@ export default function Sidebar() {
            case "mark-unread":
              markThreadUnread(threadRef);
              return;
@@ -1154,7 +1221,7 @@ index 65c00d70e..adf76ef81 100644
            case "copy-path":
              if (!threadWorkspacePath) {
                toastManager.add(
-@@ -5258,6 +5452,7 @@ export default function Sidebar() {
+@@ -5258,6 +5479,7 @@ export default function Sidebar() {
                          thread: EnvironmentThreadShell,
                          section: SidebarSection,
                          sortable?: SortableThreadRowBag,
@@ -1162,7 +1229,7 @@ index 65c00d70e..adf76ef81 100644
                        ) => {
                          const threadKey = scopedThreadKey(
                            scopeThreadRef(thread.environmentId, thread.id),
-@@ -5267,8 +5462,10 @@ export default function Sidebar() {
+@@ -5267,8 +5489,10 @@ export default function Sidebar() {
                          // from users (or the auto rules) actually parking work,
                          // not from the sidebar second-guessing what still matters.
                          // Working rows stay cards so their live status shows.
@@ -1174,7 +1241,7 @@ index 65c00d70e..adf76ef81 100644
                          const rowVariant = isCard ? "card" : "slim";
                          return (
                            <SidebarThreadRow
-@@ -5277,6 +5474,7 @@ export default function Sidebar() {
+@@ -5277,6 +5501,7 @@ export default function Sidebar() {
                              key={`${threadKey}:${rowVariant}`}
                              thread={thread}
                              variant={rowVariant}
@@ -1182,7 +1249,7 @@ index 65c00d70e..adf76ef81 100644
                              // Snoozed rows wake, settled rows un-settle, and cards settle.
                              variantAction={
                                section === "snoozed"
-@@ -5412,6 +5610,26 @@ export default function Sidebar() {
+@@ -5412,6 +5637,26 @@ export default function Sidebar() {
                        for (const item of sidebarListItems) {
                          if (item.kind === "thread") {
                            items.push(renderThreadRow(threadByKey.get(item.key)!, item.section));
