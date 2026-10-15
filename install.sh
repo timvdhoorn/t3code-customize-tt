@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Installs t3code-customize and builds it for your T3 Code Nightly AppImage.
-# Usage: bash -c "$(curl -fsSL https://raw.githubusercontent.com/btsouth/t3code-customize/main/install.sh)"
+# Usage: bash -c "$(curl -fsSL https://raw.githubusercontent.com/timvdhoorn/t3code-customize-tt/main/install.sh)"
 set -euo pipefail
 for tool in git python3; do
   command -v "$tool" >/dev/null || { echo "$tool is required. Install it and run this again." >&2; exit 1; }
@@ -10,6 +10,6 @@ if [[ -d "$repo/.git" ]]; then
   git -C "$repo" pull --ff-only --quiet
 else
   mkdir -p "$(dirname "$repo")"
-  git clone --quiet https://github.com/btsouth/t3code-customize "$repo"
+  git clone --quiet https://github.com/timvdhoorn/t3code-customize-tt "$repo"
 fi
 exec "$repo/t3code-customize" "$@"

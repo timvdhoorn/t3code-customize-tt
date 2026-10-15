@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Rebuild your installed T3 Code Nightly AppImage with a stats bar under the composer.
+"""Rebuild your installed T3 Code Nightly (Linux AppImage or macOS app) with a stats bar under the composer.
 
 Run it after every T3 Code update. Everything happens on this machine: the
-patches in this repo are applied to the exact upstream commit your AppImage was
+patches in this repo are applied to the exact upstream commit your app was
 built from, the web, server and desktop bundles are rebuilt, and the result is
-laid over a copy of your app. Your AppImage and your T3 data are never modified.
+laid over a copy of your app. Your T3 data is never modified; on Linux neither is your
+AppImage. On macOS, `update` also installs newer T3 Code releases the way T3's own updater
+does (same feed, same download, same signature check), because the customized copy cannot.
 """
 import argparse
+import base64
 import copy
 import fcntl
 import hashlib
 import json
 import os
+import plistlib
 from pathlib import Path
 import re
 import shutil
@@ -38,6 +42,15 @@ BIN = HOME / '.local/bin' / NAME
 DESKTOP = SHARE / 'applications' / (NAME + '.desktop')
 LAUNCHER_NAME = 'T3 Code (Customized)'
 SEARCH = ['Applications', 'Downloads', 'AppImages', 'Apps', '.local/bin', 'bin', 'opt']
+MAC = sys.platform == 'darwin'
+# On macOS the customized build is a signed copy of your app next to it, opened like any other app.
+MAC_APP = HOME / 'Applications' / (LAUNCHER_NAME + '.app')
+MAC_SEARCH = [Path('/Applications'), HOME / 'Applications']
+# A finished build waits here while the customized app is still open.
+PENDING = DATA / 'pending' / MAC_APP.name
+AUTOUPDATE_LABEL = 'com.github.t3code-customize.update'
+AUTOUPDATE_PLIST = HOME / 'Library/LaunchAgents' / (AUTOUPDATE_LABEL + '.plist')
+ARCH = {'x86_64': 'x64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(os.uname().machine)
 AGENTS = {
     'claude': ['claude', '-p', '--dangerously-skip-permissions'],
     'codex': ['codex', 'exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '-'],
@@ -140,7 +153,27 @@ def version_key(path):
     return [int(part) if part.isdigit() else part for part in re.split(r'(\d+)', path.name)]
 
 
+def find_mac_app(explicit=None):
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        if not (path / 'Contents/Resources/app.asar').is_file():
+            raise Stop(f'No T3 Code app at {path}.')
+        return path
+    configured = load(CONFIG / 'config.json', {}).get('appimage')
+    if configured and (Path(configured) / 'Contents/Resources/app.asar').is_file():
+        return Path(configured)
+    found = [p for folder in MAC_SEARCH for p in folder.glob('T3 Code*.app')
+             if p.name != MAC_APP.name and (p / 'Contents/Resources/app.asar').is_file()]
+    if not found:
+        raise Stop('Could not find T3 Code (Nightly).app in /Applications or ~/Applications.\n'
+                   f'Point to it once with: {NAME} --appimage "/path/to/T3 Code (Nightly).app"')
+    # Prefer Nightly, the build the patches target.
+    return sorted(found, key=lambda p: ('Nightly' in p.name, version_key(p)))[-1]
+
+
 def find_appimage(explicit=None):
+    if MAC:
+        return find_mac_app(explicit)
     if explicit:
         path = Path(explicit).expanduser().resolve()
         if not path.is_file():
@@ -163,7 +196,8 @@ def find_appimage(explicit=None):
 
 
 def fingerprint(path):
-    stat = path.stat()
+    # An app bundle is a folder; its archive changes with every update.
+    stat = (path / 'Contents/Resources/app.asar').stat() if MAC else path.stat()
     return {'path': str(path), 'size': stat.st_size, 'mtime': stat.st_mtime_ns}
 
 
@@ -313,17 +347,18 @@ def ensure_node(log):
     system = shutil.which('node')
     if system and node_major(system) >= 24:
         return None
-    arch = {'x86_64': 'x64', 'aarch64': 'arm64'}.get(os.uname().machine)
+    arch = ARCH
     if not arch:
         raise Stop('Node 24 or newer is required. Install it and run again.')
-    private = sorted((CACHE / 'node').glob(f'node-v24.*-linux-{arch}'), key=version_key)
+    platform, listing = ('darwin', f'osx-{arch}-tar') if MAC else ('linux', f'linux-{arch}')
+    private = sorted((CACHE / 'node').glob(f'node-v24.*-{platform}-{arch}'), key=version_key)
     if private and node_major(str(private[-1] / 'bin/node')) >= 24:
         return private[-1] / 'bin'
     step('Downloading Node 24 (one time, private to this tool)...')
     with urllib.request.urlopen('https://nodejs.org/dist/index.json', timeout=30) as response:
         releases = json.load(response)
-    version = next(r['version'] for r in releases if r['version'].startswith('v24.') and f'linux-{arch}' in r['files'])
-    name = f'node-{version}-linux-{arch}'
+    version = next(r['version'] for r in releases if r['version'].startswith('v24.') and listing in r['files'])
+    name = f'node-{version}-{platform}-{arch}'
     base = f'https://nodejs.org/dist/{version}/'
     with urllib.request.urlopen(base + 'SHASUMS256.txt', timeout=30) as response:
         sums = dict(reversed(line.split()) for line in response.read().decode().splitlines() if line.strip())
@@ -430,7 +465,7 @@ def checks(env, log):
             raise NeedsFix(message + ' Command: ' + ' '.join(args))
 
 
-def build_bundles(env, version, stock_root, config, log):
+def build_bundles(env, version, resources, config, log):
     step('Building T3 Code...')
     env = dict(env, APP_VERSION=version, TMPDIR=str(CACHE / 'tmp'), **config)
     Path(env['TMPDIR']).mkdir(parents=True, exist_ok=True)
@@ -448,9 +483,8 @@ def build_bundles(env, version, stock_root, config, log):
         brand = 'nightly' if 'nightly' in version else 'production'
         run(['node', 'scripts/apply-web-brand-assets.ts', brand, 'apps/server/dist/client'], cwd=SOURCE, env=env, log=log)
         # Reuse the native helper from your own app instead of compiling it.
-        arch = {'x86_64': 'x64', 'aarch64': 'arm64'}.get(os.uname().machine, 'x64')
-        helper = SOURCE / f'native/browser-secret/build/{arch}/t3-browser-secret'
-        stock_helper = stock_root / 'resources/browser-secret/t3-browser-secret'
+        helper = SOURCE / f'native/browser-secret/build/{ARCH or "x64"}/t3-browser-secret'
+        stock_helper = resources / 'browser-secret/t3-browser-secret'
         if stock_helper.exists():
             helper.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(stock_helper, helper)
@@ -518,30 +552,113 @@ def stuck_message(problem, target):
 # --- Commands -----------------------------------------------------------------------
 
 def pull_latest():
-    """Fast-forward this repo to the latest patches, keeping any local port in a backup."""
+    """Bring this repo up to date with its own remote and, in a fork, with the original repo.
+
+    A local port that is not committed is kept in a backup. Upstream is merged only when it
+    merges cleanly; otherwise the build continues with the patches you have.
+    """
     if not (REPO / '.git').exists():
         return
-    status = subprocess.run(['git', 'status', '--porcelain', '--', 'patches', 'checks.json'],
-                            cwd=REPO, capture_output=True, text=True).stdout
-    before = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=REPO, capture_output=True, text=True).stdout
-    if subprocess.run(['git', 'fetch', '--quiet'], cwd=REPO, stderr=subprocess.DEVNULL).returncode:
+
+    def repo_git(*args):
+        return subprocess.run(['git', *args], cwd=REPO, capture_output=True, text=True)
+
+    remotes = repo_git('remote').stdout.split()
+    if repo_git('fetch', '--quiet', '--all').returncode:
         say('Could not check for newer patches (offline?). Using the ones you have.')
         return
-    behind = subprocess.run(['git', 'rev-list', '--count', 'HEAD..@{u}'], cwd=REPO, capture_output=True, text=True).stdout.strip()
-    if behind in ('', '0'):
+    sources = ['@{u}'] + (['upstream/main'] if 'upstream' in remotes else [])
+    sources = [ref for ref in sources if repo_git('rev-parse', '--verify', '--quiet', ref).returncode == 0]
+    pending = [ref for ref in sources if repo_git('merge-base', '--is-ancestor', ref, 'HEAD').returncode]
+    if not pending:
         return
-    if status.strip():
+    before = repo_git('rev-parse', 'HEAD').stdout
+    if repo_git('status', '--porcelain', '--', 'patches', 'checks.json').stdout.strip():
         backup = DATA / ('patches.bak-' + time.strftime('%Y%m%d-%H%M%S'))
         shutil.copytree(REPO / 'patches', backup)
         subprocess.run(['git', 'checkout', '--quiet', '--', 'patches', 'checks.json'], cwd=REPO, check=True)
         say(f'Newer patches are available; your local port was saved to {backup}.')
-    if subprocess.run(['git', 'merge', '--ff-only', '--quiet', '@{u}'], cwd=REPO).returncode:
-        raise Stop(f'Could not update {REPO} to the latest patches. Run git status there.')
-    after = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=REPO, capture_output=True, text=True).stdout
-    if after != before:
+    for ref in pending:
+        if repo_git('merge', '--ff-only', '--quiet', ref).returncode == 0:
+            continue
+        merged = repo_git('merge', '--no-edit', '--quiet', '-m', f'Merge {ref} into {NAME}', ref)
+        if merged.returncode:
+            repo_git('merge', '--abort')
+            say(f'Could not merge the newer patches from {ref} into your fork; using the ones you have.\n'
+                f'Merge it by hand in {REPO} (git merge {ref}).')
+    if repo_git('rev-parse', 'HEAD').stdout != before:
         step('Got the latest patches.')
         # The script itself may have changed; continue with the new one.
         os.execv(sys.executable, [sys.executable, str(REPO / NAME), *sys.argv[1:], '--no-pull'])
+
+
+def finish_mac_app(app, asar):
+    """Record the new archive in Info.plist and sign the copy for this Mac only."""
+    info_path = app / 'Contents/Info.plist'
+    info = plistlib.loads(info_path.read_bytes())
+    with asar.open('rb') as archive:
+        _, _, _, json_size = struct.unpack('<4I', archive.read(16))
+        header_hash = hashlib.sha256(archive.read(json_size)).hexdigest()
+    info.setdefault('ElectronAsarIntegrity', {})['Resources/app.asar'] = {'algorithm': 'SHA256', 'hash': header_hash}
+    # T3's updater can't replace a locally signed copy; updates come through your own app and a rebuild.
+    info.setdefault('LSEnvironment', {})['T3CODE_DISABLE_AUTO_UPDATE'] = 'true'
+    info_path.write_bytes(plistlib.dumps(info))
+    run(['xattr', '-cr', str(app)])
+    # Ad-hoc signing drops T3's team entitlements (passkeys, keychain group); nothing else needs them.
+    run(['codesign', '--force', '--deep', '--sign', '-', str(app)], capture=True)
+    if run(['codesign', '--verify', '--deep', '--strict', str(app)], check=False).returncode:
+        raise Stop('The customized app failed its code signature check.')
+
+
+def app_running(app):
+    """True while any process runs from inside this app bundle."""
+    prefix = str(app) + '/Contents/'
+    listing = subprocess.run(['ps', '-axo', 'command='], capture_output=True, text=True).stdout
+    return any(line.startswith(prefix) for line in listing.splitlines())
+
+
+def replace_app(new, installed):
+    """Swap an app bundle in place; the old one is removed only after the new one is there."""
+    old = installed.with_name(installed.name + '.old')
+    shutil.rmtree(old, ignore_errors=True)
+    if installed.exists():
+        os.rename(installed, old)
+    try:
+        shutil.move(str(new), installed)
+    except BaseException:
+        if old.exists() and not installed.exists():
+            os.rename(old, installed)
+        raise
+    shutil.rmtree(old, ignore_errors=True)
+    subprocess.run(['/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister',
+                    '-f', str(installed)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def stage_mac_build(app):
+    """Install the build in ~/Applications, or keep it pending while the customized app is open."""
+    shutil.rmtree(PENDING.parent, ignore_errors=True)
+    PENDING.parent.mkdir(parents=True)
+    shutil.move(str(app), PENDING)
+    install_pending()
+    return MAC_APP
+
+
+def install_pending():
+    """Move a pending build into place once the customized app is closed. True if it did."""
+    if not PENDING.exists() or app_running(MAC_APP):
+        return False
+    MAC_APP.parent.mkdir(parents=True, exist_ok=True)
+    replace_app(PENDING, MAC_APP)
+    shutil.rmtree(PENDING.parent, ignore_errors=True)
+    return True
+
+
+def notify(message):
+    if MAC:
+        script = f'display notification {json.dumps(message)} with title {json.dumps(LAUNCHER_NAME)}'
+        subprocess.run(['osascript', '-e', script], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    elif shutil.which('notify-send'):
+        subprocess.run(['notify-send', '-a', 'T3 Code', LAUNCHER_NAME, message], check=False)
 
 
 def install_launcher(appimage_dir):
@@ -549,6 +666,10 @@ def install_launcher(appimage_dir):
     if BIN.is_symlink() or not BIN.exists():
         BIN.unlink(missing_ok=True)
         BIN.symlink_to(REPO / NAME)
+    if MAC:
+        if str(BIN.parent) not in os.environ.get('PATH', '').split(os.pathsep):
+            say(f'Note: {BIN.parent} is not on your PATH. Add it to run {NAME} from anywhere.')
+        return
     DESKTOP.parent.mkdir(parents=True, exist_ok=True)
     DESKTOP.write_text('\n'.join([
         '[Desktop Entry]', 'Type=Application', f'Name={LAUNCHER_NAME}',
@@ -574,11 +695,12 @@ def cmd_build(args):
     say('T3 Code: ' + str(appimage))
     state = load(STATE, {})
     recipe = recipe_hash()
+    built = (PENDING if PENDING.exists() else MAC_APP) / 'Contents/Info.plist' if MAC else CURRENT / 'AppRun'
     if (not args.force and not args.resume and state.get('stock') == fingerprint(appimage)
-            and state.get('recipe') == recipe and (CURRENT / 'AppRun').exists()):
+            and state.get('recipe') == recipe and built.exists()):
         install_launcher(appimage.parent)
         say(f'\nAlready up to date. Open "{LAUNCHER_NAME}" from your app launcher.')
-        return
+        return False
     DATA.mkdir(parents=True, exist_ok=True)
     logs = CACHE / 'logs'
     logs.mkdir(parents=True, exist_ok=True)
@@ -587,9 +709,15 @@ def cmd_build(args):
     with (logs / (job.name + '.log')).open('w') as log:
         say('Log: ' + log.name)
         step('Reading your T3 Code...')
-        run([str(appimage), '--appimage-extract'], cwd=job, log=log)
-        stock_root = job / 'squashfs-root'
-        archive = Archive(stock_root / 'resources/app.asar')
+        if MAC:
+            stock_root = job / MAC_APP.name
+            run(['ditto', str(appimage), str(stock_root)], log=log)
+            resources = stock_root / 'Contents/Resources'
+        else:
+            run([str(appimage), '--appimage-extract'], cwd=job, log=log)
+            stock_root = job / 'squashfs-root'
+            resources = stock_root / 'resources'
+        archive = Archive(resources / 'app.asar')
         try:
             metadata = json.loads(archive.read('package.json'))
             config = read_public_config(archive)
@@ -599,7 +727,7 @@ def cmd_build(args):
         if 'nightly' not in version:
             raise Stop(f'This is T3 Code {version}. The patches target T3 Code Nightly; install Nightly and run again.')
         if not re.fullmatch(r'[0-9a-f]{7,40}', commit):
-            raise Stop('This AppImage does not record its source commit, so it cannot be rebuilt exactly.')
+            raise Stop('This app does not record its source commit, so it cannot be rebuilt exactly.')
         say(f'    Nightly {version}, upstream commit {commit[:12]}')
         if len(config) != len(PUBLIC_CONFIG):
             say('    Note: could not read T3 Connect config from your app; sign-in may not work in this build.')
@@ -628,41 +756,58 @@ def cmd_build(args):
                 agent_fix(agent, str(problem), target, version, log)
                 resume = ported = True
         head = git('rev-parse', 'HEAD').strip()
-        build_bundles(env, version, stock_root, config, log)
+        build_bundles(env, version, resources, config, log)
         if git('rev-parse', 'HEAD').strip() != head:
             raise Stop('The source checkout changed during the build.')
         step('Assembling and verifying your customized app...')
         output = job / 'app.asar'
-        overlay(stock_root / 'resources/app.asar', output, SOURCE, config)
-        shutil.move(str(output), stock_root / 'resources/app.asar')
+        overlay(resources / 'app.asar', output, SOURCE, config)
+        shutil.move(str(output), resources / 'app.asar')
+        if MAC:
+            finish_mac_app(stock_root, resources / 'app.asar')
         if ported:
             export_patches(target)
-        destination = DATA / 'builds' / f'{version}-{recipe_hash()}-{job.name}'
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(stock_root), destination)
-        link = DATA / 'current.new'
-        if link.is_symlink():
-            link.unlink()
-        link.symlink_to(destination.relative_to(DATA))
-        os.replace(link, CURRENT)
+        if MAC:
+            destination = stage_mac_build(stock_root)
+        else:
+            destination = install_linux_build(stock_root, version, job)
         save(STATE, {'stock': fingerprint(appimage), 'version': version, 'commit': target, 'recipe': recipe_hash(),
                      'build': str(destination), 'connect': len(config) == len(PUBLIC_CONFIG),
                      'builtAt': time.strftime('%Y-%m-%dT%H:%M:%S')})
-        icon = destination / 't3code.png'
-        if icon.exists():
-            shutil.copy2(icon, DATA / 'icon.png')
-        prune()
     shutil.rmtree(job, ignore_errors=True)
     install_launcher(appimage.parent)
     minutes = max(1, round((time.time() - started) / 60))
     say(f'\nDone in {minutes} min: T3 Code {version} with the stats bar.')
     if ported:
         say(f'The ported patches were saved to {REPO / "patches"}.')
-    if DISABLED.exists():
+    if MAC:
+        if PENDING.exists():
+            say(f'"{LAUNCHER_NAME}" is open; quit it and run {NAME} again to install this build.')
+        else:
+            say(f'Quit T3 Code fully, then open "{LAUNCHER_NAME}" from ~/Applications.')
+            say('First time? Turn on Settings > General > Stats for nerds.')
+    elif DISABLED.exists():
         say(f'Customization is switched off. Run {NAME} on to use it.')
     else:
         say(f'Quit T3 Code fully, then open "{LAUNCHER_NAME}" from your app launcher.')
         say('First time? Turn on Settings > General > Stats for nerds.')
+    return True
+
+
+def install_linux_build(stock_root, version, job):
+    destination = DATA / 'builds' / f'{version}-{recipe_hash()}-{job.name}'
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(stock_root), destination)
+    link = DATA / 'current.new'
+    if link.is_symlink():
+        link.unlink()
+    link.symlink_to(destination.relative_to(DATA))
+    os.replace(link, CURRENT)
+    icon = destination / 't3code.png'
+    if icon.exists():
+        shutil.copy2(icon, DATA / 'icon.png')
+    prune()
+    return destination
 
 
 def export_patches(target):
@@ -702,7 +847,7 @@ def launch_target():
     """The customized build if it was made from the AppImage installed right now, else stock."""
     appimage = find_appimage()
     state = load(STATE, {})
-    built = CURRENT / 'AppRun'
+    built = MAC_APP if MAC else CURRENT / 'AppRun'
     if DISABLED.exists() or not built.exists():
         return appimage, None
     if state.get('stock') != fingerprint(appimage):
@@ -715,8 +860,9 @@ def cmd_launch(args):
     target, notice = launch_target()
     if notice:
         say(notice)
-        if shutil.which('notify-send'):
-            subprocess.run(['notify-send', '-a', 'T3 Code', 'Opening stock T3 Code', notice], check=False)
+        notify(notice)
+    if MAC:
+        os.execv('/usr/bin/open', ['/usr/bin/open', '-a', str(target), *(['--args', *args.rest] if args.rest else [])])
     if target != appimage:
         # Run the extracted copy as if it were the AppImage, so T3's own updater still updates the real file.
         os.environ['APPIMAGE'] = str(appimage)
@@ -724,12 +870,172 @@ def cmd_launch(args):
     os.execv(str(target), [str(target), *args.rest])
 
 
+# --- Keeping up with Nightly on macOS -----------------------------------------------
+
+def nightly_number(version):
+    """0.0.46-nightly.20261015.3145 -> comparable parts."""
+    return [int(part) for part in re.findall(r'\d+', version or '')]
+
+
+def bundle_version(app):
+    return plistlib.loads((app / 'Contents/Info.plist').read_bytes()).get('CFBundleShortVersionString', '')
+
+
+def updater_config(app):
+    """The feed T3's own updater uses, from the app-update.yml it ships with (electron-updater)."""
+    text = (app / 'Contents/Resources/app-update.yml').read_text()
+    config = dict(re.findall(r'^(\w+):\s*(\S+)\s*$', text, re.M))
+    if config.get('provider') != 'github' or not config.get('owner') or not config.get('repo'):
+        raise Stop('Your T3 Code has an update feed this tool does not know.')
+    return config
+
+
+def fetch(url):
+    request = urllib.request.Request(url, headers={'User-Agent': NAME, 'Accept': 'application/vnd.github+json'})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return response.read()
+
+
+def latest_release(config):
+    """Newest release on the updater's channel as (version, zip url, sha512), read from <channel>-mac.yml."""
+    repo = f"{config['owner']}/{config['repo']}"
+    channel = config.get('channel', 'latest')
+    releases = json.loads(fetch(f'https://api.github.com/repos/{repo}/releases?per_page=20'))
+    tag = next(r['tag_name'] for r in releases if channel in r['tag_name'] and not r.get('draft'))
+    base = f'https://github.com/{repo}/releases/download/{tag}/'
+    feed = fetch(base + channel + '-mac.yml').decode()
+    version = re.search(r"^version:\s*'?([^'\n]+)'?", feed, re.M).group(1).strip()
+    for name, digest in re.findall(r'-\s*url:\s*(\S+)\s+sha512:\s*(\S+)', feed):
+        if name.endswith(f'-{ARCH}.zip'):
+            return version, base + name, digest
+    raise Stop(f'T3 Code {version} has no macOS {ARCH} zip.')
+
+
+def sha512_base64(path):
+    digest = hashlib.sha512()
+    with path.open('rb') as source:
+        for chunk in iter(lambda: source.read(1 << 20), b''):
+            digest.update(chunk)
+    return base64.b64encode(digest.digest()).decode()
+
+
+def downloaded_by_t3(config, digest):
+    """The zip T3's updater already downloaded and verified for this release, if any."""
+    pending = HOME / 'Library/Caches' / config.get('updaterCacheDirName', 't3code-updater') / 'pending'
+    info = load(pending / 'update-info.json', {})
+    candidate = pending / info.get('fileName', '-')
+    if info.get('sha512') == digest and candidate.is_file() and sha512_base64(candidate) == digest:
+        return candidate
+    return None
+
+
+def update_stock(app, log):
+    """Install a newer release over the stock app, checked the way T3's updater checks it. True if it did."""
+    config = updater_config(app)
+    version, url, digest = latest_release(config)
+    if nightly_number(version) <= nightly_number(bundle_version(app)):
+        return False
+    if app_running(app):
+        say(f'T3 Code {version} is out; quit {app.stem} to let {NAME} install it.')
+        return False
+    work = CACHE / 'download'
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    archive = downloaded_by_t3(config, digest)
+    if archive:
+        step(f'Installing T3 Code {version}, already downloaded by T3 Code...')
+    else:
+        step(f'Downloading T3 Code {version}...')
+        archive = work / 'update.zip'
+        request = urllib.request.Request(url, headers={'User-Agent': NAME})
+        with urllib.request.urlopen(request, timeout=600) as response, archive.open('wb') as target:
+            shutil.copyfileobj(response, target)
+        if sha512_base64(archive) != digest:
+            raise Stop('The T3 Code download did not match its published checksum.')
+    run(['ditto', '-x', '-k', str(archive), str(work / 'app')], log=log)
+    found = list((work / 'app').glob('*.app'))
+    if len(found) != 1:
+        raise Stop('The T3 Code download did not contain one app.')
+    new = found[0]
+    # Squirrel's check: the update must satisfy the installed app's designated requirement.
+    details = subprocess.run(['codesign', '-d', '-r-', str(app)], capture_output=True, text=True)
+    requirement = re.search(r'designated => (.+)', details.stdout + details.stderr)
+    if not requirement or run(['codesign', '--verify', '--deep', '--strict', '-R=' + requirement.group(1), str(new)],
+                              log=log, check=False).returncode:
+        raise Stop('The T3 Code download is not signed like your installed T3 Code.')
+    replace_app(new, app)
+    shutil.rmtree(work, ignore_errors=True)
+    step(f'Installed T3 Code {version}.')
+    return True
+
+
+def cmd_update(args):
+    """Bring stock Nightly and the customized build up to date (macOS); a plain build elsewhere."""
+    if not MAC:
+        return cmd_build(args)
+    try:
+        if install_pending():
+            notify('Installed the new build. Open it to use the latest Nightly.')
+        app = find_appimage(args.appimage)
+        if args.background and app_running(MAC_APP) and PENDING.exists():
+            return
+        logs = CACHE / 'logs'
+        logs.mkdir(parents=True, exist_ok=True)
+        with (logs / 'update.log').open('a') as log:
+            update_stock(app, log)
+        if cmd_build(args) and args.background:
+            notify('A new build is ready; it installs when you quit T3 Code.' if PENDING.exists()
+                   else 'Updated to ' + load(STATE, {}).get('version', 'the latest Nightly') + '.')
+    except Stop as stop:
+        if args.background:
+            first = str(stop).strip().splitlines()[0]
+            notify(f'Update failed: {first} Run {NAME} in a terminal.')
+        raise
+
+
+def cmd_autoupdate(args):
+    """Turn the background updater (a LaunchAgent) on or off."""
+    if not MAC:
+        raise Stop('autoupdate is macOS only; T3 Code updates its AppImage itself.')
+    domain = f'gui/{os.getuid()}'
+    subprocess.run(['launchctl', 'bootout', f'{domain}/{AUTOUPDATE_LABEL}'], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if args.state == 'off':
+        AUTOUPDATE_PLIST.unlink(missing_ok=True)
+        say('Background updates off.')
+        return
+    command = [sys.executable, str(REPO / NAME), 'update', '--background']
+    if args.fix:
+        command += ['--fix', args.fix]
+    (CACHE / 'logs').mkdir(parents=True, exist_ok=True)
+    AUTOUPDATE_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    AUTOUPDATE_PLIST.write_bytes(plistlib.dumps({
+        'Label': AUTOUPDATE_LABEL, 'ProgramArguments': command,
+        # The build needs the same git, node and agents you have in a terminal.
+        'EnvironmentVariables': {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(HOME)},
+        'StartInterval': args.every * 60, 'RunAtLoad': True, 'ProcessType': 'Background', 'LowPriorityIO': True,
+        'StandardOutPath': str(CACHE / 'logs/autoupdate.log'), 'StandardErrorPath': str(CACHE / 'logs/autoupdate.log'),
+    }))
+    run(['launchctl', 'bootstrap', domain, str(AUTOUPDATE_PLIST)])
+    say(f'Background updates on: every {args.every} minutes it installs a newer Nightly, rebuilds,'
+        f' and swaps the build in when "{LAUNCHER_NAME}" is closed.' + (f' Broken patches are ported by {AGENT_NAMES[args.fix]}.' if args.fix else ''))
+    say(f'Log: {CACHE / "logs/autoupdate.log"}')
+
+
 def cmd_status(args):
     appimage = find_appimage()
     state = load(STATE, {})
     target, notice = launch_target()
-    say('Installed T3 Code:  ' + str(appimage))
+    say('Installed T3 Code:  ' + str(appimage) + (f' ({bundle_version(appimage)})' if MAC else ''))
     say('Customized build:   ' + (f"{state['version']} (built {state['builtAt']})" if state else 'none yet'))
+    if MAC:
+        say('Customized app:     ' + (str(MAC_APP) if MAC_APP.exists() else 'not installed'))
+        if PENDING.exists():
+            say('Waiting to install: a newer build, once the customized app is closed')
+        say('Background updates: ' + ('on' if AUTOUPDATE_PLIST.exists() else f'off ({NAME} autoupdate on)'))
+        if notice:
+            say(f'Your T3 Code is newer than the customized build. Run {NAME} to rebuild.')
+        return
     say('Switched:           ' + ('off' if DISABLED.exists() else 'on'))
     say('Next launch opens:  ' + ('customized build' if target != appimage else 'stock T3 Code'))
     if notice:
@@ -737,11 +1043,15 @@ def cmd_status(args):
 
 
 def cmd_on(args):
+    if MAC:
+        return say(f'On macOS, open "{LAUNCHER_NAME}" for the customized build or your T3 Code for stock.')
     DISABLED.unlink(missing_ok=True)
     say('Customization on. Quit T3 Code fully and reopen it.')
 
 
 def cmd_off(args):
+    if MAC:
+        return cmd_on(args)
     DATA.mkdir(parents=True, exist_ok=True)
     DISABLED.touch()
     say('Stock T3 Code on the next launch. Quit it fully and reopen it.')
@@ -751,6 +1061,12 @@ def cmd_uninstall(args):
     if BIN.is_symlink() and BIN.resolve() == (REPO / NAME).resolve():
         BIN.unlink()
     DESKTOP.unlink(missing_ok=True)
+    if MAC:
+        args.state = 'off'
+        cmd_autoupdate(args)
+        if app_running(MAC_APP):
+            raise Stop(f'Quit "{LAUNCHER_NAME}" first.')
+        shutil.rmtree(MAC_APP, ignore_errors=True)
     for folder in (DATA, CACHE, CONFIG):
         shutil.rmtree(folder, ignore_errors=True)
     tail = '' if DATA in REPO.parents else f' You can delete {REPO} too.'
@@ -759,18 +1075,26 @@ def cmd_uninstall(args):
 
 def main():
     parser = argparse.ArgumentParser(prog=NAME, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
-                                     epilog='With no command, it updates the patches and builds for your installed T3 Code.')
+                                     epilog='With no command, it updates the patches and builds for your installed T3 Code'
+                                            ' (on macOS it first installs a newer Nightly).')
     sub = parser.add_subparsers(dest='command')
 
     def build_options(p):
-        p.add_argument('--appimage', help='path to your T3 Code AppImage (remembered)')
+        p.add_argument('--appimage', '--app', dest='appimage', help='path to your T3 Code AppImage or .app (remembered)')
         p.add_argument('--fix', choices=sorted(AGENTS), help='if a nightly breaks the patches, let this agent port them without asking')
         p.add_argument('--resume', action='store_true', help='continue from the source checkout as you or your agent left it')
         p.add_argument('--skip-checks', action='store_true', help='skip the patch tests and typechecks')
         p.add_argument('--force', action='store_true', help='rebuild even if nothing changed')
         p.add_argument('--no-pull', action='store_true', help='do not fetch newer patches first')
 
-    build_options(sub.add_parser('build', help='update the patches and build (the default)'))
+    build_options(sub.add_parser('build', help='update the patches and build for the T3 Code you have'))
+    update = sub.add_parser('update', help='macOS: install a newer Nightly, then build (the default on macOS)')
+    build_options(update)
+    update.add_argument('--background', action='store_true', help=argparse.SUPPRESS)
+    auto = sub.add_parser('autoupdate', help='macOS: keep everything up to date in the background')
+    auto.add_argument('state', choices=['on', 'off'])
+    auto.add_argument('--every', type=int, default=60, help='minutes between checks (default 60)')
+    auto.add_argument('--fix', choices=sorted(AGENTS), help='let this agent port broken patches unattended')
     launch = sub.add_parser('launch', help='open the customized build if it matches your T3 Code, else stock')
     launch.add_argument('rest', nargs=argparse.REMAINDER)
     sub.add_parser('status', help='show what the next launch opens')
@@ -780,16 +1104,18 @@ def main():
     sub.add_parser('uninstall', help='remove the launcher, builds and caches')
     argv = sys.argv[1:]
     if not argv or argv[0].startswith('-') and argv[0] not in ('-h', '--help'):
-        argv = ['build', *argv]
+        argv = ['update' if MAC else 'build', *argv]
     args = parser.parse_args(argv)
     handler = globals()['cmd_' + args.command]
-    if args.command in ('launch', 'status', 'on', 'off'):
+    if args.command in ('launch', 'status', 'on', 'off', 'autoupdate'):
         return handler(args)
     CACHE.mkdir(parents=True, exist_ok=True)
     with (CACHE / 'lock').open('w') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            if getattr(args, 'background', False):
+                return
             raise Stop(f'Another {NAME} is already running.')
         handler(args)
 

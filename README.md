@@ -2,7 +2,7 @@
 
 Your 5 hour and weekly usage, context and tokens per second, right under the T3 Code composer.
 
-Unofficial. Not affiliated with T3 Tools. For T3 Code Nightly on Linux (AppImage).
+Unofficial. Not affiliated with T3 Tools. For T3 Code Nightly on Linux (AppImage) and macOS.
 
 ## What you get
 
@@ -16,7 +16,7 @@ Everything else is stock T3 Code, including T3 Connect and the mobile app.
 ## Install
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/btsouth/t3code-customize/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/timvdhoorn/t3code-customize-tt/main/install.sh)"
 ```
 
 Or clone it anywhere and run `./t3code-customize`.
@@ -43,6 +43,30 @@ Upstream moves fast, and sometimes a nightly changes the code the patches touch.
 
 Your current T3 Code keeps working the whole time.
 
+## macOS
+
+The customized build is a copy of your app at `~/Applications/T3 Code (Customized).app`, signed
+for your Mac only. Keep using it as your T3 Code; leave the stock app installed.
+
+```sh
+t3code-customize                 install a newer Nightly if there is one, then rebuild
+t3code-customize autoupdate on   do that every hour in the background (LaunchAgent)
+t3code-customize status          versions, pending build, background updates
+```
+
+The copy cannot update itself (Squirrel only accepts T3's own signature), so the tool takes
+over that part of T3's updater: it reads the feed from your app's `app-update.yml`, reuses an
+update T3 already downloaded, checks the sha512 from the feed, and only installs an app that
+satisfies your installed app's code signing requirement, like Squirrel does. Stock is
+replaced only while it is closed; a new customized build waits until you quit the customized
+app and is swapped in on the next run.
+
+With `autoupdate on --fix claude`, Claude Code ports the patches unattended when a nightly
+breaks them. Without it you get a notification and run `t3code-customize --fix claude` yourself.
+
+Differences from stock: passkey sign-in (needs T3's Apple team entitlements) is unavailable,
+and macOS may ask once for keychain and privacy permissions because the signature differs.
+
 ## How it works
 
 T3 Code is open source (MIT). This repo holds three patches and one script. The script:
@@ -66,7 +90,8 @@ t3code-customize uninstall   remove it, its launcher, builds and caches
 ## Good to know
 
 - **Bugs:** before reporting anything to T3 Code, run `t3code-customize off`, reopen and check it happens on stock too. Report customization problems here.
-- **macOS and Windows:** not supported yet. The patches are platform independent; only the packaging differs. Your agent can adapt it, and PRs are welcome.
+- **Windows:** not supported yet. The patches are platform independent; only the packaging differs.
+- **Fork:** this is a fork of [btsouth/t3code-customize](https://github.com/btsouth/t3code-customize). With an `upstream` remote, every run merges newer patches from there when they merge cleanly.
 - **Files:** builds live in `~/.local/share/t3code-customize`, the source checkout and logs in `~/.cache/t3code-customize`.
 
 ## License
