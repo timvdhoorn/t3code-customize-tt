@@ -1,0 +1,1883 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: timvdhoorn <timvdhoorn@gmail.com>
+Date: Thu, 15 Oct 2026 20:29:15 +0200
+Subject: [PATCH] feat(server): push agent activity directly to APNs
+
+A server with an APNs auth key in its secret store (direct-push-apns) sends
+agent notifications and Live Activity updates to APNs itself, for an app
+built under its own bundle id that the T3 relay cannot reach. Devices register
+their push and Live Activity tokens over the environment connection
+(server.registerPushDevice, server.registerPushLiveActivity) and read the
+current card with server.getPushActivitySnapshot.
+
+The delivery rules are ported from the relay. The existing activity publisher
+feeds the direct sink, so deduplication, confirmation and the startup filter
+stay shared. Each server pushes only its own threads and only ends a Live
+Activity it filled itself. Without a key the server behaves as upstream.
+---
+ apps/server/src/auth/RpcAuthorization.ts      |   3 +
+ apps/server/src/directPush/ApnsTransport.ts   | 190 ++++++
+ apps/server/src/directPush/DirectPush.test.ts | 261 ++++++++
+ apps/server/src/directPush/DirectPush.ts      | 415 +++++++++++++
+ .../src/directPush/agentActivityDelivery.ts   | 569 ++++++++++++++++++
+ .../src/environment/ServerEnvironment.ts      |   8 +-
+ .../src/observability/RpcInstrumentation.ts   |   3 +
+ .../src/relay/AgentAwarenessRelay.test.ts     |  47 ++
+ apps/server/src/relay/AgentAwarenessRelay.ts  |  72 ++-
+ apps/server/src/server.ts                     |   4 +
+ apps/server/src/ws.ts                         |  14 +
+ packages/contracts/src/rpc.ts                 |  37 ++
+ 12 files changed, 1596 insertions(+), 27 deletions(-)
+ create mode 100644 apps/server/src/directPush/ApnsTransport.ts
+ create mode 100644 apps/server/src/directPush/DirectPush.test.ts
+ create mode 100644 apps/server/src/directPush/DirectPush.ts
+ create mode 100644 apps/server/src/directPush/agentActivityDelivery.ts
+
+diff --git a/apps/server/src/auth/RpcAuthorization.ts b/apps/server/src/auth/RpcAuthorization.ts
+index 5b8d483dc..267bd81a8 100644
+--- a/apps/server/src/auth/RpcAuthorization.ts
++++ b/apps/server/src/auth/RpcAuthorization.ts
+@@ -111,6 +111,9 @@ export const RPC_REQUIRED_SCOPES = {
+   [WS_METHODS.serverRefreshUsageRates]: AuthDiagnosticsReadScope,
+   [WS_METHODS.serverSignalProcess]: AuthEnvironmentMaintainScope,
+   [WS_METHODS.serverReportClientActivity]: AuthOrchestrationReadScope,
++  [WS_METHODS.serverRegisterPushDevice]: AuthOrchestrationReadScope,
++  [WS_METHODS.serverRegisterPushLiveActivity]: AuthOrchestrationReadScope,
++  [WS_METHODS.serverGetPushActivitySnapshot]: AuthOrchestrationReadScope,
+   [WS_METHODS.serverReportHostPowerState]: AuthEnvironmentMaintainScope,
+   [WS_METHODS.serverGetBackgroundPolicy]: AuthOrchestrationReadScope,
+   [WS_METHODS.scheduledTasksList]: AuthOrchestrationReadScope,
+diff --git a/apps/server/src/directPush/ApnsTransport.ts b/apps/server/src/directPush/ApnsTransport.ts
+new file mode 100644
+index 000000000..1463d633e
+--- /dev/null
++++ b/apps/server/src/directPush/ApnsTransport.ts
+@@ -0,0 +1,190 @@
++// @effect-diagnostics nodeBuiltinImport:off -- APNs requires HTTP/2, which fetch does not speak here; ES256 signing uses node:crypto.
++import * as NodeCrypto from "node:crypto";
++import * as NodeHttp2 from "node:http2";
++
++import * as Context from "effect/Context";
++import * as Effect from "effect/Effect";
++import * as Layer from "effect/Layer";
++import * as Schema from "effect/Schema";
++
++import type { ApnsEnvironment, ApnsRequest } from "./agentActivityDelivery.ts";
++
++export interface ApnsCredentials {
++  readonly teamId: string;
++  readonly keyId: string;
++  /** PKCS#8 PEM of the .p8 key. */
++  readonly privateKey: string;
++}
++
++export interface ApnsSendInput {
++  readonly credentials: ApnsCredentials;
++  readonly environment: ApnsEnvironment;
++  readonly bundleId: string;
++  readonly request: ApnsRequest;
++}
++
++export interface ApnsResponse {
++  readonly status: number;
++  readonly reason: string | null;
++  readonly apnsId: string | null;
++}
++
++export class ApnsTransportError extends Schema.TaggedError<ApnsTransportError>()(
++  "ApnsTransportError",
++  {
++    environment: Schema.String,
++    tokenSuffix: Schema.String,
++    cause: Schema.Defect(),
++  },
++) {
++  override get message(): string {
++    return `APNs request to ${this.environment} failed for token …${this.tokenSuffix}.`;
++  }
++}
++
++export class ApnsTransport extends Context.Service<
++  ApnsTransport,
++  {
++    readonly send: (input: ApnsSendInput) => Effect.Effect<ApnsResponse, ApnsTransportError>;
++  }
++>()("t3/directPush/ApnsTransport") {}
++
++const APNS_REQUEST_TIMEOUT_MS = 10_000;
++// APNs rejects provider tokens refreshed more often than every ~20 minutes and
++// older than 60 minutes; reuse each one for 45 minutes.
++const APNS_JWT_REUSE_SECONDS = 45 * 60;
++
++const base64Url = (value: Buffer | string) => Buffer.from(value).toString("base64url");
++
++/** ES256 provider token for token-based APNs authentication. */
++export function signApnsJwt(credentials: ApnsCredentials, issuedAtSeconds: number): string {
++  const header = base64Url(JSON.stringify({ alg: "ES256", kid: credentials.keyId }));
++  const payload = base64Url(JSON.stringify({ iss: credentials.teamId, iat: issuedAtSeconds }));
++  const signingInput = `${header}.${payload}`;
++  const signature = NodeCrypto.sign("sha256", Buffer.from(signingInput), {
++    key: credentials.privateKey.replace(/\\n/g, "\n"),
++    dsaEncoding: "ieee-p1363",
++  });
++  return `${signingInput}.${base64Url(signature)}`;
++}
++
++export function apnsOrigin(environment: ApnsEnvironment): string {
++  return environment === "production"
++    ? "https://api.push.apple.com"
++    : "https://api.sandbox.push.apple.com";
++}
++
++function reasonFromBody(body: string): string | null {
++  if (body.trim().length === 0) return null;
++  try {
++    const parsed: unknown = JSON.parse(body);
++    if (typeof parsed === "object" && parsed !== null && "reason" in parsed) {
++      return typeof parsed.reason === "string" ? parsed.reason : body;
++    }
++  } catch {
++    // Not JSON: report the raw body.
++  }
++  return body;
++}
++
++export const make = Effect.gen(function* () {
++  const sessions = new Map<string, NodeHttp2.ClientHttp2Session>();
++  const tokens = new Map<string, { readonly jwt: string; readonly issuedAt: number }>();
++
++  yield* Effect.addFinalizer(() =>
++    Effect.sync(() => {
++      for (const session of sessions.values()) session.close();
++      sessions.clear();
++    }),
++  );
++
++  const sessionFor = (origin: string) => {
++    const existing = sessions.get(origin);
++    if (existing && !existing.closed && !existing.destroyed) return existing;
++    const session = NodeHttp2.connect(origin);
++    const forget = () => {
++      if (sessions.get(origin) === session) sessions.delete(origin);
++    };
++    session.on("error", forget);
++    session.on("close", forget);
++    session.on("goaway", forget);
++    // Idle connections do not keep the server process alive.
++    session.unref();
++    sessions.set(origin, session);
++    return session;
++  };
++
++  const providerToken = (credentials: ApnsCredentials) => {
++    const nowSeconds = Math.floor(Date.now() / 1_000);
++    const issuedAt = Math.floor(nowSeconds / APNS_JWT_REUSE_SECONDS) * APNS_JWT_REUSE_SECONDS;
++    const fingerprint = NodeCrypto.createHash("sha256")
++      .update(`${credentials.teamId}:${credentials.keyId}:${credentials.privateKey}`)
++      .digest("hex");
++    const cached = tokens.get(fingerprint);
++    if (cached && cached.issuedAt === issuedAt) return cached.jwt;
++    const jwt = signApnsJwt(credentials, issuedAt);
++    tokens.set(fingerprint, { jwt, issuedAt });
++    return jwt;
++  };
++
++  const send: ApnsTransport["Service"]["send"] = (input) =>
++    Effect.callback<ApnsResponse, ApnsTransportError>((resume) => {
++      const fail = (cause: unknown) =>
++        resume(
++          Effect.fail(
++            new ApnsTransportError({
++              environment: input.environment,
++              tokenSuffix: input.request.token.slice(-8),
++              cause,
++            }),
++          ),
++        );
++      let stream: NodeHttp2.ClientHttp2Stream;
++      try {
++        const topic =
++          input.request.pushType === "liveactivity"
++            ? `${input.bundleId}.push-type.liveactivity`
++            : input.bundleId;
++        stream = sessionFor(apnsOrigin(input.environment)).request({
++          ":method": "POST",
++          ":path": `/3/device/${input.request.token}`,
++          authorization: `bearer ${providerToken(input.credentials)}`,
++          "apns-push-type": input.request.pushType,
++          "apns-priority": input.request.priority,
++          "apns-topic": topic,
++          "content-type": "application/json",
++        });
++      } catch (cause) {
++        fail(cause);
++        return;
++      }
++      let status = 0;
++      let apnsId: string | null = null;
++      let body = "";
++      stream.setEncoding("utf8");
++      stream.setTimeout(APNS_REQUEST_TIMEOUT_MS, () => {
++        stream.close(NodeHttp2.constants.NGHTTP2_CANCEL);
++        fail(new Error("APNs request timed out."));
++      });
++      stream.on("response", (headers) => {
++        status = Number(headers[":status"] ?? 0);
++        const id = headers["apns-id"];
++        apnsId = typeof id === "string" ? id : null;
++      });
++      stream.on("data", (chunk: string) => {
++        body += chunk;
++      });
++      stream.on("error", fail);
++      stream.on("end", () =>
++        resume(Effect.succeed({ status, reason: reasonFromBody(body), apnsId })),
++      );
++      stream.end(JSON.stringify(input.request.payload));
++      return Effect.sync(() => {
++        if (!stream.closed) stream.close(NodeHttp2.constants.NGHTTP2_CANCEL);
++      });
++    });
++
++  return ApnsTransport.of({ send });
++});
++
++export const layer = Layer.effect(ApnsTransport, make);
+diff --git a/apps/server/src/directPush/DirectPush.test.ts b/apps/server/src/directPush/DirectPush.test.ts
+new file mode 100644
+index 000000000..98a29b45b
+--- /dev/null
++++ b/apps/server/src/directPush/DirectPush.test.ts
+@@ -0,0 +1,261 @@
++// @effect-diagnostics nodeBuiltinImport:off -- the tests generate and verify a real P-256 key.
++import * as NodeCrypto from "node:crypto";
++
++import { assert, describe, it } from "@effect/vitest";
++import { EnvironmentId, ThreadId } from "@t3tools/contracts";
++import type {
++  RelayAgentActivityState,
++  RelayDeviceRegistrationRequest,
++} from "@t3tools/contracts/relay";
++import * as Effect from "effect/Effect";
++import * as Option from "effect/Option";
++
++import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
++import * as ApnsTransport from "./ApnsTransport.ts";
++import * as DirectPush from "./DirectPush.ts";
++
++const THREAD_ID = ThreadId.make("thread-1");
++const { privateKey, publicKey } = NodeCrypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
++const PRIVATE_KEY_PEM = privateKey.export({ format: "pem", type: "pkcs8" }).toString();
++const CONFIG = {
++  teamId: "Y9PUU2MN3R",
++  keyId: "ABCDE12345",
++  privateKey: PRIVATE_KEY_PEM,
++  bundleId: "nl.example.t3code",
++};
++
++function activity(
++  phase: RelayAgentActivityState["phase"],
++  overrides: Partial<RelayAgentActivityState> = {},
++): RelayAgentActivityState {
++  return {
++    environmentId: EnvironmentId.make("env-1"),
++    threadId: THREAD_ID,
++    projectTitle: "Project",
++    threadTitle: "Fix the bug",
++    phase,
++    headline: phase,
++    modelTitle: "Model",
++    updatedAt: new Date().toISOString(),
++    deepLink: "/threads/thread-1",
++    ...overrides,
++  };
++}
++
++function device(
++  overrides: Partial<RelayDeviceRegistrationRequest> = {},
++): RelayDeviceRegistrationRequest {
++  return {
++    deviceId: "device-1",
++    label: "iPhone",
++    platform: "ios",
++    iosMajorVersion: 26,
++    bundleId: "nl.example.t3code",
++    apsEnvironment: "production",
++    pushToken: "push-token-1",
++    preferences: {
++      liveActivitiesEnabled: false,
++      notificationsEnabled: true,
++      notifyOnApproval: true,
++      notifyOnInput: true,
++      notifyOnCompletion: true,
++      notifyOnFailure: true,
++    },
++    ...overrides,
++  };
++}
++
++const makeHarness = Effect.fnUntraced(function* (
++  options: {
++    readonly configured?: boolean;
++    readonly respond?: (input: ApnsTransport.ApnsSendInput) => ApnsTransport.ApnsResponse;
++  } = {},
++) {
++  const values = new Map<string, Uint8Array>(
++    options.configured === false
++      ? []
++      : [[DirectPush.DIRECT_PUSH_APNS_SECRET, new TextEncoder().encode(JSON.stringify(CONFIG))]],
++  );
++  const secrets = ServerSecretStore.ServerSecretStore.of({
++    get: (name) => Effect.succeed(Option.fromUndefinedOr(values.get(name))),
++    create: (name, value) => Effect.sync(() => void values.set(name, value)),
++    set: (name, value) => Effect.sync(() => void values.set(name, value)),
++    remove: (name) => Effect.sync(() => void values.delete(name)),
++    getOrCreateRandom: () => Effect.die("unused"),
++  });
++  const sent: Array<ApnsTransport.ApnsSendInput> = [];
++  const transport = ApnsTransport.ApnsTransport.of({
++    send: (input) =>
++      Effect.sync(() => {
++        sent.push(input);
++        return options.respond?.(input) ?? { status: 200, reason: null, apnsId: "apns-id" };
++      }),
++  });
++  const push = yield* DirectPush.make.pipe(
++    Effect.provideService(ServerSecretStore.ServerSecretStore, secrets),
++    Effect.provideService(ApnsTransport.ApnsTransport, transport),
++  );
++  return { push, sent, values };
++});
++
++const aps = (input: ApnsTransport.ApnsSendInput) =>
++  (input.request.payload as { readonly aps: Record<string, unknown> }).aps;
++
++describe("DirectPush", () => {
++  it.live("is inert without an APNs key, as upstream", () =>
++    Effect.gen(function* () {
++      const { push, sent, values } = yield* makeHarness({ configured: false });
++      assert.isFalse(yield* push.isEnabled);
++      assert.deepStrictEqual(yield* push.registerDevice(device()), { enabled: false });
++      yield* push.publish({ threadId: THREAD_ID, state: activity("waiting_for_input") });
++      assert.strictEqual(sent.length, 0);
++      assert.isFalse(values.has(DirectPush.DIRECT_PUSH_DEVICES_SECRET));
++    }),
++  );
++
++  it.live("sends an alert push when an agent needs input, once per state", () =>
++    Effect.gen(function* () {
++      const { push, sent } = yield* makeHarness();
++      assert.deepStrictEqual(yield* push.registerDevice(device()), { enabled: true });
++      yield* push.publish({ threadId: THREAD_ID, state: activity("running") });
++      assert.strictEqual(sent.length, 0);
++      const waiting = activity("waiting_for_input");
++      yield* push.publish({ threadId: THREAD_ID, state: waiting });
++      // A relay retry republishes the same state; it must not buzz twice.
++      yield* push.publish({ threadId: THREAD_ID, state: { ...waiting, updatedAt: "later" } });
++      assert.strictEqual(sent.length, 1);
++      const [request] = sent;
++      assert.strictEqual(request!.request.pushType, "alert");
++      assert.strictEqual(request!.request.token, "push-token-1");
++      assert.strictEqual(request!.bundleId, "nl.example.t3code");
++      assert.strictEqual(request!.environment, "production");
++      assert.deepStrictEqual(aps(request!).alert, {
++        title: "Fix the bug",
++        body: "Input: Project",
++      });
++    }),
++  );
++
++  it.live("sends a completion push for a fresh finish", () =>
++    Effect.gen(function* () {
++      const { push, sent } = yield* makeHarness();
++      yield* push.registerDevice(device());
++      yield* push.publish({ threadId: THREAD_ID, state: activity("completed") });
++      assert.strictEqual(sent.length, 1);
++      assert.deepStrictEqual(aps(sent[0]!).alert, { title: "Fix the bug", body: "Done: Project" });
++    }),
++  );
++
++  it.live("skips devices of another app", () =>
++    Effect.gen(function* () {
++      const { push, sent } = yield* makeHarness();
++      yield* push.registerDevice(device({ bundleId: "com.t3tools.t3code" }));
++      yield* push.publish({ threadId: THREAD_ID, state: activity("waiting_for_input") });
++      assert.strictEqual(sent.length, 0);
++    }),
++  );
++
++  it.live("updates the Live Activity, alerts on attention and ends it when work is gone", () =>
++    Effect.gen(function* () {
++      const { push, sent } = yield* makeHarness();
++      const liveActivities = {
++        ...device().preferences,
++        liveActivitiesEnabled: true,
++      };
++      yield* push.registerDevice(device({ preferences: liveActivities }));
++      yield* push.registerLiveActivity({ deviceId: "device-1", activityPushToken: "la-token" });
++      // Nothing to show: an idle server never ends a card it did not fill.
++      assert.strictEqual(sent.length, 0);
++
++      yield* push.publish({ threadId: THREAD_ID, state: activity("running") });
++      assert.strictEqual(sent.length, 1);
++      assert.strictEqual(sent[0]!.request.pushType, "liveactivity");
++      assert.strictEqual(sent[0]!.request.token, "la-token");
++      assert.strictEqual(aps(sent[0]!).event, "update");
++      assert.isUndefined(aps(sent[0]!).alert);
++
++      yield* push.publish({ threadId: THREAD_ID, state: activity("waiting_for_approval") });
++      assert.strictEqual(sent.length, 2);
++      assert.strictEqual(sent[1]!.request.priority, "10");
++      assert.deepStrictEqual(aps(sent[1]!).alert, {
++        title: "Fix the bug",
++        body: "Approval: Project",
++        sound: "default",
++      });
++      const props = JSON.parse(
++        (aps(sent[1]!)["content-state"] as { readonly props: string }).props,
++      ) as { readonly activeCount: number };
++      assert.strictEqual(props.activeCount, 1);
++
++      yield* push.publish({ threadId: THREAD_ID, state: null });
++      assert.strictEqual(sent.length, 3);
++      assert.strictEqual(aps(sent[2]!).event, "end");
++      assert.strictEqual(sent[2]!.request.token, "la-token");
++    }),
++  );
++
++  it.live("replays the current card when its token registers again", () =>
++    Effect.gen(function* () {
++      const { push, sent } = yield* makeHarness();
++      const liveActivities = { ...device().preferences, liveActivitiesEnabled: true };
++      yield* push.registerDevice(device({ preferences: liveActivities }));
++      yield* push.publish({ threadId: THREAD_ID, state: activity("running") });
++      assert.strictEqual(sent.length, 0);
++      yield* push.registerLiveActivity({ deviceId: "device-1", activityPushToken: "la-token" });
++      assert.strictEqual(sent.length, 1);
++      assert.strictEqual(aps(sent[0]!).event, "update");
++      assert.isUndefined(aps(sent[0]!).alert);
++      const snapshot = yield* push.snapshot;
++      assert.strictEqual(snapshot?.activeCount, 1);
++    }),
++  );
++
++  it.live("drops a push token APNs reports as unregistered", () =>
++    Effect.gen(function* () {
++      const { push, sent, values } = yield* makeHarness({
++        respond: () => ({ status: 410, reason: "Unregistered", apnsId: null }),
++      });
++      yield* push.registerDevice(device());
++      yield* push.publish({ threadId: THREAD_ID, state: activity("waiting_for_input") });
++      assert.strictEqual(sent.length, 1);
++      const stored = JSON.parse(
++        new TextDecoder().decode(values.get(DirectPush.DIRECT_PUSH_DEVICES_SECRET)),
++      ) as ReadonlyArray<{ readonly pushToken: string | null }>;
++      assert.strictEqual(stored[0]!.pushToken, null);
++    }),
++  );
++
++  it.live("keeps devices across a server restart", () =>
++    Effect.gen(function* () {
++      const first = yield* makeHarness();
++      yield* first.push.registerDevice(device());
++      const second = yield* makeHarness();
++      for (const [name, value] of first.values) second.values.set(name, value);
++      yield* second.push.publish({ threadId: THREAD_ID, state: activity("waiting_for_input") });
++      assert.strictEqual(second.sent.length, 1);
++    }),
++  );
++});
++
++describe("ApnsTransport", () => {
++  it("signs an ES256 provider token APNs can verify", () => {
++    const jwt = ApnsTransport.signApnsJwt(CONFIG, 1_800_000_000);
++    const [header, payload, signature] = jwt.split(".");
++    assert.deepStrictEqual(JSON.parse(Buffer.from(header!, "base64url").toString()), {
++      alg: "ES256",
++      kid: "ABCDE12345",
++    });
++    assert.deepStrictEqual(JSON.parse(Buffer.from(payload!, "base64url").toString()), {
++      iss: "Y9PUU2MN3R",
++      iat: 1_800_000_000,
++    });
++    assert.isTrue(
++      NodeCrypto.verify(
++        "sha256",
++        Buffer.from(`${header}.${payload}`),
++        { key: publicKey, dsaEncoding: "ieee-p1363" },
++        Buffer.from(signature!, "base64url"),
++      ),
++    );
++  });
++});
+diff --git a/apps/server/src/directPush/DirectPush.ts b/apps/server/src/directPush/DirectPush.ts
+new file mode 100644
+index 000000000..0e0e33334
+--- /dev/null
++++ b/apps/server/src/directPush/DirectPush.ts
+@@ -0,0 +1,415 @@
++/**
++ * Direct push: this server sends agent activity (alert notifications and Live
++ * Activity updates) to APNs itself, for apps built under their own bundle id
++ * that the T3 relay cannot reach. Devices register over the environment
++ * connection; the APNs key lives in the server secret store. Without a key,
++ * every method is inert and the server behaves as upstream.
++ */
++import {
++  RelayAgentActivityAggregateState,
++  RelayAgentAwarenessPreferences,
++  type RelayAgentActivityState,
++  type RelayDeviceRegistrationRequest,
++  type RelayLiveActivityRegistrationRequest,
++} from "@t3tools/contracts/relay";
++import type { ThreadId } from "@t3tools/contracts";
++import * as Context from "effect/Context";
++import * as DateTime from "effect/DateTime";
++import * as Effect from "effect/Effect";
++import * as Layer from "effect/Layer";
++import * as Option from "effect/Option";
++import * as Schema from "effect/Schema";
++import * as Semaphore from "effect/Semaphore";
++
++import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
++import {
++  chooseDeliveries,
++  type ChosenDelivery,
++  type DirectPushDevice,
++  isPermanentApnsTokenFailure,
++  isTerminalPhase,
++  makeAggregateState,
++  makeApnsRequest,
++} from "./agentActivityDelivery.ts";
++import * as ApnsTransport from "./ApnsTransport.ts";
++
++/** `<stateDir>/secrets/direct-push-apns.bin`: JSON with the APNs key and app identity. */
++export const DIRECT_PUSH_APNS_SECRET = "direct-push-apns";
++/** `<stateDir>/secrets/direct-push-devices.bin`: devices registered for direct push. */
++export const DIRECT_PUSH_DEVICES_SECRET = "direct-push-devices";
++
++const ApnsEnvironmentSchema = Schema.Literals(["sandbox", "production"]);
++
++export const DirectPushApnsConfig = Schema.Struct({
++  teamId: Schema.String.check(Schema.isPattern(/^[A-Z0-9]{10}$/)),
++  keyId: Schema.String.check(Schema.isPattern(/^[A-Z0-9]{10}$/)),
++  /** PKCS#8 PEM of the .p8 key (escaped `\n` allowed). */
++  privateKey: Schema.String.check(Schema.isPattern(/PRIVATE KEY/)),
++  /** The app's bundle id, the APNs topic. Devices of other apps are skipped. */
++  bundleId: Schema.String.check(Schema.isMinLength(1)),
++  /** Used when a device does not say; TestFlight and App Store builds use production. */
++  environment: Schema.optional(ApnsEnvironmentSchema),
++});
++export type DirectPushApnsConfig = typeof DirectPushApnsConfig.Type;
++
++const StoredDevice = Schema.Struct({
++  deviceId: Schema.String,
++  label: Schema.String,
++  platform: Schema.Literals(["ios", "android"]),
++  bundleId: Schema.NullOr(Schema.String),
++  apsEnvironment: Schema.NullOr(ApnsEnvironmentSchema),
++  pushToken: Schema.NullOr(Schema.String),
++  preferences: RelayAgentAwarenessPreferences,
++  updatedAt: Schema.String,
++  activityPushToken: Schema.NullOr(Schema.String),
++  lastAggregate: Schema.NullOr(RelayAgentActivityAggregateState),
++  lastLiveActivityDeliveryAt: Schema.NullOr(Schema.String),
++});
++const StoredDevices = Schema.Array(StoredDevice);
++
++const decodeConfig = Schema.decodeUnknownOption(Schema.fromJsonString(DirectPushApnsConfig));
++const decodeDevices = Schema.decodeUnknownOption(Schema.fromJsonString(StoredDevices));
++
++// Used for a Live Activity token that arrives before its device registration.
++const DEFAULT_PREFERENCES: RelayAgentAwarenessPreferences = {
++  liveActivitiesEnabled: true,
++  notificationsEnabled: false,
++  notifyOnApproval: true,
++  notifyOnInput: true,
++  notifyOnCompletion: true,
++  notifyOnFailure: true,
++};
++
++/** Whether a valid APNs config is stored, for code that runs without the service. */
++export const readDirectPushConfigured = (
++  secrets: ServerSecretStore.ServerSecretStore["Service"],
++): Effect.Effect<boolean> =>
++  secrets.get(DIRECT_PUSH_APNS_SECRET).pipe(
++    Effect.map(
++      (bytes) =>
++        Option.isSome(bytes) && Option.isSome(decodeConfig(new TextDecoder().decode(bytes.value))),
++    ),
++    Effect.orElseSucceed(() => false),
++  );
++
++export interface DirectPushRegistrationResult {
++  readonly enabled: boolean;
++}
++
++export class DirectPush extends Context.Service<
++  DirectPush,
++  {
++    /** Whether an APNs key is configured, so this server pushes itself. */
++    readonly isEnabled: Effect.Effect<boolean>;
++    readonly registerDevice: (
++      request: RelayDeviceRegistrationRequest,
++    ) => Effect.Effect<DirectPushRegistrationResult>;
++    readonly registerLiveActivity: (
++      request: RelayLiveActivityRegistrationRequest,
++    ) => Effect.Effect<DirectPushRegistrationResult>;
++    readonly snapshot: Effect.Effect<RelayAgentActivityAggregateState | null>;
++    /** Delivers one thread's new activity state (null when it no longer shows). */
++    readonly publish: (input: {
++      readonly threadId: ThreadId;
++      readonly state: RelayAgentActivityState | null;
++    }) => Effect.Effect<void>;
++  }
++>()("t3/directPush/DirectPush") {}
++
++function publishIdentity(state: RelayAgentActivityState | null): string {
++  if (state === null) return "null";
++  const { updatedAt: _updatedAt, ...rest } = state;
++  return JSON.stringify(rest);
++}
++
++function liveActivityAggregateFor(input: {
++  readonly device: DirectPushDevice;
++  readonly states: ReadonlyArray<RelayAgentActivityState>;
++  readonly state: RelayAgentActivityState | null;
++  readonly nowMs: number;
++}) {
++  if (input.device.preferences.liveActivitiesEnabled) {
++    return makeAggregateState({
++      states: input.states,
++      terminalState: input.state && isTerminalPhase(input.state) ? input.state : null,
++      nowMs: input.nowMs,
++    });
++  }
++  // Without Live Activities a device only hears about the thread that changed.
++  if (!input.device.preferences.notificationsEnabled || input.state === null) return null;
++  return makeAggregateState({
++    states: isTerminalPhase(input.state) ? [] : [input.state],
++    terminalState: isTerminalPhase(input.state) ? input.state : null,
++    nowMs: input.nowMs,
++  });
++}
++
++export const make = Effect.gen(function* () {
++  const secrets = yield* ServerSecretStore.ServerSecretStore;
++  const transport = yield* ApnsTransport.ApnsTransport;
++  const lock = yield* Semaphore.make(1);
++  const states = new Map<ThreadId, RelayAgentActivityState>();
++  const publishedIdentities = new Map<ThreadId, string>();
++  let devices: Map<string, DirectPushDevice> | undefined;
++
++  const readSecretString = (name: string) =>
++    secrets.get(name).pipe(
++      Effect.map((bytes) => (Option.isSome(bytes) ? new TextDecoder().decode(bytes.value) : null)),
++      Effect.catch((error) =>
++        Effect.logWarning("direct push secret read failed", { name, error: error.message }).pipe(
++          Effect.as(null),
++        ),
++      ),
++    );
++
++  const readConfig = readSecretString(DIRECT_PUSH_APNS_SECRET).pipe(
++    Effect.flatMap((raw) => {
++      if (raw === null || raw.trim() === "") return Effect.succeed(null);
++      const config = Option.getOrNull(decodeConfig(raw));
++      return config === null
++        ? Effect.logWarning("direct push APNs config is invalid; direct push stays off").pipe(
++            Effect.as(null),
++          )
++        : Effect.succeed(config);
++    }),
++  );
++
++  const loadDevices = Effect.gen(function* () {
++    if (devices !== undefined) return devices;
++    const raw = yield* readSecretString(DIRECT_PUSH_DEVICES_SECRET);
++    const stored = raw === null ? [] : Option.getOrElse(decodeDevices(raw), () => []);
++    devices = new Map(stored.map((device) => [device.deviceId, device]));
++    return devices;
++  });
++
++  const saveDevices = (current: Map<string, DirectPushDevice>) =>
++    secrets
++      .set(
++        DIRECT_PUSH_DEVICES_SECRET,
++        new TextEncoder().encode(JSON.stringify([...current.values()])),
++      )
++      .pipe(
++        Effect.catch((error) =>
++          Effect.logWarning("direct push device store write failed", { error: error.message }),
++        ),
++      );
++
++  const nowIso = DateTime.now.pipe(Effect.map(DateTime.formatIso));
++
++  // Sends the chosen deliveries in order and returns the device as it stands
++  // afterwards: delivery bookkeeping on success, dead tokens dropped.
++  const deliver = Effect.fnUntraced(function* (
++    config: DirectPushApnsConfig,
++    initial: DirectPushDevice,
++    deliveries: ReadonlyArray<ChosenDelivery>,
++  ) {
++    let device = initial;
++    for (const delivery of deliveries) {
++      const now = yield* DateTime.now;
++      const environment = device.apsEnvironment ?? config.environment ?? "production";
++      const result = yield* transport
++        .send({
++          credentials: config,
++          environment,
++          bundleId: config.bundleId,
++          request: makeApnsRequest(delivery, Math.floor(now.epochMilliseconds / 1_000)),
++        })
++        .pipe(
++          Effect.catch((error) =>
++            Effect.logWarning("direct push APNs request failed", {
++              deviceId: device.deviceId,
++              kind: delivery.kind,
++              error: error.message,
++            }).pipe(Effect.as(null)),
++          ),
++        );
++      if (result === null) continue;
++      const ok = result.status >= 200 && result.status < 300;
++      yield* (ok ? Effect.logInfo : Effect.logWarning)("direct push APNs delivery", {
++        deviceId: device.deviceId,
++        kind: delivery.kind,
++        environment,
++        status: result.status,
++        reason: result.reason,
++        apnsId: result.apnsId,
++      });
++      if (ok && delivery.kind !== "push_notification") {
++        const ended = delivery.kind === "live_activity_end";
++        device = {
++          ...device,
++          activityPushToken: ended ? null : device.activityPushToken,
++          lastAggregate: ended ? null : delivery.aggregate,
++          lastLiveActivityDeliveryAt: DateTime.formatIso(now),
++        };
++      } else if (!ok && isPermanentApnsTokenFailure(result.status, result.reason)) {
++        device =
++          delivery.kind === "push_notification"
++            ? { ...device, pushToken: null }
++            : { ...device, activityPushToken: null, lastAggregate: null };
++      }
++    }
++    return device;
++  });
++
++  // Delivers the current aggregate to the given devices and persists changes.
++  const deliverToDevices = Effect.fnUntraced(function* (input: {
++    readonly config: DirectPushApnsConfig;
++    readonly deviceIds: ReadonlyArray<string>;
++    readonly state: RelayAgentActivityState | null;
++    readonly replay: boolean;
++  }) {
++    const current = yield* loadDevices;
++    const nowMs = (yield* DateTime.now).epochMilliseconds;
++    const allStates = [...states.values()];
++    let changed = false;
++    for (const deviceId of input.deviceIds) {
++      const device = current.get(deviceId);
++      if (!device || (device.bundleId !== null && device.bundleId !== input.config.bundleId)) {
++        continue;
++      }
++      const aggregate = liveActivityAggregateFor({
++        device,
++        states: allStates,
++        state: input.state,
++        nowMs,
++      });
++      const deliveries = chooseDeliveries({ device, aggregate, nowMs, replay: input.replay });
++      if (deliveries.length === 0) continue;
++      const next = yield* deliver(input.config, device, deliveries);
++      if (next !== device) {
++        current.set(deviceId, next);
++        changed = true;
++      }
++    }
++    if (changed) yield* saveDevices(current);
++  });
++
++  const isEnabled = readConfig.pipe(Effect.map((config) => config !== null));
++
++  const registerDevice: DirectPush["Service"]["registerDevice"] = (request) =>
++    lock.withPermits(1)(
++      Effect.gen(function* () {
++        const config = yield* readConfig;
++        if (config === null) return { enabled: false };
++        const current = yield* loadDevices;
++        const previous = current.get(request.deviceId);
++        const updatedAt = yield* nowIso;
++        // A push token belongs to one install; drop it from any other record.
++        if (request.pushToken) {
++          for (const [deviceId, device] of current) {
++            if (deviceId !== request.deviceId && device.pushToken === request.pushToken) {
++              current.set(deviceId, { ...device, pushToken: null });
++            }
++          }
++        }
++        current.set(request.deviceId, {
++          deviceId: request.deviceId,
++          label: request.label,
++          platform: request.platform,
++          bundleId: request.bundleId ?? null,
++          apsEnvironment: request.apsEnvironment ?? null,
++          pushToken: request.pushToken ?? previous?.pushToken ?? null,
++          preferences: request.preferences,
++          updatedAt,
++          activityPushToken: previous?.activityPushToken ?? null,
++          lastAggregate: previous?.lastAggregate ?? null,
++          lastLiveActivityDeliveryAt: previous?.lastLiveActivityDeliveryAt ?? null,
++        });
++        yield* saveDevices(current);
++        yield* Effect.logInfo("direct push device registered", {
++          deviceId: request.deviceId,
++          hasPushToken: request.pushToken !== undefined,
++          liveActivitiesEnabled: request.preferences.liveActivitiesEnabled,
++          notificationsEnabled: request.preferences.notificationsEnabled,
++        });
++        // Repaints (or ends) the device's card, as the relay does on registration.
++        yield* deliverToDevices({
++          config,
++          deviceIds: [request.deviceId],
++          state: null,
++          replay: true,
++        });
++        return { enabled: true };
++      }),
++    );
++
++  const registerLiveActivity: DirectPush["Service"]["registerLiveActivity"] = (request) =>
++    lock.withPermits(1)(
++      Effect.gen(function* () {
++        const config = yield* readConfig;
++        if (config === null) return { enabled: false };
++        const current = yield* loadDevices;
++        const updatedAt = yield* nowIso;
++        // An activity token addresses one card; detach it from any other device.
++        for (const [deviceId, device] of current) {
++          if (
++            deviceId !== request.deviceId &&
++            device.activityPushToken === request.activityPushToken
++          ) {
++            current.set(deviceId, { ...device, activityPushToken: null, lastAggregate: null });
++          }
++        }
++        const previous = current.get(request.deviceId);
++        const sameCard = previous?.activityPushToken === request.activityPushToken;
++        current.set(request.deviceId, {
++          deviceId: request.deviceId,
++          label: previous?.label ?? "iOS device",
++          platform: previous?.platform ?? "ios",
++          bundleId: previous?.bundleId ?? null,
++          apsEnvironment: previous?.apsEnvironment ?? null,
++          pushToken: previous?.pushToken ?? null,
++          preferences: previous?.preferences ?? DEFAULT_PREFERENCES,
++          updatedAt,
++          activityPushToken: request.activityPushToken,
++          // Re-registering the same card keeps what this server last showed on
++          // it, so the replay neither re-alerts nor forgets to end it.
++          lastAggregate: sameCard ? (previous?.lastAggregate ?? null) : null,
++          lastLiveActivityDeliveryAt: sameCard
++            ? (previous?.lastLiveActivityDeliveryAt ?? null)
++            : null,
++        });
++        yield* saveDevices(current);
++        yield* Effect.logInfo("direct push live activity registered", {
++          deviceId: request.deviceId,
++          sameCard,
++        });
++        yield* deliverToDevices({
++          config,
++          deviceIds: [request.deviceId],
++          state: null,
++          replay: true,
++        });
++        return { enabled: true };
++      }),
++    );
++
++  const snapshot: DirectPush["Service"]["snapshot"] = Effect.gen(function* () {
++    if ((yield* readConfig) === null) return null;
++    const nowMs = (yield* DateTime.now).epochMilliseconds;
++    return makeAggregateState({ states: [...states.values()], terminalState: null, nowMs });
++  });
++
++  const publish: DirectPush["Service"]["publish"] = ({ threadId, state }) =>
++    lock.withPermits(1)(
++      Effect.gen(function* () {
++        const config = yield* readConfig;
++        if (config === null) return;
++        // The relay publisher retries failed relay calls; a retry must not
++        // deliver the same state to the device twice.
++        const identity = publishIdentity(state);
++        if (publishedIdentities.get(threadId) === identity) return;
++        publishedIdentities.set(threadId, identity);
++        if (state === null) {
++          states.delete(threadId);
++        } else {
++          states.set(threadId, state);
++        }
++        const current = yield* loadDevices;
++        yield* deliverToDevices({ config, deviceIds: [...current.keys()], state, replay: false });
++      }),
++    );
++
++  return DirectPush.of({ isEnabled, registerDevice, registerLiveActivity, snapshot, publish });
++});
++
++export const layer = Layer.effect(DirectPush, make).pipe(Layer.provide(ApnsTransport.layer));
+diff --git a/apps/server/src/directPush/agentActivityDelivery.ts b/apps/server/src/directPush/agentActivityDelivery.ts
+new file mode 100644
+index 000000000..1bfc077a8
+--- /dev/null
++++ b/apps/server/src/directPush/agentActivityDelivery.ts
+@@ -0,0 +1,569 @@
++/**
++ * Pure delivery decisions for direct APNs push, ported from the T3 relay
++ * (`infra/relay/src/agentActivity/`: agentActivityAggregate, agentActivityPayloads,
++ * agentActivityAlerts, ApnsDeliveries and ApnsClient). The relay aggregates every
++ * environment a user linked; a server pushing directly only knows its own threads,
++ * so the aggregate here covers this environment alone.
++ */
++import type {
++  RelayAgentActivityAggregateRow,
++  RelayAgentActivityAggregateState,
++  RelayAgentActivityState,
++  RelayAgentAwarenessPreferences,
++} from "@t3tools/contracts/relay";
++
++export const LIVE_ACTIVITY_NAME = "AgentActivity";
++// The Live Activity banner renders up to five rows.
++export const MAX_ACTIVITY_ROWS = 5;
++const MAX_SUMMARY_TEXT_LENGTH = 120;
++const MAX_STATUS_TEXT_LENGTH = 40;
++const MAX_DEEP_LINK_LENGTH = 512;
++// Running phases expire quickly, waiting phases can sit for hours.
++const RUNNING_AGENT_ACTIVITY_ROW_TTL_MS = 2 * 60 * 60 * 1_000;
++const WAITING_AGENT_ACTIVITY_ROW_TTL_MS = 24 * 60 * 60 * 1_000;
++// How long a finished thread keeps its Done/Failed row in the aggregate.
++export const TERMINAL_AGENT_ACTIVITY_DISPLAY_TTL_MS = 15 * 60 * 1_000;
++// Completions replayed long after the fact must not ring the device again.
++export const TERMINAL_NOTIFICATION_FRESHNESS_MS = 2 * 60 * 1_000;
++const MIN_LIVE_ACTIVITY_UPDATE_INTERVAL_MS = 15_000;
++const STALE_AFTER_SECONDS = 10 * 60;
++const DISMISS_AFTER_SECONDS = 5 * 60;
++const CONTENTLESS_DISMISS_AFTER_SECONDS = 15;
++const PERMANENT_APNS_TOKEN_REASONS = new Set([
++  "BadDeviceToken",
++  "DeviceTokenNotForTopic",
++  "Unregistered",
++]);
++
++export type ApnsEnvironment = "sandbox" | "production";
++
++/** One registered device as this server stores it. */
++export interface DirectPushDevice {
++  readonly deviceId: string;
++  readonly label: string;
++  readonly platform: "ios" | "android";
++  readonly bundleId: string | null;
++  readonly apsEnvironment: ApnsEnvironment | null;
++  readonly pushToken: string | null;
++  readonly preferences: RelayAgentAwarenessPreferences;
++  readonly updatedAt: string;
++  readonly activityPushToken: string | null;
++  /** Last aggregate this server delivered to the current activity token. */
++  readonly lastAggregate: RelayAgentActivityAggregateState | null;
++  readonly lastLiveActivityDeliveryAt: string | null;
++}
++
++export interface NotificationPayload {
++  readonly title: string;
++  readonly body: string;
++  readonly environmentId: string;
++  readonly threadId: string;
++  readonly deepLink: string;
++  readonly phase: RelayAgentActivityState["phase"];
++  readonly updatedAt: string;
++}
++
++export interface LiveActivityAlert {
++  readonly title: string;
++  readonly body: string;
++}
++
++export type ChosenDelivery =
++  | {
++      readonly kind: "live_activity_update";
++      readonly token: string;
++      readonly aggregate: RelayAgentActivityAggregateState;
++      readonly alert: LiveActivityAlert | null;
++    }
++  | {
++      readonly kind: "live_activity_end";
++      readonly token: string;
++      readonly aggregate: RelayAgentActivityAggregateState | null;
++      readonly alert: LiveActivityAlert | null;
++    }
++  | {
++      readonly kind: "push_notification";
++      readonly token: string;
++      readonly notification: NotificationPayload;
++    };
++
++export interface ApnsRequest {
++  readonly token: string;
++  readonly pushType: "liveactivity" | "alert";
++  readonly priority: "5" | "10";
++  readonly payload: unknown;
++}
++
++function epochMillis(iso: string): number {
++  const value = Date.parse(iso);
++  return Number.isNaN(value) ? Number.NaN : value;
++}
++
++export function isTerminalPhase(state: Pick<RelayAgentActivityState, "phase">): boolean {
++  return state.phase === "completed" || state.phase === "failed";
++}
++
++export function isExpiredAgentActivityState(state: RelayAgentActivityState, nowMs: number) {
++  const updatedAtMs = epochMillis(state.updatedAt);
++  const ttlMs =
++    state.phase === "running" || state.phase === "starting"
++      ? RUNNING_AGENT_ACTIVITY_ROW_TTL_MS
++      : WAITING_AGENT_ACTIVITY_ROW_TTL_MS;
++  return !Number.isFinite(updatedAtMs) || nowMs > updatedAtMs + ttlMs;
++}
++
++function truncateText(value: string, maxLength: number): string {
++  const trimmed = value.trim();
++  return trimmed.length <= maxLength ? trimmed : trimmed.slice(0, maxLength - 3).trimEnd() + "...";
++}
++
++function sanitizeDeepLink(value: string): string {
++  const trimmed = value.trim();
++  if (!trimmed.startsWith("/") || trimmed.startsWith("//")) return "/";
++  return truncateText(trimmed, MAX_DEEP_LINK_LENGTH);
++}
++
++function sanitizeRow(row: RelayAgentActivityAggregateRow): RelayAgentActivityAggregateRow {
++  return {
++    ...row,
++    projectTitle: truncateText(row.projectTitle, MAX_SUMMARY_TEXT_LENGTH),
++    threadTitle: truncateText(row.threadTitle, MAX_SUMMARY_TEXT_LENGTH),
++    modelTitle: truncateText(row.modelTitle, MAX_SUMMARY_TEXT_LENGTH),
++    status: truncateText(row.status, MAX_STATUS_TEXT_LENGTH),
++    deepLink: sanitizeDeepLink(row.deepLink),
++  };
++}
++
++function sanitizeAggregate(
++  aggregate: RelayAgentActivityAggregateState,
++): RelayAgentActivityAggregateState {
++  return {
++    ...aggregate,
++    title: truncateText(aggregate.title, MAX_SUMMARY_TEXT_LENGTH),
++    subtitle: truncateText(aggregate.subtitle, MAX_SUMMARY_TEXT_LENGTH),
++    activities: aggregate.activities.slice(0, MAX_ACTIVITY_ROWS).map(sanitizeRow),
++  };
++}
++
++export function statusForPhase(phase: RelayAgentActivityState["phase"]): string {
++  switch (phase) {
++    case "waiting_for_approval":
++      return "Approval";
++    case "waiting_for_input":
++      return "Input";
++    case "completed":
++      return "Done";
++    case "failed":
++      return "Failed";
++    case "starting":
++      return "Connecting";
++    case "running":
++      return "Working";
++    case "stale":
++      return "Waiting";
++  }
++}
++
++function aggregateRowForState(state: RelayAgentActivityState): RelayAgentActivityAggregateRow {
++  return {
++    environmentId: state.environmentId,
++    threadId: state.threadId,
++    projectTitle: state.projectTitle,
++    threadTitle: state.threadTitle,
++    modelTitle: state.modelTitle,
++    phase: state.phase,
++    status: statusForPhase(state.phase),
++    updatedAt: state.updatedAt,
++    deepLink: state.deepLink,
++  };
++}
++
++function activityPhasePriority(phase: RelayAgentActivityState["phase"]): number {
++  if (phase === "waiting_for_approval" || phase === "waiting_for_input") return 0;
++  if (phase === "failed") return 1;
++  if (phase === "starting" || phase === "running") return 2;
++  return 3;
++}
++
++function isRecentTerminalState(state: RelayAgentActivityState, nowMs: number): boolean {
++  if (!isTerminalPhase(state)) return false;
++  const updatedAtMs = epochMillis(state.updatedAt);
++  return (
++    !Number.isNaN(updatedAtMs) && nowMs - updatedAtMs <= TERMINAL_AGENT_ACTIVITY_DISPLAY_TTL_MS
++  );
++}
++
++export function makeAggregateState(input: {
++  readonly states: ReadonlyArray<RelayAgentActivityState>;
++  readonly terminalState: RelayAgentActivityState | null;
++  readonly nowMs: number;
++}): RelayAgentActivityAggregateState | null {
++  const activeStates = input.states.filter(
++    (state) => !isTerminalPhase(state) && !isExpiredAgentActivityState(state, input.nowMs),
++  );
++  const recentTerminal = input.states
++    .filter((state) => isRecentTerminalState(state, input.nowMs))
++    .toSorted((a, b) => b.updatedAt.localeCompare(a.updatedAt));
++  if (activeStates.length === 0) {
++    if (input.terminalState !== null) {
++      return sanitizeAggregate({
++        title: "T3 Code",
++        subtitle:
++          input.terminalState.phase === "failed" ? "Agent work failed" : "Agent work completed",
++        activeCount: 0,
++        updatedAt: input.terminalState.updatedAt,
++        activities: [aggregateRowForState(input.terminalState)],
++      });
++    }
++    const newest = recentTerminal[0];
++    if (!newest) return null;
++    return sanitizeAggregate({
++      title: "T3 Code",
++      subtitle: newest.phase === "failed" ? "Agent work failed" : "Agent work completed",
++      activeCount: 0,
++      updatedAt: newest.updatedAt,
++      activities: recentTerminal.slice(0, MAX_ACTIVITY_ROWS).map(aggregateRowForState),
++    });
++  }
++  const displayed = [
++    ...activeStates
++      .toSorted((a, b) => activityPhasePriority(a.phase) - activityPhasePriority(b.phase))
++      .slice(0, MAX_ACTIVITY_ROWS),
++    ...recentTerminal,
++  ].slice(0, MAX_ACTIVITY_ROWS);
++  const updatedAt = [...activeStates, ...recentTerminal].reduce((latest, state) =>
++    state.updatedAt.localeCompare(latest.updatedAt) > 0 ? state : latest,
++  ).updatedAt;
++  return sanitizeAggregate({
++    title: "T3 Code",
++    subtitle: "Agent work in progress",
++    activeCount: activeStates.length,
++    updatedAt,
++    activities: displayed.map(aggregateRowForState),
++  });
++}
++
++function rowKey(row: RelayAgentActivityAggregateRow): string {
++  return JSON.stringify([row.environmentId, row.threadId]);
++}
++
++function isAttentionPhase(phase: string): boolean {
++  return phase === "waiting_for_approval" || phase === "waiting_for_input";
++}
++
++function isFreshTerminalNotification(updatedAt: string, nowMs: number): boolean {
++  const updatedAtMs = epochMillis(updatedAt);
++  return !Number.isNaN(updatedAtMs) && nowMs - updatedAtMs <= TERMINAL_NOTIFICATION_FRESHNESS_MS;
++}
++
++function alertAllowedForPhase(
++  preferences: RelayAgentAwarenessPreferences | null,
++  phase: string,
++): boolean {
++  if (preferences === null) return true;
++  switch (phase) {
++    case "waiting_for_approval":
++      return preferences.notifyOnApproval;
++    case "waiting_for_input":
++      return preferences.notifyOnInput;
++    case "completed":
++      return preferences.notifyOnCompletion;
++    case "failed":
++      return preferences.notifyOnFailure;
++    default:
++      return false;
++  }
++}
++
++function newlyTerminalRows(
++  previous: RelayAgentActivityAggregateState | null,
++  next: RelayAgentActivityAggregateState,
++  includeUnobserved: boolean,
++): ReadonlyArray<RelayAgentActivityAggregateRow> {
++  if (previous === null) return [];
++  const previousPhases = new Map(previous.activities.map((row) => [rowKey(row), row.phase]));
++  return next.activities.filter((row) => {
++    if (row.phase !== "completed" && row.phase !== "failed") return false;
++    const previousPhase = previousPhases.get(rowKey(row));
++    return (
++      (includeUnobserved || previousPhase !== undefined) &&
++      previousPhase !== "completed" &&
++      previousPhase !== "failed"
++    );
++  });
++}
++
++function alertForRows(rows: ReadonlyArray<RelayAgentActivityAggregateRow>) {
++  const first = rows[0];
++  if (!first) return null;
++  if (rows.length === 1) {
++    return { title: first.threadTitle, body: `${first.status}: ${first.projectTitle}` };
++  }
++  return {
++    title: `${rows.length} agents ${isAttentionPhase(first.phase) ? "need attention" : "finished"}`,
++    body: rows.map((row) => row.threadTitle).join(", "),
++  };
++}
++
++// A missing baseline is a replay, not a transition that should buzz the phone.
++function alertForTransition(input: {
++  readonly previous: RelayAgentActivityAggregateState | null;
++  readonly next: RelayAgentActivityAggregateState;
++  readonly preferences: RelayAgentAwarenessPreferences | null;
++  readonly nowMs: number;
++}): LiveActivityAlert | null {
++  if (input.previous === null) return null;
++  const previouslyAttention = new Set(
++    input.previous.activities.filter((row) => isAttentionPhase(row.phase)).map(rowKey),
++  );
++  const attention = input.next.activities.filter(
++    (row) =>
++      isAttentionPhase(row.phase) &&
++      !previouslyAttention.has(rowKey(row)) &&
++      alertAllowedForPhase(input.preferences, row.phase),
++  );
++  return (
++    alertForRows(attention) ??
++    alertForRows(
++      newlyTerminalRows(input.previous, input.next, true).filter(
++        (row) =>
++          alertAllowedForPhase(input.preferences, row.phase) &&
++          isFreshTerminalNotification(row.updatedAt, input.nowMs),
++      ),
++    )
++  );
++}
++
++function alertForTerminalAggregate(
++  aggregate: RelayAgentActivityAggregateState | null,
++  preferences: RelayAgentAwarenessPreferences | null,
++): LiveActivityAlert | null {
++  const row = aggregate?.activities[0];
++  if (!row || (row.phase !== "completed" && row.phase !== "failed")) return null;
++  return alertAllowedForPhase(preferences, row.phase) ? alertForRows([row]) : null;
++}
++
++function shouldAlertForActivity(input: {
++  readonly phase: RelayAgentActivityAggregateRow["phase"];
++  readonly updatedAt: string;
++  readonly preferences: RelayAgentAwarenessPreferences | null;
++  readonly nowMs: number;
++}): boolean {
++  return (
++    input.preferences?.notificationsEnabled === true &&
++    alertAllowedForPhase(input.preferences, input.phase) &&
++    ((input.phase !== "completed" && input.phase !== "failed") ||
++      isFreshTerminalNotification(input.updatedAt, input.nowMs))
++  );
++}
++
++export function notificationForAggregate(input: {
++  readonly device: DirectPushDevice;
++  readonly aggregate: RelayAgentActivityAggregateState | null;
++  readonly nowMs: number;
++}): NotificationPayload | null {
++  if (!input.device.pushToken || input.aggregate === null) return null;
++  const preferences = input.device.preferences;
++  if (!preferences.notificationsEnabled) return null;
++  const activity = input.aggregate.activities[0];
++  if (!activity) return null;
++  if (!shouldAlertForActivity({ ...activity, preferences, nowMs: input.nowMs })) return null;
++  const row = sanitizeRow(activity);
++  return {
++    title: row.threadTitle,
++    body: `${row.status}: ${row.projectTitle}`,
++    environmentId: row.environmentId,
++    threadId: row.threadId,
++    deepLink: row.deepLink,
++    phase: row.phase,
++    updatedAt: row.updatedAt,
++  };
++}
++
++function aggregateNeedsAttention(aggregate: RelayAgentActivityAggregateState): boolean {
++  return aggregate.activities.some((row) => isAttentionPhase(row.phase));
++}
++
++function shouldUpdateLiveActivity(input: {
++  readonly previous: RelayAgentActivityAggregateState | null;
++  readonly next: RelayAgentActivityAggregateState;
++  readonly lastDeliveryAt: string | null;
++  readonly nowMs: number;
++}): boolean {
++  if (!input.previous) return true;
++  if (JSON.stringify(input.previous) === JSON.stringify(input.next)) return false;
++  if (input.previous.activeCount !== input.next.activeCount) return true;
++  if (aggregateNeedsAttention(input.next)) return true;
++  // A thread finishing must never be throttled away.
++  if (newlyTerminalRows(input.previous, input.next, true).length > 0) return true;
++  const lastDeliveryAtMs = input.lastDeliveryAt === null ? null : epochMillis(input.lastDeliveryAt);
++  return (
++    lastDeliveryAtMs === null ||
++    Number.isNaN(lastDeliveryAtMs) ||
++    input.nowMs - lastDeliveryAtMs >= MIN_LIVE_ACTIVITY_UPDATE_INTERVAL_MS
++  );
++}
++
++// "suppressed": a Live Activity owns this state but no update is due; callers
++// must not fall back to an alert push or every republish would ring the device.
++function chooseLiveActivityDelivery(input: {
++  readonly device: DirectPushDevice;
++  readonly aggregate: RelayAgentActivityAggregateState | null;
++  readonly nowMs: number;
++  readonly replay: boolean;
++}): ChosenDelivery | "suppressed" | null {
++  const token = input.device.activityPushToken;
++  if (!input.device.preferences.liveActivitiesEnabled) {
++    return token ? { kind: "live_activity_end", token, aggregate: null, alert: null } : null;
++  }
++  // Activities are started by the app in the foreground, never remotely.
++  if (!token) return null;
++  if (input.aggregate === null) {
++    // Several servers can feed the same card. A server only ends a card it
++    // filled itself, so an idle server never ends another server's activity.
++    return input.device.lastAggregate === null
++      ? null
++      : { kind: "live_activity_end", token, aggregate: null, alert: null };
++  }
++  const previous = input.device.lastAggregate;
++  return shouldUpdateLiveActivity({
++    previous,
++    next: input.aggregate,
++    lastDeliveryAt: input.device.lastLiveActivityDeliveryAt,
++    nowMs: input.nowMs,
++  })
++    ? {
++        kind: "live_activity_update",
++        token,
++        aggregate: input.aggregate,
++        alert:
++          input.replay || !input.device.preferences.notificationsEnabled
++            ? null
++            : alertForTransition({
++                previous,
++                next: input.aggregate,
++                preferences: input.device.preferences,
++                nowMs: input.nowMs,
++              }),
++      }
++    : "suppressed";
++}
++
++/**
++ * Everything to send to one device for one published aggregate, in order. A
++ * Live Activity end that carries a companion push notification stays silent so
++ * the device buzzes once.
++ */
++export function chooseDeliveries(input: {
++  readonly device: DirectPushDevice;
++  readonly aggregate: RelayAgentActivityAggregateState | null;
++  readonly nowMs: number;
++  readonly replay: boolean;
++}): ReadonlyArray<ChosenDelivery> {
++  if (input.device.platform !== "ios") return [];
++  const liveActivity = chooseLiveActivityDelivery(input);
++  if (liveActivity === "suppressed") return [];
++  const notification = input.replay ? null : notificationForAggregate(input);
++  if (liveActivity === null) {
++    return notification && input.device.pushToken
++      ? [{ kind: "push_notification", token: input.device.pushToken, notification }]
++      : [];
++  }
++  if (liveActivity.kind !== "live_activity_end") return [liveActivity];
++  if (notification && input.device.pushToken) {
++    return [
++      { ...liveActivity, alert: null },
++      { kind: "push_notification", token: input.device.pushToken, notification },
++    ];
++  }
++  return [
++    {
++      ...liveActivity,
++      alert: input.replay
++        ? null
++        : alertForTerminalAggregate(liveActivity.aggregate, input.device.preferences),
++    },
++  ];
++}
++
++function alertPayload(alert: LiveActivityAlert) {
++  return { alert: { title: alert.title, body: alert.body, sound: "default" } };
++}
++
++export function makeApnsRequest(delivery: ChosenDelivery, nowEpochSeconds: number): ApnsRequest {
++  const timestamp = nowEpochSeconds;
++  switch (delivery.kind) {
++    case "live_activity_update":
++      return {
++        token: delivery.token,
++        pushType: "liveactivity",
++        // Alerting updates must land immediately; routine redraws stay low priority.
++        priority: delivery.alert ? "10" : "5",
++        payload: {
++          aps: {
++            timestamp,
++            event: "update",
++            ...(delivery.alert ? alertPayload(delivery.alert) : {}),
++            "content-state": {
++              name: LIVE_ACTIVITY_NAME,
++              props: JSON.stringify(sanitizeAggregate(delivery.aggregate)),
++            },
++            "stale-date": timestamp + STALE_AFTER_SECONDS,
++          },
++        },
++      };
++    case "live_activity_end":
++      return {
++        token: delivery.token,
++        pushType: "liveactivity",
++        priority: "10",
++        payload: {
++          aps: {
++            timestamp,
++            event: "end",
++            ...(delivery.aggregate
++              ? {
++                  "content-state": {
++                    name: LIVE_ACTIVITY_NAME,
++                    props: JSON.stringify(sanitizeAggregate(delivery.aggregate)),
++                  },
++                }
++              : {}),
++            ...(delivery.alert ? alertPayload(delivery.alert) : {}),
++            "dismissal-date":
++              timestamp +
++              (delivery.aggregate ? DISMISS_AFTER_SECONDS : CONTENTLESS_DISMISS_AFTER_SECONDS),
++          },
++        },
++      };
++    case "push_notification": {
++      const notification = delivery.notification;
++      return {
++        token: delivery.token,
++        pushType: "alert",
++        priority: "10",
++        payload: {
++          aps: {
++            alert: { title: notification.title, body: notification.body },
++            sound: "default",
++            // Notification Center stacks alerts by thread.
++            "thread-id":
++              notification.threadId.length > 0
++                ? `${notification.environmentId}/${notification.threadId}`
++                : "t3-agent-alerts",
++          },
++          environmentId: notification.environmentId,
++          threadId: notification.threadId,
++          deepLink: notification.deepLink,
++        },
++      };
++    }
++  }
++}
++
++export function isPermanentApnsTokenFailure(status: number, reason: string | null): boolean {
++  return (
++    status === 410 ||
++    (status === 400 && reason !== null && PERMANENT_APNS_TOKEN_REASONS.has(reason))
++  );
++}
+diff --git a/apps/server/src/environment/ServerEnvironment.ts b/apps/server/src/environment/ServerEnvironment.ts
+index 8e635f981..bc861da10 100644
+--- a/apps/server/src/environment/ServerEnvironment.ts
++++ b/apps/server/src/environment/ServerEnvironment.ts
+@@ -17,6 +17,7 @@ import packageJson from "../../package.json" with { type: "json" };
+ import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+ import { resolveServerInstallation } from "../cli/invocation.ts";
+ import { readAgentActivityPublishingActive } from "../cloud/config.ts";
++import { readDirectPushConfigured } from "../directPush/DirectPush.ts";
+ import { resolveServerSelfUpdateCapability } from "../cloud/selfUpdate.ts";
+ import { resolveServiceLauncherMode } from "../cloud/serviceLauncherClient.ts";
+ import * as ServerConfig from "../config.ts";
+@@ -272,7 +273,12 @@ export const make = Effect.gen(function* () {
+     // The publish opt-in and relay link change at runtime (`t3 connect
+     // publish`, the client settings toggle), so the capability is read per
+     // descriptor request rather than baked in at startup.
+-    getDescriptor: readAgentActivityPublishingActive(secrets).pipe(
++    // Direct push publishes without the relay, so it counts as publishing too.
++    getDescriptor: Effect.all([
++      readAgentActivityPublishingActive(secrets),
++      readDirectPushConfigured(secrets),
++    ]).pipe(
++      Effect.map(([relayPublishing, directPush]) => relayPublishing || directPush),
+       Effect.map((agentActivityPublishing) => ({
+         ...descriptor,
+         capabilities: { ...descriptor.capabilities, agentActivityPublishing },
+diff --git a/apps/server/src/observability/RpcInstrumentation.ts b/apps/server/src/observability/RpcInstrumentation.ts
+index 167ce8d11..4cde95132 100644
+--- a/apps/server/src/observability/RpcInstrumentation.ts
++++ b/apps/server/src/observability/RpcInstrumentation.ts
+@@ -82,6 +82,9 @@ const RPC_AGGREGATES = {
+   [WS_METHODS.serverRefreshUsageRates]: "server",
+   [WS_METHODS.serverSignalProcess]: "server",
+   [WS_METHODS.serverReportClientActivity]: "server",
++  [WS_METHODS.serverRegisterPushDevice]: "server",
++  [WS_METHODS.serverRegisterPushLiveActivity]: "server",
++  [WS_METHODS.serverGetPushActivitySnapshot]: "server",
+   [WS_METHODS.serverReportHostPowerState]: "server",
+   [WS_METHODS.serverGetBackgroundPolicy]: "server",
+   [WS_METHODS.scheduledTasksList]: "scheduledTasks",
+diff --git a/apps/server/src/relay/AgentAwarenessRelay.test.ts b/apps/server/src/relay/AgentAwarenessRelay.test.ts
+index 944f58c79..fb51aab44 100644
+--- a/apps/server/src/relay/AgentAwarenessRelay.test.ts
++++ b/apps/server/src/relay/AgentAwarenessRelay.test.ts
+@@ -34,6 +34,7 @@ import {
+   RELAY_ISSUER_SECRET,
+   RELAY_URL_SECRET,
+ } from "../cloud/config.ts";
++import * as DirectPush from "../directPush/DirectPush.ts";
+ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+ import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+@@ -144,6 +145,7 @@ const makeTestRelay = Effect.fnUntraced(function* (
+     /** Serves shells from this source instead of `currentShell`. */
+     readonly readShell?: (threadId: ThreadId) => Effect.Effect<OrchestrationV2ThreadShell | null>;
+     readonly domainEvents?: Stream.Stream<OrchestrationV2DomainEvent>;
++    readonly directPush?: DirectPush.DirectPush["Service"];
+   } = {},
+ ) {
+   const values = new Map<string, Uint8Array>(
+@@ -285,6 +287,10 @@ const makeTestRelay = Effect.fnUntraced(function* (
+     }),
+     Effect.provideService(FetchHttpClient.Fetch, fetch),
+     Effect.provide(NodeCrypto.layer),
++    (effect) =>
++      options.directPush === undefined
++        ? effect
++        : Effect.provideService(effect, DirectPush.DirectPush, options.directPush),
+   );
+   return { relay, secrets, secretReads, currentShell, shellReads, publications, catchUp };
+ });
+@@ -377,6 +383,47 @@ describe("AgentAwarenessRelay", () => {
+     }),
+   );
+ 
++  it.effect("publishes to direct push without a relay link", () =>
++    Effect.gen(function* () {
++      const direct: Array<RelayAgentActivityState | null> = [];
++      const { relay, publications } = yield* makeTestRelay({
++        linked: false,
++        directPush: {
++          isEnabled: Effect.succeed(true),
++          registerDevice: () => Effect.die("unused"),
++          registerLiveActivity: () => Effect.die("unused"),
++          snapshot: Effect.die("unused"),
++          publish: ({ state }) => Effect.sync(() => void direct.push(state)),
++        },
++      });
++      yield* relay.publishThread(THREAD_ID);
++      assert.equal(publications.length, 0);
++      assert.equal(direct.length, 1);
++      assert.equal(direct[0]?.threadId, THREAD_ID);
++      assert.equal(direct[0]?.phase, "running");
++    }),
++  );
++
++  it.effect("stays quiet without a relay link when direct push has no key", () =>
++    Effect.gen(function* () {
++      const direct: Array<RelayAgentActivityState | null> = [];
++      const { relay, publications, shellReads } = yield* makeTestRelay({
++        linked: false,
++        directPush: {
++          isEnabled: Effect.succeed(false),
++          registerDevice: () => Effect.die("unused"),
++          registerLiveActivity: () => Effect.die("unused"),
++          snapshot: Effect.die("unused"),
++          publish: ({ state }) => Effect.sync(() => void direct.push(state)),
++        },
++      });
++      yield* relay.publishThread(THREAD_ID);
++      assert.equal(publications.length, 0);
++      assert.equal(direct.length, 0);
++      assert.equal(shellReads.length, 0);
++    }),
++  );
++
+   it.effect("deduplicates state and republishes title changes", () =>
+     Effect.gen(function* () {
+       const { relay, currentShell, publications } = yield* makeTestRelay();
+diff --git a/apps/server/src/relay/AgentAwarenessRelay.ts b/apps/server/src/relay/AgentAwarenessRelay.ts
+index ae9d053ac..68016cd3e 100644
+--- a/apps/server/src/relay/AgentAwarenessRelay.ts
++++ b/apps/server/src/relay/AgentAwarenessRelay.ts
+@@ -46,6 +46,7 @@ import {
+   RELAY_URL_SECRET,
+ } from "../cloud/config.ts";
+ import { getOrCreateEnvironmentKeyPairFromSecretStore } from "../cloud/environmentKeys.ts";
++import * as DirectPush from "../directPush/DirectPush.ts";
+ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+ import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
+ import * as ProjectService from "../project/ProjectService.ts";
+@@ -379,6 +380,12 @@ export const make = Effect.gen(function* () {
+   // Holds at most one pending wake, so a burst of requests costs one retry.
+   const catchUpRequests = yield* Queue.dropping<void>(1);
+   const publishedStateByThreadRef = yield* Ref.make(new Map<ThreadId, string>());
++  // Direct push (an APNs key in the secret store) publishes without the relay.
++  const directPush = yield* Effect.serviceOption(DirectPush.DirectPush);
++  const readDirectPushEnabled = Option.match(directPush, {
++    onNone: () => Effect.succeed(false),
++    onSome: (service) => service.isEnabled,
++  });
+ 
+   const readSecretString = (name: string) =>
+     secrets
+@@ -444,8 +451,9 @@ export const make = Effect.gen(function* () {
+   });
+ 
+   const publishThreadUnsafe = Effect.fn("publishThreadUnsafe")(function* (threadId: ThreadId) {
++    const directPushEnabled = yield* readDirectPushEnabled;
+     const publishAgentActivity = yield* readPublishAgentActivityEnabled;
+-    if (!publishAgentActivity) {
++    if (!publishAgentActivity && !directPushEnabled) {
+       yield* cancelPublishRetries;
+       yield* resetPublishedConnection;
+       yield* Effect.logDebug("agent activity publish skipped; publication disabled", {
+@@ -453,8 +461,8 @@ export const make = Effect.gen(function* () {
+       });
+       return;
+     }
+-    const relayConfig = yield* readRelayConfig;
+-    if (!relayConfig) {
++    const relayConfig = publishAgentActivity ? yield* readRelayConfig : null;
++    if (!relayConfig && !directPushEnabled) {
+       yield* cancelPublishRetries;
+       yield* resetPublishedConnection;
+       yield* Effect.logDebug("agent activity publish skipped; relay link credentials unavailable", {
+@@ -463,9 +471,10 @@ export const make = Effect.gen(function* () {
+       return;
+     }
+     if (
+-      publishedRelayConfig?.url !== relayConfig.url ||
+-      publishedRelayConfig.issuer !== relayConfig.issuer ||
+-      publishedRelayConfig.environmentCredential !== relayConfig.environmentCredential
++      relayConfig &&
++      (publishedRelayConfig?.url !== relayConfig.url ||
++        publishedRelayConfig.issuer !== relayConfig.issuer ||
++        publishedRelayConfig.environmentCredential !== relayConfig.environmentCredential)
+     ) {
+       yield* resetPublishedConnection;
+       publishedRelayConfig = relayConfig;
+@@ -480,6 +489,10 @@ export const make = Effect.gen(function* () {
+       readonly reason: string;
+     }) =>
+       Effect.gen(function* () {
++        if (directPushEnabled && Option.isSome(directPush)) {
++          yield* directPush.value.publish({ threadId, state: input.state });
++        }
++        if (!relayConfig) return;
+         if (cachedRelayClient === undefined) {
+           cachedRelayClient = yield* makeRelayClient(relayConfig);
+         }
+@@ -707,26 +720,33 @@ export const make = Effect.gen(function* () {
+   // Publishes the active threads once. Returns why it did not, so the retry
+   // knows whether it is waiting on a link or on the publish setting.
+   const publishActiveThreadsUnsafe = Effect.gen(function* () {
+-    // One secret read settles the common never-linked case; the full link
+-    // config is read only once publishing is on.
+-    const relayUrl = yield* readSecretString(RELAY_URL_SECRET).pipe(
+-      Effect.orElseSucceed(() => null),
+-    );
+-    if (!relayUrl) {
+-      yield* Effect.logDebug("agent activity snapshot skipped; relay link credentials unavailable");
+-      return "unlinked" as const;
+-    }
+-    const publishAgentActivity = yield* readPublishAgentActivityEnabled.pipe(
+-      Effect.orElseSucceed(() => false),
+-    );
+-    if (!publishAgentActivity) {
+-      yield* Effect.logDebug("agent activity snapshot skipped; publication disabled");
+-      return "disabled" as const;
+-    }
+-    const relayConfig = yield* readRelayConfig.pipe(Effect.orElseSucceed(() => null));
+-    if (!relayConfig) {
+-      yield* Effect.logDebug("agent activity snapshot skipped; relay link credentials unavailable");
+-      return "unlinked" as const;
++    // Direct push needs no relay link; otherwise one secret read settles the
++    // common never-linked case and the full link config is read only once
++    // publishing is on.
++    if (!(yield* readDirectPushEnabled)) {
++      const relayUrl = yield* readSecretString(RELAY_URL_SECRET).pipe(
++        Effect.orElseSucceed(() => null),
++      );
++      if (!relayUrl) {
++        yield* Effect.logDebug(
++          "agent activity snapshot skipped; relay link credentials unavailable",
++        );
++        return "unlinked" as const;
++      }
++      const publishAgentActivity = yield* readPublishAgentActivityEnabled.pipe(
++        Effect.orElseSucceed(() => false),
++      );
++      if (!publishAgentActivity) {
++        yield* Effect.logDebug("agent activity snapshot skipped; publication disabled");
++        return "disabled" as const;
++      }
++      const relayConfig = yield* readRelayConfig.pipe(Effect.orElseSucceed(() => null));
++      if (!relayConfig) {
++        yield* Effect.logDebug(
++          "agent activity snapshot skipped; relay link credentials unavailable",
++        );
++        return "unlinked" as const;
++      }
+     }
+     const environmentId = yield* serverEnvironment.getEnvironmentId;
+     const [projectSnapshot, shellSnapshot] = yield* Effect.all([
+diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
+index 23981a932..c4e4f110c 100644
+--- a/apps/server/src/server.ts
++++ b/apps/server/src/server.ts
+@@ -79,6 +79,7 @@ import * as Keybindings from "./keybindings.ts";
+ import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
+ import * as ServerOwnership from "./serverOwnership.ts";
+ import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
++import * as DirectPush from "./directPush/DirectPush.ts";
+ import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
+ import * as ServerSettings from "./serverSettings.ts";
+ import * as ProjectEnrichmentService from "./project/ProjectEnrichmentService.ts";
+@@ -661,6 +662,9 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
+   Layer.provideMerge(layerRepositoryIdentityResolver),
+   Layer.provideMerge(layerServerEnvironment),
+   Layer.provideMerge(layerAuth),
++  // One direct-push instance: the activity publisher feeds it and the
++  // registration RPCs read the same in-memory activity.
++  Layer.provideMerge(DirectPush.layer),
+   Layer.provideMerge(ServerSecretStore.layer),
+   Layer.provideMerge(
+     Layer.mergeAll(
+diff --git a/apps/server/src/ws.ts b/apps/server/src/ws.ts
+index 96994ee37..a297f691b 100644
+--- a/apps/server/src/ws.ts
++++ b/apps/server/src/ws.ts
+@@ -216,6 +216,7 @@ import * as DirectEndpoints from "./environment/DirectEndpoints.ts";
+ import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
+ import * as DefectReporter from "./observability/DefectReporter.ts";
+ import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
++import * as DirectPush from "./directPush/DirectPush.ts";
+ import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
+ import { requiredScopeForDeviceList, rpcAuthorizationError } from "./auth/RpcAuthorization.ts";
+ import * as RpcAuthorization from "./auth/RpcAuthorization.ts";
+@@ -1305,6 +1306,7 @@ const layerWsRpc = (
+       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
+       const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
+       const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
++      const directPush = yield* Effect.serviceOption(DirectPush.DirectPush);
+       const rpcClientIds = yield* Ref.make(new Set<RpcClientId>());
+       yield* Effect.addFinalizer(() =>
+         Ref.get(rpcClientIds).pipe(
+@@ -2460,6 +2462,18 @@ const layerWsRpc = (
+               ),
+             ),
+           ),
++        [WS_METHODS.serverRegisterPushDevice]: (input) =>
++          Option.isSome(directPush)
++            ? directPush.value.registerDevice(input)
++            : Effect.succeed({ enabled: false }),
++        [WS_METHODS.serverRegisterPushLiveActivity]: (input) =>
++          Option.isSome(directPush)
++            ? directPush.value.registerLiveActivity(input)
++            : Effect.succeed({ enabled: false }),
++        [WS_METHODS.serverGetPushActivitySnapshot]: (_input) =>
++          Option.isSome(directPush)
++            ? directPush.value.snapshot.pipe(Effect.map((aggregate) => ({ aggregate })))
++            : Effect.succeed({ aggregate: null }),
+         [WS_METHODS.serverReportHostPowerState]: (input) =>
+           backgroundPolicy.reportHostPowerState(input),
+         [WS_METHODS.serverGetBackgroundPolicy]: (_input) => backgroundPolicy.snapshot,
+diff --git a/packages/contracts/src/rpc.ts b/packages/contracts/src/rpc.ts
+index 61304c52f..b4c1dc2a9 100644
+--- a/packages/contracts/src/rpc.ts
++++ b/packages/contracts/src/rpc.ts
+@@ -26,6 +26,11 @@ import * as Rpc from "effect/rpc/Rpc";
+ import * as RpcGroup from "effect/rpc/RpcGroup";
+ import * as RpcMiddleware from "effect/rpc/RpcMiddleware";
+ import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
++import {
++  RelayAgentActivitySnapshotResponse,
++  RelayDeviceRegistrationRequest,
++  RelayLiveActivityRegistrationRequest,
++} from "./relay.ts";
+ import {
+   CodexAuthCallbackInput,
+   CodexAuthCallbackState,
+@@ -507,6 +512,11 @@ export const WS_METHODS = {
+   serverSignalProcess: "server.signalProcess",
+   serverReportClientActivity: "server.reportClientActivity",
+   serverReportHostPowerState: "server.reportHostPowerState",
++  // Direct push: a client registers its APNs tokens with this server, which
++  // sends agent activity to APNs itself instead of through the T3 relay.
++  serverRegisterPushDevice: "server.registerPushDevice",
++  serverRegisterPushLiveActivity: "server.registerPushLiveActivity",
++  serverGetPushActivitySnapshot: "server.getPushActivitySnapshot",
+   serverGetBackgroundPolicy: "server.getBackgroundPolicy",
+   serverGetUsageSummary: "server.getUsageSummary",
+   serverRefreshUsageRates: "server.refreshUsageRates",
+@@ -939,6 +949,30 @@ const WsServerReportClientActivityRpc = Rpc.make(WS_METHODS.serverReportClientAc
+   error: EnvironmentAuthorizationError,
+ });
+ 
++export const DirectPushRegistrationResult = Schema.Struct({
++  /** False when this server has no APNs key, so it will not push. */
++  enabled: Schema.Boolean,
++});
++export type DirectPushRegistrationResult = typeof DirectPushRegistrationResult.Type;
++
++const WsServerRegisterPushDeviceRpc = Rpc.make(WS_METHODS.serverRegisterPushDevice, {
++  payload: RelayDeviceRegistrationRequest,
++  success: DirectPushRegistrationResult,
++  error: EnvironmentAuthorizationError,
++});
++
++const WsServerRegisterPushLiveActivityRpc = Rpc.make(WS_METHODS.serverRegisterPushLiveActivity, {
++  payload: RelayLiveActivityRegistrationRequest,
++  success: DirectPushRegistrationResult,
++  error: EnvironmentAuthorizationError,
++});
++
++const WsServerGetPushActivitySnapshotRpc = Rpc.make(WS_METHODS.serverGetPushActivitySnapshot, {
++  payload: Schema.Struct({}),
++  success: RelayAgentActivitySnapshotResponse,
++  error: EnvironmentAuthorizationError,
++});
++
+ const WsServerReportHostPowerStateRpc = Rpc.make(WS_METHODS.serverReportHostPowerState, {
+   payload: HostPowerSnapshot,
+   error: EnvironmentAuthorizationError,
+@@ -1937,6 +1971,9 @@ export const WsRpcGroup = RpcGroup.make(
+   WsScheduledTasksListWebhookDeliveriesRpc,
+   WsScheduledTasksGetWebhookDeliveryRpc,
+   WsServerReportClientActivityRpc,
++  WsServerRegisterPushDeviceRpc,
++  WsServerRegisterPushLiveActivityRpc,
++  WsServerGetPushActivitySnapshotRpc,
+   WsServerReportHostPowerStateRpc,
+   WsServerGetBackgroundPolicyRpc,
+   WsCloudGetRelayClientStatusRpc,

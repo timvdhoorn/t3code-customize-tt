@@ -1,0 +1,3054 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: timvdhoorn <timvdhoorn@gmail.com>
+Date: Thu, 15 Oct 2026 20:14:40 +0200
+Subject: [PATCH] feat(mobile): show stats for nerds in the composer
+
+---
+ .../settings/SettingsThreadsRouteScreen.tsx   |  26 +
+ .../src/features/threads/ComposerStats.tsx    | 565 ++++++++++++++++
+ .../src/features/threads/ThreadComposer.tsx   |   3 +
+ .../features/threads/ThreadDetailScreen.tsx   |  40 +-
+ .../features/threads/ThreadRouteScreen.tsx    |   1 +
+ apps/mobile/src/lib/storage.test.ts           |  10 +
+ .../src/persistence/mobile-preferences.ts     |   6 +
+ apps/mobile/src/state/use-composer-stats.ts   |  42 ++
+ .../src/state/use-thread-composer-state.ts    |  40 ++
+ apps/web/src/components/ChatView.tsx          |  64 +-
+ apps/web/src/components/chat/ChatComposer.tsx |   2 +-
+ .../chat/ComposerPrimaryActions.tsx           |   2 +-
+ .../components/chat/ComposerStats.logic.ts    | 303 +--------
+ .../web/src/components/chat/ComposerStats.tsx |  57 +-
+ .../components/chat/ContextWindowMeter.tsx    |   5 +-
+ apps/web/src/lib/contextWindow.ts             | 180 +-----
+ packages/client-runtime/package.json          |   8 +
+ .../src/state/composerStats.test.ts           | 608 ++++++++++++++++++
+ .../client-runtime/src/state/composerStats.ts | 424 ++++++++++++
+ .../src/state/contextWindow.test.ts           | 158 +++++
+ .../client-runtime/src/state/contextWindow.ts | 179 ++++++
+ 21 files changed, 2145 insertions(+), 578 deletions(-)
+ create mode 100644 apps/mobile/src/features/threads/ComposerStats.tsx
+ create mode 100644 apps/mobile/src/state/use-composer-stats.ts
+ create mode 100644 packages/client-runtime/src/state/composerStats.test.ts
+ create mode 100644 packages/client-runtime/src/state/composerStats.ts
+ create mode 100644 packages/client-runtime/src/state/contextWindow.test.ts
+ create mode 100644 packages/client-runtime/src/state/contextWindow.ts
+
+diff --git a/apps/mobile/src/features/settings/SettingsThreadsRouteScreen.tsx b/apps/mobile/src/features/settings/SettingsThreadsRouteScreen.tsx
+index 047f28e5f..c57334c8a 100644
+--- a/apps/mobile/src/features/settings/SettingsThreadsRouteScreen.tsx
++++ b/apps/mobile/src/features/settings/SettingsThreadsRouteScreen.tsx
+@@ -47,6 +47,7 @@ export function SettingsThreadsRouteScreen() {
+           contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 18) + 18 }}
+         >
+           <AutoSettleSettingsRows />
++          <ComposerSettingsSection />
+           <BetaSettingsSection />
+           <LegacySettingsSection />
+         </ScrollView>
+@@ -260,6 +261,31 @@ function AutoSettleSettingsRows() {
+   );
+ }
+ 
++/** Device-local counterpart of web's Settings → General → Stats for nerds. */
++function ComposerSettingsSection() {
++  const savePreferences = useAtomSet(updateMobilePreferencesAtom);
++  const preferences = useAtomValue(mobilePreferencesAtom);
++  const statsForNerdsEnabled =
++    AsyncResult.isSuccess(preferences) && preferences.value.statsForNerdsEnabled === true;
++
++  return (
++    <View className="gap-3">
++      <SettingsSection title="Composer">
++        <SettingsSwitchRow
++          icon="chart.bar.xaxis"
++          label="Stats for nerds"
++          value={statsForNerdsEnabled}
++          onValueChange={(value) => savePreferences({ statsForNerdsEnabled: value })}
++        />
++      </SettingsSection>
++      <Text className="px-2 text-sm text-foreground-muted">
++        Show reported context, main-agent turn tokens, cache rate, and elapsed time below the
++        composer. Available stats depend on the provider.
++      </Text>
++    </View>
++  );
++}
++
+ /**
+  * Device-local beta toggles, the counterpart of web's Working section (beta)
+  * in Settings → General.
+diff --git a/apps/mobile/src/features/threads/ComposerStats.tsx b/apps/mobile/src/features/threads/ComposerStats.tsx
+new file mode 100644
+index 000000000..825e50838
+--- /dev/null
++++ b/apps/mobile/src/features/threads/ComposerStats.tsx
+@@ -0,0 +1,565 @@
++import {
++  COMPOSER_STATS_CLOCK_MS,
++  composerLimitDisplay,
++  composerLimitsFreshness,
++  composerLimitSourceLabel,
++  deriveContextCompaction,
++  deriveResponseRate,
++  deriveTurnCachePercentage,
++  deriveTurnElapsedMs,
++  formatCachePercentage,
++  formatResponseRateText,
++  formatStatCount,
++  formatUsageTimestamp,
++  selectComposerLimitWindows,
++  toneOf,
++  usageReadingLabel,
++  type ComposerStatsData,
++  type ComposerStatsTone,
++} from "@t3tools/client-runtime/state/composer-stats";
++import { formatContextWindowTokens } from "@t3tools/client-runtime/state/context-window";
++import { formatDuration } from "@t3tools/shared/orchestrationTiming";
++import { formatResetsIn } from "@t3tools/shared/usageLimits";
++import * as DateTime from "effect/DateTime";
++import { Fragment, useEffect, useState, type ReactNode } from "react";
++import { Pressable, ScrollView, View } from "react-native";
++import { useSafeAreaInsets } from "react-native-safe-area-context";
++
++import { AppSheet } from "../../components/AppSheet";
++import { AppText as Text } from "../../components/AppText";
++import { ListRowLayout } from "../../components/ListRowLayout";
++import { ListSection } from "../../components/ListSection";
++import { RowPressable } from "../../components/RowPressable";
++import { cn } from "../../lib/cn";
++
++/** Height the stats row adds under the composer surface. */
++export const COMPOSER_STATS_ROW_HEIGHT = 22;
++
++type SheetKind = "limits" | "turn" | "context";
++
++const TONE_TEXT: Record<ComposerStatsTone, string> = {
++  normal: "text-foreground",
++  warning: "text-warning-foreground",
++  critical: "text-danger-foreground",
++};
++const TONE_FILL: Record<ComposerStatsTone, string> = {
++  normal: "bg-foreground-muted",
++  warning: "bg-warning-foreground",
++  critical: "bg-danger-foreground",
++};
++
++const TABULAR = { fontVariant: ["tabular-nums" as const] };
++
++function useStatsClock(fast: boolean): number {
++  const [now, setNow] = useState(Date.now);
++  useEffect(() => {
++    setNow(Date.now());
++    const timer = setInterval(() => setNow(Date.now()), fast ? 1000 : COMPOSER_STATS_CLOCK_MS);
++    return () => clearInterval(timer);
++  }, [fast]);
++  return now;
++}
++
++function StatText(props: { readonly children: ReactNode; readonly className?: string }) {
++  return (
++    <Text className={cn("text-xs text-foreground-muted", props.className)} style={TABULAR}>
++      {props.children}
++    </Text>
++  );
++}
++
++function Chip(props: {
++  readonly label: string;
++  readonly onPress: () => void;
++  readonly children: ReactNode;
++}) {
++  return (
++    <Pressable
++      accessibilityRole="button"
++      accessibilityLabel={props.label}
++      hitSlop={{ top: 8, bottom: 8, left: 4, right: 4 }}
++      onPress={props.onPress}
++      className="flex-row items-center gap-1 active:opacity-60"
++    >
++      {props.children}
++    </Pressable>
++  );
++}
++
++function Meter(props: {
++  readonly label: string;
++  readonly percent: number;
++  readonly displayPercent: number | null;
++  readonly percentText: string;
++  readonly dimmed: boolean;
++}) {
++  const tone = toneOf(props.percent);
++  return (
++    <View className={cn("flex-row items-center gap-1.5", props.dimmed && "opacity-50")}>
++      <StatText>{props.label}</StatText>
++      <View className="h-[3px] w-7 overflow-hidden rounded-full bg-foreground/10">
++        <View
++          className={cn("h-full", props.dimmed ? "bg-foreground-muted" : TONE_FILL[tone])}
++          style={{
++            width: `${props.displayPercent === null ? 0 : Math.max(0, Math.min(100, props.displayPercent))}%`,
++          }}
++        />
++      </View>
++      <StatText className={props.dimmed ? undefined : TONE_TEXT[tone]}>
++        {props.percentText}
++      </StatText>
++    </View>
++  );
++}
++
++function Bar(props: { readonly percent: number; readonly dimmed?: boolean }) {
++  return (
++    <View
++      className={cn(
++        "mx-4 mb-3 h-2 overflow-hidden rounded-full bg-foreground/10",
++        props.dimmed && "opacity-50",
++      )}
++    >
++      <View
++        className="h-full bg-foreground-muted"
++        style={{ width: `${Math.max(0, Math.min(100, props.percent))}%` }}
++      />
++    </View>
++  );
++}
++
++function Separated(props: { readonly children: ReadonlyArray<ReactNode> }) {
++  return (
++    <>
++      {props.children.map((child, index) => (
++        <Fragment key={index}>
++          {index > 0 ? <View className="ml-4 h-px bg-border" /> : null}
++          {child}
++        </Fragment>
++      ))}
++    </>
++  );
++}
++
++function Detail(props: { readonly label: string; readonly value: string }) {
++  return <ListRowLayout label={props.label} detail={props.value} />;
++}
++
++function Note(props: { readonly children: ReactNode }) {
++  return <Text className="px-4 text-sm text-foreground-muted">{props.children}</Text>;
++}
++
++function SheetBody(props: { readonly children: ReactNode }) {
++  const insets = useSafeAreaInsets();
++  return (
++    <ScrollView
++      contentInsetAdjustmentBehavior="automatic"
++      contentContainerClassName="gap-4 px-5 pt-4"
++      contentContainerStyle={{ paddingBottom: Math.max(20, insets.bottom) }}
++    >
++      {props.children}
++    </ScrollView>
++  );
++}
++
++function LimitsSheet(props: {
++  readonly limits: NonNullable<ComposerStatsData["usageLimits"]>;
++  readonly now: number;
++  readonly onClose: () => void;
++}) {
++  const { limits, providerName } = props.limits;
++  const chips = selectComposerLimitWindows(limits);
++  const freshness = composerLimitsFreshness(
++    chips.map(({ window }) => window.checkedAt ?? limits.checkedAt),
++    props.now,
++  );
++  return (
++    <AppSheet title="Usage limits" onClose={props.onClose}>
++      <SheetBody>
++        {limits.windows.map((window) => {
++          const display = composerLimitDisplay(window, limits.checkedAt, props.now);
++          const resets = display.resetPending
++            ? window.resetsAt
++              ? `Reset at ${formatUsageTimestamp(window.resetsAt)}, waiting for a new reading`
++              : "Waiting for a new reading"
++            : formatResetsIn(window, props.now);
++          return (
++            <ListSection key={window.id}>
++              <ListRowLayout
++                label={window.label}
++                detail={
++                  display.resetPending
++                    ? "0% used"
++                    : display.freshness.status === "expired"
++                      ? "—"
++                      : `${Math.round(window.usedPercent)}% used`
++                }
++              />
++              <Bar percent={display.displayPercent ?? 0} dimmed={display.dimmed} />
++              <View className="gap-1 px-4 pb-3">
++                <StatText>{usageReadingLabel(window, limits.checkedAt, props.now)}</StatText>
++                {resets ? <StatText>{resets}</StatText> : null}
++              </View>
++            </ListSection>
++          );
++        })}
++        <Note>
++          {providerName}. Usage comes from account and turn readings, with CLI estimates filling
++          gaps. Stale values show their age; readings older than 15 minutes are hidden.
++          {freshness.ageMins === null
++            ? " Check time unavailable."
++            : ` Checked ${freshness.ageMins === 0 ? "just now" : `${freshness.ageMins} min ago`}.`}{" "}
++          At reset time a window shows 0% until a new reading arrives.
++        </Note>
++      </SheetBody>
++    </AppSheet>
++  );
++}
++
++function TurnSheet(props: {
++  readonly turn: NonNullable<ComposerStatsData["turn"]>;
++  readonly now: number;
++  readonly onClose: () => void;
++}) {
++  const { turn } = props;
++  const rateText = formatResponseRateText(turn);
++  const estimated = turn.responseThroughput?.basis === "codex_active_windows_estimate";
++  const usage = turn.turnTokenUsage;
++  const available = usage?.usageStatus !== "unavailable" ? usage : undefined;
++  const cache = deriveTurnCachePercentage(available);
++  const elapsed = deriveTurnElapsedMs(turn, props.now);
++  const throughput = turn.responseThroughput;
++  return (
++    <AppSheet
++      title={`${turn.status === "running" ? "Current" : "Latest"} turn`}
++      onClose={props.onClose}
++    >
++      <SheetBody>
++        <ListSection>
++          <Separated>
++            {[
++              <Detail key="status" label="Status" value={turn.status} />,
++              ...(rateText !== null
++                ? [<Detail key="rate" label="Output rate" value={`${rateText} tok/s`} />]
++                : []),
++              ...(elapsed !== null
++                ? [
++                    <Detail
++                      key="elapsed"
++                      label="Elapsed wall time"
++                      value={formatDuration(elapsed)}
++                    />,
++                  ]
++                : []),
++              ...(cache !== null
++                ? [<Detail key="cache" label="Cached input" value={formatCachePercentage(cache)} />]
++                : []),
++              <Detail
++                key="in"
++                label="Input tokens"
++                value={formatStatCount(available?.inputTokens)}
++              />,
++              <Detail
++                key="reads"
++                label="Cache reads"
++                value={formatStatCount(available?.cachedInputTokens)}
++              />,
++              <Detail
++                key="writes"
++                label="Cache writes"
++                value={formatStatCount(available?.cacheCreationTokens)}
++              />,
++              <Detail
++                key="out"
++                label="Output tokens"
++                value={formatStatCount(available?.outputTokens)}
++              />,
++              <Detail
++                key="reasoning"
++                label="Reasoning tokens"
++                value={formatStatCount(available?.reasoningTokens)}
++              />,
++            ]}
++          </Separated>
++        </ListSection>
++        <Note>
++          Main-agent turn only. Input includes cache reads and writes; output includes reasoning.
++          Elapsed time includes tools and waits. Child-agent usage is excluded.
++          {usage?.hasSubagents ? " This turn used subagents." : ""}
++          {available?.usageStatus === "partial"
++            ? " Partial report: counts cover only the usage this provider reported."
++            : ""}
++        </Note>
++        {rateText !== null ? (
++          <Note>
++            {estimated
++              ? "Output rate: Codex-reported turn output tokens, including reasoning and tool arguments, divided by estimated response-active time. Silent reasoning, queue time and tool argument generation may be missed."
++              : "Output rate: Claude-reported output tokens, including reasoning and tool arguments, divided by observed response start-to-stop time. Includes network, buffering and server-side waits; excludes local tool waits between responses."}
++            {throughput?.partial ? " Partial coverage: some activity could not be measured." : ""}
++          </Note>
++        ) : null}
++      </SheetBody>
++    </AppSheet>
++  );
++}
++
++function ContextSheet(props: {
++  readonly stats: ComposerStatsData;
++  readonly onCompact: () => void;
++  readonly compactDisabled: boolean;
++  readonly compactDisabledReason: string | null;
++  readonly isCompacting: boolean;
++  readonly onClose: () => void;
++}) {
++  const { context, compactions } = props.stats;
++  const compaction = deriveContextCompaction(
++    context,
++    props.stats.contextDriver,
++    props.stats.configuredClaudeThreshold,
++  );
++  const compactBlocked = props.compactDisabled || props.isCompacting;
++  return (
++    <AppSheet title="Context usage" onClose={props.onClose}>
++      <SheetBody>
++        <ListSection>
++          <ListRowLayout
++            label="Context window"
++            detail={
++              context?.usedPercentage != null
++                ? `${Math.round(context.usedPercentage)}% of window`
++                : "Not reported"
++            }
++          />
++          {context?.usedPercentage != null ? <Bar percent={context.usedPercentage} /> : null}
++          <Separated>
++            {[
++              <Detail
++                key="used"
++                label="Used tokens"
++                value={context ? formatStatCount(context.usedTokens) : "Not reported"}
++              />,
++              <Detail
++                key="size"
++                label="Window size"
++                value={formatStatCount(context?.maxTokens ?? undefined)}
++              />,
++              <Detail
++                key="remaining"
++                label="Window remaining"
++                value={formatStatCount(context?.remainingTokens ?? undefined)}
++              />,
++              <Detail key="auto" label="Auto-compact" value={compaction.status} />,
++              ...(compaction.threshold !== null
++                ? [
++                    <Detail
++                      key="threshold"
++                      label={
++                        compaction.source === "configured"
++                          ? "Configured threshold"
++                          : "Reported threshold"
++                      }
++                      value={`${formatStatCount(compaction.threshold)} tokens`}
++                    />,
++                    <Detail
++                      key="toThreshold"
++                      label="Tokens to threshold"
++                      value={
++                        compaction.remainingTokens === null
++                          ? "Not reported"
++                          : formatStatCount(compaction.remainingTokens)
++                      }
++                    />,
++                  ]
++                : []),
++              <Detail
++                key="count"
++                label="Recorded compactions"
++                value={String(compactions.length)}
++              />,
++            ]}
++          </Separated>
++        </ListSection>
++        {compaction.source === "configured" ? (
++          <Note>
++            Claude's current setting applies when a query starts. A running query may use an earlier
++            setting. Tokens to threshold use the latest context report, not a countdown.
++          </Note>
++        ) : null}
++        {compactions.length > 0 ? (
++          <ListSection title="Recent compactions">
++            <Separated>
++              {compactions.slice(-3).map((item) => (
++                <ListRowLayout
++                  key={item.id}
++                  label={`${
++                    item.beforeTokenCount !== undefined
++                      ? formatContextWindowTokens(item.beforeTokenCount)
++                      : "Unknown"
++                  } → ${
++                    item.afterTokenCount !== undefined
++                      ? formatContextWindowTokens(item.afterTokenCount)
++                      : "Unknown"
++                  } tokens`}
++                  detail={
++                    item.completedAt != null
++                      ? new Date(DateTime.toEpochMillis(item.completedAt)).toLocaleTimeString([], {
++                          hour: "numeric",
++                          minute: "2-digit",
++                        })
++                      : undefined
++                  }
++                />
++              ))}
++            </Separated>
++          </ListSection>
++        ) : null}
++        <ListSection
++          footer={
++            props.compactDisabled && !props.isCompacting
++              ? (props.compactDisabledReason ?? undefined)
++              : undefined
++          }
++        >
++          <RowPressable
++            accessibilityRole="button"
++            accessibilityState={{ disabled: compactBlocked }}
++            disabled={compactBlocked}
++            onPress={() => {
++              props.onCompact();
++              props.onClose();
++            }}
++            className="bg-grouped-card"
++          >
++            <ListRowLayout
++              icon="arrow.down.right.and.arrow.up.left"
++              label={props.isCompacting ? "Compacting…" : "Compact now"}
++              disabled={compactBlocked}
++            />
++          </RowPressable>
++        </ListSection>
++        <Note>
++          {context
++            ? "Latest provider report, not a live token estimate or a quality score."
++            : "This provider has not reported context occupancy yet."}{" "}
++          Compactions count completed events in the loaded main-agent history for this provider
++          session.
++          {context ? ` Reported ${new Date(context.updatedAt).toLocaleString()}.` : ""}
++        </Note>
++      </SheetBody>
++    </AppSheet>
++  );
++}
++
++/** Touch version of web's "Stats for nerds" line under the composer. */
++export function ComposerStats(props: {
++  readonly stats: ComposerStatsData;
++  readonly onCompact: () => void;
++  readonly compactDisabled: boolean;
++  readonly compactDisabledReason: string | null;
++  readonly isCompacting: boolean;
++}) {
++  const { stats } = props;
++  const { context, turn, compactions, usageLimits } = stats;
++  const [sheet, setSheet] = useState<SheetKind | null>(null);
++  const now = useStatsClock(turn?.status === "running");
++  const compaction = deriveContextCompaction(
++    context,
++    stats.contextDriver,
++    stats.configuredClaudeThreshold,
++  );
++  const responseRate = deriveResponseRate(turn);
++  const rateText = formatResponseRateText(turn, responseRate);
++  const usage = turn?.turnTokenUsage;
++  const available = usage?.usageStatus !== "unavailable" ? usage : undefined;
++  const cache = deriveTurnCachePercentage(available);
++  const hasElapsed =
++    turn !== null &&
++    turn.startedAt !== null &&
++    (turn.status === "running" || deriveTurnElapsedMs(turn, 0) !== null);
++  const hasTokens = available?.inputTokens !== undefined || available?.outputTokens !== undefined;
++  const limitChips = selectComposerLimitWindows(usageLimits?.limits);
++  const showContext =
++    context !== null || compactions.length > 0 || !props.compactDisabled || props.isCompacting;
++  const showTurn = turn !== null && (hasElapsed || hasTokens || rateText !== null);
++  if (!showContext && !showTurn && cache === null && limitChips.length === 0) return null;
++
++  return (
++    <>
++      <View
++        accessibilityLabel="Stats for nerds"
++        className="flex-row flex-wrap items-center gap-x-4 px-1 pt-1"
++        style={{ minHeight: COMPOSER_STATS_ROW_HEIGHT }}
++      >
++        {usageLimits && limitChips.length > 0 ? (
++          <Chip label="Usage limit details" onPress={() => setSheet("limits")}>
++            <View className="flex-row items-center gap-x-4">
++              {limitChips.map(({ window, shortLabel }) => {
++                const display = composerLimitDisplay(window, usageLimits.limits.checkedAt, now);
++                return (
++                  <Meter
++                    key={window.id}
++                    label={shortLabel}
++                    percent={window.usedPercent}
++                    displayPercent={display.displayPercent}
++                    percentText={display.percentText}
++                    dimmed={display.dimmed}
++                  />
++                );
++              })}
++            </View>
++          </Chip>
++        ) : null}
++        <View className="ml-auto flex-row flex-wrap items-center gap-x-2.5">
++          {showContext ? (
++            <Chip label="Context usage details" onPress={() => setSheet("context")}>
++              {context?.usedPercentage != null ? (
++                <StatText className={TONE_TEXT[toneOf(compaction.pressurePercentage)]}>
++                  {Math.round(context.usedPercentage)}%
++                </StatText>
++              ) : (
++                <StatText className="text-foreground">
++                  {context ? formatContextWindowTokens(context.usedTokens) : "—"}
++                </StatText>
++              )}
++              <StatText>context</StatText>
++            </Chip>
++          ) : null}
++          {showTurn ? (
++            <Chip label="Turn token details" onPress={() => setSheet("turn")}>
++              {rateText !== null ? (
++                <>
++                  <StatText className="text-foreground">{rateText}</StatText>
++                  <StatText>tok/s{turn?.responseThroughput?.partial ? " partial" : ""}</StatText>
++                </>
++              ) : (
++                <StatText>Tokens</StatText>
++              )}
++            </Chip>
++          ) : null}
++          {cache !== null ? (
++            <Chip label="Cache details" onPress={() => setSheet("turn")}>
++              <StatText className="text-foreground">{formatCachePercentage(cache)}</StatText>
++              <StatText>cached</StatText>
++            </Chip>
++          ) : null}
++        </View>
++      </View>
++      {sheet === "limits" && usageLimits ? (
++        <LimitsSheet limits={usageLimits} now={now} onClose={() => setSheet(null)} />
++      ) : null}
++      {sheet === "turn" && turn ? (
++        <TurnSheet turn={turn} now={now} onClose={() => setSheet(null)} />
++      ) : null}
++      {sheet === "context" ? (
++        <ContextSheet
++          stats={stats}
++          onCompact={props.onCompact}
++          compactDisabled={props.compactDisabled}
++          compactDisabledReason={props.compactDisabledReason}
++          isCompacting={props.isCompacting}
++          onClose={() => setSheet(null)}
++        />
++      ) : null}
++    </>
++  );
++}
+diff --git a/apps/mobile/src/features/threads/ThreadComposer.tsx b/apps/mobile/src/features/threads/ThreadComposer.tsx
+index a45f31942..e5e1d40f8 100644
+--- a/apps/mobile/src/features/threads/ThreadComposer.tsx
++++ b/apps/mobile/src/features/threads/ThreadComposer.tsx
+@@ -160,6 +160,8 @@ export interface ThreadComposerProps {
+   readonly selectedThread: EnvironmentThreadShell;
+   readonly reportedModelSelection?: ModelSelection | null;
+   readonly hasCompactableConversation: boolean;
++  /** Rendered under the composer surface, above the bottom inset (the stats line). */
++  readonly footer?: ReactNode;
+   readonly serverConfig: T3ServerConfig | null;
+   readonly queueCount: number;
+   readonly activeThreadBusy: boolean;
+@@ -1204,6 +1206,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
+             This connection cannot control this task. You can still edit your draft.
+           </Text>
+         ) : null}
++        {props.footer}
+       </Animated.View>
+ 
+       <VideoPreviewModal source={previewVideo} onRequestClose={closePreview} />
+diff --git a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
+index 1707debb9..fe9cb2a5d 100644
+--- a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
++++ b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
+@@ -144,6 +144,9 @@ import {
+   ThreadComposer,
+ } from "./ThreadComposer";
+ import { ComposerPopoverHost } from "./ComposerPopoverHost";
++import { composerCompactDisabledReason } from "@t3tools/client-runtime/state/composer-stats";
++import { ComposerStats, COMPOSER_STATS_ROW_HEIGHT } from "./ComposerStats";
++import { useComposerStats } from "../../state/use-composer-stats";
+ import { ThreadFeed, type ThreadFeedHistoryControls } from "./ThreadFeed";
+ import { useThreadTurnSubagents } from "./ThreadAgentsSheet";
+ import { ComposerQueuedEditBanner } from "./ComposerQueuedEdit";
+@@ -229,6 +232,8 @@ export interface ThreadDetailScreenProps {
+   readonly onRemoveDraftImage: (imageId: string) => void;
+   readonly onStopThread: () => void;
+   readonly onSendMessage: (followUp?: ActiveTurnComposerAction) => Promise<MessageId | null>;
++  /** Sends "/compact" without touching the draft. */
++  readonly onCompactContext: () => void;
+   readonly onReconnectEnvironment: () => void;
+   /** Whether the model picker may offer providers other than this thread's. */
+   readonly canSwitchThreadProvider: boolean;
+@@ -586,7 +591,14 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
+     ) ||
+     (props.historyControls?.hasMoreHistory === true &&
+       props.selectedThread.latestUserMessageAt !== null);
+-  const composerChrome = composerExpanded ? COMPOSER_EXPANDED_CHROME : COMPOSER_COLLAPSED_CHROME;
++  const composerStatsData = useComposerStats({
++    serverConfig: props.serverConfig,
++    instanceId: props.selectedThread.modelSelection.instanceId,
++  });
++  const composerStatsVisible = composerStatsData !== null && !isProviderSubagent;
++  const composerChrome =
++    (composerExpanded ? COMPOSER_EXPANDED_CHROME : COMPOSER_COLLAPSED_CHROME) +
++    (composerStatsVisible ? COMPOSER_STATS_ROW_HEIGHT : 0);
+   const composerOverlapHeight = composerChrome + composerBottomInset;
+   // While a user-input request is pending, the questionnaire owns the
+   // composer slot outright: expanded it is the full card, collapsed it is a
+@@ -1440,6 +1452,32 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
+                         hasCompactableConversation={
+                           hasCompactableConversation && !props.isCompacting
+                         }
++                        footer={
++                          composerStatsVisible ? (
++                            <ComposerStats
++                              stats={composerStatsData}
++                              onCompact={props.onCompactContext}
++                              isCompacting={props.isCompacting}
++                              compactDisabled={
++                                !hasCompactableConversation ||
++                                props.activeThreadBusy ||
++                                props.activePendingApproval !== null ||
++                                props.activePendingUserInput !== null ||
++                                !props.canOperateThread
++                              }
++                              compactDisabledReason={composerCompactDisabledReason({
++                                hasPendingApproval: props.activePendingApproval !== null,
++                                hasPendingUserInput: props.activePendingUserInput !== null,
++                                isWorking: props.activeThreadBusy,
++                                fallback: !props.canOperateThread
++                                  ? "This connection cannot control this task."
++                                  : !hasCompactableConversation
++                                    ? "Nothing to compact yet."
++                                    : null,
++                              })}
++                            />
++                          ) : null
++                        }
+                         serverConfig={props.serverConfig}
+                         queueCount={props.selectedThreadQueueCount}
+                         activeThreadBusy={props.activeThreadBusy}
+diff --git a/apps/mobile/src/features/threads/ThreadRouteScreen.tsx b/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
+index 348f73777..f1020e1b8 100644
+--- a/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
++++ b/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
+@@ -1066,6 +1066,7 @@ function ThreadRouteContent(
+           serverConfig={serverConfig}
+           onStopThread={awaitingBootstrapTurn ? handleCancelWorktreeSetup : handleStopThread}
+           onSendMessage={composer.onSendMessage}
++          onCompactContext={composer.onCompactContext}
+           onReconnectEnvironment={handleReconnectEnvironment}
+           canSwitchThreadProvider={composer.canSwitchThreadProvider}
+           onUpdateThreadModelSelection={composer.onUpdateModelSelection}
+diff --git a/apps/mobile/src/lib/storage.test.ts b/apps/mobile/src/lib/storage.test.ts
+index b9f7a17b4..8aa03e229 100644
+--- a/apps/mobile/src/lib/storage.test.ts
++++ b/apps/mobile/src/lib/storage.test.ts
+@@ -261,6 +261,16 @@ describe("mobile connection storage", () => {
+     });
+   });
+ 
++  it("persists the stats for nerds preference and drops a non-boolean value", async () => {
++    await expect(savePreferencesPatch({ statsForNerdsEnabled: true })).resolves.toEqual({
++      statsForNerdsEnabled: true,
++    });
++    await expect(loadPreferences()).resolves.toEqual({ statsForNerdsEnabled: true });
++
++    mocks.setPreferencesJson(JSON.stringify({ statsForNerdsEnabled: "yes" }), Date.now() + 60_000);
++    await expect(loadPreferences()).resolves.toEqual({});
++  });
++
+   it("drops legacy and invalid thread list shelf expansion preferences", async () => {
+     mocks.setPreferencesJson(
+       JSON.stringify({
+diff --git a/apps/mobile/src/persistence/mobile-preferences.ts b/apps/mobile/src/persistence/mobile-preferences.ts
+index 808383183..c148c354c 100644
+--- a/apps/mobile/src/persistence/mobile-preferences.ts
++++ b/apps/mobile/src/persistence/mobile-preferences.ts
+@@ -83,6 +83,8 @@ export interface Preferences {
+   readonly planModeEnabled?: boolean;
+   /** Device-local counterpart of web's `sidebarWorkingShelfEnabled` beta. */
+   readonly workingShelfEnabled?: boolean;
++  /** Device-local counterpart of web's `statsForNerdsEnabled`; off by default. */
++  readonly statsForNerdsEnabled?: boolean;
+   /** @deprecated Retained to migrate favorites to the connected environment. */
+   readonly modelFavorites?: ReadonlyArray<{
+     readonly provider: ProviderInstanceId;
+@@ -157,6 +159,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
+     projectGroupingMode?: SidebarProjectGroupingMode;
+     planModeEnabled?: boolean;
+     workingShelfEnabled?: boolean;
++    statsForNerdsEnabled?: boolean;
+     modelFavorites?: Preferences["modelFavorites"];
+     threadListSettledShelfExpanded?: boolean;
+     threadListSnoozedShelfExpanded?: boolean;
+@@ -257,6 +260,9 @@ function sanitizePreferences(parsed: Preferences): Preferences {
+   if (typeof parsed.workingShelfEnabled === "boolean") {
+     preferences.workingShelfEnabled = parsed.workingShelfEnabled;
+   }
++  if (typeof parsed.statsForNerdsEnabled === "boolean") {
++    preferences.statsForNerdsEnabled = parsed.statsForNerdsEnabled;
++  }
+   if (Array.isArray(parsed.modelFavorites)) {
+     preferences.modelFavorites = parsed.modelFavorites.filter(
+       (favorite) =>
+diff --git a/apps/mobile/src/state/use-composer-stats.ts b/apps/mobile/src/state/use-composer-stats.ts
+new file mode 100644
+index 000000000..c8207d610
+--- /dev/null
++++ b/apps/mobile/src/state/use-composer-stats.ts
+@@ -0,0 +1,42 @@
++import { useAtomValue } from "@effect/atom-react";
++import { useMemo } from "react";
++import { AsyncResult } from "effect/reactivity";
++import type { ServerConfig as T3ServerConfig } from "@t3tools/contracts";
++import {
++  deriveComposerStats,
++  type ComposerStatsData,
++} from "@t3tools/client-runtime/state/composer-stats";
++
++import { mobilePreferencesAtom } from "./preferences";
++import { useSelectedThreadProjection } from "./use-thread-detail";
++
++/**
++ * The stats line's data for the selected thread, or null while "Stats for nerds"
++ * is off. Usage limits come from the provider instance the thread runs on.
++ */
++export function useComposerStats(input: {
++  readonly serverConfig: T3ServerConfig | null;
++  readonly instanceId: string;
++}): ComposerStatsData | null {
++  const preferences = useAtomValue(mobilePreferencesAtom);
++  const enabled =
++    AsyncResult.isSuccess(preferences) && preferences.value.statsForNerdsEnabled === true;
++  const selected = useSelectedThreadProjection();
++  const projection = selected?.projection ?? null;
++  const { serverConfig, instanceId } = input;
++  return useMemo(() => {
++    if (!enabled) return null;
++    const provider = serverConfig?.providers.find((entry) => entry.instanceId === instanceId);
++    const usageLimits = provider?.usageLimits
++      ? {
++          limits: provider.usageLimits,
++          providerName: provider.displayName?.trim() || provider.instanceId,
++        }
++      : null;
++    return deriveComposerStats(
++      projection,
++      serverConfig?.settings.providerInstances ?? {},
++      usageLimits,
++    );
++  }, [enabled, projection, serverConfig, instanceId]);
++}
+diff --git a/apps/mobile/src/state/use-thread-composer-state.ts b/apps/mobile/src/state/use-thread-composer-state.ts
+index 623eff1b0..6b6254ace 100644
+--- a/apps/mobile/src/state/use-thread-composer-state.ts
++++ b/apps/mobile/src/state/use-thread-composer-state.ts
+@@ -770,6 +770,45 @@ export function useThreadComposerState() {
+     ],
+   );
+ 
++  /** Sends "/compact" the way the slash command does, leaving the user's draft untouched. */
++  const onCompactContext = useCallback(() => {
++    if (
++      !selectedThreadShell ||
++      selectedThreadCreation !== null ||
++      selectedEnvironmentRuntime?.connectionState !== "connected" ||
++      !readEnvironmentScope(selectedThreadShell.environmentId, AuthOrchestrationOperateScope)
++    )
++      return;
++    const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
++    const draft = getComposerDraftSnapshot(threadKey);
++    const modelSelection = draft.modelSelection ?? selectedThreadShell.modelSelection;
++    const provider = selectedEnvironmentRuntime.serverConfig?.providers.find(
++      (entry) => entry.instanceId === modelSelection.instanceId,
++    );
++    const metadata = makeQueuedMessageMetadata();
++    clearThreadComposerError(threadKey);
++    void enqueueThreadOutboxMessage({
++      environmentId: selectedThreadShell.environmentId,
++      threadId: selectedThreadShell.id,
++      messageId: MessageId.make(metadata.messageId),
++      commandId: CommandId.make(metadata.commandId),
++      text: "/compact",
++      attachments: [],
++      modelSelection,
++      runtimeMode: draft.runtimeMode ?? selectedThreadShell.runtimeMode,
++      interactionMode: resolveProviderInteractionMode(
++        provider,
++        draft.interactionMode ?? selectedThreadShell.interactionMode,
++      ),
++      createdAt: metadata.createdAt,
++    }).catch((error: unknown) => {
++      setThreadComposerError(
++        threadKey,
++        error instanceof Error ? error.message : "Failed to save the queued message.",
++      );
++    });
++  }, [selectedEnvironmentRuntime, selectedThreadCreation, selectedThreadShell]);
++
+   const onChangeDraftMessage = useCallback(
+     (value: string) => {
+       if (!selectedThreadShell) {
+@@ -1115,6 +1154,7 @@ export function useThreadComposerState() {
+     onNativePasteText,
+     onRemoveDraftImage,
+     onSendMessage,
++    onCompactContext,
+     onUpdateModelSelection,
+     onUpdateRuntimeMode,
+     onUpdateInteractionMode,
+diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
+index 2bcddefbb..2133ca868 100644
+--- a/apps/web/src/components/ChatView.tsx
++++ b/apps/web/src/components/ChatView.tsx
+@@ -501,7 +501,10 @@ import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
+ import { ThreadStatusLine } from "./chat/ThreadStatusLine";
+ import { formatRelativeTimeLabel, formatRelativeTimeUntilLabel } from "../timestampFormat";
+ import { ComposerStats } from "./chat/ComposerStats";
+-import { selectComposerStatsTurns, selectRecordedCompactions } from "./chat/ComposerStats.logic";
++import {
++  composerCompactDisabledReason,
++  deriveComposerStats,
++} from "@t3tools/client-runtime/state/composer-stats";
+ import { ComposerSurface } from "./chat/ComposerSurface";
+ import { resolveThreadSyncPhase } from "../threadSync";
+ import {
+@@ -512,7 +515,7 @@ import {
+ import {
+   deriveLatestContextWindowSnapshot,
+   latestProviderTurnTokenUsage,
+-} from "../lib/contextWindow";
++} from "@t3tools/client-runtime/state/context-window";
+ import {
+   DRAFT_HERO_TRANSITION_ANIMATION_ID,
+   DRAFT_HERO_TRANSITION_EASING,
+@@ -3727,45 +3730,11 @@ export default function ChatView(props: ChatViewProps) {
+     activeProviderStatus?.displayName?.trim() || activeProviderStatus?.instanceId || "";
+   const composerStats = useMemo(() => {
+     if (!settings.statsForNerdsEnabled) return null;
+-    const usageLimits = activeUsageLimits
+-      ? { limits: activeUsageLimits, providerName: activeProviderName }
+-      : null;
+-    if (!serverProjection)
+-      return {
+-        turn: null,
+-        compactions: [],
+-        context: null,
+-        usageLimits,
+-        contextDriver: undefined,
+-        configuredClaudeThreshold: undefined,
+-      };
+-    const turns = selectComposerStatsTurns(serverProjection);
+-    const contextUsage = turns.findLast((turn) => turn.tokenUsage !== undefined)?.tokenUsage;
+-    const providerThread = serverProjection.providerThreads.find(
+-      (thread) => thread.id === serverProjection.thread.activeProviderThreadId,
++    return deriveComposerStats(
++      serverProjection,
++      settings.providerInstances,
++      activeUsageLimits ? { limits: activeUsageLimits, providerName: activeProviderName } : null,
+     );
+-    const providerConfig = providerThread
+-      ? settings.providerInstances[providerThread.providerInstanceId]?.config
+-      : undefined;
+-    const configuredClaudeThreshold =
+-      providerConfig !== null &&
+-      typeof providerConfig === "object" &&
+-      "autoCompactWindow" in providerConfig
+-        ? providerConfig.autoCompactWindow
+-        : undefined;
+-    const compactions = selectRecordedCompactions(serverProjection.turnItems, turns);
+-    return {
+-      turn: turns.at(-1) ?? null,
+-      compactions,
+-      usageLimits,
+-      contextDriver: providerThread?.driver,
+-      configuredClaudeThreshold,
+-      context: deriveLatestContextWindowSnapshot(
+-        compactions.map((item) => ({ item })),
+-        contextUsage,
+-        providerThread,
+-      ),
+-    };
+   }, [
+     settings.statsForNerdsEnabled,
+     settings.providerInstances,
+@@ -11778,15 +11747,12 @@ export default function ChatView(props: ChatViewProps) {
+                           {...composerStats}
+                           onCompact={() => composerRef.current?.compactContext()}
+                           compactDisabled={compactDisabled}
+-                          compactDisabledReason={
+-                            pendingApprovals.length > 0
+-                              ? "Resolve the pending approval first."
+-                              : pendingUserInputs.length > 0
+-                                ? "Answer the pending question first."
+-                                : isWorking
+-                                  ? "Wait for the current turn to finish."
+-                                  : compactDisabledReason
+-                          }
++                          compactDisabledReason={composerCompactDisabledReason({
++                            hasPendingApproval: pendingApprovals.length > 0,
++                            hasPendingUserInput: pendingUserInputs.length > 0,
++                            isWorking,
++                            fallback: compactDisabledReason,
++                          })}
+                           isCompacting={isCompacting}
+                         />
+                       )}
+diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
+index 5f775123d..90fd0775e 100644
+--- a/apps/web/src/components/chat/ChatComposer.tsx
++++ b/apps/web/src/components/chat/ChatComposer.tsx
+@@ -1142,7 +1142,7 @@ import {
+   resolveComposerDispatchMode,
+   type ComposerDispatchMode,
+ } from "@t3tools/client-runtime/state/composer-dispatch";
+-import type { ContextWindowSnapshot } from "../../lib/contextWindow";
++import type { ContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
+ import {
+   getProviderSlashCommandsForSlashMenu,
+   getProviderSkillsForSlashMenu,
+diff --git a/apps/web/src/components/chat/ComposerPrimaryActions.tsx b/apps/web/src/components/chat/ComposerPrimaryActions.tsx
+index fc811118a..e9b34d9ad 100644
+--- a/apps/web/src/components/chat/ComposerPrimaryActions.tsx
++++ b/apps/web/src/components/chat/ComposerPrimaryActions.tsx
+@@ -3,7 +3,7 @@ import { CheckIcon, ChevronDownIcon, ChevronLeftIcon, Minimize2Icon, PlayIcon }
+ import { CornerUpRight, ListPlus } from "lucide";
+ import { MorphIcon } from "~/components/MorphIcon";
+ import { useEnvironmentIdentificationMode } from "~/hooks/useSettings";
+-import { formatContextWindowTokens } from "~/lib/contextWindow";
++import { formatContextWindowTokens } from "@t3tools/client-runtime/state/context-window";
+ import { cn } from "~/lib/utils";
+ import { useShortcutModifierState } from "../../shortcutModifierState";
+ import { StageBackdropButtonArt, useSidebarStageBackdropVariant } from "../SidebarStageBackdrop";
+diff --git a/apps/web/src/components/chat/ComposerStats.logic.ts b/apps/web/src/components/chat/ComposerStats.logic.ts
+index 6e7ed5e4c..f9196990b 100644
+--- a/apps/web/src/components/chat/ComposerStats.logic.ts
++++ b/apps/web/src/components/chat/ComposerStats.logic.ts
+@@ -1,302 +1 @@
+-import type {
+-  OrchestrationV2ProviderTurn,
+-  OrchestrationV2ThreadProjection,
+-  OrchestrationV2TurnItem,
+-  ServerProviderUsageLimits,
+-  ServerProviderUsageWindow,
+-  TurnTokenUsage,
+-} from "@t3tools/contracts";
+-import * as DateTime from "effect/DateTime";
+-import type { ContextWindowSnapshot } from "~/lib/contextWindow";
+-
+-/** Provider turn ordinals are scoped to a provider thread; children have their own nodes. */
+-export function selectComposerStatsTurns(projection: {
+-  readonly thread: Pick<OrchestrationV2ThreadProjection["thread"], "activeProviderThreadId">;
+-  readonly nodes: ReadonlyArray<
+-    Pick<OrchestrationV2ThreadProjection["nodes"][number], "id" | "kind" | "parentNodeId">
+-  >;
+-  readonly providerTurns: ReadonlyArray<OrchestrationV2ProviderTurn>;
+-}): ReadonlyArray<OrchestrationV2ProviderTurn> {
+-  const mainNodes = new Set(
+-    projection.nodes
+-      .filter((node) => node.kind === "root_turn" && node.parentNodeId === null)
+-      .map((node) => node.id),
+-  );
+-  return projection.providerTurns
+-    .filter(
+-      (turn) =>
+-        turn.providerThreadId === projection.thread.activeProviderThreadId &&
+-        mainNodes.has(turn.nodeId),
+-    )
+-    .toSorted((a, b) => a.ordinal - b.ordinal);
+-}
+-
+-/** Cache reads are a subset of normalized input (which includes cache writes). */
+-export function deriveTurnCachePercentage(usage: TurnTokenUsage | undefined): number | null {
+-  if (
+-    usage === undefined ||
+-    usage.usageStatus === "unavailable" ||
+-    usage.inputTokens === undefined ||
+-    usage.inputTokens <= 0 ||
+-    usage.cachedInputTokens === undefined ||
+-    usage.cachedInputTokens > usage.inputTokens
+-  ) {
+-    return null;
+-  }
+-  return (usage.cachedInputTokens / usage.inputTokens) * 100;
+-}
+-
+-/**
+- * One decimal, truncated: 99.96% reads 99.9%, so 100% means every input token was cached.
+- * The epsilon keeps exact tenths (99.8) from flooring to the tenth below.
+- */
+-export function formatCachePercentage(percentage: number): string {
+-  if (percentage >= 100) return "100%";
+-  if (percentage <= 0) return "0%";
+-  return `${(Math.floor(percentage * 10 + 1e-9) / 10).toFixed(1)}%`;
+-}
+-
+-/** Wall time includes tools and waits. It must never be used as generation time for TPS. */
+-export function deriveTurnElapsedMs(
+-  turn: Pick<OrchestrationV2ProviderTurn, "status" | "startedAt" | "completedAt">,
+-  nowMs: number,
+-): number | null {
+-  if (turn.startedAt === null) return null;
+-  const end =
+-    turn.status === "running"
+-      ? nowMs
+-      : turn.completedAt === null
+-        ? null
+-        : DateTime.toEpochMillis(turn.completedAt);
+-  const start = DateTime.toEpochMillis(turn.startedAt);
+-  return end !== null && Number.isFinite(end) && end >= start ? end - start : null;
+-}
+-
+-/** These are observed completed events, not a lifetime count for a provider. */
+-export function selectRecordedCompactions(
+-  items: ReadonlyArray<OrchestrationV2TurnItem>,
+-  turns: ReadonlyArray<OrchestrationV2ProviderTurn>,
+-): ReadonlyArray<Extract<OrchestrationV2TurnItem, { type: "compaction" }>> {
+-  const nodes = new Set(turns.map((turn) => turn.nodeId));
+-  const threads = new Set(turns.map((turn) => turn.providerThreadId));
+-  const turnIds = new Set(turns.map((turn) => turn.id));
+-  const nativeAcpTurns = new Set(
+-    items
+-      .filter(
+-        (item) =>
+-          item.type === "compaction" &&
+-          item.status === "completed" &&
+-          item.nativeItemRef?.nativeId?.startsWith("acp-compaction:"),
+-      )
+-      .map((item) => item.providerTurnId),
+-  );
+-  const seen = new Set<string>();
+-  return items
+-    .filter((item): item is Extract<OrchestrationV2TurnItem, { type: "compaction" }> => {
+-      if (
+-        item.type !== "compaction" ||
+-        item.status !== "completed" ||
+-        !(
+-          (item.nodeId !== null && nodes.has(item.nodeId)) ||
+-          (item.providerTurnId !== null && turnIds.has(item.providerTurnId))
+-        ) ||
+-        item.providerThreadId === null ||
+-        !threads.has(item.providerThreadId) ||
+-        // ACP may report the native event as well as a synthetic /compact completion.
+-        (item.providerTurnId !== null &&
+-          nativeAcpTurns.has(item.providerTurnId) &&
+-          item.nativeItemRef?.strength === "weak" &&
+-          item.nativeItemRef.nativeId?.endsWith(":compaction")) ||
+-        seen.has(item.id)
+-      )
+-        return false;
+-      seen.add(item.id);
+-      return true;
+-    })
+-    .toSorted((a, b) => DateTime.toEpochMillis(a.updatedAt) - DateTime.toEpochMillis(b.updatedAt));
+-}
+-
+-/** Persisted provider telemetry is independent of whole-turn wall time. */
+-export function deriveResponseRate(turn: OrchestrationV2ProviderTurn | null): number | null {
+-  const throughput = turn?.responseThroughput;
+-  if (
+-    !(
+-      (turn?.nativeTurnRef?.driver === "claudeAgent" &&
+-        (throughput?.basis === undefined || throughput.basis === "claude_observed")) ||
+-      (turn?.nativeTurnRef?.driver === "codex" &&
+-        throughput?.basis === "codex_active_windows_estimate")
+-    ) ||
+-    throughput === undefined ||
+-    throughput.responseCount <= 0 ||
+-    !Number.isSafeInteger(throughput.responseCount) ||
+-    !Number.isSafeInteger(throughput.outputTokens) ||
+-    throughput.outputTokens < 0 ||
+-    !Number.isFinite(throughput.elapsedMs) ||
+-    throughput.elapsedMs <= 0
+-  )
+-    return null;
+-  return throughput.outputTokens / (throughput.elapsedMs / 1000);
+-}
+-
+-function windowShortLabel(window: ServerProviderUsageWindow): string {
+-  const mins = window.windowDurationMins;
+-  if (mins !== undefined && mins > 0) {
+-    if (mins % 10_080 === 0) return mins === 10_080 ? "Week" : `${mins / 10_080}wk`;
+-    if (mins % 1_440 === 0) return `${mins / 1_440}d`;
+-    if (mins % 60 === 0) return `${mins / 60}h`;
+-    return `${mins}m`;
+-  }
+-  return window.kind === "session" ? "Session" : window.kind === "weekly" ? "Week" : window.label;
+-}
+-
+-/**
+- * The account-wide session and weekly windows for the inline stats line, in
+- * that order. Model-scoped weeklies stay in the popover; providers list the
+- * account-wide window of each kind first.
+- */
+-export function selectComposerLimitWindows(
+-  limits: ServerProviderUsageLimits | undefined,
+-): ReadonlyArray<{ readonly window: ServerProviderUsageWindow; readonly shortLabel: string }> {
+-  if (!limits || limits.unavailable?.reason === "unsupported") return [];
+-  return (["session", "weekly"] as const).flatMap((kind) => {
+-    const window = limits.windows.find((candidate) => candidate.kind === kind);
+-    return window ? [{ window, shortLabel: windowShortLabel(window) }] : [];
+-  });
+-}
+-
+-export const COMPOSER_STATS_CLOCK_MS = 30_000;
+-
+-/** Age of the newest valid fetch among the displayed windows. */
+-export function composerLimitsFreshness(
+-  checkedAts: ReadonlyArray<string | undefined>,
+-  nowMs: number,
+-): {
+-  readonly status: "fresh" | "stale" | "expired";
+-  readonly ageMins: number | null;
+-  readonly checkedAt: string | undefined;
+-} {
+-  const times = checkedAts.flatMap((checkedAt) => {
+-    const time = checkedAt === undefined ? NaN : Date.parse(checkedAt);
+-    // The render clock can trail a newly received fetch by one interval.
+-    return Number.isFinite(time) && time <= nowMs + COMPOSER_STATS_CLOCK_MS
+-      ? [{ time, checkedAt }]
+-      : [];
+-  });
+-  const newest = times.toSorted((a, b) => b.time - a.time)[0];
+-  if (!newest) return { status: "expired", ageMins: null, checkedAt: undefined };
+-  const ageMs = Math.max(0, nowMs - newest.time);
+-  return {
+-    status: ageMs <= 3 * 60_000 ? "fresh" : ageMs <= 15 * 60_000 ? "stale" : "expired",
+-    ageMins: Math.floor(ageMs / 60_000),
+-    checkedAt: newest.checkedAt,
+-  };
+-}
+-
+-export function composerLimitResetPending(
+-  window: Pick<ServerProviderUsageWindow, "resetPending" | "resetsAt">,
+-  nowMs: number,
+-): boolean {
+-  if (window.resetPending === true) return true;
+-  if (window.resetsAt === undefined) return false;
+-  const resetMs = Date.parse(window.resetsAt);
+-  return Number.isFinite(resetMs) && resetMs <= nowMs;
+-}
+-
+-export function composerLimitSourceLabel(
+-  source: ServerProviderUsageWindow["source"],
+-): "account" | "turn" | "CLI estimate" {
+-  return source === "account" ? "account" : source === "turn" ? "turn" : "CLI estimate";
+-}
+-
+-export function composerLimitDisplay(
+-  window: ServerProviderUsageWindow,
+-  fallbackCheckedAt: string | undefined,
+-  nowMs: number,
+-): {
+-  readonly freshness: ReturnType<typeof composerLimitsFreshness>;
+-  readonly resetPending: boolean;
+-  readonly displayPercent: number | null;
+-  readonly percentText: string;
+-  readonly dimmed: boolean;
+-} {
+-  const freshness = composerLimitsFreshness([window.checkedAt ?? fallbackCheckedAt], nowMs);
+-  const resetPending = composerLimitResetPending(window, nowMs);
+-  if (resetPending) {
+-    return {
+-      freshness,
+-      resetPending: true,
+-      displayPercent: 0,
+-      percentText: "0%",
+-      dimmed: true,
+-    };
+-  }
+-  if (freshness.status === "expired") {
+-    return {
+-      freshness,
+-      resetPending: false,
+-      displayPercent: null,
+-      percentText: "—",
+-      dimmed: true,
+-    };
+-  }
+-  const age =
+-    freshness.status === "stale" && freshness.ageMins !== null ? ` · ${freshness.ageMins}m` : "";
+-  return {
+-    freshness,
+-    resetPending: false,
+-    displayPercent: window.usedPercent,
+-    percentText: `${Math.round(window.usedPercent)}%${age}`,
+-    dimmed: freshness.status !== "fresh",
+-  };
+-}
+-
+-/** A configured limit is a launch setting, not proof of the running query's limit. */
+-export function deriveContextCompaction(
+-  context: Pick<
+-    ContextWindowSnapshot,
+-    "usedTokens" | "usedPercentage" | "autoCompactThreshold" | "compactsAutomatically"
+-  > | null,
+-  driver: string | undefined,
+-  configuredClaudeThreshold: unknown,
+-) {
+-  const configured =
+-    driver === "claudeAgent" &&
+-    typeof configuredClaudeThreshold === "string" &&
+-    /^\d+$/.test(configuredClaudeThreshold.trim())
+-      ? Number(configuredClaudeThreshold)
+-      : null;
+-  const validConfigured =
+-    configured !== null && configured >= 100_000 && configured <= 1_000_000 ? configured : null;
+-  const reported = context?.autoCompactThreshold;
+-  const validReported =
+-    context?.compactsAutomatically !== false &&
+-    typeof reported === "number" &&
+-    Number.isFinite(reported) &&
+-    reported > 0
+-      ? reported
+-      : null;
+-  const threshold =
+-    context?.compactsAutomatically === false ? null : (validReported ?? validConfigured);
+-  const source = threshold === null ? null : validReported !== null ? "reported" : "configured";
+-  const usedTokens = context?.usedTokens;
+-  const remainingTokens =
+-    threshold !== null && usedTokens !== undefined ? Math.max(0, threshold - usedTokens) : null;
+-  const thresholdPercentage =
+-    threshold !== null && usedTokens !== undefined ? (usedTokens / threshold) * 100 : null;
+-  const pressurePercentage = Math.max(context?.usedPercentage ?? 0, thresholdPercentage ?? 0);
+-  const status =
+-    context?.compactsAutomatically === false
+-      ? "Reported off"
+-      : threshold !== null
+-        ? source === "reported"
+-          ? "Provider reported"
+-          : "Claude setting"
+-        : driver === "claudeAgent"
+-          ? "Managed by Claude (threshold not reported)"
+-          : driver === "codex"
+-            ? "Managed by Codex (threshold not reported)"
+-            : context?.compactsAutomatically === true
+-              ? "On (threshold not reported)"
+-              : "Not reported";
+-  return { threshold, source, remainingTokens, thresholdPercentage, pressurePercentage, status };
+-}
++export * from "@t3tools/client-runtime/state/composer-stats";
+diff --git a/apps/web/src/components/chat/ComposerStats.tsx b/apps/web/src/components/chat/ComposerStats.tsx
+index 53b81a83a..02888a823 100644
+--- a/apps/web/src/components/chat/ComposerStats.tsx
++++ b/apps/web/src/components/chat/ComposerStats.tsx
+@@ -9,7 +9,10 @@ import { formatResetsIn } from "@t3tools/shared/usageLimits";
+ import * as DateTime from "effect/DateTime";
+ import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
+ 
+-import { type ContextWindowSnapshot, formatContextWindowTokens } from "~/lib/contextWindow";
++import {
++  type ContextWindowSnapshot,
++  formatContextWindowTokens,
++} from "@t3tools/client-runtime/state/context-window";
+ import { Button } from "../ui/button";
+ import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
+ import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+@@ -24,8 +27,14 @@ import {
+   deriveTurnCachePercentage,
+   formatCachePercentage,
+   deriveTurnElapsedMs,
++  formatStatCount,
++  formatResponseRateText,
++  formatUsageTimestamp,
+   selectComposerLimitWindows,
+-} from "./ComposerStats.logic";
++  toneOf,
++  usageReadingLabel,
++  type ComposerStatsTone as Tone,
++} from "@t3tools/client-runtime/state/composer-stats";
+ 
+ function ElapsedTime({ turn }: { turn: OrchestrationV2ProviderTurn }) {
+   const textRef = useRef<HTMLSpanElement>(null);
+@@ -65,12 +74,6 @@ function ContextBar({ percentage }: { percentage: number }) {
+   );
+ }
+ 
+-type Tone = "normal" | "warning" | "critical";
+-
+-function toneOf(usedPercent: number): Tone {
+-  return usedPercent >= 90 ? "critical" : usedPercent >= 75 ? "warning" : "normal";
+-}
+-
+ const TONE_TEXT: Record<Tone, string> = {
+   normal: "text-foreground/80",
+   warning: "text-warning",
+@@ -124,36 +127,6 @@ function Meter({
+   );
+ }
+ 
+-function formatUsageTimestamp(value: string | undefined): string {
+-  if (value === undefined) return "unknown time";
+-  const timeMs = Date.parse(value);
+-  if (!Number.isFinite(timeMs)) return "unknown time";
+-  return new Intl.DateTimeFormat(undefined, {
+-    month: "short",
+-    day: "numeric",
+-    hour: "numeric",
+-    minute: "2-digit",
+-  }).format(new Date(timeMs));
+-}
+-
+-function usageReadingLabel(
+-  window: ServerProviderUsageWindow,
+-  fallbackCheckedAt: string | undefined,
+-  now: number,
+-): string {
+-  const checkedAt = window.checkedAt ?? fallbackCheckedAt;
+-  const freshness = composerLimitsFreshness([checkedAt], now);
+-  const age =
+-    freshness.ageMins === null
+-      ? "age unknown"
+-      : freshness.ageMins === 0
+-        ? "just now"
+-        : `${freshness.ageMins}m ago`;
+-  return `as of ${formatUsageTimestamp(checkedAt)} (${age}) · ${composerLimitSourceLabel(
+-    window.source,
+-  )}`;
+-}
+-
+ /** Ages and reset countdowns share the summary clock while the popover is open. */
+ function UsageLimitRows({
+   windows,
+@@ -320,14 +293,10 @@ export function ComposerStats({
+     compactDisabled
+   )
+     return null;
+-  const count = (value: number | undefined) =>
+-    value === undefined ? "Not reported" : value.toLocaleString("en-US");
++  const count = formatStatCount;
+   const stats: Array<{ key: string; node: ReactNode }> = [];
+   const throughput = turn?.responseThroughput;
+-  const rateText =
+-    responseRate === null
+-      ? null
+-      : `${estimated ? "≈" : ""}${responseRate.toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
++  const rateText = formatResponseRateText(turn, responseRate);
+   // T3 already shows turn time inline in the timeline, so the line shows tok/s and
+   // keeps elapsed time in the details popover.
+   if (turn !== null && (hasElapsed || hasTokens || rateText !== null)) {
+diff --git a/apps/web/src/components/chat/ContextWindowMeter.tsx b/apps/web/src/components/chat/ContextWindowMeter.tsx
+index 5c9fc8bb7..12ed7c05d 100644
+--- a/apps/web/src/components/chat/ContextWindowMeter.tsx
++++ b/apps/web/src/components/chat/ContextWindowMeter.tsx
+@@ -1,5 +1,8 @@
+ import { Button } from "../ui/button";
+-import { type ContextWindowSnapshot, formatContextWindowTokens } from "~/lib/contextWindow";
++import {
++  type ContextWindowSnapshot,
++  formatContextWindowTokens,
++} from "@t3tools/client-runtime/state/context-window";
+ import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
+ import {
+   formatContextWindowCompactionMessage,
+diff --git a/apps/web/src/lib/contextWindow.ts b/apps/web/src/lib/contextWindow.ts
+index 1eca0df91..b4e8bb564 100644
+--- a/apps/web/src/lib/contextWindow.ts
++++ b/apps/web/src/lib/contextWindow.ts
+@@ -1,179 +1 @@
+-import type {
+-  OrchestrationV2ProviderTurn,
+-  OrchestrationV2ProviderTurnTokenUsage,
+-  OrchestrationV2ProviderThread,
+-  OrchestrationV2TurnItem,
+-  ThreadTokenUsageSnapshot,
+-} from "@t3tools/contracts";
+-import * as DateTime from "effect/DateTime";
+-
+-function asFiniteNumber(value: unknown): number | null {
+-  return typeof value === "number" && Number.isFinite(value) ? value : null;
+-}
+-
+-type NullableContextWindowUsage = {
+-  readonly [Key in keyof ThreadTokenUsageSnapshot]: undefined extends ThreadTokenUsageSnapshot[Key]
+-    ? Exclude<ThreadTokenUsageSnapshot[Key], undefined> | null
+-    : ThreadTokenUsageSnapshot[Key];
+-};
+-
+-export type ContextWindowSnapshot = NullableContextWindowUsage & {
+-  readonly remainingTokens: number | null;
+-  readonly usedPercentage: number | null;
+-  readonly remainingPercentage: number | null;
+-  readonly updatedAt: string;
+-};
+-
+-/** Newest usage report across a thread's provider turns. Snapshots order turns
+-    by provider thread, not time, so pick by timestamp. */
+-export function latestProviderTurnTokenUsage(
+-  turns: ReadonlyArray<Pick<OrchestrationV2ProviderTurn, "tokenUsage">>,
+-): OrchestrationV2ProviderTurnTokenUsage | null {
+-  let latest: OrchestrationV2ProviderTurnTokenUsage | null = null;
+-  for (const { tokenUsage } of turns) {
+-    if (tokenUsage === undefined) continue;
+-    // Ties go to the later entry, since live upserts append.
+-    if (latest === null || Date.parse(tokenUsage.updatedAt) >= Date.parse(latest.updatedAt)) {
+-      latest = tokenUsage;
+-    }
+-  }
+-  return latest;
+-}
+-
+-/** Prefers the provider's live usage report (#8144); falls back to the last compaction item. */
+-export function deriveLatestContextWindowSnapshot(
+-  entries: ReadonlyArray<{
+-    readonly item: OrchestrationV2TurnItem;
+-  }>,
+-  liveUsage?: OrchestrationV2ProviderTurnTokenUsage | null,
+-  providerThread?: Pick<OrchestrationV2ProviderThread, "contextUsage" | "updatedAt"> | null,
+-): ContextWindowSnapshot | null {
+-  if (liveUsage != null) {
+-    const usedTokens = Math.max(0, liveUsage.usedTokens);
+-    const maxTokens = liveUsage.maxTokens ?? null;
+-    const usedPercentage =
+-      maxTokens !== null && maxTokens > 0 ? Math.min(100, (usedTokens / maxTokens) * 100) : null;
+-    const remainingTokens =
+-      maxTokens !== null ? Math.max(0, Math.round(maxTokens - usedTokens)) : null;
+-    const remainingPercentage = usedPercentage !== null ? Math.max(0, 100 - usedPercentage) : null;
+-    return {
+-      usedTokens,
+-      totalProcessedTokens: null,
+-      maxTokens,
+-      remainingTokens,
+-      usedPercentage,
+-      remainingPercentage,
+-      inputTokens: liveUsage.inputTokens ?? null,
+-      cachedInputTokens: liveUsage.cachedInputTokens ?? null,
+-      outputTokens: liveUsage.outputTokens ?? null,
+-      reasoningOutputTokens: liveUsage.reasoningOutputTokens ?? null,
+-      lastUsedTokens: null,
+-      lastInputTokens: null,
+-      lastCachedInputTokens: null,
+-      lastOutputTokens: null,
+-      lastReasoningOutputTokens: null,
+-      toolUses: null,
+-      durationMs: null,
+-      compactsAutomatically: providerThread?.contextUsage?.compactsAutomatically ?? null,
+-      autoCompactThreshold: providerThread?.contextUsage?.autoCompactThreshold ?? null,
+-      cost: null,
+-      updatedAt: liveUsage.updatedAt,
+-    };
+-  }
+-  const providerUsage = providerThread?.contextUsage;
+-  const providerUsageUpdatedAt = providerThread?.updatedAt;
+-  if (
+-    providerUsage !== null &&
+-    providerUsage !== undefined &&
+-    providerUsageUpdatedAt !== undefined
+-  ) {
+-    const maxTokens = asFiniteNumber(providerUsage.maxTokens);
+-    const usedTokens = providerUsage.usedTokens;
+-    const usedPercentage =
+-      maxTokens !== null && maxTokens > 0 ? Math.min(100, (usedTokens / maxTokens) * 100) : null;
+-    return {
+-      usedTokens,
+-      totalProcessedTokens: asFiniteNumber(providerUsage.totalProcessedTokens),
+-      maxTokens,
+-      remainingTokens: maxTokens === null ? null : Math.max(0, Math.round(maxTokens - usedTokens)),
+-      usedPercentage,
+-      remainingPercentage: usedPercentage === null ? null : Math.max(0, 100 - usedPercentage),
+-      inputTokens: asFiniteNumber(providerUsage.inputTokens),
+-      cachedInputTokens: asFiniteNumber(providerUsage.cachedInputTokens),
+-      outputTokens: asFiniteNumber(providerUsage.outputTokens),
+-      reasoningOutputTokens: asFiniteNumber(providerUsage.reasoningOutputTokens),
+-      lastUsedTokens: asFiniteNumber(providerUsage.lastUsedTokens),
+-      lastInputTokens: asFiniteNumber(providerUsage.lastInputTokens),
+-      lastCachedInputTokens: asFiniteNumber(providerUsage.lastCachedInputTokens),
+-      lastOutputTokens: asFiniteNumber(providerUsage.lastOutputTokens),
+-      lastReasoningOutputTokens: asFiniteNumber(providerUsage.lastReasoningOutputTokens),
+-      toolUses: asFiniteNumber(providerUsage.toolUses),
+-      durationMs: asFiniteNumber(providerUsage.durationMs),
+-      compactsAutomatically: providerUsage.compactsAutomatically ?? null,
+-      cost: providerUsage.cost ?? null,
+-      autoCompactThreshold: providerUsage.autoCompactThreshold ?? null,
+-      updatedAt: DateTime.formatIso(providerUsageUpdatedAt),
+-    };
+-  }
+-  for (let index = entries.length - 1; index >= 0; index -= 1) {
+-    const entry = entries[index];
+-    if (!entry || entry.item.type !== "compaction" || entry.item.status !== "completed") {
+-      continue;
+-    }
+-    const payload = entry.item;
+-    const usedTokens = asFiniteNumber(payload.afterTokenCount);
+-    if (usedTokens === null || usedTokens < 0) {
+-      continue;
+-    }
+-
+-    const maxTokens = null;
+-    const usedPercentage =
+-      maxTokens !== null && maxTokens > 0 ? Math.min(100, (usedTokens / maxTokens) * 100) : null;
+-    const remainingTokens =
+-      maxTokens !== null ? Math.max(0, Math.round(maxTokens - usedTokens)) : null;
+-    const remainingPercentage = usedPercentage !== null ? Math.max(0, 100 - usedPercentage) : null;
+-
+-    return {
+-      usedTokens,
+-      totalProcessedTokens: null,
+-      maxTokens,
+-      remainingTokens,
+-      usedPercentage,
+-      remainingPercentage,
+-      inputTokens: null,
+-      cachedInputTokens: null,
+-      outputTokens: null,
+-      reasoningOutputTokens: null,
+-      lastUsedTokens: null,
+-      lastInputTokens: null,
+-      lastCachedInputTokens: null,
+-      lastOutputTokens: null,
+-      lastReasoningOutputTokens: null,
+-      toolUses: null,
+-      durationMs: null,
+-      compactsAutomatically: null,
+-      autoCompactThreshold: null,
+-      cost: null,
+-      updatedAt: DateTime.formatIso(payload.completedAt ?? payload.updatedAt),
+-    };
+-  }
+-
+-  return null;
+-}
+-
+-export function formatContextWindowTokens(value: number | null): string {
+-  if (value === null || !Number.isFinite(value)) {
+-    return "0";
+-  }
+-  if (value < 1_000) {
+-    return `${Math.round(value)}`;
+-  }
+-  if (value < 10_000) {
+-    return `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
+-  }
+-  // Anything from 999,500 rounds to 1000k, so it belongs to the next unit.
+-  if (value < 999_500) {
+-    return `${Math.round(value / 1_000)}k`;
+-  }
+-  return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`;
+-}
++export * from "@t3tools/client-runtime/state/context-window";
+diff --git a/packages/client-runtime/package.json b/packages/client-runtime/package.json
+index 703d418ac..e7c70a789 100644
+--- a/packages/client-runtime/package.json
++++ b/packages/client-runtime/package.json
+@@ -123,6 +123,14 @@
+       "types": "./src/relay/index.ts",
+       "default": "./src/relay/index.ts"
+     },
++    "./state/context-window": {
++      "types": "./src/state/contextWindow.ts",
++      "default": "./src/state/contextWindow.ts"
++    },
++    "./state/composer-stats": {
++      "types": "./src/state/composerStats.ts",
++      "default": "./src/state/composerStats.ts"
++    },
+     "./state/auth": {
+       "types": "./src/state/auth.ts",
+       "default": "./src/state/auth.ts"
+diff --git a/packages/client-runtime/src/state/composerStats.test.ts b/packages/client-runtime/src/state/composerStats.test.ts
+new file mode 100644
+index 000000000..dadcac452
+--- /dev/null
++++ b/packages/client-runtime/src/state/composerStats.test.ts
+@@ -0,0 +1,608 @@
++import {
++  NodeId,
++  ProviderDriverKind,
++  ThreadId,
++  TurnItemId,
++  type OrchestrationV2TurnItem,
++  ProviderThreadId,
++  ProviderTurnId,
++  type OrchestrationV2ProviderTurn,
++} from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++import { describe, expect, it } from "vite-plus/test";
++
++import {
++  composerLimitDisplay,
++  composerLimitsFreshness,
++  composerCompactDisabledReason,
++  deriveComposerStats,
++  deriveContextCompaction,
++  deriveResponseRate,
++  deriveTurnCachePercentage,
++  formatCachePercentage,
++  deriveTurnElapsedMs,
++  selectComposerLimitWindows,
++  selectComposerStatsTurns,
++  selectRecordedCompactions,
++} from "./composerStats.ts";
++
++const start = DateTime.makeUnsafe("2026-10-03T10:00:00Z");
++const end = DateTime.makeUnsafe("2026-10-03T10:00:48Z");
++const nowMs = DateTime.toEpochMillis(end);
++
++function turn(ordinal: number, node = "main", thread = "active"): OrchestrationV2ProviderTurn {
++  return {
++    id: ProviderTurnId.make(`turn-${ordinal}-${node}`),
++    providerThreadId: ProviderThreadId.make(thread),
++    nodeId: NodeId.make(node),
++    runAttemptId: null,
++    nativeTurnRef: null,
++    ordinal,
++    status: "completed",
++    startedAt: start,
++    completedAt: end,
++  };
++}
++
++describe("composer stats scope", () => {
++  it("excludes child agents and old provider sessions and orders the main turns", () => {
++    const latest = turn(2);
++    expect(
++      selectComposerStatsTurns({
++        thread: { activeProviderThreadId: ProviderThreadId.make("active") },
++        nodes: [
++          { id: NodeId.make("main"), kind: "root_turn", parentNodeId: null },
++          { id: NodeId.make("child"), kind: "root_turn", parentNodeId: NodeId.make("main") },
++        ],
++        providerTurns: [latest, turn(99, "child"), turn(100, "main", "old"), turn(1)],
++      }),
++    ).toEqual([turn(1), latest]);
++  });
++
++  it("keeps a newest turn with missing usage instead of borrowing a previous turn's counts", () => {
++    const previous = {
++      ...turn(1),
++      turnTokenUsage: {
++        usageStatus: "complete",
++        usageScope: "main_agent",
++        inputTokens: 1000,
++        outputTokens: 200,
++        hasSubagents: false,
++      },
++    } as const;
++    const turns = selectComposerStatsTurns({
++      thread: { activeProviderThreadId: ProviderThreadId.make("active") },
++      nodes: [{ id: NodeId.make("main"), kind: "root_turn", parentNodeId: null }],
++      providerTurns: [previous, turn(2)],
++    });
++    expect(turns.at(-1)?.turnTokenUsage).toBeUndefined();
++  });
++});
++
++describe("turn cache share", () => {
++  it("uses normalized input including reads and writes, for complete or partial reports", () => {
++    for (const usageStatus of ["complete", "partial"] as const) {
++      expect(
++        deriveTurnCachePercentage({
++          usageStatus,
++          usageScope: "main_agent",
++          inputTokens: 1000,
++          cachedInputTokens: 810,
++          cacheCreationTokens: 100,
++          outputTokens: 25,
++          hasSubagents: true,
++        }),
++      ).toBe(81);
++    }
++  });
++
++  it("distinguishes a known zero cache rate from unavailable or inconsistent counters", () => {
++    const usage = {
++      usageStatus: "partial",
++      usageScope: "main_agent",
++      inputTokens: 1000,
++      hasSubagents: false,
++    } as const;
++    expect(deriveTurnCachePercentage({ ...usage, cachedInputTokens: 0 })).toBe(0);
++    expect(deriveTurnCachePercentage(usage)).toBeNull();
++    expect(
++      deriveTurnCachePercentage({ ...usage, inputTokens: 0, cachedInputTokens: 0 }),
++    ).toBeNull();
++    expect(deriveTurnCachePercentage({ ...usage, cachedInputTokens: 1001 })).toBeNull();
++    expect(
++      deriveTurnCachePercentage({ ...usage, usageStatus: "unavailable", cachedInputTokens: 100 }),
++    ).toBeNull();
++    expect(deriveTurnCachePercentage(undefined)).toBeNull();
++  });
++
++  it("shows cache rates to one decimal without rounding up to 100%", () => {
++    expect(formatCachePercentage((998 / 1000) * 100)).toBe("99.8%");
++    expect(formatCachePercentage((9996 / 10000) * 100)).toBe("99.9%");
++    expect(formatCachePercentage(100)).toBe("100%");
++    expect(formatCachePercentage((873 / 1000) * 100)).toBe("87.3%");
++    expect(formatCachePercentage(0)).toBe("0%");
++  });
++});
++
++describe("turn wall time", () => {
++  it("ticks only running turns and freezes settled turns at their reported end", () => {
++    expect(deriveTurnElapsedMs({ ...turn(1), status: "running", completedAt: null }, nowMs)).toBe(
++      48_000,
++    );
++    for (const status of ["completed", "interrupted", "failed", "cancelled"] as const) {
++      expect(deriveTurnElapsedMs({ ...turn(1), status }, nowMs + 60_000)).toBe(48_000);
++      expect(deriveTurnElapsedMs({ ...turn(1), status, completedAt: null }, nowMs)).toBeNull();
++    }
++  });
++
++  it("does not turn pending age, missing start times, or reversed timestamps into duration", () => {
++    expect(
++      deriveTurnElapsedMs({ ...turn(1), status: "pending", completedAt: null }, nowMs),
++    ).toBeNull();
++    expect(deriveTurnElapsedMs({ ...turn(1), startedAt: null }, nowMs)).toBeNull();
++    expect(
++      deriveTurnElapsedMs({ ...turn(1), startedAt: end, completedAt: start }, nowMs),
++    ).toBeNull();
++  });
++});
++
++describe("recorded compactions", () => {
++  function compaction(
++    id: string,
++    node = "main",
++    thread = "active",
++    status: "completed" | "running" = "completed",
++  ): Extract<OrchestrationV2TurnItem, { type: "compaction" }> {
++    return {
++      id: TurnItemId.make(id),
++      threadId: ThreadId.make("thread"),
++      runId: null,
++      nodeId: NodeId.make(node),
++      providerThreadId: ProviderThreadId.make(thread),
++      providerTurnId: null,
++      nativeItemRef: null,
++      parentItemId: null,
++      ordinal: 0,
++      status,
++      title: null,
++      startedAt: start,
++      completedAt: end,
++      updatedAt: end,
++      type: "compaction",
++      driver: null,
++      beforeTokenCount: 100000,
++      afterTokenCount: 20000,
++    };
++  }
++  it("counts completed main-session events once and excludes children, old sessions and pending events", () => {
++    const item = compaction("one");
++    expect(
++      selectRecordedCompactions(
++        [
++          item,
++          item,
++          compaction("child", "child"),
++          compaction("old", "main", "old"),
++          compaction("pending", "main", "active", "running"),
++        ],
++        [turn(1)],
++      ),
++    ).toEqual([item]);
++  });
++  it("includes native tool-node compactions and suppresses ACP's duplicate command completion", () => {
++    const main = turn(1);
++    const native = {
++      ...compaction("native", "tool"),
++      providerTurnId: main.id,
++      nativeItemRef: {
++        driver: ProviderDriverKind.make("grok"),
++        nativeId: "acp-compaction:one",
++        strength: "strong",
++      },
++    } as const;
++    const synthetic = {
++      ...compaction("synthetic"),
++      providerTurnId: main.id,
++      nativeItemRef: {
++        driver: ProviderDriverKind.make("grok"),
++        nativeId: "turn:compaction",
++        strength: "weak",
++      },
++    } as const;
++    expect(selectRecordedCompactions([synthetic, native], [main])).toEqual([native]);
++    expect(selectRecordedCompactions([synthetic], [main])).toEqual([synthetic]);
++  });
++  it("orders events by report time rather than item ordinals from different turns", () => {
++    const older = { ...compaction("older"), ordinal: 99, updatedAt: start };
++    const newer = compaction("newer");
++    expect(selectRecordedCompactions([newer, older], [turn(1)])).toEqual([older, newer]);
++  });
++});
++
++describe("observed response rate", () => {
++  const measured = {
++    ...turn(1),
++    nativeTurnRef: {
++      driver: ProviderDriverKind.make("claudeAgent"),
++      nativeId: "root",
++      strength: "strong",
++    },
++    responseThroughput: { outputTokens: 400, elapsedMs: 4000, responseCount: 2, partial: false },
++  } as const;
++  it("uses persisted envelopes, including partial coverage, without turn wall time", () => {
++    expect(deriveResponseRate(measured)).toBe(100);
++    expect(
++      deriveResponseRate({
++        ...measured,
++        responseThroughput: { ...measured.responseThroughput, partial: true },
++      }),
++    ).toBe(100);
++    expect(
++      deriveResponseRate({
++        ...measured,
++        responseThroughput: { ...measured.responseThroughput, outputTokens: 0 },
++      }),
++    ).toBe(0);
++  });
++  it("distinguishes Codex estimates from observed Claude and legacy payloads", () => {
++    const codex = {
++      ...measured,
++      nativeTurnRef: { ...measured.nativeTurnRef, driver: ProviderDriverKind.make("codex") },
++      responseThroughput: {
++        ...measured.responseThroughput,
++        basis: "codex_active_windows_estimate",
++      },
++    } as const;
++    expect(deriveResponseRate(codex)).toBe(100);
++    expect(
++      deriveResponseRate({
++        ...codex,
++        status: "interrupted",
++        responseThroughput: { ...codex.responseThroughput, partial: true },
++      }),
++    ).toBe(100);
++    expect(
++      deriveResponseRate({ ...measured, responseThroughput: codex.responseThroughput }),
++    ).toBeNull();
++    expect(
++      deriveResponseRate({
++        ...measured,
++        responseThroughput: { ...measured.responseThroughput, basis: "claude_observed" },
++      }),
++    ).toBe(100);
++  });
++  it("omits historical, unsupported and invalid telemetry", () => {
++    expect(deriveResponseRate(null)).toBeNull();
++    expect(deriveResponseRate(turn(1))).toBeNull();
++    expect(
++      deriveResponseRate({
++        ...measured,
++        nativeTurnRef: { ...measured.nativeTurnRef, driver: ProviderDriverKind.make("codex") },
++      }),
++    ).toBeNull();
++    for (const elapsedMs of [0, -1, NaN, Infinity]) {
++      expect(
++        deriveResponseRate({
++          ...measured,
++          responseThroughput: { ...measured.responseThroughput, elapsedMs },
++        }),
++      ).toBeNull();
++    }
++  });
++});
++
++describe("selectComposerLimitWindows", () => {
++  const checkedAt = "2026-10-04T16:00:00.000Z";
++  const window = (
++    id: string,
++    kind: "session" | "weekly" | "monthly" | "other",
++    windowDurationMins?: number,
++  ) => ({
++    id,
++    kind,
++    label: id,
++    usedPercent: 12,
++    ...(windowDurationMins === undefined ? {} : { windowDurationMins }),
++  });
++
++  it("picks the account-wide session then weekly window with short labels", () => {
++    const selected = selectComposerLimitWindows({
++      checkedAt,
++      windows: [
++        window("seven_day", "weekly", 10_080),
++        window("five_hour", "session", 300),
++        window("seven_day_fable", "weekly", 10_080),
++      ],
++    });
++    expect(selected.map(({ window, shortLabel }) => [window.id, shortLabel])).toEqual([
++      ["five_hour", "5h"],
++      ["seven_day", "Week"],
++    ]);
++  });
++
++  it("falls back to the kind when the provider omits the duration", () => {
++    expect(
++      selectComposerLimitWindows({ checkedAt, windows: [window("primary", "session")] }).map(
++        ({ shortLabel }) => shortLabel,
++      ),
++    ).toEqual(["Session"]);
++  });
++
++  it("shows nothing for missing, unsupported or empty limits", () => {
++    expect(selectComposerLimitWindows(undefined)).toEqual([]);
++    expect(selectComposerLimitWindows({ checkedAt, windows: [] })).toEqual([]);
++    expect(
++      selectComposerLimitWindows({
++        checkedAt,
++        windows: [window("five_hour", "session", 300)],
++        unavailable: { reason: "unsupported" },
++      }),
++    ).toEqual([]);
++  });
++
++  it("keeps the last reported windows when a later probe failed", () => {
++    expect(
++      selectComposerLimitWindows({
++        checkedAt,
++        windows: [window("five_hour", "session", 300)],
++        unavailable: { reason: "probeFailed" },
++      }),
++    ).toHaveLength(1);
++  });
++});
++
++describe("composer limit freshness", () => {
++  const now = Date.parse("2026-10-04T12:00:00Z");
++  const ago = (ms: number) => DateTime.formatIso(DateTime.makeUnsafe(now - ms));
++  it("keeps fresh meters through 3 minutes, dims through 15, then hides percentages", () => {
++    for (const [age, status] of [
++      [0, "fresh"],
++      [180000, "fresh"],
++      [180001, "stale"],
++      [900000, "stale"],
++      [900001, "expired"],
++    ] as const) {
++      expect(composerLimitsFreshness([ago(age)], now)).toEqual({
++        status,
++        ageMins: Math.floor(age / 60000),
++        checkedAt: ago(age),
++      });
++    }
++  });
++  it("uses the newest displayed fetch and treats unknown or invalid times as expired", () => {
++    expect(composerLimitsFreshness([ago(20 * 60000), ago(4 * 60000)], now).ageMins).toBe(4);
++    for (const checkedAts of [[], [undefined], ["invalid"], [ago(-60000)]]) {
++      expect(composerLimitsFreshness(checkedAts, now)).toEqual({
++        status: "expired",
++        ageMins: null,
++        checkedAt: undefined,
++      });
++    }
++  });
++});
++
++it("keeps newly fetched data visible before the next render-clock tick", () => {
++  const now = Date.parse("2026-10-04T12:00:00Z");
++  const checkedAt = "2026-10-04T12:00:25Z";
++  expect(composerLimitsFreshness([checkedAt], now)).toEqual({
++    status: "fresh",
++    ageMins: 0,
++    checkedAt,
++  });
++});
++
++describe("composer limit display", () => {
++  const now = Date.parse("2026-10-04T12:00:00Z");
++  const window = {
++    id: "five_hour",
++    kind: "session" as const,
++    label: "Session",
++    source: "probe" as const,
++    usedPercent: 63,
++    windowDurationMins: 300,
++  };
++
++  it("shows zero and waits for a new reading after the reset", () => {
++    expect(
++      composerLimitDisplay(
++        {
++          ...window,
++          checkedAt: "2026-10-04T11:59:30Z",
++          resetsAt: "2026-10-04T11:59:00Z",
++        },
++        undefined,
++        now,
++      ),
++    ).toEqual({
++      freshness: { status: "fresh", ageMins: 0, checkedAt: "2026-10-04T11:59:30Z" },
++      resetPending: true,
++      displayPercent: 0,
++      percentText: "0%",
++      dimmed: true,
++    });
++  });
++
++  it("shows the reading age inline while a value is stale", () => {
++    expect(
++      composerLimitDisplay({ ...window, checkedAt: "2026-10-04T11:53:00Z" }, undefined, now)
++        .percentText,
++    ).toBe("63% · 7m");
++  });
++
++  it("hides a percentage once the reading is expired", () => {
++    const display = composerLimitDisplay(
++      { ...window, checkedAt: "2026-10-04T11:44:00Z" },
++      undefined,
++      now,
++    );
++    expect(display.displayPercent).toBeNull();
++    expect(display.percentText).toBe("—");
++    expect(display.dimmed).toBe(true);
++  });
++});
++
++describe("context compaction pressure", () => {
++  const context = {
++    usedTokens: 360_000,
++    usedPercentage: 36,
++    autoCompactThreshold: null,
++    compactsAutomatically: null,
++  };
++
++  it("keeps window fullness separate from Claude's configured 400k limit", () => {
++    expect(deriveContextCompaction(context, "claudeAgent", "400000")).toMatchObject({
++      threshold: 400_000,
++      source: "configured",
++      remainingTokens: 40_000,
++      thresholdPercentage: 90,
++      pressurePercentage: 90,
++      status: "Claude setting",
++    });
++    expect(context.usedPercentage).toBe(36);
++  });
++
++  it("prefers an actual provider threshold over a newly configured limit", () => {
++    expect(
++      deriveContextCompaction(
++        { ...context, autoCompactThreshold: 500_000 },
++        "claudeAgent",
++        "400000",
++      ),
++    ).toMatchObject({ threshold: 500_000, source: "reported", remainingTokens: 140_000 });
++  });
++
++  it("does not apply Claude's configuration to Codex or another driver", () => {
++    for (const driver of ["codex", "opencode", undefined]) {
++      expect(deriveContextCompaction(context, driver, "400000")).toMatchObject({
++        threshold: null,
++        source: null,
++        remainingTokens: null,
++        pressurePercentage: 36,
++      });
++    }
++    expect(deriveContextCompaction(context, "codex", "400000").status).toContain(
++      "Managed by Codex",
++    );
++  });
++
++  it("does not invent a default threshold or accept invalid settings", () => {
++    for (const value of [
++      undefined,
++      "",
++      "NaN",
++      "Infinity",
++      "99999",
++      "1000001",
++      "400000oops",
++      400000,
++    ]) {
++      expect(deriveContextCompaction(context, "claudeAgent", value)).toMatchObject({
++        threshold: null,
++        source: null,
++      });
++    }
++  });
++
++  it("honors a provider report that automatic compaction is off", () => {
++    expect(
++      deriveContextCompaction(
++        { ...context, compactsAutomatically: false, autoCompactThreshold: 300_000 },
++        "claudeAgent",
++        "400000",
++      ),
++    ).toMatchObject({ status: "Reported off", threshold: null, pressurePercentage: 36 });
++  });
++
++  it("shows a setting without inventing occupancy", () => {
++    expect(deriveContextCompaction(null, "claudeAgent", "400000")).toMatchObject({
++      threshold: 400_000,
++      source: "configured",
++      remainingTokens: null,
++      thresholdPercentage: null,
++    });
++  });
++
++  it("clamps remaining tokens and warns at the smaller window limit", () => {
++    expect(
++      deriveContextCompaction({ ...context, usedTokens: 420_000 }, "claudeAgent", "400000"),
++    ).toMatchObject({ remainingTokens: 0, pressurePercentage: 105 });
++    expect(
++      deriveContextCompaction(
++        { ...context, usedTokens: 180_000, usedPercentage: 90 },
++        "claudeAgent",
++        "400000",
++      ),
++    ).toMatchObject({ remainingTokens: 220_000, pressurePercentage: 90 });
++  });
++});
++
++describe("deriveComposerStats", () => {
++  const nodes = [{ id: NodeId.make("main"), kind: "root_turn", parentNodeId: null }] as const;
++  const thread = { activeProviderThreadId: ProviderThreadId.make("active") };
++
++  it("returns the empty shape without a projection, keeping the limits", () => {
++    const usageLimits = { limits: { windows: [] } as never, providerName: "Claude" };
++    expect(deriveComposerStats(null, {}, usageLimits)).toEqual({
++      turn: null,
++      compactions: [],
++      context: null,
++      usageLimits,
++      contextDriver: undefined,
++      configuredClaudeThreshold: undefined,
++    });
++  });
++
++  it("derives the latest turn, context, driver and configured Claude threshold", () => {
++    const withUsage = {
++      ...turn(2),
++      tokenUsage: {
++        usedTokens: 50_000,
++        maxTokens: 200_000,
++        updatedAt: "2026-10-03T10:00:30Z",
++      },
++    } as OrchestrationV2ProviderTurn;
++    const providerThread = {
++      id: ProviderThreadId.make("active"),
++      providerInstanceId: "claudeAgent",
++      driver: ProviderDriverKind.make("claudeAgent"),
++    } as never;
++    const result = deriveComposerStats(
++      {
++        thread,
++        nodes,
++        providerTurns: [turn(1), withUsage],
++        providerThreads: [providerThread],
++        turnItems: [],
++      },
++      { claudeAgent: { config: { autoCompactWindow: "300000" } }, other: undefined },
++      null,
++    );
++    expect(result.turn?.ordinal).toBe(2);
++    expect(result.context?.usedTokens).toBe(50_000);
++    expect(result.context?.usedPercentage).toBe(25);
++    expect(result.contextDriver).toBe("claudeAgent");
++    expect(result.configuredClaudeThreshold).toBe("300000");
++    expect(result.compactions).toEqual([]);
++    expect(
++      deriveContextCompaction(
++        result.context,
++        result.contextDriver,
++        result.configuredClaudeThreshold,
++      ).threshold,
++    ).toBe(300_000);
++  });
++
++  it("explains why compacting is disabled, approvals first", () => {
++    const base = { hasPendingApproval: false, hasPendingUserInput: false, isWorking: true };
++    expect(composerCompactDisabledReason({ ...base, fallback: "x" })).toBe(
++      "Wait for the current turn to finish.",
++    );
++    expect(
++      composerCompactDisabledReason({ ...base, hasPendingApproval: true, fallback: "x" }),
++    ).toBe("Resolve the pending approval first.");
++    expect(
++      composerCompactDisabledReason({ ...base, hasPendingUserInput: true, fallback: "x" }),
++    ).toBe("Answer the pending question first.");
++    expect(composerCompactDisabledReason({ ...base, isWorking: false, fallback: "x" })).toBe("x");
++  });
++});
+diff --git a/packages/client-runtime/src/state/composerStats.ts b/packages/client-runtime/src/state/composerStats.ts
+new file mode 100644
+index 000000000..0cdfd8e23
+--- /dev/null
++++ b/packages/client-runtime/src/state/composerStats.ts
+@@ -0,0 +1,424 @@
++import type {
++  OrchestrationV2ProviderTurn,
++  OrchestrationV2ThreadProjection,
++  OrchestrationV2TurnItem,
++  ServerProviderUsageLimits,
++  ServerProviderUsageWindow,
++  TurnTokenUsage,
++} from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++import { deriveLatestContextWindowSnapshot, type ContextWindowSnapshot } from "./contextWindow.ts";
++
++/** Provider turn ordinals are scoped to a provider thread; children have their own nodes. */
++export function selectComposerStatsTurns(projection: {
++  readonly thread: Pick<OrchestrationV2ThreadProjection["thread"], "activeProviderThreadId">;
++  readonly nodes: ReadonlyArray<
++    Pick<OrchestrationV2ThreadProjection["nodes"][number], "id" | "kind" | "parentNodeId">
++  >;
++  readonly providerTurns: ReadonlyArray<OrchestrationV2ProviderTurn>;
++}): ReadonlyArray<OrchestrationV2ProviderTurn> {
++  const mainNodes = new Set(
++    projection.nodes
++      .filter((node) => node.kind === "root_turn" && node.parentNodeId === null)
++      .map((node) => node.id),
++  );
++  return projection.providerTurns
++    .filter(
++      (turn) =>
++        turn.providerThreadId === projection.thread.activeProviderThreadId &&
++        mainNodes.has(turn.nodeId),
++    )
++    .toSorted((a, b) => a.ordinal - b.ordinal);
++}
++
++/** Cache reads are a subset of normalized input (which includes cache writes). */
++export function deriveTurnCachePercentage(usage: TurnTokenUsage | undefined): number | null {
++  if (
++    usage === undefined ||
++    usage.usageStatus === "unavailable" ||
++    usage.inputTokens === undefined ||
++    usage.inputTokens <= 0 ||
++    usage.cachedInputTokens === undefined ||
++    usage.cachedInputTokens > usage.inputTokens
++  ) {
++    return null;
++  }
++  return (usage.cachedInputTokens / usage.inputTokens) * 100;
++}
++
++/**
++ * One decimal, truncated: 99.96% reads 99.9%, so 100% means every input token was cached.
++ * The epsilon keeps exact tenths (99.8) from flooring to the tenth below.
++ */
++export function formatCachePercentage(percentage: number): string {
++  if (percentage >= 100) return "100%";
++  if (percentage <= 0) return "0%";
++  return `${(Math.floor(percentage * 10 + 1e-9) / 10).toFixed(1)}%`;
++}
++
++/** Wall time includes tools and waits. It must never be used as generation time for TPS. */
++export function deriveTurnElapsedMs(
++  turn: Pick<OrchestrationV2ProviderTurn, "status" | "startedAt" | "completedAt">,
++  nowMs: number,
++): number | null {
++  if (turn.startedAt === null) return null;
++  const end =
++    turn.status === "running"
++      ? nowMs
++      : turn.completedAt === null
++        ? null
++        : DateTime.toEpochMillis(turn.completedAt);
++  const start = DateTime.toEpochMillis(turn.startedAt);
++  return end !== null && Number.isFinite(end) && end >= start ? end - start : null;
++}
++
++/** These are observed completed events, not a lifetime count for a provider. */
++export function selectRecordedCompactions(
++  items: ReadonlyArray<OrchestrationV2TurnItem>,
++  turns: ReadonlyArray<OrchestrationV2ProviderTurn>,
++): ReadonlyArray<Extract<OrchestrationV2TurnItem, { type: "compaction" }>> {
++  const nodes = new Set(turns.map((turn) => turn.nodeId));
++  const threads = new Set(turns.map((turn) => turn.providerThreadId));
++  const turnIds = new Set(turns.map((turn) => turn.id));
++  const nativeAcpTurns = new Set(
++    items
++      .filter(
++        (item) =>
++          item.type === "compaction" &&
++          item.status === "completed" &&
++          item.nativeItemRef?.nativeId?.startsWith("acp-compaction:"),
++      )
++      .map((item) => item.providerTurnId),
++  );
++  const seen = new Set<string>();
++  return items
++    .filter((item): item is Extract<OrchestrationV2TurnItem, { type: "compaction" }> => {
++      if (
++        item.type !== "compaction" ||
++        item.status !== "completed" ||
++        !(
++          (item.nodeId !== null && nodes.has(item.nodeId)) ||
++          (item.providerTurnId !== null && turnIds.has(item.providerTurnId))
++        ) ||
++        item.providerThreadId === null ||
++        !threads.has(item.providerThreadId) ||
++        // ACP may report the native event as well as a synthetic /compact completion.
++        (item.providerTurnId !== null &&
++          nativeAcpTurns.has(item.providerTurnId) &&
++          item.nativeItemRef?.strength === "weak" &&
++          item.nativeItemRef.nativeId?.endsWith(":compaction")) ||
++        seen.has(item.id)
++      )
++        return false;
++      seen.add(item.id);
++      return true;
++    })
++    .toSorted((a, b) => DateTime.toEpochMillis(a.updatedAt) - DateTime.toEpochMillis(b.updatedAt));
++}
++
++/** Persisted provider telemetry is independent of whole-turn wall time. */
++export function deriveResponseRate(turn: OrchestrationV2ProviderTurn | null): number | null {
++  const throughput = turn?.responseThroughput;
++  if (
++    !(
++      (turn?.nativeTurnRef?.driver === "claudeAgent" &&
++        (throughput?.basis === undefined || throughput.basis === "claude_observed")) ||
++      (turn?.nativeTurnRef?.driver === "codex" &&
++        throughput?.basis === "codex_active_windows_estimate")
++    ) ||
++    throughput === undefined ||
++    throughput.responseCount <= 0 ||
++    !Number.isSafeInteger(throughput.responseCount) ||
++    !Number.isSafeInteger(throughput.outputTokens) ||
++    throughput.outputTokens < 0 ||
++    !Number.isFinite(throughput.elapsedMs) ||
++    throughput.elapsedMs <= 0
++  )
++    return null;
++  return throughput.outputTokens / (throughput.elapsedMs / 1000);
++}
++
++function windowShortLabel(window: ServerProviderUsageWindow): string {
++  const mins = window.windowDurationMins;
++  if (mins !== undefined && mins > 0) {
++    if (mins % 10_080 === 0) return mins === 10_080 ? "Week" : `${mins / 10_080}wk`;
++    if (mins % 1_440 === 0) return `${mins / 1_440}d`;
++    if (mins % 60 === 0) return `${mins / 60}h`;
++    return `${mins}m`;
++  }
++  return window.kind === "session" ? "Session" : window.kind === "weekly" ? "Week" : window.label;
++}
++
++/**
++ * The account-wide session and weekly windows for the inline stats line, in
++ * that order. Model-scoped weeklies stay in the popover; providers list the
++ * account-wide window of each kind first.
++ */
++export function selectComposerLimitWindows(
++  limits: ServerProviderUsageLimits | undefined,
++): ReadonlyArray<{ readonly window: ServerProviderUsageWindow; readonly shortLabel: string }> {
++  if (!limits || limits.unavailable?.reason === "unsupported") return [];
++  return (["session", "weekly"] as const).flatMap((kind) => {
++    const window = limits.windows.find((candidate) => candidate.kind === kind);
++    return window ? [{ window, shortLabel: windowShortLabel(window) }] : [];
++  });
++}
++
++export const COMPOSER_STATS_CLOCK_MS = 30_000;
++
++/** Age of the newest valid fetch among the displayed windows. */
++export function composerLimitsFreshness(
++  checkedAts: ReadonlyArray<string | undefined>,
++  nowMs: number,
++): {
++  readonly status: "fresh" | "stale" | "expired";
++  readonly ageMins: number | null;
++  readonly checkedAt: string | undefined;
++} {
++  const times = checkedAts.flatMap((checkedAt) => {
++    const time = checkedAt === undefined ? NaN : Date.parse(checkedAt);
++    // The render clock can trail a newly received fetch by one interval.
++    return Number.isFinite(time) && time <= nowMs + COMPOSER_STATS_CLOCK_MS
++      ? [{ time, checkedAt }]
++      : [];
++  });
++  const newest = times.toSorted((a, b) => b.time - a.time)[0];
++  if (!newest) return { status: "expired", ageMins: null, checkedAt: undefined };
++  const ageMs = Math.max(0, nowMs - newest.time);
++  return {
++    status: ageMs <= 3 * 60_000 ? "fresh" : ageMs <= 15 * 60_000 ? "stale" : "expired",
++    ageMins: Math.floor(ageMs / 60_000),
++    checkedAt: newest.checkedAt,
++  };
++}
++
++export function composerLimitResetPending(
++  window: Pick<ServerProviderUsageWindow, "resetPending" | "resetsAt">,
++  nowMs: number,
++): boolean {
++  if (window.resetPending === true) return true;
++  if (window.resetsAt === undefined) return false;
++  const resetMs = Date.parse(window.resetsAt);
++  return Number.isFinite(resetMs) && resetMs <= nowMs;
++}
++
++export function composerLimitSourceLabel(
++  source: ServerProviderUsageWindow["source"],
++): "account" | "turn" | "CLI estimate" {
++  return source === "account" ? "account" : source === "turn" ? "turn" : "CLI estimate";
++}
++
++export function composerLimitDisplay(
++  window: ServerProviderUsageWindow,
++  fallbackCheckedAt: string | undefined,
++  nowMs: number,
++): {
++  readonly freshness: ReturnType<typeof composerLimitsFreshness>;
++  readonly resetPending: boolean;
++  readonly displayPercent: number | null;
++  readonly percentText: string;
++  readonly dimmed: boolean;
++} {
++  const freshness = composerLimitsFreshness([window.checkedAt ?? fallbackCheckedAt], nowMs);
++  const resetPending = composerLimitResetPending(window, nowMs);
++  if (resetPending) {
++    return {
++      freshness,
++      resetPending: true,
++      displayPercent: 0,
++      percentText: "0%",
++      dimmed: true,
++    };
++  }
++  if (freshness.status === "expired") {
++    return {
++      freshness,
++      resetPending: false,
++      displayPercent: null,
++      percentText: "—",
++      dimmed: true,
++    };
++  }
++  const age =
++    freshness.status === "stale" && freshness.ageMins !== null ? ` · ${freshness.ageMins}m` : "";
++  return {
++    freshness,
++    resetPending: false,
++    displayPercent: window.usedPercent,
++    percentText: `${Math.round(window.usedPercent)}%${age}`,
++    dimmed: freshness.status !== "fresh",
++  };
++}
++
++/** A configured limit is a launch setting, not proof of the running query's limit. */
++export function deriveContextCompaction(
++  context: Pick<
++    ContextWindowSnapshot,
++    "usedTokens" | "usedPercentage" | "autoCompactThreshold" | "compactsAutomatically"
++  > | null,
++  driver: string | undefined,
++  configuredClaudeThreshold: unknown,
++) {
++  const configured =
++    driver === "claudeAgent" &&
++    typeof configuredClaudeThreshold === "string" &&
++    /^\d+$/.test(configuredClaudeThreshold.trim())
++      ? Number(configuredClaudeThreshold)
++      : null;
++  const validConfigured =
++    configured !== null && configured >= 100_000 && configured <= 1_000_000 ? configured : null;
++  const reported = context?.autoCompactThreshold;
++  const validReported =
++    context?.compactsAutomatically !== false &&
++    typeof reported === "number" &&
++    Number.isFinite(reported) &&
++    reported > 0
++      ? reported
++      : null;
++  const threshold =
++    context?.compactsAutomatically === false ? null : (validReported ?? validConfigured);
++  const source = threshold === null ? null : validReported !== null ? "reported" : "configured";
++  const usedTokens = context?.usedTokens;
++  const remainingTokens =
++    threshold !== null && usedTokens !== undefined ? Math.max(0, threshold - usedTokens) : null;
++  const thresholdPercentage =
++    threshold !== null && usedTokens !== undefined ? (usedTokens / threshold) * 100 : null;
++  const pressurePercentage = Math.max(context?.usedPercentage ?? 0, thresholdPercentage ?? 0);
++  const status =
++    context?.compactsAutomatically === false
++      ? "Reported off"
++      : threshold !== null
++        ? source === "reported"
++          ? "Provider reported"
++          : "Claude setting"
++        : driver === "claudeAgent"
++          ? "Managed by Claude (threshold not reported)"
++          : driver === "codex"
++            ? "Managed by Codex (threshold not reported)"
++            : context?.compactsAutomatically === true
++              ? "On (threshold not reported)"
++              : "Not reported";
++  return { threshold, source, remainingTokens, thresholdPercentage, pressurePercentage, status };
++}
++
++export type ComposerStatsTone = "normal" | "warning" | "critical";
++
++export function toneOf(usedPercent: number): ComposerStatsTone {
++  return usedPercent >= 90 ? "critical" : usedPercent >= 75 ? "warning" : "normal";
++}
++
++export function formatStatCount(value: number | undefined): string {
++  return value === undefined ? "Not reported" : value.toLocaleString("en-US");
++}
++
++/** Output rate text; a leading "≈" marks Codex's estimate. */
++export function formatResponseRateText(
++  turn: OrchestrationV2ProviderTurn | null,
++  responseRate: number | null = deriveResponseRate(turn),
++): string | null {
++  if (responseRate === null) return null;
++  const estimated = turn?.responseThroughput?.basis === "codex_active_windows_estimate";
++  return `${estimated ? "≈" : ""}${responseRate.toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
++}
++
++export function formatUsageTimestamp(value: string | undefined): string {
++  if (value === undefined) return "unknown time";
++  const timeMs = Date.parse(value);
++  if (!Number.isFinite(timeMs)) return "unknown time";
++  return new Intl.DateTimeFormat(undefined, {
++    month: "short",
++    day: "numeric",
++    hour: "numeric",
++    minute: "2-digit",
++  }).format(timeMs);
++}
++
++export function usageReadingLabel(
++  window: ServerProviderUsageWindow,
++  fallbackCheckedAt: string | undefined,
++  now: number,
++): string {
++  const checkedAt = window.checkedAt ?? fallbackCheckedAt;
++  const freshness = composerLimitsFreshness([checkedAt], now);
++  const age =
++    freshness.ageMins === null
++      ? "age unknown"
++      : freshness.ageMins === 0
++        ? "just now"
++        : `${freshness.ageMins}m ago`;
++  return `as of ${formatUsageTimestamp(checkedAt)} (${age}) · ${composerLimitSourceLabel(
++    window.source,
++  )}`;
++}
++
++export function composerCompactDisabledReason(input: {
++  readonly hasPendingApproval: boolean;
++  readonly hasPendingUserInput: boolean;
++  readonly isWorking: boolean;
++  readonly fallback: string | null;
++}): string | null {
++  return input.hasPendingApproval
++    ? "Resolve the pending approval first."
++    : input.hasPendingUserInput
++      ? "Answer the pending question first."
++      : input.isWorking
++        ? "Wait for the current turn to finish."
++        : input.fallback;
++}
++
++export interface ComposerStatsData {
++  readonly turn: OrchestrationV2ProviderTurn | null;
++  readonly compactions: ReadonlyArray<Extract<OrchestrationV2TurnItem, { type: "compaction" }>>;
++  readonly context: ContextWindowSnapshot | null;
++  readonly usageLimits: { limits: ServerProviderUsageLimits; providerName: string } | null;
++  readonly contextDriver: string | undefined;
++  readonly configuredClaudeThreshold: unknown;
++}
++
++/** Everything the stats line needs from one thread projection, shared by web and mobile. */
++export function deriveComposerStats(
++  projection:
++    | (Parameters<typeof selectComposerStatsTurns>[0] &
++        Pick<OrchestrationV2ThreadProjection, "providerThreads" | "turnItems">)
++    | null
++    | undefined,
++  providerInstances: Readonly<Record<string, { readonly config?: unknown } | undefined>>,
++  usageLimits: ComposerStatsData["usageLimits"],
++): ComposerStatsData {
++  if (!projection)
++    return {
++      turn: null,
++      compactions: [],
++      context: null,
++      usageLimits,
++      contextDriver: undefined,
++      configuredClaudeThreshold: undefined,
++    };
++  const turns = selectComposerStatsTurns(projection);
++  const contextUsage = turns.findLast((turn) => turn.tokenUsage !== undefined)?.tokenUsage;
++  const providerThread = projection.providerThreads.find(
++    (thread) => thread.id === projection.thread.activeProviderThreadId,
++  );
++  const providerConfig = providerThread
++    ? providerInstances[providerThread.providerInstanceId]?.config
++    : undefined;
++  const configuredClaudeThreshold =
++    providerConfig !== null &&
++    typeof providerConfig === "object" &&
++    "autoCompactWindow" in providerConfig
++      ? providerConfig.autoCompactWindow
++      : undefined;
++  const compactions = selectRecordedCompactions(projection.turnItems, turns);
++  return {
++    turn: turns.at(-1) ?? null,
++    compactions,
++    usageLimits,
++    contextDriver: providerThread?.driver,
++    configuredClaudeThreshold,
++    context: deriveLatestContextWindowSnapshot(
++      compactions.map((item) => ({ item })),
++      contextUsage,
++      providerThread,
++    ),
++  };
++}
+diff --git a/packages/client-runtime/src/state/contextWindow.test.ts b/packages/client-runtime/src/state/contextWindow.test.ts
+new file mode 100644
+index 000000000..45a882ab4
+--- /dev/null
++++ b/packages/client-runtime/src/state/contextWindow.test.ts
+@@ -0,0 +1,158 @@
++import { describe, expect, it } from "vite-plus/test";
++import * as DateTime from "effect/DateTime";
++import {
++  deriveLatestContextWindowSnapshot,
++  formatContextWindowTokens,
++  latestProviderTurnTokenUsage,
++} from "./contextWindow.ts";
++
++describe("V2 context window presentation", () => {
++  it("uses retained compaction token data when available", () => {
++    const entries = [
++      {
++        item: {
++          id: "compaction-1" as never,
++          threadId: "thread-1" as never,
++          runId: null,
++          nodeId: null,
++          providerThreadId: null,
++          providerTurnId: null,
++          nativeItemRef: null,
++          parentItemId: null,
++          ordinal: 1,
++          status: "completed",
++          title: null,
++          startedAt: DateTime.makeUnsafe("2026-06-19T23:59:00.000Z"),
++          completedAt: DateTime.makeUnsafe("2026-06-20T00:00:00.000Z"),
++          updatedAt: DateTime.makeUnsafe("2026-06-20T00:00:00.000Z"),
++          type: "compaction",
++          driver: null,
++          beforeTokenCount: 10_000,
++          afterTokenCount: 2_000,
++        },
++      },
++    ] as const;
++    const snapshot = deriveLatestContextWindowSnapshot(entries);
++    expect(snapshot?.updatedAt).toBe("2026-06-20T00:00:00.000Z");
++    for (const status of ["running", "failed"] as const) {
++      expect(
++        deriveLatestContextWindowSnapshot(
++          entries.map((entry) => ({ item: { ...entry.item, status } })),
++        ),
++      ).toBeNull();
++    }
++    expect(snapshot?.usedTokens).toBe(2_000);
++    expect(snapshot?.totalProcessedTokens).toBeNull();
++    expect(snapshot?.compactsAutomatically).toBeNull();
++  });
++
++  it("prefers current provider usage and preserves ACP cost", () => {
++    const snapshot = deriveLatestContextWindowSnapshot([], undefined, {
++      contextUsage: {
++        usedTokens: 2_500,
++        maxTokens: 10_000,
++        cost: { amount: 0.42, currency: "USD" },
++      },
++      updatedAt: DateTime.makeUnsafe("2026-08-23T00:00:00.000Z"),
++    });
++
++    expect(snapshot).toMatchObject({
++      usedTokens: 2_500,
++      maxTokens: 10_000,
++      remainingTokens: 7_500,
++      usedPercentage: 25,
++      cost: { amount: 0.42, currency: "USD" },
++    });
++  });
++
++  it("formats compact token values", () => {
++    expect(formatContextWindowTokens(1_500)).toBe("1.5k");
++  });
++
++  it.each([
++    [999_499, "999k"],
++    [999_500, "1m"],
++    [999_999, "1m"],
++    [1_000_000, "1m"],
++    [1_100_000, "1.1m"],
++  ])("formats %d tokens as %s at the million boundary", (tokens, expected) => {
++    expect(formatContextWindowTokens(tokens)).toBe(expected);
++  });
++});
++
++describe("live provider-turn usage (#8144)", () => {
++  it("prefers the provider's live report over compaction items", () => {
++    const snapshot = deriveLatestContextWindowSnapshot([], {
++      usedTokens: 42_000,
++      maxTokens: 200_000,
++      inputTokens: 40_000,
++      outputTokens: 2_000,
++      updatedAt: "2026-08-27T00:00:00.000Z",
++    });
++    expect(snapshot).not.toBeNull();
++    expect(snapshot?.usedTokens).toBe(42_000);
++    expect(snapshot?.maxTokens).toBe(200_000);
++    expect(snapshot?.remainingTokens).toBe(158_000);
++    expect(snapshot?.usedPercentage).toBe(21);
++  });
++
++  it("handles a report without a known context window", () => {
++    const snapshot = deriveLatestContextWindowSnapshot([], {
++      usedTokens: 42_000,
++      updatedAt: "2026-08-27T00:00:00.000Z",
++    });
++    expect(snapshot?.maxTokens).toBeNull();
++    expect(snapshot?.usedPercentage).toBeNull();
++  });
++});
++
++describe("latestProviderTurnTokenUsage", () => {
++  it("picks the newest report, not the last turn in snapshot order", () => {
++    const usage = (usedTokens: number, updatedAt: string) => ({
++      tokenUsage: { usedTokens, updatedAt },
++    });
++    // Snapshots sort by provider thread id, so an older thread can come last.
++    const latest = latestProviderTurnTokenUsage([
++      usage(300_000, "2026-06-20T12:00:00.000Z"),
++      {},
++      usage(90_000, "2026-06-20T09:00:00.000Z"),
++    ]);
++    expect(latest?.usedTokens).toBe(300_000);
++  });
++});
++
++describe("compaction policy metadata", () => {
++  it("preserves reported policy alongside newer turn occupancy", () => {
++    const snapshot = deriveLatestContextWindowSnapshot(
++      [],
++      {
++        usedTokens: 360_000,
++        maxTokens: 1_000_000,
++        updatedAt: "2026-10-10T12:00:00.000Z",
++      },
++      {
++        contextUsage: {
++          usedTokens: 300_000,
++          autoCompactThreshold: 400_000,
++          compactsAutomatically: true,
++        },
++        updatedAt: DateTime.makeUnsafe("2026-10-10T11:00:00.000Z"),
++      },
++    );
++    expect(snapshot).toMatchObject({
++      usedTokens: 360_000,
++      usedPercentage: 36,
++      autoCompactThreshold: 400_000,
++      compactsAutomatically: true,
++    });
++  });
++
++  it("does not assume automatic compaction from a usage report", () => {
++    expect(
++      deriveLatestContextWindowSnapshot([], {
++        usedTokens: 42_000,
++        updatedAt: "2026-10-10T12:00:00.000Z",
++      }),
++    ).toMatchObject({ compactsAutomatically: null, autoCompactThreshold: null });
++  });
++});
+diff --git a/packages/client-runtime/src/state/contextWindow.ts b/packages/client-runtime/src/state/contextWindow.ts
+new file mode 100644
+index 000000000..1eca0df91
+--- /dev/null
++++ b/packages/client-runtime/src/state/contextWindow.ts
+@@ -0,0 +1,179 @@
++import type {
++  OrchestrationV2ProviderTurn,
++  OrchestrationV2ProviderTurnTokenUsage,
++  OrchestrationV2ProviderThread,
++  OrchestrationV2TurnItem,
++  ThreadTokenUsageSnapshot,
++} from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++
++function asFiniteNumber(value: unknown): number | null {
++  return typeof value === "number" && Number.isFinite(value) ? value : null;
++}
++
++type NullableContextWindowUsage = {
++  readonly [Key in keyof ThreadTokenUsageSnapshot]: undefined extends ThreadTokenUsageSnapshot[Key]
++    ? Exclude<ThreadTokenUsageSnapshot[Key], undefined> | null
++    : ThreadTokenUsageSnapshot[Key];
++};
++
++export type ContextWindowSnapshot = NullableContextWindowUsage & {
++  readonly remainingTokens: number | null;
++  readonly usedPercentage: number | null;
++  readonly remainingPercentage: number | null;
++  readonly updatedAt: string;
++};
++
++/** Newest usage report across a thread's provider turns. Snapshots order turns
++    by provider thread, not time, so pick by timestamp. */
++export function latestProviderTurnTokenUsage(
++  turns: ReadonlyArray<Pick<OrchestrationV2ProviderTurn, "tokenUsage">>,
++): OrchestrationV2ProviderTurnTokenUsage | null {
++  let latest: OrchestrationV2ProviderTurnTokenUsage | null = null;
++  for (const { tokenUsage } of turns) {
++    if (tokenUsage === undefined) continue;
++    // Ties go to the later entry, since live upserts append.
++    if (latest === null || Date.parse(tokenUsage.updatedAt) >= Date.parse(latest.updatedAt)) {
++      latest = tokenUsage;
++    }
++  }
++  return latest;
++}
++
++/** Prefers the provider's live usage report (#8144); falls back to the last compaction item. */
++export function deriveLatestContextWindowSnapshot(
++  entries: ReadonlyArray<{
++    readonly item: OrchestrationV2TurnItem;
++  }>,
++  liveUsage?: OrchestrationV2ProviderTurnTokenUsage | null,
++  providerThread?: Pick<OrchestrationV2ProviderThread, "contextUsage" | "updatedAt"> | null,
++): ContextWindowSnapshot | null {
++  if (liveUsage != null) {
++    const usedTokens = Math.max(0, liveUsage.usedTokens);
++    const maxTokens = liveUsage.maxTokens ?? null;
++    const usedPercentage =
++      maxTokens !== null && maxTokens > 0 ? Math.min(100, (usedTokens / maxTokens) * 100) : null;
++    const remainingTokens =
++      maxTokens !== null ? Math.max(0, Math.round(maxTokens - usedTokens)) : null;
++    const remainingPercentage = usedPercentage !== null ? Math.max(0, 100 - usedPercentage) : null;
++    return {
++      usedTokens,
++      totalProcessedTokens: null,
++      maxTokens,
++      remainingTokens,
++      usedPercentage,
++      remainingPercentage,
++      inputTokens: liveUsage.inputTokens ?? null,
++      cachedInputTokens: liveUsage.cachedInputTokens ?? null,
++      outputTokens: liveUsage.outputTokens ?? null,
++      reasoningOutputTokens: liveUsage.reasoningOutputTokens ?? null,
++      lastUsedTokens: null,
++      lastInputTokens: null,
++      lastCachedInputTokens: null,
++      lastOutputTokens: null,
++      lastReasoningOutputTokens: null,
++      toolUses: null,
++      durationMs: null,
++      compactsAutomatically: providerThread?.contextUsage?.compactsAutomatically ?? null,
++      autoCompactThreshold: providerThread?.contextUsage?.autoCompactThreshold ?? null,
++      cost: null,
++      updatedAt: liveUsage.updatedAt,
++    };
++  }
++  const providerUsage = providerThread?.contextUsage;
++  const providerUsageUpdatedAt = providerThread?.updatedAt;
++  if (
++    providerUsage !== null &&
++    providerUsage !== undefined &&
++    providerUsageUpdatedAt !== undefined
++  ) {
++    const maxTokens = asFiniteNumber(providerUsage.maxTokens);
++    const usedTokens = providerUsage.usedTokens;
++    const usedPercentage =
++      maxTokens !== null && maxTokens > 0 ? Math.min(100, (usedTokens / maxTokens) * 100) : null;
++    return {
++      usedTokens,
++      totalProcessedTokens: asFiniteNumber(providerUsage.totalProcessedTokens),
++      maxTokens,
++      remainingTokens: maxTokens === null ? null : Math.max(0, Math.round(maxTokens - usedTokens)),
++      usedPercentage,
++      remainingPercentage: usedPercentage === null ? null : Math.max(0, 100 - usedPercentage),
++      inputTokens: asFiniteNumber(providerUsage.inputTokens),
++      cachedInputTokens: asFiniteNumber(providerUsage.cachedInputTokens),
++      outputTokens: asFiniteNumber(providerUsage.outputTokens),
++      reasoningOutputTokens: asFiniteNumber(providerUsage.reasoningOutputTokens),
++      lastUsedTokens: asFiniteNumber(providerUsage.lastUsedTokens),
++      lastInputTokens: asFiniteNumber(providerUsage.lastInputTokens),
++      lastCachedInputTokens: asFiniteNumber(providerUsage.lastCachedInputTokens),
++      lastOutputTokens: asFiniteNumber(providerUsage.lastOutputTokens),
++      lastReasoningOutputTokens: asFiniteNumber(providerUsage.lastReasoningOutputTokens),
++      toolUses: asFiniteNumber(providerUsage.toolUses),
++      durationMs: asFiniteNumber(providerUsage.durationMs),
++      compactsAutomatically: providerUsage.compactsAutomatically ?? null,
++      cost: providerUsage.cost ?? null,
++      autoCompactThreshold: providerUsage.autoCompactThreshold ?? null,
++      updatedAt: DateTime.formatIso(providerUsageUpdatedAt),
++    };
++  }
++  for (let index = entries.length - 1; index >= 0; index -= 1) {
++    const entry = entries[index];
++    if (!entry || entry.item.type !== "compaction" || entry.item.status !== "completed") {
++      continue;
++    }
++    const payload = entry.item;
++    const usedTokens = asFiniteNumber(payload.afterTokenCount);
++    if (usedTokens === null || usedTokens < 0) {
++      continue;
++    }
++
++    const maxTokens = null;
++    const usedPercentage =
++      maxTokens !== null && maxTokens > 0 ? Math.min(100, (usedTokens / maxTokens) * 100) : null;
++    const remainingTokens =
++      maxTokens !== null ? Math.max(0, Math.round(maxTokens - usedTokens)) : null;
++    const remainingPercentage = usedPercentage !== null ? Math.max(0, 100 - usedPercentage) : null;
++
++    return {
++      usedTokens,
++      totalProcessedTokens: null,
++      maxTokens,
++      remainingTokens,
++      usedPercentage,
++      remainingPercentage,
++      inputTokens: null,
++      cachedInputTokens: null,
++      outputTokens: null,
++      reasoningOutputTokens: null,
++      lastUsedTokens: null,
++      lastInputTokens: null,
++      lastCachedInputTokens: null,
++      lastOutputTokens: null,
++      lastReasoningOutputTokens: null,
++      toolUses: null,
++      durationMs: null,
++      compactsAutomatically: null,
++      autoCompactThreshold: null,
++      cost: null,
++      updatedAt: DateTime.formatIso(payload.completedAt ?? payload.updatedAt),
++    };
++  }
++
++  return null;
++}
++
++export function formatContextWindowTokens(value: number | null): string {
++  if (value === null || !Number.isFinite(value)) {
++    return "0";
++  }
++  if (value < 1_000) {
++    return `${Math.round(value)}`;
++  }
++  if (value < 10_000) {
++    return `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
++  }
++  // Anything from 999,500 rounds to 1000k, so it belongs to the next unit.
++  if (value < 999_500) {
++    return `${Math.round(value / 1_000)}k`;
++  }
++  return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`;
++}

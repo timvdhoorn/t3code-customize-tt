@@ -1,0 +1,2252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: timvdhoorn <timvdhoorn@gmail.com>
+Date: Thu, 15 Oct 2026 20:14:07 +0200
+Subject: [PATCH] feat(mobile): nest child threads under their opener in the
+ thread list
+
+---
+ .../src/features/home/HomeRouteScreen.tsx     |   5 +-
+ apps/mobile/src/features/home/HomeScreen.tsx  |  23 +
+ .../threads/ThreadNavigationSidebar.tsx       |  26 +-
+ .../features/threads/thread-list-v2-items.tsx | 210 +++++++-
+ .../src/features/threads/threadListV2.test.ts | 165 ++++++
+ .../src/features/threads/threadListV2.ts      | 472 ++++++++++++------
+ .../use-thread-list-v2-shelf-preferences.ts   |  22 +
+ apps/mobile/src/lib/storage.test.ts           |  13 +
+ .../src/persistence/mobile-preferences.ts     |   9 +
+ apps/mobile/src/state/entities.ts             |   5 +
+ apps/web/src/components/Sidebar.families.ts   | 197 +-------
+ apps/web/src/components/Sidebar.tsx           |  26 +-
+ packages/client-runtime/package.json          |   4 +
+ .../src/state/threadFamilies.test.ts          | 232 +++++++++
+ .../src/state/threadFamilies.ts               | 229 +++++++++
+ .../src/state/threadShell.test.ts             |  37 ++
+ .../client-runtime/src/state/threadShell.ts   |  24 +
+ 17 files changed, 1341 insertions(+), 358 deletions(-)
+ create mode 100644 packages/client-runtime/src/state/threadFamilies.test.ts
+ create mode 100644 packages/client-runtime/src/state/threadFamilies.ts
+
+diff --git a/apps/mobile/src/features/home/HomeRouteScreen.tsx b/apps/mobile/src/features/home/HomeRouteScreen.tsx
+index 8ce82e951..73d4cc780 100644
+--- a/apps/mobile/src/features/home/HomeRouteScreen.tsx
++++ b/apps/mobile/src/features/home/HomeRouteScreen.tsx
+@@ -45,10 +45,7 @@ export function HomeRouteScreen() {
+   // Streaming turns rewrite thread shells many times a second. While a Thread
+   // covers Home, rebuilding this list is invisible work.
+   const visible = useHomeRouteVisible();
+-  const threads = useAtomValueWhileVisible(
+-    environmentThreadShells.navigationThreadShellsAtom,
+-    visible,
+-  );
++  const threads = useAtomValueWhileVisible(environmentThreadShells.rosterThreadShellsAtom, visible);
+   const { environments: workspaceEnvironments, state: catalogState } = useWorkspaceState();
+   const { savedConnectionsById } = useSavedRemoteConnections();
+   const navigation = useNavigation();
+diff --git a/apps/mobile/src/features/home/HomeScreen.tsx b/apps/mobile/src/features/home/HomeScreen.tsx
+index cd0e1c120..bf32cada6 100644
+--- a/apps/mobile/src/features/home/HomeScreen.tsx
++++ b/apps/mobile/src/features/home/HomeScreen.tsx
+@@ -50,6 +50,7 @@ import { threadListEnvironmentsAtom } from "../../state/server";
+ import type { PendingNewTask } from "../../state/use-pending-new-tasks";
+ import { useQueuedThreadKeys } from "../../state/use-thread-outbox";
+ import {
++  ThreadListV2ChildStubRow,
+   ThreadListV2PendingRow,
+   ThreadListV2Row,
+   ThreadListV2SettledShelfHeader,
+@@ -525,6 +526,8 @@ export function HomeScreen(props: HomeScreenProps) {
+     snoozedShelfExpanded,
+     workingShelfEnabled,
+     workingShelfExpanded,
++    collapsedChildThreadKeys,
++    toggleChildThreads,
+     toggleSettledShelf,
+     toggleSnoozedShelf,
+     toggleWorkingShelf,
+@@ -619,8 +622,10 @@ export function HomeScreen(props: HomeScreenProps) {
+       snoozedShelfExpanded,
+       settledShelfExpanded,
+       selectedThreadKey,
++      collapsedChildThreadKeys,
+     });
+   }, [
++    collapsedChildThreadKeys,
+     workingShelfEnabled,
+     workingShelfExpanded,
+     pendingOrder,
+@@ -738,6 +743,17 @@ export function HomeScreen(props: HomeScreenProps) {
+           />
+         );
+       }
++      if (item.type === "v2-child-stub") {
++        return (
++          <ThreadListV2ChildStubRow
++            headKey={item.headKey}
++            label={item.label}
++            cardSection={item.cardSection}
++            showTrailingDivider={item.showTrailingDivider}
++            onExpand={toggleChildThreads}
++          />
++        );
++      }
+       if (item.type === "v2-working-shelf") {
+         return (
+           <ThreadListV2WorkingShelfHeader
+@@ -823,6 +839,12 @@ export function HomeScreen(props: HomeScreenProps) {
+           }
+           canMoveUp={item.canMoveUp}
+           canMoveDown={item.canMoveDown}
++          nested={item.item.nested}
++          familyEdge={item.item.familyEdge}
++          headTitle={item.item.headTitle}
++          cardSection={item.item.cardSection}
++          headOf={item.item.headOf}
++          onToggleChildThreads={toggleChildThreads}
+           onSnoozeThread={handleSnoozeThread}
+           onUnsnoozeThread={handleUnsnoozeThread}
+           onUnsettleThread={handleUnsettleThread}
+@@ -838,6 +860,7 @@ export function HomeScreen(props: HomeScreenProps) {
+       );
+     },
+     [
++      toggleChildThreads,
+       handleDeleteThread,
+       activeReorderEnvironmentIds,
+       handleMoveThread,
+diff --git a/apps/mobile/src/features/threads/ThreadNavigationSidebar.tsx b/apps/mobile/src/features/threads/ThreadNavigationSidebar.tsx
+index 92cc958a8..1550353fa 100644
+--- a/apps/mobile/src/features/threads/ThreadNavigationSidebar.tsx
++++ b/apps/mobile/src/features/threads/ThreadNavigationSidebar.tsx
+@@ -28,7 +28,7 @@ import { SymbolView } from "../../components/AppSymbol";
+ import { NATIVE_LIQUID_GLASS_SUPPORTED } from "../../native/native-glass";
+ import { NativeStackScreenOptions } from "../../native/StackHeader";
+ import { scopedProjectKey, scopedThreadKey } from "../../lib/scopedEntities";
+-import { useProjects, useNavigationThreadShells } from "../../state/entities";
++import { useProjects, useRosterThreadShells } from "../../state/entities";
+ import { useThreadSearch } from "../../state/queries";
+ import { useThreadListV2ShelfPreferences } from "./use-thread-list-v2-shelf-preferences";
+ import { usePendingThreadOrder } from "../../state/thread-order";
+@@ -57,6 +57,7 @@ import { SidebarFilterButton } from "./sidebar-filter-button";
+ import { createSidebarHeaderItems } from "./sidebar-native-header-items";
+ import { SidebarNavigationShell } from "./sidebar-navigation-shell";
+ import {
++  ThreadListV2ChildStubRow,
+   ThreadListV2PendingRow,
+   ThreadListV2Row,
+   ThreadListV2SettledShelfHeader,
+@@ -138,7 +139,7 @@ function ThreadNavigationSidebarPane(
+   const insets = useSafeAreaInsets();
+   const { fabClearance } = useAndroidControlSizing();
+   const projects = useProjects();
+-  const threads = useNavigationThreadShells();
++  const threads = useRosterThreadShells();
+   const { environments: workspaceEnvironments, state: catalogState } = useWorkspaceState();
+   const { savedConnectionsById } = useSavedRemoteConnections();
+   const searchInputRef = useRef<TextInputInstance>(null);
+@@ -297,6 +298,8 @@ function ThreadNavigationSidebarPane(
+     snoozedShelfExpanded,
+     workingShelfEnabled,
+     workingShelfExpanded,
++    collapsedChildThreadKeys,
++    toggleChildThreads,
+     toggleSettledShelf,
+     toggleSnoozedShelf,
+     toggleWorkingShelf,
+@@ -387,8 +390,10 @@ function ThreadNavigationSidebarPane(
+       snoozedShelfExpanded,
+       settledShelfExpanded,
+       selectedThreadKey: props.selectedThreadKey ?? null,
++      collapsedChildThreadKeys,
+     });
+   }, [
++    collapsedChildThreadKeys,
+     workingShelfEnabled,
+     workingShelfExpanded,
+     pendingOrder,
+@@ -679,6 +684,17 @@ function ThreadNavigationSidebarPane(
+             />
+           );
+         }
++        case "v2-child-stub":
++          return (
++            <ThreadListV2ChildStubRow
++              headKey={item.headKey}
++              label={item.label}
++              cardSection={item.cardSection}
++              showTrailingDivider={item.showTrailingDivider}
++              pane="sidebar"
++              onExpand={toggleChildThreads}
++            />
++          );
+         case "v2-thread": {
+           const thread = item.item.thread;
+           const scopeKey = scopedProjectKey(thread.environmentId, thread.projectId);
+@@ -741,6 +757,12 @@ function ThreadNavigationSidebarPane(
+               }
+               canMoveUp={item.canMoveUp}
+               canMoveDown={item.canMoveDown}
++              nested={item.item.nested}
++              familyEdge={item.item.familyEdge}
++              headTitle={item.item.headTitle}
++              cardSection={item.item.cardSection}
++              headOf={item.item.headOf}
++              onToggleChildThreads={toggleChildThreads}
+               onSnoozeThread={snoozeThread}
+               onUnsnoozeThread={unsnoozeThread}
+               onUnsettleThread={unsettleThread}
+diff --git a/apps/mobile/src/features/threads/thread-list-v2-items.tsx b/apps/mobile/src/features/threads/thread-list-v2-items.tsx
+index 9c1cbe34b..1db3dfdd2 100644
+--- a/apps/mobile/src/features/threads/thread-list-v2-items.tsx
++++ b/apps/mobile/src/features/threads/thread-list-v2-items.tsx
+@@ -21,7 +21,7 @@ import { AuthOrchestrationOperateScope, type EnvironmentMachineKind } from "@t3t
+ import { canSnooze, resolveSnoozePresets } from "@t3tools/client-runtime/state/thread-settled";
+ import type { MenuAction } from "@react-native-menu/menu";
+ import { memo, useCallback, useEffect, useMemo, useState, type ComponentProps } from "react";
+-import { Alert, Pressable, useWindowDimensions, View } from "react-native";
++import { Alert, Pressable, StyleSheet, useWindowDimensions, View } from "react-native";
+ import type { SwipeableMethods } from "react-native-gesture-handler/ReanimatedSwipeable";
+ 
+ import type { ThreadListProvider } from "../../state/thread-list-environments";
+@@ -275,6 +275,93 @@ export const ThreadListV2SettledShelfHeader = memo(function ThreadListV2SettledS
+   return <ThreadListV2ShelfHeader {...props} kind="settled" />;
+ });
+ 
++// A child thread's guide line runs under the head's favicon: the row's
++// horizontal padding plus half the 15pt favicon.
++const FAMILY_GUIDE_LEFT = { screen: 27, sidebar: 19 } as const;
++const FAMILY_CORNER_RADIUS = 6;
++const FAMILY_GUIDE_WIDTH = 1;
++
++/** Hairline that ties a family's rows to the head; the last row ends in a
++    rounded corner that points at it. */
++function ThreadListV2FamilyGuide(props: {
++  readonly pane?: "screen" | "sidebar";
++  readonly edge: "middle" | "last";
++}) {
++  const sidebarPane = props.pane === "sidebar";
++  const left = FAMILY_GUIDE_LEFT[sidebarPane ? "sidebar" : "screen"];
++  // A 1pt line in a label tone: a hairline in the separator colour vanishes
++  // against the dark list background.
++  const colorClassName = sidebarPane
++    ? "border-drawer-foreground-muted"
++    : "border-foreground-tertiary";
++  return props.edge === "middle" ? (
++    <View
++      pointerEvents="none"
++      className={cn("absolute bottom-0 top-0", colorClassName)}
++      style={{ left, borderLeftWidth: FAMILY_GUIDE_WIDTH }}
++    />
++  ) : (
++    <View
++      pointerEvents="none"
++      className={cn("absolute top-0", colorClassName)}
++      style={{
++        left,
++        height: "50%",
++        width: 10,
++        borderLeftWidth: FAMILY_GUIDE_WIDTH,
++        borderBottomWidth: FAMILY_GUIDE_WIDTH,
++        borderBottomLeftRadius: FAMILY_CORNER_RADIUS,
++      }}
++    />
++  );
++}
++
++/** "3 child threads · 1 failed" under a collapsed family; tap shows them. */
++export const ThreadListV2ChildStubRow = memo(function ThreadListV2ChildStubRow(props: {
++  readonly headKey: string;
++  readonly label: string;
++  readonly cardSection: boolean;
++  readonly showTrailingDivider: boolean;
++  readonly pane?: "screen" | "sidebar";
++  readonly onExpand: (headKey: string) => void;
++}) {
++  const sidebarPane = props.pane === "sidebar";
++  return (
++    <Pressable
++      accessibilityHint="Shows the child threads."
++      accessibilityLabel={props.label}
++      accessibilityRole="button"
++      className={sidebarPane ? undefined : "bg-screen"}
++      onPress={() => props.onExpand(props.headKey)}
++      style={({ pressed }) => ({ opacity: pressed ? 0.6 : 1 })}
++    >
++      <View
++        className={cn(
++          "min-h-[32px] justify-center py-1.5",
++          sidebarPane ? "pl-9 pr-3" : "pl-12 pr-5",
++        )}
++      >
++        <ThreadListV2FamilyGuide pane={props.pane} edge="last" />
++        <Text
++          className={cn(
++            "text-xs",
++            sidebarPane ? "text-drawer-foreground-muted" : "text-foreground-muted",
++          )}
++          numberOfLines={1}
++        >
++          {props.label}
++        </Text>
++      </View>
++      {!sidebarPane &&
++      THREAD_LIST_V2_ROW_DIVIDERS &&
++      props.cardSection &&
++      props.showTrailingDivider ? (
++        <View className="ml-5 h-px bg-border-subtle" />
++      ) : null}
++    </Pressable>
++  );
++});
++
+ export const ThreadListV2ShowMoreRow = memo(function ThreadListV2ShowMoreRow(props: {
+   readonly pane?: "screen" | "sidebar";
+   readonly hiddenCount: number;
+@@ -575,6 +662,15 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+       would fall off the end of the list. */
+   readonly canMoveUp?: boolean;
+   readonly canMoveDown?: boolean;
++  /** A child thread under its head: a slim row with a guide line, no favicon. */
++  readonly nested?: boolean;
++  readonly familyEdge?: "none" | "middle" | "last";
++  readonly headTitle?: string;
++  /** The row's section is a card section, so a nested row ends in a hairline. */
++  readonly cardSection?: boolean;
++  /** Set on a head that has child threads; adds Hide/Show child threads. */
++  readonly headOf?: { readonly childCount: number; readonly collapsed: boolean };
++  readonly onToggleChildThreads?: (headKey: string) => void;
+   readonly onSwipeableWillOpen: (methods: SwipeableMethods) => void;
+   readonly onSwipeableClose: (methods: SwipeableMethods) => void;
+   /** List key checked against the Home swipe row activation. */
+@@ -720,7 +816,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+   // hides the card until wake with the pin intact.)
+   const arrangementMenuItems = useMemo<MenuAction[]>(
+     () => [
+-      ...(props.reorderSupported === true
++      ...(props.reorderSupported === true && props.nested !== true
+         ? [
+             { id: "arrange", title: "Arrange threads…", image: "line.3.horizontal" },
+             {
+@@ -749,6 +845,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+       props.canMoveDown,
+       props.canMoveUp,
+       props.reorderSupported,
++      props.nested,
+       props.pinningSupported,
+       thread.pinnedAt,
+       variant,
+@@ -849,9 +946,25 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+     ],
+     [arrangementMenuItems, titleMenuItems],
+   );
++  const childThreadMenuItems = useMemo<MenuAction[]>(
++    () =>
++      props.headOf === undefined
++        ? []
++        : [
++            {
++              id: "toggle-child-threads",
++              title: props.headOf.collapsed ? "Show child threads" : "Hide child threads",
++              image: "list.bullet.indent",
++            },
++          ],
++    [props.headOf?.collapsed, props.headOf === undefined],
++  );
+   const handleMenuAction = useCallback(
+     ({ nativeEvent }: { readonly nativeEvent: { readonly event: string } }) => {
+       if (nativeEvent.event === "new-thread-on-branch") onNewThreadOnBranch(thread);
++      if (nativeEvent.event === "toggle-child-threads") {
++        props.onToggleChildThreads?.(`${thread.environmentId}:${thread.id}`);
++      }
+       if (nativeEvent.event === "settle") handleSettle();
+       if (nativeEvent.event === "unsettle") handleUnsettle();
+       if (nativeEvent.event === "unsnooze") handleUnsnooze();
+@@ -886,6 +999,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+     },
+     [
+       onNewThreadOnBranch,
++      props.onToggleChildThreads,
+       thread,
+       handleArchive,
+       handleDelete,
+@@ -1189,8 +1303,97 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+     cardContent
+   );
+ 
++  const nestedAccessibilityLabel = `Child of ${props.headTitle ?? "its parent thread"}, ${thread.title}`;
+   const rowContent = (close: () => void) =>
+-    variant === "card" ? (
++    props.nested === true ? (
++      <RowPressable
++        key={`${thread.environmentId}:${thread.id}`}
++        interactionClassName={rowAppearance.interactionClassName}
++        interactionOpacity={rowAppearance.interactionOpacity}
++        accessibilityHint={swipeAccessibilityHint}
++        accessibilityLabel={
++          props.hasQueuedMessages
++            ? `${nestedAccessibilityLabel}, messages queued to send`
++            : nestedAccessibilityLabel
++        }
++        accessibilityRole="button"
++        accessibilityState={{ selected }}
++        className={rowAppearance.className}
++        onPress={() => {
++          close();
++          onSelectThread(thread);
++        }}
++        style={rowAppearance.style}
++      >
++        {/* Child threads: no favicon, a larger inset and the guide line. A
++            live child names its state on the right instead of the time. */}
++        <View
++          className={cn(
++            "min-h-[40px] flex-row items-center gap-2 py-1.5",
++            sidebarPane ? "pl-9 pr-3" : "pl-12 pr-5",
++          )}
++        >
++          <ThreadListV2FamilyGuide
++            pane={props.pane}
++            edge={props.familyEdge === "last" ? "last" : "middle"}
++          />
++          <View className="min-w-0 flex-1">
++            <Text
++              className={cn(
++                "text-sm",
++                !recede && "font-t3-medium",
++                selected
++                  ? selectedThreadRowColors.foregroundClassName
++                  : rowAppearance.foregroundClassName,
++              )}
++              numberOfLines={1}
++            >
++              {thread.title}
++            </Text>
++            {props.searchMatch ? (
++              <ThreadSearchMatchExcerpt
++                sidebar={sidebarPane}
++                match={props.searchMatch}
++                query={props.searchQuery ?? ""}
++                selected={selected}
++              />
++            ) : null}
++          </View>
++          {props.hasQueuedMessages ? <QueuedMessageIcon selected={selected} /> : null}
++          {statusLabel ? (
++            <Text
++              className={cn(
++                "text-xs font-t3-bold",
++                selected ? selectedThreadRowColors.foregroundClassName : statusLabel.className,
++              )}
++            >
++              {statusLabel.label}
++            </Text>
++          ) : (
++            <Text
++              className={cn(
++                "text-xs tabular-nums",
++                selected
++                  ? selectedThreadRowColors.mutedForegroundClassName
++                  : snoozedRow
++                    ? rowAppearance.mutedForegroundClassName
++                    : rowAppearance.tertiaryForegroundClassName,
++              )}
++            >
++              {snoozedRow && props.snoozeWakeLabelText !== undefined
++                ? props.snoozeWakeLabelText
++                : timeLabel}
++            </Text>
++          )}
++        </View>
++        {!sidebarPane &&
++        THREAD_LIST_V2_ROW_DIVIDERS &&
++        props.cardSection === true &&
++        props.showTrailingDivider !== false ? (
++          <View className="ml-5 h-px bg-border-subtle" />
++        ) : null}
++      </RowPressable>
++    ) : variant === "card" ? (
+       <RowPressable
+         key={`${thread.environmentId}:${thread.id}`}
+         interactionClassName={rowAppearance.interactionClassName}
+@@ -1341,6 +1544,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+                   ]
+                 : []),
+               { id: "copy-thread-id", title: "Copy thread ID", image: "doc.on.doc" },
++              ...childThreadMenuItems,
+               ...(snoozedRow
+                 ? snoozedMenuActions
+                 : !props.settlementSupported
+diff --git a/apps/mobile/src/features/threads/threadListV2.test.ts b/apps/mobile/src/features/threads/threadListV2.test.ts
+index d5946e62c..bd0392e27 100644
+--- a/apps/mobile/src/features/threads/threadListV2.test.ts
++++ b/apps/mobile/src/features/threads/threadListV2.test.ts
+@@ -2437,3 +2437,168 @@ describe("Working section beta", () => {
+     ]);
+   });
+ });
++
++describe("child threads", () => {
++  const SNOOZED = {
++    snoozedUntil: "2026-06-03T09:00:00.000Z",
++    snoozedAt: "2026-06-01T12:00:00.000Z",
++  };
++  const opener = (id: string, extra: Partial<EnvironmentThreadShell> = {}) =>
++    makeThread({ id: ThreadId.make(id), title: id, ...extra });
++  const child = (id: string, openedBy: string, extra: Partial<EnvironmentThreadShell> = {}) =>
++    makeThread({
++      id: ThreadId.make(id),
++      title: id,
++      openedByThreadId: ThreadId.make(openedBy),
++      ...extra,
++    });
++  const build = (
++    threads: EnvironmentThreadShell[],
++    extra: Partial<Parameters<typeof buildThreadListV2Items>[0]> = {},
++  ) =>
++    buildThreadListV2Items({
++      threads,
++      environmentId: null,
++      searchQuery: "",
++      now: NOW,
++      snoozedShelfExpanded: true,
++      ...extra,
++    });
++  const ids = (layout: ReturnType<typeof build>) =>
++    layout.items.map((row) => `${row.nested === true ? ">" : ""}${row.thread.id}`);
++  const settledAt = { settledOverride: "settled" as const, settledAt: NOW };
++
++  it("nests a live child under its opener in the same section", () => {
++    const layout = build([child("kid", "boss"), opener("boss")]);
++    expect(ids(layout)).toEqual(["boss", ">kid"]);
++    expect(layout.items[0]?.headOf).toEqual({ childCount: 1, collapsed: false });
++    expect(layout.items[1]?.familyEdge).toBe("last");
++  });
++
++  it("moves an agent-settled child into its live opener's section", () => {
++    const layout = build([
++      opener("boss"),
++      child("kid", "boss", { ...settledAt, settledBy: "agent" }),
++    ]);
++    expect(ids(layout)).toEqual(["boss", ">kid"]);
++    expect(layout.settledCount).toBe(0);
++    expect(layout.items[1]?.variant).toBe("slim");
++  });
++
++  it("keeps a child the user settled in Settled", () => {
++    const layout = build([opener("boss"), child("kid", "boss", settledAt)]);
++    expect(ids(layout)).toEqual(["boss", "kid"]);
++    expect(layout.settledCount).toBe(1);
++  });
++
++  it("keeps a live child under a settled opener in its own section", () => {
++    const layout = build([opener("boss", settledAt), child("kid", "boss")]);
++    expect(ids(layout)).toEqual(["kid", "boss"]);
++  });
++
++  it("renders a worker under a snoozed delegator in Snoozed", () => {
++    const layout = build([
++      opener("boss", SNOOZED),
++      opener("worker", { delegatedByThreadId: ThreadId.make("boss") }),
++    ]);
++    expect(ids(layout)).toEqual(["boss", ">worker"]);
++    expect(layout.snoozedShelfHeaderIndex).toBe(0);
++    expect(layout.items[1]?.snoozed).toBe(false);
++  });
++
++  it("hides a worker whose delegator is not shown", () => {
++    const worker = opener("worker", { delegatedByThreadId: ThreadId.make("gone") });
++    expect(ids(build([worker]))).toEqual([]);
++    const boss = opener("boss", { archivedAt: NOW });
++    const second = opener("worker2", { delegatedByThreadId: ThreadId.make("boss") });
++    expect(ids(build([boss, second]))).toEqual([]);
++  });
++
++  it("applies project and search filters to workers", () => {
++    const layout = build(
++      [opener("boss"), opener("worker", { delegatedByThreadId: ThreadId.make("boss") })],
++      { searchQuery: "boss" },
++    );
++    expect(ids(layout)).toEqual(["boss"]);
++  });
++
++  it("collapses a family to a stub, keeping children that need the user and the open thread", () => {
++    const needsInput = child("asks", "boss", { hasPendingUserInput: true });
++    const layout = build(
++      [
++        opener("boss"),
++        needsInput,
++        child("quiet", "boss"),
++        child("open", "boss"),
++        child("failed", "boss", {
++          runtime: {
++            status: "failed",
++            activeRunId: null,
++            providerInstanceId: ProviderInstanceId.make("codex"),
++            providerName: "Codex",
++            lastError: "boom",
++            lastErrorClass: null,
++            updatedAt: NOW,
++          },
++        }),
++      ],
++      {
++        collapsedChildThreadKeys: [`${environmentId}:boss`],
++        selectedThreadKey: `${environmentId}:open`,
++      },
++    );
++    expect(ids(layout)).toEqual(["boss", ">asks", ">open"]);
++    expect(layout.items[0]?.headOf).toEqual({ childCount: 4, collapsed: true });
++    const stub = layout.items[2]?.stubAfter;
++    expect(stub?.label).toBe("2 more child threads · 1 failed");
++    const list = buildThreadListV2ListItems({ items: layout.items, pendingTasks: [] });
++    expect(list.map((entry) => entry.type)).toEqual([
++      "v2-thread",
++      "v2-thread",
++      "v2-thread",
++      "v2-child-stub",
++    ]);
++    const entry = list.at(-1);
++    expect(entry && isThreadListV2ListItem(entry)).toBe(true);
++    // No hairline inside the family.
++    expect(
++      list.map((row) =>
++        row.type === "v2-pending" ? false : "showTrailingDivider" in row && row.showTrailingDivider,
++      ),
++    ).toEqual([false, false, false, false]);
++  });
++
++  it("emits the stub right after a head whose children are all hidden", () => {
++    const layout = build([opener("boss"), child("kid", "boss"), opener("next")], {
++      collapsedChildThreadKeys: [`${environmentId}:boss`],
++    });
++    const list = buildThreadListV2ListItems({ items: layout.items, pendingTasks: [] });
++    expect(list.map((entry) => entry.type)).toEqual(["v2-thread", "v2-child-stub", "v2-thread"]);
++    const stub = list[1];
++    expect(stub?.type === "v2-child-stub" && stub.label).toBe("1 child thread");
++    // The divider separates the family from the next row.
++    expect(stub?.type === "v2-child-stub" && stub.showTrailingDivider).toBe(true);
++  });
++
++  it("keeps threads without an opener flat", () => {
++    const layout = build([opener("a"), opener("b"), opener("c")]);
++    expect(ids(layout)).toEqual(["a", "b", "c"]);
++    expect(layout.items.every((row) => row.headOf === undefined && row.nested !== true)).toBe(true);
++  });
++
++  it("leaves nested rows out of the movable section", () => {
++    const threads = [opener("boss"), child("kid", "boss"), opener("other")];
++    const ordered = getThreadListV2OrderedSection({ threads, section: "active", now: NOW });
++    expect(ordered.map((thread) => thread.id)).toEqual(["boss", "other"]);
++  });
++
++  it("tells the recycler when a row's family state changes", () => {
++    const [head] = build([opener("boss"), child("kid", "boss")]).items;
++    const collapsed = build([opener("boss"), child("kid", "boss")], {
++      collapsedChildThreadKeys: [`${environmentId}:boss`],
++    }).items[0]!;
++    const toList = (item: NonNullable<typeof head>) =>
++      buildThreadListV2ListItems({ items: [item], pendingTasks: [] })[0]!;
++    expect(threadListV2ListItemsAreEqual(toList(head!), toList(collapsed))).toBe(false);
++  });
++});
+diff --git a/apps/mobile/src/features/threads/threadListV2.ts b/apps/mobile/src/features/threads/threadListV2.ts
+index 4024af958..616b5e5d3 100644
+--- a/apps/mobile/src/features/threads/threadListV2.ts
++++ b/apps/mobile/src/features/threads/threadListV2.ts
+@@ -11,6 +11,17 @@ import type { SnoozePreset } from "@t3tools/client-runtime/state/thread-settled"
+ import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
+ import { resolveThreadProviderStack } from "@t3tools/client-runtime/state/models";
+ import { threadSearchMatchKey } from "@t3tools/client-runtime/state/thread-search";
++import {
++  buildSidebarThreadFamilies,
++  childThreadNeedsUser,
++  foldSidebarThreadFamily,
++  formatHiddenChildThreadsLabel,
++  placeDelegatedChildThreads,
++  placeSettledChildThreads,
++  threadDelegatorKeyOf,
++  threadFamilyKeyOf,
++  threadOpenerKeyOf,
++} from "@t3tools/client-runtime/state/thread-families";
+ import {
+   createInboxReturnTracker,
+   isThreadWorking,
+@@ -236,36 +247,164 @@ export function sortThreadsForListV2<
+   return sortActiveThreadsByOrderKey(threads);
+ }
+ 
+-/** Canonical card section for Move up/down, independent of search or scope. */
+-export function getThreadListV2OrderedSection(input: {
+-  readonly threads: readonly EnvironmentThreadShell[];
+-  readonly section: "pinned" | "active";
+-  readonly pendingOrder?: PendingThreadOrder | null;
+-  readonly now: string;
++interface ThreadListV2PartitionInput {
++  readonly threads: ReadonlyArray<EnvironmentThreadShell>;
++  readonly environmentId: EnvironmentId | null;
++  readonly projectRefs?: ReadonlyArray<{
++    readonly environmentId: EnvironmentId;
++    readonly projectId: ProjectId;
++  }> | null;
++  readonly searchQuery: string;
++  readonly matchedThreadKeys?: ReadonlySet<string>;
+   readonly settlementEnvironmentIds?: ReadonlySet<EnvironmentId>;
+   readonly snoozeEnvironmentIds?: ReadonlySet<EnvironmentId>;
++  readonly now: string;
++  readonly workingShelfEnabled: boolean;
+   readonly queuedThreadKeys?: ReadonlySet<string>;
+-}): EnvironmentThreadShell[] {
++}
++
++/**
++ * Sorts every shown thread into its section, before ordering. Child threads
++ * follow the desktop sidebar (threadFamilies.ts): a child an agent or
++ * auto-settle settled joins an opener that is pinned, active or working; a
++ * child the user settled stays settled; a delegate_task worker lands in its
++ * delegator's section, whatever its own state, and stays hidden while the
++ * delegator is not shown. Provider-native subagents never show.
++ */
++function partitionThreadListV2Threads(input: ThreadListV2PartitionInput) {
++  const now = input.now;
++  const query = input.searchQuery.trim().toLocaleLowerCase();
++  const projectKeys = input.projectRefs
++    ? new Set(input.projectRefs.map((ref) => `${ref.environmentId}:${ref.projectId}`))
++    : null;
++  const pinned: EnvironmentThreadShell[] = [];
++  const active: EnvironmentThreadShell[] = [];
++  const working: EnvironmentThreadShell[] = [];
++  const settled: EnvironmentThreadShell[] = [];
++  const snoozed: EnvironmentThreadShell[] = [];
++  const delegated: EnvironmentThreadShell[] = [];
++  let nextSnoozeWakeAt: string | null = null;
+   // An empty set is treated as absent so `?.` skips building the key.
+   const queuedThreadKeys = input.queuedThreadKeys?.size ? input.queuedThreadKeys : undefined;
+-  const threads = input.threads.filter((thread) => {
+-    if (thread.archivedAt !== null || thread.lineage.relationshipToParent === "subagent")
+-      return false;
+-    if (
+-      (input.settlementEnvironmentIds?.has(thread.environmentId) ?? true) &&
+-      thread.settledOverride === "settled" &&
+-      queuedThreadKeys?.has(`${thread.environmentId}:${thread.id}`) !== true
+-    ) {
+-      return false;
++  for (const thread of input.threads) {
++    const isDelegated = thread.delegatedByThreadId !== undefined;
++    if (thread.archivedAt !== null) continue;
++    if (!isDelegated && thread.lineage.relationshipToParent === "subagent") continue;
++    // The server stamps settledOverride for the tail.
++    if (input.environmentId !== null && thread.environmentId !== input.environmentId) continue;
++    if (projectKeys !== null && !projectKeys.has(`${thread.environmentId}:${thread.projectId}`)) {
++      continue;
+     }
+     if (
+-      (input.snoozeEnvironmentIds?.has(thread.environmentId) ?? true) &&
+-      effectiveSnoozed(thread, { now: input.now })
++      query.length > 0 &&
++      !thread.title.toLocaleLowerCase().includes(query) &&
++      !threadPullRequestSearchTerms(thread).some((term) =>
++        term.toLocaleLowerCase().includes(query),
++      ) &&
++      input.matchedThreadKeys?.has(
++        threadSearchMatchKey({
++          environmentId: thread.environmentId,
++          threadId: thread.id,
++        }),
++      ) !== true
+     ) {
+-      return false;
++      continue;
++    }
++    if (isDelegated) {
++      delegated.push(thread);
++      continue;
++    }
++    const supportsSettlement = input.settlementEnvironmentIds?.has(thread.environmentId) ?? true;
++    const supportsSnooze = input.snoozeEnvironmentIds?.has(thread.environmentId) ?? true;
++    // Snooze outranks settlement and pinning until the thread wakes.
++    if (supportsSnooze && effectiveSnoozed(thread, { now })) {
++      snoozed.push(thread);
++      if (
++        thread.snoozedUntil != null &&
++        (nextSnoozeWakeAt === null ||
++          parseTimestampMs(thread.snoozedUntil) < parseTimestampMs(nextSnoozeWakeAt))
++      ) {
++        nextSnoozeWakeAt = thread.snoozedUntil;
++      }
++      continue;
++    }
++    const hasQueuedMessages =
++      queuedThreadKeys?.has(`${thread.environmentId}:${thread.id}`) === true;
++    if (supportsSettlement && thread.settledOverride === "settled" && !hasQueuedMessages) {
++      settled.push(thread);
++    } else if (thread.pinnedAt != null) {
++      pinned.push(thread);
++    } else if (input.workingShelfEnabled && isThreadWorking(thread)) {
++      working.push(thread);
++    } else {
++      active.push(thread);
+     }
+-    return (thread.pinnedAt != null) === (input.section === "pinned");
++  }
++  // A child an agent or auto-settle settled stays under an opener that is
++  // still live; one the user settled goes to Settled.
++  const liveSectionByKey = new Map<string, EnvironmentThreadShell[]>();
++  for (const list of [pinned, active, working]) {
++    for (const thread of list) liveSectionByKey.set(threadFamilyKeyOf(thread), list);
++  }
++  const placedSettled = placeSettledChildThreads(
++    settled,
++    threadFamilyKeyOf,
++    threadOpenerKeyOf,
++    (key) => liveSectionByKey.get(key) ?? null,
++    (thread) => thread.settledBy === undefined,
++  );
++  settled.splice(0, settled.length, ...placedSettled.settled);
++  for (const { thread, section } of placedSettled.moved) section.push(thread);
++  const sectionByKey = new Map<string, EnvironmentThreadShell[]>();
++  for (const list of [pinned, active, working, snoozed, settled]) {
++    for (const thread of list) sectionByKey.set(threadFamilyKeyOf(thread), list);
++  }
++  for (const { thread, section } of placeDelegatedChildThreads(
++    delegated,
++    threadFamilyKeyOf,
++    threadDelegatorKeyOf,
++    (key) => sectionByKey.get(key) ?? null,
++  ).placed) {
++    section.push(thread);
++  }
++  return { pinned, active, working, settled, snoozed, nextSnoozeWakeAt };
++}
++
++/** Families of one card section: heads are the rows that can move. */
++function threadListV2SectionFamilies(
++  input: Omit<Parameters<typeof getThreadListV2OrderedSection>[0], "section">,
++  section: "pinned" | "active",
++) {
++  const parts = partitionThreadListV2Threads({
++    threads: input.threads,
++    environmentId: null,
++    searchQuery: "",
++    settlementEnvironmentIds: input.settlementEnvironmentIds,
++    snoozeEnvironmentIds: input.snoozeEnvironmentIds,
++    now: input.now,
++    workingShelfEnabled: false,
++    queuedThreadKeys: input.queuedThreadKeys,
+   });
++  return buildSidebarThreadFamilies(
++    section === "pinned" ? parts.pinned : parts.active,
++    threadFamilyKeyOf,
++    threadOpenerKeyOf,
++  );
++}
++
++/** Canonical card section for Move up/down, independent of search or scope.
++    Child threads nest under their head and move with it, so they are not
++    listed. */
++export function getThreadListV2OrderedSection(input: {
++  readonly threads: readonly EnvironmentThreadShell[];
++  readonly section: "pinned" | "active";
++  readonly pendingOrder?: PendingThreadOrder | null;
++  readonly now: string;
++  readonly settlementEnvironmentIds?: ReadonlySet<EnvironmentId>;
++  readonly snoozeEnvironmentIds?: ReadonlySet<EnvironmentId>;
++  readonly queuedThreadKeys?: ReadonlySet<string>;
++}): EnvironmentThreadShell[] {
++  const threads = threadListV2SectionFamilies(input, input.section).map((family) => family.head);
+   const ordered =
+     input.section === "pinned"
+       ? sortPinnedThreadsByOrderKey(threads)
+@@ -277,6 +416,19 @@ export function getThreadListV2OrderedSection(input: {
+   return applyPendingThreadOrder(ordered, input.section, pending);
+ }
+ 
++/** Keys of the threads nested under a pinned or active head. */
++export function getThreadListV2NestedThreadKeys(
++  input: Omit<Parameters<typeof getThreadListV2OrderedSection>[0], "section">,
++): Set<string> {
++  const keys = new Set<string>();
++  for (const section of ["pinned", "active"] as const) {
++    for (const family of threadListV2SectionFamilies(input, section)) {
++      for (const child of family.children) keys.add(threadFamilyKeyOf(child));
++    }
++  }
++  return keys;
++}
++
+ export interface ThreadListV2Item {
+   readonly thread: EnvironmentThreadShell;
+   readonly variant: "card" | "slim";
+@@ -285,6 +437,20 @@ export interface ThreadListV2Item {
+   /** Pinned-block row: renders the pin glyph and offers Unpin. */
+   readonly pinned: boolean;
+   readonly isLast: boolean;
++  /** A child thread rendered under its head (threadFamilies.ts). */
++  readonly nested?: boolean;
++  /** Where a nested row sits in its family, for the guide line. */
++  readonly familyEdge?: "none" | "middle" | "last";
++  /** Title of the family's head, for the nested row's accessibility label. */
++  readonly headTitle?: string;
++  /** The row sits in a card section (pinned, active, working), where rows
++      carry a hairline. Set on nested rows, whose variant follows their own
++      state. */
++  readonly cardSection?: boolean;
++  /** Set on a head that has child threads. */
++  readonly headOf?: { readonly childCount: number; readonly collapsed: boolean };
++  /** A collapsed family's stub follows this row as its own list item. */
++  readonly stubAfter?: { readonly headKey: string; readonly label: string };
+ }
+ 
+ export interface ThreadListV2Layout {
+@@ -340,6 +506,17 @@ export interface ThreadListV2ThreadListItem {
+   readonly canMoveDown: boolean;
+ }
+ 
++/** "3 child threads · 1 failed" under a collapsed family; tap expands it. */
++export interface ThreadListV2ChildStubListItem {
++  readonly type: "v2-child-stub";
++  readonly key: string;
++  /** Scoped key of the family's head thread. */
++  readonly headKey: string;
++  readonly label: string;
++  readonly cardSection: boolean;
++  readonly showTrailingDivider: boolean;
++}
++
+ export interface ThreadListV2PendingListItem {
+   readonly type: "v2-pending";
+   readonly key: string;
+@@ -383,6 +560,7 @@ export interface ThreadListV2SettledShelfListItem {
+ 
+ export type ThreadListV2ListItem =
+   | ThreadListV2ThreadListItem
++  | ThreadListV2ChildStubListItem
+   | ThreadListV2PendingListItem
+   | ThreadListV2WorkingShelfListItem
+   | ThreadListV2SnoozedShelfListItem
+@@ -395,6 +573,7 @@ export function isThreadListV2ListItem(value: {
+ }): value is ThreadListV2ListItem {
+   return (
+     value.type === "v2-thread" ||
++    value.type === "v2-child-stub" ||
+     value.type === "v2-pending" ||
+     value.type === "v2-working-shelf" ||
+     value.type === "v2-snoozed-shelf" ||
+@@ -422,6 +601,12 @@ export function threadListV2ListItemsAreEqual(
+         previous.item.variant === item.item.variant &&
+         previous.item.snoozed === item.item.snoozed &&
+         previous.item.pinned === item.item.pinned &&
++        previous.item.nested === item.item.nested &&
++        previous.item.familyEdge === item.item.familyEdge &&
++        previous.item.headTitle === item.item.headTitle &&
++        previous.item.cardSection === item.item.cardSection &&
++        previous.item.headOf?.childCount === item.item.headOf?.childCount &&
++        previous.item.headOf?.collapsed === item.item.headOf?.collapsed &&
+         previous.snoozeWakeLabelText === item.snoozeWakeLabelText &&
+         previous.timeLabel === item.timeLabel &&
+         previous.snoozePresetMinute === item.snoozePresetMinute &&
+@@ -430,6 +615,15 @@ export function threadListV2ListItemsAreEqual(
+         previous.canMoveUp === item.canMoveUp &&
+         previous.canMoveDown === item.canMoveDown
+       );
++    case "v2-child-stub":
++      return (
++        previous.type === "v2-child-stub" &&
++        previous.key === item.key &&
++        previous.headKey === item.headKey &&
++        previous.label === item.label &&
++        previous.cardSection === item.cardSection &&
++        previous.showTrailingDivider === item.showTrailingDivider
++      );
+     case "v2-pending":
+       return (
+         previous.type === "v2-pending" &&
+@@ -522,7 +716,9 @@ export function buildThreadListV2ListItems(input: {
+ }): ThreadListV2ListItem[] {
+   // An empty set is treated as absent so `?.` skips building the key.
+   const queuedThreadKeys = input.queuedThreadKeys?.size ? input.queuedThreadKeys : undefined;
+-  const threadItems = input.items.map((item): ThreadListV2ListItem => {
++  // A row and the stub that follows its family, so shelf header indexes into
++  // `input.items` stay valid.
++  const threadItemGroups = input.items.map((item): ThreadListV2ListItem[] => {
+     const snoozeWakeLabelText =
+       item.snoozed && item.thread.snoozedUntil != null && input.snoozeLabelNow !== undefined
+         ? snoozeWakeLabel(item.thread.snoozedUntil, { now: input.snoozeLabelNow })
+@@ -543,7 +739,7 @@ export function buildThreadListV2ListItems(input: {
+       item.variant === "card"
+         ? input.moveAvailability?.get(`${item.thread.environmentId}:${item.thread.id}`)
+         : undefined;
+-    return {
++    const row: ThreadListV2ListItem = {
+       type: "v2-thread",
+       key: `v2-thread:${item.thread.environmentId}:${item.thread.id}`,
+       item,
+@@ -556,7 +752,21 @@ export function buildThreadListV2ListItems(input: {
+       canMoveUp: move?.canMoveUp === true,
+       canMoveDown: move?.canMoveDown === true,
+     };
++    return item.stubAfter === undefined
++      ? [row]
++      : [
++          row,
++          {
++            type: "v2-child-stub",
++            key: `v2-child-stub:${item.stubAfter.headKey}`,
++            headKey: item.stubAfter.headKey,
++            label: item.stubAfter.label,
++            cardSection: item.cardSection ?? item.variant === "card",
++            showTrailingDivider: false,
++          },
++        ];
+   });
++  const itemsBetween = (start: number, end?: number) => threadItemGroups.slice(start, end).flat();
+   const pendingItems = input.pendingTasks.map((pendingTask, index): ThreadListV2ListItem => ({
+     type: "v2-pending",
+     key: `v2-${pendingTask.key}`,
+@@ -570,10 +780,10 @@ export function buildThreadListV2ListItems(input: {
+   const snoozedShelfHeaderIndex = input.snoozedShelfHeaderIndex ?? null;
+   const settledCount = input.settledCount ?? 0;
+   const settledShelfHeaderIndex = input.settledShelfHeaderIndex ?? null;
+-  const snoozedEnd = settledShelfHeaderIndex ?? threadItems.length;
++  const snoozedEnd = settledShelfHeaderIndex ?? input.items.length;
+   const workingEnd = snoozedShelfHeaderIndex ?? snoozedEnd;
+   const activeEnd = workingShelfHeaderIndex ?? workingEnd;
+-  const result: ThreadListV2ListItem[] = [...threadItems.slice(0, activeEnd), ...pendingItems];
++  const result: ThreadListV2ListItem[] = [...itemsBetween(0, activeEnd), ...pendingItems];
+   const shelfDisabled = input.shelfPreferencesLoading === true;
+   if (workingShelfHeaderIndex !== null && workingCount > 0) {
+     result.push({
+@@ -583,7 +793,7 @@ export function buildThreadListV2ListItems(input: {
+       expanded: input.workingShelfExpanded === true,
+       disabled: shelfDisabled,
+     });
+-    result.push(...threadItems.slice(workingShelfHeaderIndex, workingEnd));
++    result.push(...itemsBetween(workingShelfHeaderIndex, workingEnd));
+   }
+   if (snoozedShelfHeaderIndex !== null && snoozedCount > 0) {
+     result.push({
+@@ -593,7 +803,7 @@ export function buildThreadListV2ListItems(input: {
+       expanded: input.snoozedShelfExpanded === true,
+       disabled: shelfDisabled,
+     });
+-    result.push(...threadItems.slice(snoozedShelfHeaderIndex, snoozedEnd));
++    result.push(...itemsBetween(snoozedShelfHeaderIndex, snoozedEnd));
+   }
+   if (settledShelfHeaderIndex !== null && settledCount > 0) {
+     result.push({
+@@ -603,15 +813,25 @@ export function buildThreadListV2ListItems(input: {
+       expanded: input.settledShelfExpanded !== false,
+       disabled: shelfDisabled,
+     });
+-    result.push(...threadItems.slice(settledShelfHeaderIndex));
++    result.push(...itemsBetween(settledShelfHeaderIndex));
+   }
+   // Hairlines depend on the final neighbour, so they are stamped after the
+   // splice: a recycled cell only re-renders when its divider actually flips.
+   return result.map((entry, index) => {
+-    if (entry.type !== "v2-thread" && entry.type !== "v2-pending") return entry;
++    if (
++      entry.type !== "v2-thread" &&
++      entry.type !== "v2-pending" &&
++      entry.type !== "v2-child-stub"
++    ) {
++      return entry;
++    }
+     const next = result[index + 1];
++    // No hairline inside a family: children and the stub hang off the head.
++    const nextInFamily =
++      next?.type === "v2-child-stub" || (next?.type === "v2-thread" && next.item.nested === true);
+     const showTrailingDivider =
+-      next?.type === "v2-thread" || (next?.type === "v2-pending" && !next.showPendingDivider);
++      !nextInFamily &&
++      (next?.type === "v2-thread" || (next?.type === "v2-pending" && !next.showPendingDivider));
+     return showTrailingDivider === entry.showTrailingDivider
+       ? entry
+       : { ...entry, showTrailingDivider };
+@@ -689,6 +909,10 @@ export function buildThreadListV2Items(input: {
+       outbox. Such a thread has work the user is waiting on, so it stays in
+       the active block even when the server has settled it. */
+   readonly queuedThreadKeys?: ReadonlySet<string>;
++  /** Scoped keys (`environmentId:threadId`) of heads whose child threads the
++      user hid. A collapsed family keeps only children that need input or
++      approval and the selected thread, and shows a stub for the rest. */
++  readonly collapsedChildThreadKeys?: ReadonlyArray<string>;
+ }): ThreadListV2Layout {
+   const now = input.now;
+   const pending =
+@@ -702,68 +926,9 @@ export function buildThreadListV2Items(input: {
+             pendingOrder: null,
+           }),
+         );
+-  const query = input.searchQuery.trim().toLocaleLowerCase();
+-  const projectKeys = input.projectRefs
+-    ? new Set(input.projectRefs.map((ref) => `${ref.environmentId}:${ref.projectId}`))
+-    : null;
+-
+   const workingShelfEnabled = input.workingShelfEnabled === true;
+-  const pinned: EnvironmentThreadShell[] = [];
+-  const active: EnvironmentThreadShell[] = [];
+-  const working: EnvironmentThreadShell[] = [];
+-  const settled: EnvironmentThreadShell[] = [];
+-  const snoozed: EnvironmentThreadShell[] = [];
+-  let nextSnoozeWakeAt: string | null = null;
+-  // An empty set is treated as absent so `?.` skips building the key.
+-  const queuedThreadKeys = input.queuedThreadKeys?.size ? input.queuedThreadKeys : undefined;
+-  for (const thread of input.threads) {
+-    if (thread.archivedAt !== null || thread.lineage.relationshipToParent === "subagent") continue;
+-    // The server stamps settledOverride for the tail.
+-    if (input.environmentId !== null && thread.environmentId !== input.environmentId) continue;
+-    if (projectKeys !== null && !projectKeys.has(`${thread.environmentId}:${thread.projectId}`)) {
+-      continue;
+-    }
+-    if (
+-      query.length > 0 &&
+-      !thread.title.toLocaleLowerCase().includes(query) &&
+-      !threadPullRequestSearchTerms(thread).some((term) =>
+-        term.toLocaleLowerCase().includes(query),
+-      ) &&
+-      input.matchedThreadKeys?.has(
+-        threadSearchMatchKey({
+-          environmentId: thread.environmentId,
+-          threadId: thread.id,
+-        }),
+-      ) !== true
+-    ) {
+-      continue;
+-    }
+-    const supportsSettlement = input.settlementEnvironmentIds?.has(thread.environmentId) ?? true;
+-    const supportsSnooze = input.snoozeEnvironmentIds?.has(thread.environmentId) ?? true;
+-    // Snooze outranks settlement and pinning until the thread wakes.
+-    if (supportsSnooze && effectiveSnoozed(thread, { now })) {
+-      snoozed.push(thread);
+-      if (
+-        thread.snoozedUntil != null &&
+-        (nextSnoozeWakeAt === null ||
+-          parseTimestampMs(thread.snoozedUntil) < parseTimestampMs(nextSnoozeWakeAt))
+-      ) {
+-        nextSnoozeWakeAt = thread.snoozedUntil;
+-      }
+-      continue;
+-    }
+-    const hasQueuedMessages =
+-      queuedThreadKeys?.has(`${thread.environmentId}:${thread.id}`) === true;
+-    if (supportsSettlement && thread.settledOverride === "settled" && !hasQueuedMessages) {
+-      settled.push(thread);
+-    } else if (thread.pinnedAt != null) {
+-      pinned.push(thread);
+-    } else if (workingShelfEnabled && isThreadWorking(thread)) {
+-      working.push(thread);
+-    } else {
+-      active.push(thread);
+-    }
+-  }
++  const { pinned, active, working, settled, snoozed, nextSnoozeWakeAt } =
++    partitionThreadListV2Threads({ ...input, workingShelfEnabled });
+ 
+   // The beta inbox is time-ordered, so the saved arrangement (and any move in
+   // flight) is kept but not applied until the beta is off again.
+@@ -809,58 +974,87 @@ export function buildThreadListV2Items(input: {
+         );
+ 
+   const items: ThreadListV2Item[] = [];
+-  for (const thread of applyPendingThreadOrder(
+-    sortPinnedThreadsByOrderKey(pinned),
+-    "pinned",
+-    pending,
+-  )) {
+-    items.push({
+-      thread,
+-      variant: "card",
+-      snoozed: false,
+-      pinned: true,
+-      isLast: false,
+-    });
+-  }
+-  for (const thread of orderedActive) {
+-    items.push({
+-      thread,
+-      variant: "card",
+-      snoozed: false,
+-      pinned: false,
+-      isLast: false,
+-    });
+-  }
++  const collapsedChildThreadKeys = new Set(input.collapsedChildThreadKeys ?? []);
++  const queuedThreadKeys = input.queuedThreadKeys?.size ? input.queuedThreadKeys : undefined;
++  // Families are built on each section's final visible rows (as the desktop
++  // sidebar does), so paging and shelf collapse decide what nests.
++  const pushFamilies = (
++    threads: ReadonlyArray<EnvironmentThreadShell>,
++    base: Pick<ThreadListV2Item, "variant" | "snoozed" | "pinned">,
++  ) => {
++    for (const family of buildSidebarThreadFamilies(
++      threads,
++      threadFamilyKeyOf,
++      threadOpenerKeyOf,
++    )) {
++      const headKey = threadFamilyKeyOf(family.head);
++      const collapsed = collapsedChildThreadKeys.has(headKey);
++      const { shown, hidden } = foldSidebarThreadFamily(family.children, {
++        collapsed,
++        keepVisible: (child) =>
++          threadFamilyKeyOf(child) === selectedThreadKey ||
++          childThreadNeedsUser(resolveThreadListV2Status(child)),
++      });
++      const stubAfter =
++        hidden.length === 0
++          ? undefined
++          : {
++              headKey,
++              label: formatHiddenChildThreadsLabel(
++                hidden.map((child) => ({
++                  status: resolveThreadListV2Status(child),
++                  isUnread: threadHasUnseenCompletion(child),
++                })),
++                { someShown: shown.length > 0 },
++              ),
++            };
++      items.push({
++        thread: family.head,
++        ...base,
++        isLast: false,
++        ...(family.children.length === 0
++          ? {}
++          : { headOf: { childCount: family.children.length, collapsed } }),
++        ...(shown.length === 0 && stubAfter !== undefined ? { stubAfter } : {}),
++      });
++      shown.forEach((child, index) => {
++        const isLastShown = index === shown.length - 1;
++        // A child keeps its own state's actions: a settled child under a live
++        // opener offers Unsettle, a worker under a snoozed delegator is not
++        // itself snoozed.
++        const childSettled =
++          (input.settlementEnvironmentIds?.has(child.environmentId) ?? true) &&
++          child.settledOverride === "settled" &&
++          queuedThreadKeys?.has(`${child.environmentId}:${child.id}`) !== true;
++        items.push({
++          thread: child,
++          variant: base.variant === "card" && !childSettled ? "card" : "slim",
++          snoozed:
++            (input.snoozeEnvironmentIds?.has(child.environmentId) ?? true) &&
++            effectiveSnoozed(child, { now }),
++          pinned: base.pinned && child.pinnedAt != null,
++          isLast: false,
++          nested: true,
++          headTitle: family.head.title,
++          cardSection: base.variant === "card",
++          familyEdge: isLastShown && stubAfter === undefined ? "last" : "middle",
++          ...(isLastShown && stubAfter !== undefined ? { stubAfter } : {}),
++        });
++      });
++    }
++  };
++  pushFamilies(applyPendingThreadOrder(sortPinnedThreadsByOrderKey(pinned), "pinned", pending), {
++    variant: "card",
++    snoozed: false,
++    pinned: true,
++  });
++  pushFamilies(orderedActive, { variant: "card", snoozed: false, pinned: false });
+   const workingShelfHeaderIndex = orderedWorking.length > 0 ? items.length : null;
+-  for (const thread of visibleWorking) {
+-    items.push({
+-      thread,
+-      variant: "card",
+-      snoozed: false,
+-      pinned: false,
+-      isLast: false,
+-    });
+-  }
++  pushFamilies(visibleWorking, { variant: "card", snoozed: false, pinned: false });
+   const snoozedShelfHeaderIndex = orderedSnoozed.length > 0 ? items.length : null;
+-  for (const thread of visibleSnoozed) {
+-    items.push({
+-      thread,
+-      variant: "slim",
+-      snoozed: true,
+-      pinned: false,
+-      isLast: false,
+-    });
+-  }
++  pushFamilies(visibleSnoozed, { variant: "slim", snoozed: true, pinned: false });
+   const settledShelfHeaderIndex = orderedSettled.length > 0 ? items.length : null;
+-  for (const thread of visibleSettled) {
+-    items.push({
+-      thread,
+-      variant: "slim",
+-      snoozed: false,
+-      pinned: false,
+-      isLast: false,
+-    });
+-  }
++  pushFamilies(visibleSettled, { variant: "slim", snoozed: false, pinned: false });
+   const last = items.at(-1);
+   if (last) {
+     items[items.length - 1] = { ...last, isLast: true };
+diff --git a/apps/mobile/src/features/threads/use-thread-list-v2-shelf-preferences.ts b/apps/mobile/src/features/threads/use-thread-list-v2-shelf-preferences.ts
+index 1ee46cbff..9de2176e8 100644
+--- a/apps/mobile/src/features/threads/use-thread-list-v2-shelf-preferences.ts
++++ b/apps/mobile/src/features/threads/use-thread-list-v2-shelf-preferences.ts
+@@ -2,6 +2,8 @@ import { useAtomSet, useAtomValue } from "@effect/atom-react";
+ import { AsyncResult } from "effect/reactivity";
+ import { useCallback, useRef } from "react";
+ 
++const NO_COLLAPSED_CHILD_THREADS: readonly string[] = [];
++
+ import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
+ 
+ /**
+@@ -21,6 +23,11 @@ export function useThreadListV2ShelfPreferences() {
+   const workingShelfEnabled = loaded && preferencesResult.value.workingShelfEnabled === true;
+   const workingShelfExpanded =
+     loaded && preferencesResult.value.threadListWorkingShelfExpanded === true;
++  const collapsedChildThreadKeys =
++    (loaded ? preferencesResult.value.threadListCollapsedChildThreadKeys : undefined) ??
++    NO_COLLAPSED_CHILD_THREADS;
++  const collapsedChildThreadKeysRef = useRef(collapsedChildThreadKeys);
++  collapsedChildThreadKeysRef.current = collapsedChildThreadKeys;
+   const snoozedShelfExpandedRef = useRef(snoozedShelfExpanded);
+   const settledShelfExpandedRef = useRef(settledShelfExpanded);
+   const workingShelfExpandedRef = useRef(workingShelfExpanded);
+@@ -46,9 +53,24 @@ export function useThreadListV2ShelfPreferences() {
+     workingShelfExpandedRef.current = expanded;
+     savePreferences({ threadListWorkingShelfExpanded: expanded });
+   }, [loaded, savePreferences]);
++  /** Hides or shows a family's child threads; `headKey` is the head's scoped key. */
++  const toggleChildThreads = useCallback(
++    (headKey: string) => {
++      if (!loaded) return;
++      const current = collapsedChildThreadKeysRef.current;
++      const next = current.includes(headKey)
++        ? current.filter((key) => key !== headKey)
++        : [...current, headKey];
++      collapsedChildThreadKeysRef.current = next;
++      savePreferences({ threadListCollapsedChildThreadKeys: next });
++    },
++    [loaded, savePreferences],
++  );
+ 
+   return {
+     loaded,
++    collapsedChildThreadKeys,
++    toggleChildThreads,
+     settledShelfExpanded,
+     snoozedShelfExpanded,
+     workingShelfEnabled,
+diff --git a/apps/mobile/src/lib/storage.test.ts b/apps/mobile/src/lib/storage.test.ts
+index 8aa03e229..b717e4d1d 100644
+--- a/apps/mobile/src/lib/storage.test.ts
++++ b/apps/mobile/src/lib/storage.test.ts
+@@ -271,6 +271,19 @@ describe("mobile connection storage", () => {
+     await expect(loadPreferences()).resolves.toEqual({});
+   });
+ 
++  it("persists hidden child thread families and drops non-string keys", async () => {
++    await expect(
++      savePreferencesPatch({ threadListCollapsedChildThreadKeys: ["environment-1:thread-1"] }),
++    ).resolves.toEqual({ threadListCollapsedChildThreadKeys: ["environment-1:thread-1"] });
++    mocks.setPreferencesJson(
++      JSON.stringify({ threadListCollapsedChildThreadKeys: ["a:b", 1, null] }),
++      20,
++    );
++    await expect(loadPreferences()).resolves.toEqual({
++      threadListCollapsedChildThreadKeys: ["a:b"],
++    });
++  });
++
+   it("drops legacy and invalid thread list shelf expansion preferences", async () => {
+     mocks.setPreferencesJson(
+       JSON.stringify({
+diff --git a/apps/mobile/src/persistence/mobile-preferences.ts b/apps/mobile/src/persistence/mobile-preferences.ts
+index c148c354c..99027c462 100644
+--- a/apps/mobile/src/persistence/mobile-preferences.ts
++++ b/apps/mobile/src/persistence/mobile-preferences.ts
+@@ -94,6 +94,8 @@ export interface Preferences {
+   readonly threadListSettledShelfExpanded?: boolean;
+   readonly threadListSnoozedShelfExpanded?: boolean;
+   readonly threadListWorkingShelfExpanded?: boolean;
++  /** Scoped keys of heads whose child threads the user hid in the list. */
++  readonly threadListCollapsedChildThreadKeys?: readonly string[];
+   /** Home list filters, restored on the next launch. */
+   readonly threadListFilters?: ThreadListFilters;
+   readonly pullRequestListFilters?: PullRequestListPreferences;
+@@ -164,6 +166,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
+     threadListSettledShelfExpanded?: boolean;
+     threadListSnoozedShelfExpanded?: boolean;
+     threadListWorkingShelfExpanded?: boolean;
++    threadListCollapsedChildThreadKeys?: readonly string[];
+     threadListFilters?: ThreadListFilters;
+     pullRequestListFilters?: PullRequestListPreferences;
+   } = {};
+@@ -283,6 +286,12 @@ function sanitizePreferences(parsed: Preferences): Preferences {
+   if (typeof parsed.threadListWorkingShelfExpanded === "boolean") {
+     preferences.threadListWorkingShelfExpanded = parsed.threadListWorkingShelfExpanded;
+   }
++  if (Array.isArray(parsed.threadListCollapsedChildThreadKeys)) {
++    preferences.threadListCollapsedChildThreadKeys =
++      parsed.threadListCollapsedChildThreadKeys.filter(
++        (key): key is string => typeof key === "string",
++      );
++  }
+   if (isThreadListFilters(parsed.threadListFilters)) {
+     preferences.threadListFilters = parsed.threadListFilters;
+   }
+diff --git a/apps/mobile/src/state/entities.ts b/apps/mobile/src/state/entities.ts
+index b8e42b0cb..37948c780 100644
+--- a/apps/mobile/src/state/entities.ts
++++ b/apps/mobile/src/state/entities.ts
+@@ -88,6 +88,11 @@ export function useNavigationThreadShells(): ReadonlyArray<EnvironmentThreadShel
+   return useAtomValue(environmentThreadShells.navigationThreadShellsAtom);
+ }
+ 
++/** Navigation threads plus `delegate_task` workers, which the list nests. */
++export function useRosterThreadShells(): ReadonlyArray<EnvironmentThreadShell> {
++  return useAtomValue(environmentThreadShells.rosterThreadShellsAtom);
++}
++
+ export function useProject(ref: ScopedProjectRef | null): EnvironmentProject | null {
+   return useAtomValue(ref === null ? EMPTY_PROJECT_ATOM : environmentProjects.projectAtom(ref));
+ }
+diff --git a/apps/web/src/components/Sidebar.families.ts b/apps/web/src/components/Sidebar.families.ts
+index 6e34c3f71..c36543a6f 100644
+--- a/apps/web/src/components/Sidebar.families.ts
++++ b/apps/web/src/components/Sidebar.families.ts
+@@ -1,194 +1,3 @@
+-// Child threads in the sidebar, after Claude.app's nested sessions: a thread
+-// an agent opened through T3 tools renders under the thread that opened it.
+-// Nesting is a view inside one section. A child an agent or auto-settle
+-// settled follows an opener that is still live (pinned, active, working), so
+-// finished children stay under the thread that runs them; a child the user
+-// settled goes to Settled. Otherwise every thread keeps the section its own
+-// state puts it in: a live child under a settled opener stays live on its
+-// own, and a child whose opener is archived, hidden, or paged out renders on
+-// its own. Families are one level deep: a grandchild hangs under the
+-// topmost ancestor in its section.
+-//
+-// A task an agent delegated (`delegate_task`) belongs to the thread that
+-// delegated it: it renders in that thread's section whatever its own state,
+-// so the orchestrator keeps its workers together, and it stays hidden while
+-// that thread is not shown.
+-
+-import type { SidebarThreadStatus } from "./Sidebar.logic";
+-
+-/** Upper bound on opener chains, so corrupt data can never spin. */
+-const MAX_FAMILY_DEPTH = 32;
+-
+-export interface SidebarThreadFamily<T> {
+-  readonly head: T;
+-  readonly children: readonly T[];
+-}
+-
+-/**
+- * Group one section's threads, in display order, into families. Heads keep
+- * their place; children follow their head in the order the section lists
+- * them. `parentKeyOf` names the thread that opened a thread, or null.
+- */
+-export function buildSidebarThreadFamilies<T>(
+-  threads: readonly T[],
+-  keyOf: (thread: T) => string,
+-  parentKeyOf: (thread: T) => string | null,
+-): SidebarThreadFamily<T>[] {
+-  const byKey = new Map(threads.map((thread) => [keyOf(thread), thread] as const));
+-  const headKeyOf = (thread: T): string => {
+-    const ownKey = keyOf(thread);
+-    const seen = new Set([ownKey]);
+-    let currentKey = ownKey;
+-    let current = thread;
+-    for (let depth = 0; depth < MAX_FAMILY_DEPTH; depth += 1) {
+-      const parentKey = parentKeyOf(current);
+-      const parent = parentKey === null ? undefined : byKey.get(parentKey);
+-      if (parentKey === null || parent === undefined) return currentKey;
+-      // A cycle has no head, so its threads stay on their own.
+-      if (seen.has(parentKey)) return ownKey;
+-      seen.add(parentKey);
+-      currentKey = parentKey;
+-      current = parent;
+-    }
+-    return ownKey;
+-  };
+-
+-  const childrenByHead = new Map<string, T[]>();
+-  const heads: T[] = [];
+-  for (const thread of threads) {
+-    const headKey = headKeyOf(thread);
+-    if (headKey === keyOf(thread)) {
+-      heads.push(thread);
+-      continue;
+-    }
+-    const children = childrenByHead.get(headKey);
+-    if (children === undefined) childrenByHead.set(headKey, [thread]);
+-    else children.push(thread);
+-  }
+-  return heads.map((head) => ({ head, children: childrenByHead.get(keyOf(head)) ?? [] }));
+-}
+-
+-/**
+- * Settled threads whose opener chain reaches a live thread move to that
+- * thread's section, unless the user settled them (`userSettled`). The walk
+- * passes through settled openers only, so a settled grandchild follows its
+- * settled parent up to the live root, and a snoozed or missing opener keeps
+- * the child settled.
+- */
+-export function placeSettledChildThreads<T, S>(
+-  settled: readonly T[],
+-  keyOf: (thread: T) => string,
+-  parentKeyOf: (thread: T) => string | null,
+-  liveSectionOf: (key: string) => S | null,
+-  userSettled: (thread: T) => boolean,
+-): { readonly settled: T[]; readonly moved: { readonly thread: T; readonly section: S }[] } {
+-  const settledByKey = new Map(settled.map((thread) => [keyOf(thread), thread] as const));
+-  const stay: T[] = [];
+-  const moved: { thread: T; section: S }[] = [];
+-  for (const thread of settled) {
+-    if (userSettled(thread)) {
+-      stay.push(thread);
+-      continue;
+-    }
+-    let section: S | null = null;
+-    let current = thread;
+-    const seen = new Set([keyOf(thread)]);
+-    for (let depth = 0; depth < MAX_FAMILY_DEPTH; depth += 1) {
+-      const parentKey = parentKeyOf(current);
+-      if (parentKey === null || seen.has(parentKey)) break;
+-      section = liveSectionOf(parentKey);
+-      if (section !== null) break;
+-      const parent = settledByKey.get(parentKey);
+-      if (parent === undefined) break;
+-      seen.add(parentKey);
+-      current = parent;
+-    }
+-    if (section === null) stay.push(thread);
+-    else moved.push({ thread, section });
+-  }
+-  return { settled: stay, moved };
+-}
+-
+-/**
+- * The section each delegated child renders in: its delegator's, found through
+- * delegated ancestors up to the first thread `sectionOf` places. A child whose
+- * chain ends at a thread that is not shown stays hidden (`hidden`).
+- */
+-export function placeDelegatedChildThreads<T, S>(
+-  delegated: readonly T[],
+-  keyOf: (thread: T) => string,
+-  delegatorKeyOf: (thread: T) => string,
+-  sectionOf: (key: string) => S | null,
+-): { readonly placed: { readonly thread: T; readonly section: S }[]; readonly hidden: T[] } {
+-  const delegatedByKey = new Map(delegated.map((thread) => [keyOf(thread), thread] as const));
+-  const placed: { thread: T; section: S }[] = [];
+-  const hidden: T[] = [];
+-  for (const thread of delegated) {
+-    let section: S | null = null;
+-    let current = thread;
+-    const seen = new Set([keyOf(thread)]);
+-    for (let depth = 0; depth < MAX_FAMILY_DEPTH; depth += 1) {
+-      const delegatorKey = delegatorKeyOf(current);
+-      if (seen.has(delegatorKey)) break;
+-      section = sectionOf(delegatorKey);
+-      if (section !== null) break;
+-      const delegator = delegatedByKey.get(delegatorKey);
+-      if (delegator === undefined) break;
+-      seen.add(delegatorKey);
+-      current = delegator;
+-    }
+-    if (section === null) hidden.push(thread);
+-    else placed.push({ thread, section });
+-  }
+-  return { placed, hidden };
+-}
+-
+-/** Heads then their shown children, the order rows render and keys traverse. */
+-export function flattenSidebarThreadFamilies<T>(families: readonly SidebarThreadFamily<T>[]): T[] {
+-  return families.flatMap((family) => [family.head, ...family.children]);
+-}
+-
+-/**
+- * A collapsed family still shows a child that needs the user (an approval or
+- * a question) and the open thread. A child that is only working stays hidden:
+- * its status shows on the stub instead.
+- */
+-export function foldSidebarThreadFamily<T>(
+-  children: readonly T[],
+-  input: {
+-    readonly collapsed: boolean;
+-    readonly keepVisible: (thread: T) => boolean;
+-  },
+-): { readonly shown: readonly T[]; readonly hidden: readonly T[] } {
+-  if (!input.collapsed) return { shown: children, hidden: [] };
+-  const shown: T[] = [];
+-  const hidden: T[] = [];
+-  for (const child of children) (input.keepVisible(child) ? shown : hidden).push(child);
+-  return { shown, hidden };
+-}
+-
+-export function childThreadNeedsUser(status: SidebarThreadStatus): boolean {
+-  return status === "approval" || status === "input";
+-}
+-
+-/** The collapsed family's stub: "3 child threads · 1 failed · 2 working". */
+-export function formatHiddenChildThreadsLabel(
+-  hidden: readonly { readonly status: SidebarThreadStatus; readonly isUnread: boolean }[],
+-  options: { readonly someShown: boolean },
+-): string {
+-  let failed = 0;
+-  let unread = 0;
+-  let working = 0;
+-  for (const child of hidden) {
+-    if (child.status === "failed" || child.status === "limited") failed += 1;
+-    else if (child.isUnread) unread += 1;
+-    else if (child.status === "working" || child.status === "waiting") working += 1;
+-  }
+-  const noun = hidden.length === 1 ? "child thread" : "child threads";
+-  return [
+-    `${hidden.length} ${options.someShown ? "more " : ""}${noun}`,
+-    ...(failed > 0 ? [`${failed} failed`] : []),
+-    ...(unread > 0 ? [`${unread} new`] : []),
+-    ...(working > 0 ? [`${working} working`] : []),
+-  ].join(" · ");
+-}
++// Child-thread family rules now live in client-runtime so the web sidebar and
++// the mobile thread list nest threads the same way.
++export * from "@t3tools/client-runtime/state/thread-families";
+diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
+index b9a34facd..20b652a6f 100644
+--- a/apps/web/src/components/Sidebar.tsx
++++ b/apps/web/src/components/Sidebar.tsx
+@@ -242,8 +242,11 @@ import {
+   formatHiddenChildThreadsLabel,
+   placeDelegatedChildThreads,
+   placeSettledChildThreads,
++  threadDelegatorKeyOf,
++  threadFamilyKeyOf,
++  threadOpenerKeyOf,
+   type SidebarThreadFamily,
+-} from "./Sidebar.families";
++} from "@t3tools/client-runtime/state/thread-families";
+ import { resolveLocalCheckoutBranchMismatch } from "./BranchToolbar.logic";
+ import {
+   createSidebarCollisionDetection,
+@@ -330,18 +333,9 @@ interface RenderedChildThreadFamily extends SidebarThreadFamily<EnvironmentThrea
+   readonly hasChildren: boolean;
+ }
+ 
+-const threadKeyOf = (thread: EnvironmentThreadShell) =>
+-  scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
+-const openerKeyOf = (thread: EnvironmentThreadShell) => {
+-  const openerId = thread.openedByThreadId ?? thread.delegatedByThreadId;
+-  return openerId === undefined
+-    ? null
+-    : scopedThreadKey(scopeThreadRef(thread.environmentId, openerId));
+-};
+-// Only called for delegated children; without a delegator a thread names
+-// itself, which ends the walk and keeps it hidden.
+-const delegatorKeyOf = (thread: EnvironmentThreadShell) =>
+-  scopedThreadKey(scopeThreadRef(thread.environmentId, thread.delegatedByThreadId ?? thread.id));
++const threadKeyOf = threadFamilyKeyOf;
++const openerKeyOf = threadOpenerKeyOf;
++const delegatorKeyOf = threadDelegatorKeyOf;
+ 
+ // Working beta: when this client saw each thread leave the Working shelf.
+ // Module scope keeps the inbox order across routes that unmount the sidebar.
+@@ -3011,7 +3005,7 @@ export default function Sidebar() {
+       }
+     }
+     // A child an agent or auto-settle settled stays under an opener that is
+-    // still live; one the user settled goes to Settled (Sidebar.families.ts).
++    // still live; one the user settled goes to Settled (threadFamilies.ts).
+     const liveSectionByKey = new Map<string, EnvironmentThreadShell[]>();
+     for (const list of [pinned, active, working]) {
+       for (const thread of list) liveSectionByKey.set(threadKeyOf(thread), list);
+@@ -3026,7 +3020,7 @@ export default function Sidebar() {
+     settled.splice(0, settled.length, ...placed.settled);
+     for (const { thread, section } of placed.moved) section.push(thread);
+     // Delegated tasks render under the thread that delegated them, in its
+-    // section (Sidebar.families.ts); other subagents stay out of the roster.
++    // section (threadFamilies.ts); other subagents stay out of the roster.
+     const sectionByKey = new Map<string, EnvironmentThreadShell[]>();
+     for (const list of [pinned, active, working, snoozed, settled]) {
+       for (const thread of list) sectionByKey.set(threadKeyOf(thread), list);
+@@ -3259,7 +3253,7 @@ export default function Sidebar() {
+     return routeThread === undefined ? EMPTY_THREADS : [routeThread];
+   }, [routeThreadKey, workingShelfExpanded, workingThreads]);
+ 
+-  // Child threads (Sidebar.families.ts): a thread an agent opened renders
++  // Child threads (threadFamilies.ts): a thread an agent opened renders
+   // under its opener when both sit in the same section. A collapsed family
+   // keeps only children that need the user, plus the open thread.
+   const [collapsedChildThreadKeys, setCollapsedChildThreadKeys] = useLocalStorage(
+diff --git a/packages/client-runtime/package.json b/packages/client-runtime/package.json
+index e7c70a789..c3581abd3 100644
+--- a/packages/client-runtime/package.json
++++ b/packages/client-runtime/package.json
+@@ -287,6 +287,10 @@
+       "types": "./src/state/threadSort.ts",
+       "default": "./src/state/threadSort.ts"
+     },
++    "./state/thread-families": {
++      "types": "./src/state/threadFamilies.ts",
++      "default": "./src/state/threadFamilies.ts"
++    },
+     "./state/thread-inbox": {
+       "types": "./src/state/threadInbox.ts",
+       "default": "./src/state/threadInbox.ts"
+diff --git a/packages/client-runtime/src/state/threadFamilies.test.ts b/packages/client-runtime/src/state/threadFamilies.test.ts
+new file mode 100644
+index 000000000..042134273
+--- /dev/null
++++ b/packages/client-runtime/src/state/threadFamilies.test.ts
+@@ -0,0 +1,232 @@
++import { describe, expect, it } from "vite-plus/test";
++import {
++  buildSidebarThreadFamilies,
++  childThreadNeedsUser,
++  flattenSidebarThreadFamilies,
++  foldSidebarThreadFamily,
++  formatHiddenChildThreadsLabel,
++  placeDelegatedChildThreads,
++  placeSettledChildThreads,
++} from "./threadFamilies.ts";
++
++interface Row {
++  readonly key: string;
++  readonly openedBy: string | null;
++  readonly userSettled?: boolean;
++}
++
++const row = (key: string, openedBy: string | null = null): Row => ({ key, openedBy });
++const families = (rows: readonly Row[]) =>
++  buildSidebarThreadFamilies(
++    rows,
++    (thread) => thread.key,
++    (thread) => thread.openedBy,
++  ).map((family) => [family.head.key, family.children.map((child) => child.key)]);
++
++describe("buildSidebarThreadFamilies", () => {
++  it("puts children after their head in section order", () => {
++    expect(families([row("c1", "p"), row("x"), row("p"), row("c2", "p")])).toEqual([
++      ["x", []],
++      ["p", ["c1", "c2"]],
++    ]);
++  });
++
++  it("keeps a child on its own when its opener is not in the section", () => {
++    expect(families([row("child", "settled-parent"), row("other")])).toEqual([
++      ["child", []],
++      ["other", []],
++    ]);
++  });
++
++  it("flattens grandchildren under the topmost ancestor in the section", () => {
++    expect(families([row("root"), row("child", "root"), row("grandchild", "child")])).toEqual([
++      ["root", ["child", "grandchild"]],
++    ]);
++  });
++
++  it("stops at the topmost ancestor that is in the section", () => {
++    // The root sits in another section, so the child heads its own family.
++    expect(families([row("child", "root"), row("grandchild", "child")])).toEqual([
++      ["child", ["grandchild"]],
++    ]);
++  });
++
++  it("leaves threads in an opener cycle on their own", () => {
++    expect(families([row("a", "b"), row("b", "a"), row("c", "a")])).toEqual([
++      ["a", []],
++      ["b", []],
++      ["c", []],
++    ]);
++  });
++
++  it("flattens families back to render order", () => {
++    const built = buildSidebarThreadFamilies(
++      [row("c", "p"), row("p"), row("x")],
++      (thread) => thread.key,
++      (thread) => thread.openedBy,
++    );
++    expect(flattenSidebarThreadFamilies(built).map((thread) => thread.key)).toEqual([
++      "p",
++      "c",
++      "x",
++    ]);
++  });
++});
++
++describe("placeSettledChildThreads", () => {
++  const place = (settled: readonly Row[], live: Record<string, "active" | "working">) => {
++    const placed = placeSettledChildThreads(
++      settled,
++      (thread) => thread.key,
++      (thread) => thread.openedBy,
++      (key) => live[key] ?? null,
++      (thread) => thread.userSettled === true,
++    );
++    return {
++      settled: placed.settled.map((thread) => thread.key),
++      moved: placed.moved.map(({ thread, section }) => [thread.key, section]),
++    };
++  };
++
++  it("moves a finished child to its live opener's section", () => {
++    expect(place([row("done", "parent"), row("old")], { parent: "working" })).toEqual({
++      settled: ["old"],
++      moved: [["done", "working"]],
++    });
++  });
++
++  it("leaves a child the user settled in Settled", () => {
++    expect(
++      place([{ ...row("mine", "parent"), userSettled: true }, row("agent", "parent")], {
++        parent: "active",
++      }),
++    ).toEqual({ settled: ["mine"], moved: [["agent", "active"]] });
++  });
++
++  it("follows settled openers up to the live root", () => {
++    expect(place([row("child", "root"), row("grandchild", "child")], { root: "active" })).toEqual({
++      settled: [],
++      moved: [
++        ["child", "active"],
++        ["grandchild", "active"],
++      ],
++    });
++  });
++
++  it("keeps a child settled when no opener is live", () => {
++    expect(place([row("child", "parent"), row("parent"), row("orphan", "gone")], {})).toEqual({
++      settled: ["child", "parent", "orphan"],
++      moved: [],
++    });
++  });
++
++  it("stops on an opener cycle", () => {
++    expect(place([row("a", "b"), row("b", "a")], {})).toEqual({
++      settled: ["a", "b"],
++      moved: [],
++    });
++  });
++});
++
++describe("placeDelegatedChildThreads", () => {
++  const place = (
++    delegated: readonly { key: string; by: string }[],
++    sections: Record<string, string>,
++  ) => {
++    const result = placeDelegatedChildThreads(
++      delegated,
++      (thread) => thread.key,
++      (thread) => thread.by,
++      (key) => sections[key] ?? null,
++    );
++    return {
++      placed: result.placed.map(({ thread, section }) => [thread.key, section]),
++      hidden: result.hidden.map((thread) => thread.key),
++    };
++  };
++
++  it("puts a delegated child in its delegator's section, whatever its own state", () => {
++    expect(place([{ key: "worker", by: "orchestrator" }], { orchestrator: "settled" })).toEqual({
++      placed: [["worker", "settled"]],
++      hidden: [],
++    });
++  });
++
++  it("follows delegated ancestors up to the shown thread", () => {
++    expect(
++      place(
++        [
++          { key: "reviewer", by: "worker" },
++          { key: "worker", by: "orchestrator" },
++        ],
++        { orchestrator: "active" },
++      ),
++    ).toEqual({
++      placed: [
++        ["reviewer", "active"],
++        ["worker", "active"],
++      ],
++      hidden: [],
++    });
++  });
++
++  it("hides a child whose delegator is not shown, and survives cycles", () => {
++    expect(
++      place(
++        [
++          { key: "orphan", by: "archived" },
++          { key: "a", by: "b" },
++          { key: "b", by: "a" },
++        ],
++        {},
++      ),
++    ).toEqual({ placed: [], hidden: ["orphan", "a", "b"] });
++  });
++});
++
++describe("foldSidebarThreadFamily", () => {
++  const children = [row("working"), row("asks"), row("open")];
++  const keepVisible = (thread: Row) => thread.key === "asks" || thread.key === "open";
++
++  it("shows every child while the family is open", () => {
++    expect(foldSidebarThreadFamily(children, { collapsed: false, keepVisible })).toEqual({
++      shown: children,
++      hidden: [],
++    });
++  });
++
++  it("keeps only children that need the user or are open when collapsed", () => {
++    const folded = foldSidebarThreadFamily(children, { collapsed: true, keepVisible });
++    expect(folded.shown.map((thread) => thread.key)).toEqual(["asks", "open"]);
++    expect(folded.hidden.map((thread) => thread.key)).toEqual(["working"]);
++  });
++
++  it("treats approvals and questions as needing the user, not working", () => {
++    expect(childThreadNeedsUser("approval")).toBe(true);
++    expect(childThreadNeedsUser("input")).toBe(true);
++    expect(childThreadNeedsUser("working")).toBe(false);
++    expect(childThreadNeedsUser("ready")).toBe(false);
++  });
++});
++
++describe("formatHiddenChildThreadsLabel", () => {
++  it("counts hidden children and their news", () => {
++    expect(
++      formatHiddenChildThreadsLabel(
++        [
++          { status: "failed", isUnread: true },
++          { status: "ready", isUnread: true },
++          { status: "working", isUnread: false },
++          { status: "waiting", isUnread: false },
++        ],
++        { someShown: false },
++      ),
++    ).toBe("4 child threads · 1 failed · 1 new · 2 working");
++  });
++
++  it("says more when some children still show", () => {
++    expect(
++      formatHiddenChildThreadsLabel([{ status: "ready", isUnread: false }], { someShown: true }),
++    ).toBe("1 more child thread");
++  });
++});
+diff --git a/packages/client-runtime/src/state/threadFamilies.ts b/packages/client-runtime/src/state/threadFamilies.ts
+new file mode 100644
+index 000000000..619018739
+--- /dev/null
++++ b/packages/client-runtime/src/state/threadFamilies.ts
+@@ -0,0 +1,229 @@
++// Child threads in the sidebar, after Claude.app's nested sessions: a thread
++// an agent opened through T3 tools renders under the thread that opened it.
++// Nesting is a view inside one section. A child an agent or auto-settle
++// settled follows an opener that is still live (pinned, active, working), so
++// finished children stay under the thread that runs them; a child the user
++// settled goes to Settled. Otherwise every thread keeps the section its own
++// state puts it in: a live child under a settled opener stays live on its
++// own, and a child whose opener is archived, hidden, or paged out renders on
++// its own. Families are one level deep: a grandchild hangs under the
++// topmost ancestor in its section.
++//
++// A task an agent delegated (`delegate_task`) belongs to the thread that
++// delegated it: it renders in that thread's section whatever its own state,
++// so the orchestrator keeps its workers together, and it stays hidden while
++// that thread is not shown.
++
++import { scopeThreadRef, scopedThreadKey } from "../environment/scoped.ts";
++import type { EnvironmentThreadShell } from "./models.ts";
++
++/** The thread statuses a family cares about (the sidebar's inbox statuses). */
++export type ThreadFamilyStatus =
++  | "approval"
++  | "input"
++  | "working"
++  | "waiting"
++  | "failed"
++  | "limited"
++  | "ready";
++
++/** Upper bound on opener chains, so corrupt data can never spin. */
++const MAX_FAMILY_DEPTH = 32;
++
++export interface SidebarThreadFamily<T> {
++  readonly head: T;
++  readonly children: readonly T[];
++}
++
++/**
++ * Group one section's threads, in display order, into families. Heads keep
++ * their place; children follow their head in the order the section lists
++ * them. `parentKeyOf` names the thread that opened a thread, or null.
++ */
++export function buildSidebarThreadFamilies<T>(
++  threads: readonly T[],
++  keyOf: (thread: T) => string,
++  parentKeyOf: (thread: T) => string | null,
++): SidebarThreadFamily<T>[] {
++  const byKey = new Map(threads.map((thread) => [keyOf(thread), thread] as const));
++  const headKeyOf = (thread: T): string => {
++    const ownKey = keyOf(thread);
++    const seen = new Set([ownKey]);
++    let currentKey = ownKey;
++    let current = thread;
++    for (let depth = 0; depth < MAX_FAMILY_DEPTH; depth += 1) {
++      const parentKey = parentKeyOf(current);
++      const parent = parentKey === null ? undefined : byKey.get(parentKey);
++      if (parentKey === null || parent === undefined) return currentKey;
++      // A cycle has no head, so its threads stay on their own.
++      if (seen.has(parentKey)) return ownKey;
++      seen.add(parentKey);
++      currentKey = parentKey;
++      current = parent;
++    }
++    return ownKey;
++  };
++
++  const childrenByHead = new Map<string, T[]>();
++  const heads: T[] = [];
++  for (const thread of threads) {
++    const headKey = headKeyOf(thread);
++    if (headKey === keyOf(thread)) {
++      heads.push(thread);
++      continue;
++    }
++    const children = childrenByHead.get(headKey);
++    if (children === undefined) childrenByHead.set(headKey, [thread]);
++    else children.push(thread);
++  }
++  return heads.map((head) => ({ head, children: childrenByHead.get(keyOf(head)) ?? [] }));
++}
++
++/**
++ * Settled threads whose opener chain reaches a live thread move to that
++ * thread's section, unless the user settled them (`userSettled`). The walk
++ * passes through settled openers only, so a settled grandchild follows its
++ * settled parent up to the live root, and a snoozed or missing opener keeps
++ * the child settled.
++ */
++export function placeSettledChildThreads<T, S>(
++  settled: readonly T[],
++  keyOf: (thread: T) => string,
++  parentKeyOf: (thread: T) => string | null,
++  liveSectionOf: (key: string) => S | null,
++  userSettled: (thread: T) => boolean,
++): { readonly settled: T[]; readonly moved: { readonly thread: T; readonly section: S }[] } {
++  const settledByKey = new Map(settled.map((thread) => [keyOf(thread), thread] as const));
++  const stay: T[] = [];
++  const moved: { thread: T; section: S }[] = [];
++  for (const thread of settled) {
++    if (userSettled(thread)) {
++      stay.push(thread);
++      continue;
++    }
++    let section: S | null = null;
++    let current = thread;
++    const seen = new Set([keyOf(thread)]);
++    for (let depth = 0; depth < MAX_FAMILY_DEPTH; depth += 1) {
++      const parentKey = parentKeyOf(current);
++      if (parentKey === null || seen.has(parentKey)) break;
++      section = liveSectionOf(parentKey);
++      if (section !== null) break;
++      const parent = settledByKey.get(parentKey);
++      if (parent === undefined) break;
++      seen.add(parentKey);
++      current = parent;
++    }
++    if (section === null) stay.push(thread);
++    else moved.push({ thread, section });
++  }
++  return { settled: stay, moved };
++}
++
++/**
++ * The section each delegated child renders in: its delegator's, found through
++ * delegated ancestors up to the first thread `sectionOf` places. A child whose
++ * chain ends at a thread that is not shown stays hidden (`hidden`).
++ */
++export function placeDelegatedChildThreads<T, S>(
++  delegated: readonly T[],
++  keyOf: (thread: T) => string,
++  delegatorKeyOf: (thread: T) => string,
++  sectionOf: (key: string) => S | null,
++): { readonly placed: { readonly thread: T; readonly section: S }[]; readonly hidden: T[] } {
++  const delegatedByKey = new Map(delegated.map((thread) => [keyOf(thread), thread] as const));
++  const placed: { thread: T; section: S }[] = [];
++  const hidden: T[] = [];
++  for (const thread of delegated) {
++    let section: S | null = null;
++    let current = thread;
++    const seen = new Set([keyOf(thread)]);
++    for (let depth = 0; depth < MAX_FAMILY_DEPTH; depth += 1) {
++      const delegatorKey = delegatorKeyOf(current);
++      if (seen.has(delegatorKey)) break;
++      section = sectionOf(delegatorKey);
++      if (section !== null) break;
++      const delegator = delegatedByKey.get(delegatorKey);
++      if (delegator === undefined) break;
++      seen.add(delegatorKey);
++      current = delegator;
++    }
++    if (section === null) hidden.push(thread);
++    else placed.push({ thread, section });
++  }
++  return { placed, hidden };
++}
++
++/** Heads then their shown children, the order rows render and keys traverse. */
++export function flattenSidebarThreadFamilies<T>(families: readonly SidebarThreadFamily<T>[]): T[] {
++  return families.flatMap((family) => [family.head, ...family.children]);
++}
++
++/**
++ * A collapsed family still shows a child that needs the user (an approval or
++ * a question) and the open thread. A child that is only working stays hidden:
++ * its status shows on the stub instead.
++ */
++export function foldSidebarThreadFamily<T>(
++  children: readonly T[],
++  input: {
++    readonly collapsed: boolean;
++    readonly keepVisible: (thread: T) => boolean;
++  },
++): { readonly shown: readonly T[]; readonly hidden: readonly T[] } {
++  if (!input.collapsed) return { shown: children, hidden: [] };
++  const shown: T[] = [];
++  const hidden: T[] = [];
++  for (const child of children) (input.keepVisible(child) ? shown : hidden).push(child);
++  return { shown, hidden };
++}
++
++export function childThreadNeedsUser(status: ThreadFamilyStatus): boolean {
++  return status === "approval" || status === "input";
++}
++
++/** The collapsed family's stub: "3 child threads · 1 failed · 2 working". */
++export function formatHiddenChildThreadsLabel(
++  hidden: readonly { readonly status: ThreadFamilyStatus; readonly isUnread: boolean }[],
++  options: { readonly someShown: boolean },
++): string {
++  let failed = 0;
++  let unread = 0;
++  let working = 0;
++  for (const child of hidden) {
++    if (child.status === "failed" || child.status === "limited") failed += 1;
++    else if (child.isUnread) unread += 1;
++    else if (child.status === "working" || child.status === "waiting") working += 1;
++  }
++  const noun = hidden.length === 1 ? "child thread" : "child threads";
++  return [
++    `${hidden.length} ${options.someShown ? "more " : ""}${noun}`,
++    ...(failed > 0 ? [`${failed} failed`] : []),
++    ...(unread > 0 ? [`${unread} new`] : []),
++    ...(working > 0 ? [`${working} working`] : []),
++  ].join(" · ");
++}
++
++/**
++ * The thread that opened or delegated a thread, as a scoped key, or null.
++ * A delegated worker counts as opened by its delegator.
++ */
++export function threadOpenerKeyOf(thread: EnvironmentThreadShell): string | null {
++  const openerId = thread.openedByThreadId ?? thread.delegatedByThreadId;
++  return openerId === undefined
++    ? null
++    : scopedThreadKey(scopeThreadRef(thread.environmentId, openerId));
++}
++
++/**
++ * Only for delegated children; without a delegator a thread names itself,
++ * which ends the walk and keeps it hidden.
++ */
++export function threadDelegatorKeyOf(thread: EnvironmentThreadShell): string {
++  return scopedThreadKey(
++    scopeThreadRef(thread.environmentId, thread.delegatedByThreadId ?? thread.id),
++  );
++}
++
++export const threadFamilyKeyOf = (thread: EnvironmentThreadShell): string =>
++  scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
+diff --git a/packages/client-runtime/src/state/threadShell.test.ts b/packages/client-runtime/src/state/threadShell.test.ts
+index 44e10c29a..151acd853 100644
+--- a/packages/client-runtime/src/state/threadShell.test.ts
++++ b/packages/client-runtime/src/state/threadShell.test.ts
+@@ -106,6 +106,43 @@ describe("v2 thread shell lists", () => {
+     registry.dispose();
+   });
+ 
++  it("keeps delegated workers in the roster but not provider-native subagents", () => {
++    const { registry, threads, snapshotAtom } = makeHarness();
++    const root = v2ThreadShell;
++    const subagentLineage = {
++      ...root.lineage,
++      parentThreadId: root.id,
++      relationshipToParent: "subagent" as const,
++    };
++    const delegated = {
++      ...root,
++      id: ThreadId.make("delegated"),
++      creationSource: "mcp" as const,
++      lineage: subagentLineage,
++    };
++    const native = {
++      ...root,
++      id: ThreadId.make("native"),
++      creationSource: "provider" as const,
++      lineage: subagentLineage,
++    };
++    const archived = { ...delegated, id: ThreadId.make("archived"), archivedAt: v2Now };
++    registry.set(snapshotAtom(environmentId), {
++      ...v2ShellSnapshot,
++      threads: [root, delegated, native, archived],
++    });
++    const dispose = registry.mount(threads.rosterThreadShellsAtom);
++    const before = registry.get(threads.rosterThreadShellsAtom);
++    expect(before.map((thread) => thread.id)).toEqual([root.id, delegated.id]);
++    registry.set(snapshotAtom(environmentId), {
++      ...v2ShellSnapshot,
++      threads: [root, delegated, { ...native, title: "Native streaming" }, archived],
++    });
++    expect(registry.get(threads.rosterThreadShellsAtom)).toBe(before);
++    dispose();
++    registry.dispose();
++  });
++
+   it("names the delegator of a delegate_task child, not of a provider-native subagent", () => {
+     const { registry, threads, snapshotAtom } = makeHarness();
+     const root = v2ThreadShell;
+diff --git a/packages/client-runtime/src/state/threadShell.ts b/packages/client-runtime/src/state/threadShell.ts
+index a4315f2f8..fee9e9a21 100644
+--- a/packages/client-runtime/src/state/threadShell.ts
++++ b/packages/client-runtime/src/state/threadShell.ts
+@@ -360,6 +360,29 @@ export function createEnvironmentThreadShellAtoms(input: {
+     return next;
+   }).pipe(Atom.withLabel("environment-navigation-thread-shells"));
+ 
++  // Navigation plus the `delegate_task` workers a client nests under the
++  // thread that delegated them. Provider-native subagents stay out.
++  let previousRosterShells: ReadonlyArray<EnvironmentThreadShell> = [];
++  const rosterThreadShellsAtom = Atom.make((get) => {
++    const next: EnvironmentThreadShell[] = [];
++    for (const environmentId of enabledEnvironmentIds(get(input.catalogValueAtom))) {
++      const subagentRequests = get(pendingSubagentRequestsAtom(environmentId));
++      for (const thread of get(environmentThreadsAtom(environmentId))) {
++        if (thread.archivedAt !== null) continue;
++        const shell = scopedThread(environmentId, thread, subagentRequests);
++        if (
++          thread.lineage.relationshipToParent === "subagent" &&
++          shell.delegatedByThreadId === undefined
++        )
++          continue;
++        next.push(shell);
++      }
++    }
++    if (arrayElementsEqual(previousRosterShells, next)) return previousRosterShells;
++    previousRosterShells = next;
++    return next;
++  }).pipe(Atom.withLabel("environment-roster-thread-shells"));
++
+   return {
+     environmentThreadsAtom,
+     environmentThreadIndexAtom,
+@@ -368,6 +391,7 @@ export function createEnvironmentThreadShellAtoms(input: {
+     threadRefsAtom,
+     threadShellsAtom,
+     navigationThreadShellsAtom,
++    rosterThreadShellsAtom,
+     threadShellsForProjectRefsAtom: (refs: ReadonlyArray<ScopedProjectRef>) =>
+       threadShellsForProjectRefsAtomFamily(projectRefCollectionKey(refs)),
+     threadShellAtom: (ref: ScopedThreadRef) => threadShellAtomFamily(threadKey(ref)),
