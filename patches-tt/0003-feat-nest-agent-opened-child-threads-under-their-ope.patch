@@ -20,15 +20,15 @@ guide line, context-menu collapse and a summary stub.
  .../ThreadManagementService.ts                |   2 +
  .../src/orchestration-v2/runtimeLayer.test.ts |  15 +
  .../src/components/Sidebar.families.test.ts   | 175 +++++++++++
- apps/web/src/components/Sidebar.families.ts   | 155 +++++++++
- apps/web/src/components/Sidebar.tsx           | 294 +++++++++++++++---
+ apps/web/src/components/Sidebar.families.ts   | 155 ++++++++++
+ apps/web/src/components/Sidebar.tsx           | 289 +++++++++++++++---
  .../components/threadActionMenu.logic.test.ts |  11 +
  .../src/components/threadActionMenu.logic.ts  |  13 +
  apps/web/src/contextMenuFallback.ts           |   7 +
  packages/client-runtime/src/state/models.ts   |   6 +
  .../src/state/threadCommands.ts               |  10 +-
  packages/contracts/src/orchestrationV2.ts     |  23 ++
- 19 files changed, 719 insertions(+), 55 deletions(-)
+ 19 files changed, 714 insertions(+), 55 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.families.test.ts
  create mode 100644 apps/web/src/components/Sidebar.families.ts
 
@@ -102,7 +102,7 @@ index c346ad620..0c01a4a6f 100644
            creationSource: "mcp",
          }).pipe(
 diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
-index 6b723e860..0038036cf 100644
+index 2ea6aebf3..a6da50607 100644
 --- a/apps/server/src/orchestration-v2/Orchestrator.ts
 +++ b/apps/server/src/orchestration-v2/Orchestrator.ts
 @@ -2270,6 +2270,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
@@ -129,7 +129,7 @@ index 6b723e860..0038036cf 100644
              settledOverride: "settled",
              settledAt: alreadySettled ? thread.settledAt : (command.settledAt ?? now),
              pullRequests: thread.pullRequests?.map((link) => withPullRequestWatch(link, undefined)),
-@@ -10869,6 +10876,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -10863,6 +10870,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
              type: "thread.settle",
              commandId: command.commandId,
              threadId: command.threadId,
@@ -642,7 +642,7 @@ index 000000000..605d1c6d7
 +  ].join(" · ");
 +}
 diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
-index 246a075bf..56d3b61ad 100644
+index 65c00d70e..8d7bde56b 100644
 --- a/apps/web/src/components/Sidebar.tsx
 +++ b/apps/web/src/components/Sidebar.tsx
 @@ -234,6 +234,15 @@ import {
@@ -661,7 +661,7 @@ index 246a075bf..56d3b61ad 100644
  import { resolveLocalCheckoutBranchMismatch } from "./BranchToolbar.logic";
  import {
    createSidebarCollisionDetection,
-@@ -308,6 +317,23 @@ const SETTLED_TAIL_PAGE_COUNT = 25;
+@@ -309,6 +318,23 @@ const SETTLED_TAIL_PAGE_COUNT = 25;
  const SETTLED_SHELF_EXPANDED_KEY = "t3code:sidebar:settled-expanded";
  const SNOOZED_SHELF_EXPANDED_KEY = "t3code:sidebar:snoozed-expanded";
  const WORKING_SHELF_EXPANDED_KEY = "t3code:sidebar:working-expanded";
@@ -685,7 +685,7 @@ index 246a075bf..56d3b61ad 100644
  
  // Working beta: when this client saw each thread leave the Working shelf.
  // Module scope keeps the inbox order across routes that unmount the sidebar.
-@@ -1110,9 +1136,72 @@ const dropVerbBadge: Record<SidebarDropVerb, ReactNode> = {
+@@ -1111,9 +1137,72 @@ const dropVerbBadge: Record<SidebarDropVerb, ReactNode> = {
    ),
  };
  
@@ -758,7 +758,7 @@ index 246a075bf..56d3b61ad 100644
    // Settled rows un-settle, snoozed rows wake, and cards settle.
    variantAction: SidebarSweepAction;
    // False on environments whose server predates thread.settle/unsettle:
-@@ -1814,7 +1903,11 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
+@@ -1815,7 +1904,11 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                  aria-current={accessibility.current}
                  data-testid="sidebar-row-slim"
                  aria-busy={isRegeneratingTitle || undefined}
@@ -771,7 +771,7 @@ index 246a075bf..56d3b61ad 100644
                  onClick={handleClick}
                  onDoubleClick={handleDoubleClick}
                  onKeyDown={handleKeyDown}
-@@ -1825,15 +1918,19 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
+@@ -1826,15 +1919,19 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
              {accessibleTitle}
              {/* Settled history recedes: dimmed favicon at rest, restored on
                hover so the tail stays scannable when you're hunting. */}
@@ -800,7 +800,7 @@ index 246a075bf..56d3b61ad 100644
              {draftIndicator}
              {title}
              {pinIndicator}
-@@ -2880,6 +2977,21 @@ export default function Sidebar() {
+@@ -2878,6 +2975,21 @@ export default function Sidebar() {
          ).push(thread);
        }
      }
@@ -822,7 +822,7 @@ index 246a075bf..56d3b61ad 100644
      // One shared rule on every platform (see sortPinnedThreadsByOrderKey):
      // user-arranged keys first, keyless threads in creation order below.
      // Server capability only gates DRAGGING — it must not influence the
-@@ -3093,21 +3205,79 @@ export default function Sidebar() {
+@@ -3091,21 +3203,75 @@ export default function Sidebar() {
      return routeThread === undefined ? EMPTY_THREADS : [routeThread];
    }, [routeThreadKey, workingShelfExpanded, workingThreads]);
  
@@ -885,10 +885,6 @@ index 246a075bf..56d3b61ad 100644
 +      ),
 +    [sectionFamilies],
 +  );
-+  const familyByHeadKeyRef = useRef(familyByHeadKey);
-+  familyByHeadKeyRef.current = familyByHeadKey;
-+  const collapsedChildThreadKeysRef = useRef(collapsedChildThreadKeys);
-+  collapsedChildThreadKeysRef.current = collapsedChildThreadKeys;
    const orderedThreads = useMemo(
 -    () => [
 -      ...pinnedThreads,
@@ -916,9 +912,9 @@ index 246a075bf..56d3b61ad 100644
    );
    const orderedThreadKeys = useMemo(
      () =>
-@@ -3663,19 +3833,14 @@ export default function Sidebar() {
+@@ -3660,19 +3826,14 @@ export default function Sidebar() {
+       });
      },
-     [attemptUnsettle, attemptUnsnooze, serverConfigs, settleThreads],
    );
 +  // Children move with their head, so drop orders list heads only.
    const pinnedKeys = useMemo(
@@ -941,7 +937,7 @@ index 246a075bf..56d3b61ad 100644
    );
    useEffect(() => {
      if (optimisticDrop === null) return;
-@@ -3820,14 +3985,13 @@ export default function Sidebar() {
+@@ -3817,14 +3978,13 @@ export default function Sidebar() {
    // Include every visible row in the measured order. Older servers disable
    // pickup on their rows without changing where those rows render.
    const sidebarListItems = useMemo((): readonly SidebarListItem[] => {
@@ -960,7 +956,7 @@ index 246a075bf..56d3b61ad 100644
      if (
        pinnedThreads.length +
          activeThreads.length +
-@@ -3839,33 +4003,31 @@ export default function Sidebar() {
+@@ -3836,33 +3996,31 @@ export default function Sidebar() {
        return [];
      }
      const items: SidebarListItem[] = [{ kind: "marker", marker: "pinned-header" }];
@@ -1002,17 +998,17 @@ index 246a075bf..56d3b61ad 100644
      workingThreads.length,
    ]);
    useEffect(() => {
-@@ -4684,6 +4846,9 @@ export default function Sidebar() {
+@@ -4667,6 +4825,9 @@ export default function Sidebar() {
                  titleRegeneration: supportsTitleRegeneration,
                },
                snoozePresets,
-+              childThreads: familyByHeadKeyRef.current.get(threadKey)?.hasChildren
-+                ? { collapsed: collapsedChildThreadKeysRef.current.includes(threadKey) }
++              childThreads: familyByHeadKey.get(threadKey)?.hasChildren
++                ? { collapsed: collapsedChildThreadKeys.includes(threadKey) }
 +                : null,
              }),
              position,
            ),
-@@ -4797,6 +4962,10 @@ export default function Sidebar() {
+@@ -4780,6 +4941,10 @@ export default function Sidebar() {
            case "mark-unread":
              markThreadUnread(threadRef);
              return;
@@ -1023,15 +1019,7 @@ index 246a075bf..56d3b61ad 100644
            case "copy-path":
              if (!threadWorkspacePath) {
                toastManager.add(
-@@ -4901,6 +5070,7 @@ export default function Sidebar() {
-       setProjectScopeKey,
-       setThreadAutoSettle,
-       startThreadRename,
-+      toggleChildThreadsCollapsed,
-       updateThreadMetadata,
-       timestampFormat,
-     ],
-@@ -5301,6 +5471,7 @@ export default function Sidebar() {
+@@ -5258,6 +5423,7 @@ export default function Sidebar() {
                          thread: EnvironmentThreadShell,
                          section: SidebarSection,
                          sortable?: SortableThreadRowBag,
@@ -1039,7 +1027,7 @@ index 246a075bf..56d3b61ad 100644
                        ) => {
                          const threadKey = scopedThreadKey(
                            scopeThreadRef(thread.environmentId, thread.id),
-@@ -5310,8 +5481,10 @@ export default function Sidebar() {
+@@ -5267,8 +5433,10 @@ export default function Sidebar() {
                          // from users (or the auto rules) actually parking work,
                          // not from the sidebar second-guessing what still matters.
                          // Working rows stay cards so their live status shows.
@@ -1051,7 +1039,7 @@ index 246a075bf..56d3b61ad 100644
                          const rowVariant = isCard ? "card" : "slim";
                          return (
                            <SidebarThreadRow
-@@ -5320,6 +5493,7 @@ export default function Sidebar() {
+@@ -5277,6 +5445,7 @@ export default function Sidebar() {
                              key={`${threadKey}:${rowVariant}`}
                              thread={thread}
                              variant={rowVariant}
@@ -1059,7 +1047,7 @@ index 246a075bf..56d3b61ad 100644
                              // Snoozed rows wake, settled rows un-settle, and cards settle.
                              variantAction={
                                section === "snoozed"
-@@ -5455,6 +5629,26 @@ export default function Sidebar() {
+@@ -5412,6 +5581,26 @@ export default function Sidebar() {
                        for (const item of sidebarListItems) {
                          if (item.kind === "thread") {
                            items.push(renderThreadRow(threadByKey.get(item.key)!, item.section));
