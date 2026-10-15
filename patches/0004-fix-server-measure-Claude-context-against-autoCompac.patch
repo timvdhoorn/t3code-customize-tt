@@ -1,0 +1,294 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t3code-customize <t3code-customize@localhost>
+Date: Thu, 15 Oct 2026 12:15:33 +0200
+Subject: [PATCH 4/4] fix(server): measure Claude context against
+ autoCompactWindow
+
+---
+ .../Adapters/ClaudeAdapterV2.test.ts          | 19 +++++++
+ .../Adapters/ClaudeAdapterV2.ts               | 45 ++++++++++++++--
+ .../src/provider/Drivers/ClaudeSkills.test.ts | 51 ++++++++++++++++++-
+ .../src/provider/Drivers/ClaudeSkills.ts      | 48 +++++++++++++++++
+ .../components/chat/ComposerStats.logic.ts    |  2 +-
+ 5 files changed, 160 insertions(+), 5 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
+index d70809004..d7dede776 100644
+--- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
+@@ -912,6 +912,25 @@ describe("ClaudeAdapterV2 context usage", () => {
+     });
+   });
+ 
++  it("measures context against autoCompactWindow, as Claude Code does", () => {
++    const usage = ClaudeAdapterV2.claudeProviderTurnTokenUsage(
++      { input_tokens: 129_000, output_tokens: 1_000 },
++      CLAUDE_TEST_MODEL_SELECTION,
++      "2026-08-29T00:00:00.000Z",
++      ClaudeAdapterV2.claudeEffectiveContextWindow(1_000_000, "", 300_000),
++    );
++    assert.strictEqual(usage.maxTokens, 300_000);
++
++    const effective = ClaudeAdapterV2.claudeEffectiveContextWindow;
++    // No setting anywhere: the model's window.
++    assert.strictEqual(effective(1_000_000, "", undefined), 1_000_000);
++    // T3's own setting reaches the CLI as flag settings and outranks the files.
++    assert.strictEqual(effective(1_000_000, "400000", 300_000), 400_000);
++    // A setting never raises the window past the model's.
++    assert.strictEqual(effective(200_000, "", 300_000), 200_000);
++    assert.strictEqual(effective(null, "", 300_000), 300_000);
++  });
++
+   it("reports the prompt cache TTL the response wrote", () => {
+     const ttlFor = (cache_creation: {
+       ephemeral_1h_input_tokens: number;
+diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
+index 0341cfc94..a50ab95f7 100644
+--- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
+@@ -111,7 +111,10 @@ import * as Stream from "effect/Stream";
+ import { resolveAttachmentPath } from "../../attachmentStore.ts";
+ import { resolveClaudeSdkExecutablePath } from "../../provider/Drivers/ClaudeExecutable.ts";
+ import { planClaudeSkillDispatch } from "../../provider/Drivers/ClaudeSkillDispatch.ts";
+-import { discoverClaudeSkills } from "../../provider/Drivers/ClaudeSkills.ts";
++import {
++  discoverClaudeSkills,
++  readClaudeAutoCompactWindow,
++} from "../../provider/Drivers/ClaudeSkills.ts";
+ import {
+   compileClaudeModelSelection,
+   type CompiledClaudeModelSelection,
+@@ -183,6 +186,23 @@ function claudeContextWindow(modelSelection: ModelSelection): number | null {
+   );
+ }
+ 
++/**
++ * The window Claude Code measures context against: the model's window, capped
++ * by `autoCompactWindow` when one is set. T3's own setting reaches the CLI as
++ * flag settings, which outrank the settings files.
++ */
++export function claudeEffectiveContextWindow(
++  modelWindow: number | null,
++  t3AutoCompactWindow: string | undefined,
++  fileAutoCompactWindow: number | undefined,
++): number | null {
++  const t3Value = t3AutoCompactWindow?.trim() ? Number(t3AutoCompactWindow) : undefined;
++  const configured =
++    t3Value !== undefined && Number.isFinite(t3Value) ? t3Value : fileAutoCompactWindow;
++  if (configured === undefined) return modelWindow;
++  return modelWindow === null ? configured : Math.min(modelWindow, configured);
++}
++
+ interface ClaudeCacheCreation {
+   readonly ephemeral_1h_input_tokens: number;
+   readonly ephemeral_5m_input_tokens: number;
+@@ -210,6 +230,7 @@ export function claudeProviderTurnTokenUsage(
+   },
+   modelSelection: ModelSelection,
+   updatedAt: string,
++  contextWindow: number | null = claudeContextWindow(modelSelection),
+ ) {
+   const inputTokens =
+     usage.input_tokens +
+@@ -219,7 +240,7 @@ export function claudeProviderTurnTokenUsage(
+   const promptCacheTtlMs = claudePromptCacheTtlMs(usage.cache_creation);
+   return {
+     usedTokens: inputTokens + outputTokens,
+-    maxTokens: claudeContextWindow(modelSelection),
++    maxTokens: contextWindow,
+     inputTokens,
+     cachedInputTokens: usage.cache_read_input_tokens ?? 0,
+     outputTokens,
+@@ -3012,6 +3033,8 @@ function formatClaudeUsageLimitWait(waitMs: number): string {
+ 
+ interface ActiveClaudeTurnContext {
+   readonly responseThroughput: ClaudeResponseThroughput;
++  /** See `claudeEffectiveContextWindow`; resolved once per turn. */
++  readonly contextWindow: number | null;
+   readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
+   readonly nativeThreadId: string;
+   readonly nativeTurnId: string;
+@@ -3519,6 +3542,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+           model: input.modelSelection.model,
+           now,
+         });
++        // The CLI reads its settings files when it starts, so read them once here
++        // rather than on the turn-start path.
++        const fileAutoCompactWindow = yield* readClaudeAutoCompactWindow(
++          adapterOptions.settings,
++          input.runtimePolicy.cwd ?? undefined,
++          adapterOptions.environment,
++        ).pipe(
++          Effect.provideService(FileSystem.FileSystem, fileSystem),
++          Effect.provideService(Path.Path, path),
++        );
+         const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+         const activeTurn = yield* Ref.make<ActiveClaudeTurnContext | null>(null);
+         const sdkMessageLock = yield* Semaphore.make(1);
+@@ -7091,7 +7124,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+                   completedAt: null,
+                   tokenUsage: {
+                     usedTokens: afterTokenCount,
+-                    maxTokens: claudeContextWindow(context.input.modelSelection),
++                    maxTokens: context.contextWindow,
+                     updatedAt: DateTime.formatIso(now),
+                   },
+                 },
+@@ -7244,6 +7277,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+                     message.message.usage,
+                     context.input.modelSelection,
+                     DateTime.formatIso(now),
++                    context.contextWindow,
+                   ),
+                 },
+               });
+@@ -8756,6 +8790,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+             }
+             const context: ActiveClaudeTurnContext = {
+               responseThroughput: new ClaudeResponseThroughput(),
++              contextWindow: claudeEffectiveContextWindow(
++                claudeContextWindow(turnInput.modelSelection),
++                adapterOptions.settings.autoCompactWindow,
++                fileAutoCompactWindow,
++              ),
+               input: turnInput,
+               nativeThreadId,
+               nativeTurnId,
+diff --git a/apps/server/src/provider/Drivers/ClaudeSkills.test.ts b/apps/server/src/provider/Drivers/ClaudeSkills.test.ts
+index c4b328cdc..6ed8b732e 100644
+--- a/apps/server/src/provider/Drivers/ClaudeSkills.test.ts
++++ b/apps/server/src/provider/Drivers/ClaudeSkills.test.ts
+@@ -5,7 +5,11 @@ import * as Effect from "effect/Effect";
+ import * as FileSystem from "effect/FileSystem";
+ import * as Path from "effect/Path";
+ 
+-import { discoverClaudeSkills, skillOverrideSettingsPaths } from "./ClaudeSkills.ts";
++import {
++  discoverClaudeSkills,
++  readClaudeAutoCompactWindow,
++  skillOverrideSettingsPaths,
++} from "./ClaudeSkills.ts";
+ 
+ const writeSkill = Effect.fn(function* (
+   skillsDir: string,
+@@ -739,3 +743,48 @@ it.layer(NodeServices.layer)("discoverClaudeSkills", (it) => {
+     }),
+   );
+ });
++
++it.layer(NodeServices.layer)("readClaudeAutoCompactWindow", (it) => {
++  it.effect("reads autoCompactWindow with project settings over user settings", () =>
++    Effect.gen(function* () {
++      const fs = yield* FileSystem.FileSystem;
++      const path = yield* Path.Path;
++      const tempDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-claude-window-" });
++      const configDir = path.join(tempDir, "claude-home");
++      const workspace = path.join(tempDir, "workspace");
++      yield* fs.makeDirectory(configDir, { recursive: true });
++      yield* fs.makeDirectory(path.join(workspace, ".claude"), { recursive: true });
++
++      assert.isUndefined(yield* readClaudeAutoCompactWindow({ homePath: configDir }, workspace, {}));
++
++      // Hand-edited files may carry comments; Claude Code tolerates them.
++      yield* fs.writeFileString(
++        path.join(configDir, "settings.json"),
++        '{\n  // compact early\n  "autoCompactWindow": 300000,\n}',
++      );
++      assert.strictEqual(
++        yield* readClaudeAutoCompactWindow({ homePath: configDir }, workspace, {}),
++        300_000,
++      );
++
++      yield* fs.writeFileString(
++        path.join(workspace, ".claude", "settings.local.json"),
++        JSON.stringify({ autoCompactWindow: 500_000 }),
++      );
++      assert.strictEqual(
++        yield* readClaudeAutoCompactWindow({ homePath: configDir }, workspace, {}),
++        500_000,
++      );
++
++      // Out of the CLI's range: ignored, so the user value stands.
++      yield* fs.writeFileString(
++        path.join(workspace, ".claude", "settings.local.json"),
++        JSON.stringify({ autoCompactWindow: 5_000 }),
++      );
++      assert.strictEqual(
++        yield* readClaudeAutoCompactWindow({ homePath: configDir }, workspace, {}),
++        300_000,
++      );
++    }),
++  );
++});
+diff --git a/apps/server/src/provider/Drivers/ClaudeSkills.ts b/apps/server/src/provider/Drivers/ClaudeSkills.ts
+index 40ab84d65..2da6c3c73 100644
+--- a/apps/server/src/provider/Drivers/ClaudeSkills.ts
++++ b/apps/server/src/provider/Drivers/ClaudeSkills.ts
+@@ -312,6 +312,54 @@ const resolveClaudeConfigDirPath = Effect.fn("resolveClaudeConfigDirPath")(funct
+   return path.join(home, ".claude");
+ });
+ 
++const AutoCompactWindowSettings = fromLenientJson(
++  Schema.Struct({ autoCompactWindow: Schema.optional(Schema.Unknown) }),
++);
++const decodeAutoCompactWindowSettings = Schema.decodeUnknownEffect(AutoCompactWindowSettings);
++
++/**
++ * Claude Code's `autoCompactWindow` from its settings files, read from the same
++ * files in the same precedence as `skillOverrides` (the last file that sets it
++ * wins). Claude treats it as the context window: `/context` and auto-compaction
++ * both measure against it. Values outside the CLI's 100,000 to 1,000,000 range
++ * are ignored, as the CLI ignores them.
++ */
++export const readClaudeAutoCompactWindow = Effect.fn("readClaudeAutoCompactWindow")(function* (
++  config: Pick<ClaudeSettings, "homePath">,
++  cwd: string | undefined,
++  environment: NodeJS.ProcessEnv,
++): Effect.fn.Return<number | undefined, never, FileSystem.FileSystem | Path.Path> {
++  const fileSystem = yield* FileSystem.FileSystem;
++  const path = yield* Path.Path;
++  const platform = yield* HostProcess.Platform;
++  const configDirPath = yield* resolveClaudeConfigDirPath(config, environment, cwd);
++  const repositoryRoot = cwd === undefined ? undefined : yield* findRepositoryRoot(cwd);
++  let window: number | undefined;
++  for (const settingsPath of skillOverrideSettingsPaths(
++    path,
++    configDirPath,
++    cwd,
++    platform,
++    environment,
++    repositoryRoot,
++  )) {
++    const contents = yield* fileSystem
++      .readFileString(settingsPath)
++      .pipe(Effect.orElseSucceed(() => undefined));
++    if (contents === undefined) {
++      continue;
++    }
++    const parsed = yield* decodeAutoCompactWindowSettings(contents).pipe(
++      Effect.orElseSucceed(() => undefined),
++    );
++    const value = parsed?.autoCompactWindow;
++    if (typeof value === "number" && Number.isInteger(value) && value >= 100_000 && value <= 1_000_000) {
++      window = value;
++    }
++  }
++  return window;
++});
++
+ /**
+  * Enumerate Claude Code skills from the user config dir and the workspace
+  * `.claude/skills`. Discovery is best-effort: unreadable roots and malformed
+diff --git a/apps/web/src/components/chat/ComposerStats.logic.ts b/apps/web/src/components/chat/ComposerStats.logic.ts
+index 8c8236a63..6e7ed5e4c 100644
+--- a/apps/web/src/components/chat/ComposerStats.logic.ts
++++ b/apps/web/src/components/chat/ComposerStats.logic.ts
+@@ -292,7 +292,7 @@ export function deriveContextCompaction(
+           ? "Provider reported"
+           : "Claude setting"
+         : driver === "claudeAgent"
+-          ? "Claude default (threshold not reported)"
++          ? "Managed by Claude (threshold not reported)"
+           : driver === "codex"
+             ? "Managed by Codex (threshold not reported)"
+             : context?.compactsAutomatically === true

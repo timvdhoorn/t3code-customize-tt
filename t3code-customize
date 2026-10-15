@@ -782,7 +782,10 @@ def cmd_build(args):
         say(f'The ported patches were saved to {REPO / "patches"}.')
     if MAC:
         if PENDING.exists():
-            say(f'"{LAUNCHER_NAME}" is open; quit it and run {NAME} again to install this build.')
+            # Swap the build in as soon as the open app quits.
+            subprocess.Popen([sys.executable, str(REPO / NAME), 'install-pending'], start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            say(f'"{LAUNCHER_NAME}" is open; the new build installs when you quit it. Then reopen it.')
         else:
             say(f'Quit T3 Code fully, then open "{LAUNCHER_NAME}" from ~/Applications.')
             say('First time? Turn on Settings > General > Stats for nerds.')
@@ -993,6 +996,21 @@ def cmd_update(args):
         raise
 
 
+def cmd_install_pending(args):
+    """Wait for the customized app to quit, then install the pending build (started by a build)."""
+    deadline = time.time() + 24 * 3600
+    while PENDING.exists() and app_running(MAC_APP) and time.time() < deadline:
+        time.sleep(3)
+    CACHE.mkdir(parents=True, exist_ok=True)
+    with (CACHE / 'lock').open('w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return  # A running build or update installs it itself.
+        if install_pending():
+            notify('The new build is installed. Open it again to use it.')
+
+
 def cmd_autoupdate(args):
     """Turn the background updater (a LaunchAgent) on or off."""
     if not MAC:
@@ -1102,12 +1120,13 @@ def main():
     sub.add_parser('off', help='go back to stock T3 Code')
     sub.add_parser('verify', help='apply the patches to their base and run the checks (for CI)')
     sub.add_parser('uninstall', help='remove the launcher, builds and caches')
+    sub.add_parser('install-pending', help=argparse.SUPPRESS)
     argv = sys.argv[1:]
     if not argv or argv[0].startswith('-') and argv[0] not in ('-h', '--help'):
         argv = ['update' if MAC else 'build', *argv]
     args = parser.parse_args(argv)
     handler = globals()['cmd_' + args.command]
-    if args.command in ('launch', 'status', 'on', 'off', 'autoupdate'):
+    if args.command in ('launch', 'status', 'on', 'off', 'autoupdate', 'install-pending'):
         return handler(args)
     CACHE.mkdir(parents=True, exist_ok=True)
     with (CACHE / 'lock').open('w') as lock:
