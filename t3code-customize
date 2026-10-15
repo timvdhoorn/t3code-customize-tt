@@ -836,9 +836,7 @@ def cmd_build(args):
         say(f'The ported patches were saved to {PORT} and {OWN_PATCHES}; commit them.')
     if MAC:
         if PENDING.exists():
-            # Swap the build in as soon as the open app quits.
-            subprocess.Popen([sys.executable, str(REPO / NAME), 'install-pending'], start_new_session=True,
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            start_install_waiter()
             say(f'"{LAUNCHER_NAME}" is open; the new build installs when you quit it. Then reopen it.')
         else:
             say(f'Quit T3 Code fully, then open "{LAUNCHER_NAME}" from ~/Applications.')
@@ -1063,6 +1061,25 @@ def cmd_update(args):
         raise
 
 
+def start_install_waiter():
+    """Swap the pending build in as soon as the open app quits, from a launchd job so it
+    outlives this terminal."""
+    label = AUTOUPDATE_LABEL.rsplit('.', 1)[0] + '.install-pending'
+    plist = CACHE / (label + '.plist')
+    plist.write_bytes(plistlib.dumps({
+        'Label': label, 'ProgramArguments': [sys.executable, str(REPO / NAME), 'install-pending'],
+        'EnvironmentVariables': {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(HOME)},
+        'RunAtLoad': True, 'ProcessType': 'Background',
+        'StandardOutPath': str(CACHE / 'logs/install-pending.log'),
+        'StandardErrorPath': str(CACHE / 'logs/install-pending.log'),
+    }))
+    domain = f'gui/{os.getuid()}'
+    subprocess.run(['launchctl', 'bootout', f'{domain}/{label}'], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(['launchctl', 'bootstrap', domain, str(plist)], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def cmd_install_pending(args):
     """Wait for the customized app to quit, then install the pending build (started by a build)."""
     deadline = time.time() + 24 * 3600
@@ -1192,7 +1209,7 @@ def main():
     if not argv or argv[0].startswith('-') and argv[0] not in ('-h', '--help'):
         argv = ['update' if MAC else 'build', *argv]
     args = parser.parse_args(argv)
-    handler = globals()['cmd_' + args.command]
+    handler = globals()['cmd_' + args.command.replace('-', '_')]
     if args.command in ('launch', 'status', 'on', 'off', 'autoupdate', 'install-pending'):
         return handler(args)
     CACHE.mkdir(parents=True, exist_ok=True)
