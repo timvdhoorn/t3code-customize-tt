@@ -16,8 +16,8 @@ stay shared. Each server pushes only its own threads and only ends a Live
 Activity it filled itself. Without a key the server behaves as upstream.
 ---
  apps/server/src/auth/RpcAuthorization.ts      |   3 +
- apps/server/src/directPush/ApnsTransport.ts   | 190 ++++++
- apps/server/src/directPush/DirectPush.test.ts | 261 ++++++++
+ apps/server/src/directPush/ApnsTransport.ts   | 196 ++++++
+ apps/server/src/directPush/DirectPush.test.ts | 262 ++++++++
  apps/server/src/directPush/DirectPush.ts      | 415 +++++++++++++
  .../src/directPush/agentActivityDelivery.ts   | 569 ++++++++++++++++++
  .../src/environment/ServerEnvironment.ts      |   8 +-
@@ -27,7 +27,7 @@ Activity it filled itself. Without a key the server behaves as upstream.
  apps/server/src/server.ts                     |   4 +
  apps/server/src/ws.ts                         |  14 +
  packages/contracts/src/rpc.ts                 |  37 ++
- 12 files changed, 1596 insertions(+), 27 deletions(-)
+ 12 files changed, 1603 insertions(+), 27 deletions(-)
  create mode 100644 apps/server/src/directPush/ApnsTransport.ts
  create mode 100644 apps/server/src/directPush/DirectPush.test.ts
  create mode 100644 apps/server/src/directPush/DirectPush.ts
@@ -49,20 +49,23 @@ index 5b8d483dc..267bd81a8 100644
    [WS_METHODS.scheduledTasksList]: AuthOrchestrationReadScope,
 diff --git a/apps/server/src/directPush/ApnsTransport.ts b/apps/server/src/directPush/ApnsTransport.ts
 new file mode 100644
-index 000000000..1463d633e
+index 000000000..cc7ec0e04
 --- /dev/null
 +++ b/apps/server/src/directPush/ApnsTransport.ts
-@@ -0,0 +1,190 @@
+@@ -0,0 +1,196 @@
 +// @effect-diagnostics nodeBuiltinImport:off -- APNs requires HTTP/2, which fetch does not speak here; ES256 signing uses node:crypto.
 +import * as NodeCrypto from "node:crypto";
 +import * as NodeHttp2 from "node:http2";
 +
++import * as Clock from "effect/Clock";
 +import * as Context from "effect/Context";
 +import * as Effect from "effect/Effect";
 +import * as Layer from "effect/Layer";
 +import * as Schema from "effect/Schema";
 +
 +import type { ApnsEnvironment, ApnsRequest } from "./agentActivityDelivery.ts";
++
++const encodePayload = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 +
 +export interface ApnsCredentials {
 +  readonly teamId: string;
@@ -169,8 +172,8 @@ index 000000000..1463d633e
 +    return session;
 +  };
 +
-+  const providerToken = (credentials: ApnsCredentials) => {
-+    const nowSeconds = Math.floor(Date.now() / 1_000);
++  const providerToken = (credentials: ApnsCredentials, nowMs: number) => {
++    const nowSeconds = Math.floor(nowMs / 1_000);
 +    const issuedAt = Math.floor(nowSeconds / APNS_JWT_REUSE_SECONDS) * APNS_JWT_REUSE_SECONDS;
 +    const fingerprint = NodeCrypto.createHash("sha256")
 +      .update(`${credentials.teamId}:${credentials.keyId}:${credentials.privateKey}`)
@@ -183,6 +186,9 @@ index 000000000..1463d633e
 +  };
 +
 +  const send: ApnsTransport["Service"]["send"] = (input) =>
++    Effect.flatMap(Clock.currentTimeMillis, (nowMs) => sendAt(input, nowMs));
++
++  const sendAt = (input: Parameters<ApnsTransport["Service"]["send"]>[0], nowMs: number) =>
 +    Effect.callback<ApnsResponse, ApnsTransportError>((resume) => {
 +      const fail = (cause: unknown) =>
 +        resume(
@@ -203,7 +209,7 @@ index 000000000..1463d633e
 +        stream = sessionFor(apnsOrigin(input.environment)).request({
 +          ":method": "POST",
 +          ":path": `/3/device/${input.request.token}`,
-+          authorization: `bearer ${providerToken(input.credentials)}`,
++          authorization: `bearer ${providerToken(input.credentials, nowMs)}`,
 +          "apns-push-type": input.request.pushType,
 +          "apns-priority": input.request.priority,
 +          "apns-topic": topic,
@@ -233,7 +239,7 @@ index 000000000..1463d633e
 +      stream.on("end", () =>
 +        resume(Effect.succeed({ status, reason: reasonFromBody(body), apnsId })),
 +      );
-+      stream.end(JSON.stringify(input.request.payload));
++      stream.end(encodePayload(input.request.payload));
 +      return Effect.sync(() => {
 +        if (!stream.closed) stream.close(NodeHttp2.constants.NGHTTP2_CANCEL);
 +      });
@@ -245,10 +251,10 @@ index 000000000..1463d633e
 +export const layer = Layer.effect(ApnsTransport, make);
 diff --git a/apps/server/src/directPush/DirectPush.test.ts b/apps/server/src/directPush/DirectPush.test.ts
 new file mode 100644
-index 000000000..98a29b45b
+index 000000000..8a32b39a7
 --- /dev/null
 +++ b/apps/server/src/directPush/DirectPush.test.ts
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,262 @@
 +// @effect-diagnostics nodeBuiltinImport:off -- the tests generate and verify a real P-256 key.
 +import * as NodeCrypto from "node:crypto";
 +
@@ -258,6 +264,7 @@ index 000000000..98a29b45b
 +  RelayAgentActivityState,
 +  RelayDeviceRegistrationRequest,
 +} from "@t3tools/contracts/relay";
++import * as DateTime from "effect/DateTime";
 +import * as Effect from "effect/Effect";
 +import * as Option from "effect/Option";
 +
@@ -287,7 +294,7 @@ index 000000000..98a29b45b
 +    phase,
 +    headline: phase,
 +    modelTitle: "Model",
-+    updatedAt: new Date().toISOString(),
++    updatedAt: DateTime.formatIso(DateTime.nowUnsafe()),
 +    deepLink: "/threads/thread-1",
 +    ...overrides,
 +  };
