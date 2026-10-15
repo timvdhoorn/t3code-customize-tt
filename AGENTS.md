@@ -99,3 +99,17 @@ code, then run `python3 -m py_compile t3code-customize` and `./t3code-customize 
 | macOS build | `t3code-customize` (`find_mac_app`, `finish_mac_app`, `stage_mac_build`, `install_pending`) | Copy of the installed `.app` at `~/Applications/T3 Code (Customized).app`: rebuilt `app.asar`, matching `ElectronAsarIntegrity`, `T3CODE_DISABLE_AUTO_UPDATE` in `LSEnvironment`, ad-hoc signature. Swapped in only while closed. | `./t3code-customize status`; `codesign --verify --deep --strict` on the copy. |
 | macOS updates | `t3code-customize` (`update_stock`, `cmd_update`, `cmd_autoupdate`, `cmd_install_pending`) | Installs newer releases the way T3's updater does: feed from the app's `app-update.yml`, a zip T3 already downloaded when it matches, sha512 from the feed, the installed app's designated requirement, swap only while closed. | `./t3code-customize` reports "Already up to date" or installs; a foreign or ad-hoc signed app must fail the requirement check. |
 | Upstream merge | `t3code-customize` (`pull_latest`) | Each run merges `upstream/main` when it merges cleanly, else continues with the patches it has. | `git log upstream/main..HEAD` shows only fork commits after a run. |
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues on the fork `timvdhoorn/t3code-customize-tt`, via `gh`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five default labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` and `docs/adr/` at the repo root, created when needed. See `docs/agents/domain.md`.
