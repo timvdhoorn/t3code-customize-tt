@@ -56,7 +56,7 @@ upstream did not break or duplicate them. This section says how.
 | Upstream owns (never commit changes) | The fork owns (commit changes) |
 | --- | --- |
 | `patches/*.patch`, `patches/base.txt`, `checks.json` | `patches-port/`, `patches-tt/`, `checks-tt.json`, this section, `CLAUDE.md` |
-| the Linux code paths in `t3code-customize` | macOS and update code in `t3code-customize`, `README.md` macOS section |
+| the Linux code paths in `t3code-customize` | macOS, update, server and fleet code in `t3code-customize`, `machines.json`, the `README.md` macOS, server and machines sections |
 
 - A port of the shared patches goes to `patches-port/` (with its own `base.txt`), never to
   `patches/`; the tool writes it there. Builds use it while it targets a newer nightly than
@@ -64,6 +64,20 @@ upstream did not break or duplicate them. This section says how.
   delete it in a commit.
 - Every change to T3 Code itself is one commit in `patches-tt/`, with its tests in
   `checks-tt.json` and a row in the table below. Never fold it into a shared patch.
+
+### Machines
+
+Tim runs T3 on every machine in `machines.json`: the MacBook Pro and MacBook Air (app plus
+built-in server, `kind: mac`) and devbox1 (headless server, `kind: server`). All of them
+run the same patches.
+
+- **After every change to this repo** (script, `patches-*`, checks) that is committed and
+  pushed, run `./t3code-customize fleet` and report the summary per machine. It restarts
+  devbox1's T3 server, which reconnects open sessions; say so when you report.
+- **A new machine:** follow "A new machine" in `README.md`. A new Linux box is first set up
+  with `~/Devops/Personal/playbook-new-box`; this repo only adds the patches.
+- Never edit a machine's T3 install by hand; `server`, `server-off` and `update` own it.
+- Python must stay compatible with macOS's system Python 3.9.
 
 ### Porting own patches
 
@@ -96,8 +110,11 @@ code, then run `python3 -m py_compile t3code-customize` and `./t3code-customize 
 | Change | Files | Intent | Check |
 | --- | --- | --- | --- |
 | Claude context window (`patches-tt/0001`) | `apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts`, `apps/server/src/provider/Drivers/ClaudeSkills.ts`, `apps/web/src/components/chat/ComposerStats.logic.ts` | Claude context is measured against the smaller of the model window and `autoCompactWindow` (T3's "Auto-compact after", else Claude's user, project and local settings files, read once per session, as the CLI does). Label "Managed by Claude". | Tests in `checks-tt.json`. In the app, with `"autoCompactWindow": 300000` in `~/.claude/settings.json`, the context popover shows a window of 300,000. |
+| Worktree handoff continuation (`patches-tt/0002`) | `apps/server/src/mcp/WorktreeMcpService.ts`, `apps/server/src/orchestration-v2/{Orchestrator,RunExecutionService,ProviderSessionManager,EffectOutbox,EffectWorker}.ts`, `packages/contracts/src/orchestrationV2.ts`, `packages/provider-core/src/server/ProviderAdapter.ts` | Port of upstream PR pingdotgg/t3code#15203 (fixes #15136): after `t3_worktree_handoff` the continuation prompt starts instead of "Provider event stream closed unexpectedly". Drop this patch once `gh pr view 15203 --repo pingdotgg/t3code --json state` says MERGED and that nightly is installed everywhere; then restore the handoff note in `~/.agents/rules/t3-code.md`. | Tests in `checks-tt.json`. In T3, a thread on the project root calls `t3_worktree_handoff` with a `continuationPrompt` and continues in the worktree. |
 | macOS build | `t3code-customize` (`find_mac_app`, `finish_mac_app`, `stage_mac_build`, `install_pending`) | Copy of the installed `.app` at `~/Applications/T3 Code (Customized).app`: rebuilt `app.asar`, matching `ElectronAsarIntegrity`, `T3CODE_DISABLE_AUTO_UPDATE` in `LSEnvironment`, ad-hoc signature. Swapped in only while closed. | `./t3code-customize status`; `codesign --verify --deep --strict` on the copy. |
 | macOS updates | `t3code-customize` (`update_stock`, `cmd_update`, `cmd_autoupdate`, `cmd_install_pending`) | Installs newer releases the way T3's updater does: feed from the app's `app-update.yml`, a zip T3 already downloaded when it matches, sha512 from the feed, the installed app's designated requirement, swap only while closed. | `./t3code-customize` reports "Already up to date" or installs; a foreign or ad-hoc signed app must fail the requirement check. |
+| T3 server | `t3code-customize` (`cmd_server`, `build_server`, `install_server_build`, `restart_server`, `server_autoupdate`) | Patched `t3` and `client/` in `~/.t3/runtime/versions/<active>/`, built from tag `v<version>` with `VP_NODE_VERSION` = upstream's `SEA_NODE_VERSION`; originals kept as `*.stock`; health check on port 3773 or back to stock. Depends on upstream's `apps/server/scripts/cli.ts build-exe` and the runtime layout. | `./t3code-customize status` on devbox1 shows "Customized: yes"; `curl` on port 3773 gives 200; `t3 connect status --json` is still linked. |
+| Fleet | `t3code-customize` (`cmd_fleet`, `sync_repo`), `machines.json` | One command updates every machine from any machine; files arrive by Syncthing or SSH copy, identical script and recipe hash required before building. | `./t3code-customize fleet` ends with every machine `ok`. |
 | Upstream merge | `t3code-customize` (`pull_latest`) | Each run merges `upstream/main` when it merges cleanly, else continues with the patches it has. | `git log upstream/main..HEAD` shows only fork commits after a run. |
 
 ## Agent skills

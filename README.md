@@ -67,6 +67,54 @@ breaks them. Without it you get a notification and run `t3code-customize --fix c
 Differences from stock: passkey sign-in (needs T3's Apple team entitlements) is unavailable,
 and macOS may ask once for keychain and privacy permissions because the signature differs.
 
+## T3 server (Linux, headless)
+
+On a box that runs T3 as a server (`npm install -g t3@nightly` with the `t3code.service`
+systemd user service), the patches go into the server itself, so every client that connects
+to it (desktop, web, phone) gets them.
+
+```sh
+t3code-customize server          build for the version the service runs, switch to it, restart
+t3code-customize server-off      put the stock server back and restart
+t3code-customize autoupdate on   rebuild when T3 switches versions, and nightly at 04:30
+t3code-customize status          server version, customized or not, background updates
+```
+
+It reads the active version from `~/.t3/runtime/service-state.json`, builds the patched
+binary and web client from the tag `v<version>` (with the Node upstream embeds, as its
+release workflow does), and swaps them into `~/.t3/runtime/versions/<version>/`. The
+originals stay beside them as `t3.stock` and `client.stock`. After the restart it waits
+for the service to answer on port 3773; if it does not, it puts stock back and restarts
+again. A new T3 version (from `t3 update` or any other installer) lands in a new folder,
+so it runs stock until the rebuild, which `autoupdate on` starts as soon as T3 switches.
+
+## Machines (fleet)
+
+`machines.json` lists every machine that runs T3 with these patches: `kind` is `mac` (app
+plus its built-in server) or `server` (headless Linux), `hostname` is how a machine
+recognizes itself, `ssh` the aliases to try from the others.
+
+```sh
+t3code-customize fleet                 update every machine at once
+t3code-customize fleet --only devbox1  just one
+```
+
+It runs from any machine on the list. Each other machine first gets this repo's files
+(Syncthing usually brings them; otherwise they are copied over SSH), then runs `update`
+(Mac) or `server` (Linux) in its login shell. A summary shows per machine: ok, needs a
+port, or failed. Run it after every change to this repo; the background updaters on each
+machine pick changes up on their own within the hour (Mac) or night (server).
+
+### A new machine
+
+1. Install stock T3 Code Nightly: the app on a Mac, or `npm install -g t3@nightly` and its
+   service on a Linux server (`t3 service install`, then `t3 connect` to link it).
+2. Make sure the other machines reach it over SSH without a prompt, and that it has git and
+   Python 3.
+3. Add it to `machines.json`, commit and push.
+4. From any machine: `t3code-customize fleet --only <name>`, then on the new machine
+   `t3code-customize autoupdate on`.
+
 ## How it works
 
 T3 Code is open source (MIT). This repo holds three patches and one script. The script:

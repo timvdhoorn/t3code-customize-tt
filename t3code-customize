@@ -10,6 +10,7 @@ does (same feed, same download, same signature check), because the customized co
 """
 import argparse
 import base64
+import contextlib
 import copy
 import fcntl
 import hashlib
@@ -18,11 +19,14 @@ import os
 import plistlib
 from pathlib import Path
 import re
+import shlex
 import shutil
+import socket
 import struct
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import urllib.request
 
@@ -51,6 +55,17 @@ PENDING = DATA / 'pending' / MAC_APP.name
 AUTOUPDATE_LABEL = 'com.github.t3code-customize.update'
 AUTOUPDATE_PLIST = HOME / 'Library/LaunchAgents' / (AUTOUPDATE_LABEL + '.plist')
 ARCH = {'x86_64': 'x64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(os.uname().machine)
+# A headless T3 server (npm `t3` with the t3code systemd user service) runs the binary in
+# ~/.t3/runtime/versions/<active version>/. `server` swaps that binary and its web client
+# for customized ones and keeps the originals beside them.
+T3_HOME = Path(os.environ.get('T3CODE_HOME') or HOME / '.t3')
+SERVICE_UNIT = 't3code.service'
+SERVER_MARK = '.t3code-customize.json'
+SERVER_PORT = int(os.environ.get('T3CODE_CUSTOMIZE_PORT', '3773'))
+SYSTEMD_USER = Path(os.environ.get('XDG_CONFIG_HOME') or HOME / '.config') / 'systemd/user'
+SERVER_UNITS = {name: SYSTEMD_USER / (NAME + '-server' + name) for name in ('.service', '.path', '.timer')}
+# Every machine `fleet` updates; see "Machines" in README.md.
+MACHINES = REPO / 'machines.json'
 AGENTS = {
     'claude': ['claude', '-p', '--dangerously-skip-permissions'],
     'codex': ['codex', 'exec', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check', '-'],
@@ -277,8 +292,12 @@ class Archive:
 
 def read_public_config(archive):
     """Upstream's public cloud config from the stock web bundle, by name."""
+    return public_config_from(data for _, data in archive.scripts('apps/server/dist/client/'))
+
+
+def public_config_from(scripts):
     found = {}
-    for _, data in archive.scripts('apps/server/dist/client/'):
+    for data in scripts:
         for name in PUBLIC_CONFIG:
             if name in found:
                 continue
@@ -397,6 +416,22 @@ def ensure_node(log):
     with urllib.request.urlopen('https://nodejs.org/dist/index.json', timeout=30) as response:
         releases = json.load(response)
     version = next(r['version'] for r in releases if r['version'].startswith('v24.') and listing in r['files'])
+    return download_node(version)
+
+
+def exact_node(version, log):
+    """bin folder of exactly Node version (e.g. 26.8.2), downloaded once."""
+    if not ARCH:
+        raise Stop(f'Node {version} is required on this architecture; install it and run again.')
+    folder = CACHE / 'node' / f"node-v{version}-{'darwin' if MAC else 'linux'}-{ARCH}" / 'bin'
+    if (folder / 'node').exists():
+        return folder
+    step(f'Downloading Node {version} (one time, private to this tool)...')
+    return download_node('v' + version)
+
+
+def download_node(version):
+    platform, arch = ('darwin' if MAC else 'linux'), ARCH
     name = f'node-{version}-{platform}-{arch}'
     base = f'https://nodejs.org/dist/{version}/'
     with urllib.request.urlopen(base + 'SHASUMS256.txt', timeout=30) as response:
@@ -518,23 +553,38 @@ def checks(env, log):
             raise NeedsFix(message + ' Command: ' + ' '.join(args))
 
 
-def build_bundles(env, version, resources, config, log):
-    step('Building T3 Code...')
-    env = dict(env, APP_VERSION=version, TMPDIR=str(CACHE / 'tmp'), **config)
-    Path(env['TMPDIR']).mkdir(parents=True, exist_ok=True)
-    packages = [SOURCE / 'apps' / app / 'package.json' for app in ('web', 'server', 'desktop')]
-    # The desktop build regenerates this tracked file; put the committed copy back afterwards.
-    generated = [SOURCE / 'apps/desktop/src/preview/AnnotationStyles.generated.ts']
-    originals = {path: path.read_bytes() for path in packages + generated if path.exists()}
+@contextlib.contextmanager
+def pinned_versions(version, apps, extra=()):
+    """Stamp version into the apps' package.json files for a build, then restore the
+    committed copies (and any extra generated files) afterwards."""
+    packages = [SOURCE / 'apps' / app / 'package.json' for app in apps]
+    originals = {path: path.read_bytes() for path in [*packages, *extra] if path.exists()}
     try:
         for path in packages:
             package = json.loads(originals[path])
             package['version'] = version
             path.write_text(json.dumps(package, indent=2) + '\n')
-        run(['vp', 'build'], cwd=SOURCE / 'apps/web', env=env, log=log)
-        run(['node', 'scripts/cli.ts', 'build'], cwd=SOURCE / 'apps/server', env=env, log=log)
-        brand = 'nightly' if 'nightly' in version else 'production'
-        run(['node', 'scripts/apply-web-brand-assets.ts', brand, 'apps/server/dist/client'], cwd=SOURCE, env=env, log=log)
+        yield
+    finally:
+        for path, original in originals.items():
+            path.write_bytes(original)
+
+
+def build_web_and_server(env, version, log):
+    run(['vp', 'build'], cwd=SOURCE / 'apps/web', env=env, log=log)
+    run(['node', 'scripts/cli.ts', 'build'], cwd=SOURCE / 'apps/server', env=env, log=log)
+    brand = 'nightly' if 'nightly' in version else 'production'
+    run(['node', 'scripts/apply-web-brand-assets.ts', brand, 'apps/server/dist/client'], cwd=SOURCE, env=env, log=log)
+
+
+def build_bundles(env, version, resources, config, log):
+    step('Building T3 Code...')
+    env = dict(env, APP_VERSION=version, TMPDIR=str(CACHE / 'tmp'), **config)
+    Path(env['TMPDIR']).mkdir(parents=True, exist_ok=True)
+    # The desktop build regenerates this tracked file; put the committed copy back afterwards.
+    generated = [SOURCE / 'apps/desktop/src/preview/AnnotationStyles.generated.ts']
+    with pinned_versions(version, ('web', 'server', 'desktop'), generated):
+        build_web_and_server(env, version, log)
         # Reuse the native helper from your own app instead of compiling it.
         helper = SOURCE / f'native/browser-secret/build/{ARCH or "x64"}/t3-browser-secret'
         stock_helper = resources / 'browser-secret/t3-browser-secret'
@@ -545,9 +595,6 @@ def build_bundles(env, version, resources, config, log):
         run(['node', 'scripts/build-browser-secret.mjs'], cwd=SOURCE / 'apps/desktop', env=env, log=log)
         run(['node', 'scripts/build-preview-annotation-css.mjs'], cwd=SOURCE / 'apps/desktop', env=env, log=log)
         run(['vp', 'pack'], cwd=SOURCE / 'apps/desktop', env=env, log=log)
-    finally:
-        for path, original in originals.items():
-            path.write_bytes(original)
 
 
 # --- Porting help -------------------------------------------------------------------
@@ -736,6 +783,33 @@ def install_launcher(appimage_dir):
         say(f'Note: {BIN.parent} is not on your PATH. Add it to run {NAME} from anywhere.')
 
 
+def apply_patches(args, target, version, env, log):
+    """Put the patches on target and pass their checks, letting an agent port them if allowed.
+    True if the patches were ported (export and commit them)."""
+    choose_shared(log)
+    step('Applying the patches...')
+    attempts = 2
+    resume = ported = args.resume
+    agent = None
+    while True:
+        try:
+            prepare(target, log, resume=resume)
+            install_dependencies(env, log)
+            if not args.skip_checks:
+                checks(env, log)
+            return ported
+        except NeedsFix as problem:
+            if older_than_patches(target):
+                raise Stop(stuck_message(problem, target))
+            say(str(problem))
+            agent = agent or choose_agent(args.fix)
+            if not agent or attempts == 0:
+                raise NeedsFix(stuck_message(problem, target))
+            attempts -= 1
+            agent_fix(agent, str(problem), target, version, log)
+            resume = ported = True
+
+
 def cmd_build(args):
     started = time.time()
     if not shutil.which('git'):
@@ -787,28 +861,7 @@ def cmd_build(args):
         node_bin = ensure_node(log)
         env = build_env(node_bin)
         target = ensure_commit(commit, version, log)
-        choose_shared(log)
-        step('Applying the patches...')
-        attempts = 2
-        resume = ported = args.resume
-        agent = None
-        while True:
-            try:
-                prepare(target, log, resume=resume)
-                install_dependencies(env, log)
-                if not args.skip_checks:
-                    checks(env, log)
-                break
-            except NeedsFix as problem:
-                if older_than_patches(target):
-                    raise Stop(stuck_message(problem, target))
-                say(str(problem))
-                agent = agent or choose_agent(args.fix)
-                if not agent or attempts == 0:
-                    raise NeedsFix(stuck_message(problem, target))
-                attempts -= 1
-                agent_fix(agent, str(problem), target, version, log)
-                resume = ported = True
+        ported = apply_patches(args, target, version, env, log)
         head = git('rev-parse', 'HEAD').strip()
         build_bundles(env, version, resources, config, log)
         if git('rev-parse', 'HEAD').strip() != head:
@@ -825,7 +878,9 @@ def cmd_build(args):
             destination = stage_mac_build(stock_root)
         else:
             destination = install_linux_build(stock_root, version, job)
-        save(STATE, {'stock': fingerprint(appimage), 'version': version, 'commit': target, 'recipe': recipe_hash(),
+        # The recipe this build was made from; a port changes it, a sync during the build must not.
+        save(STATE, {'stock': fingerprint(appimage), 'version': version, 'commit': target,
+                     'recipe': recipe_hash() if ported else recipe,
                      'build': str(destination), 'connect': len(config) == len(PUBLIC_CONFIG),
                      'builtAt': time.strftime('%Y-%m-%dT%H:%M:%S')})
     shutil.rmtree(job, ignore_errors=True)
@@ -936,6 +991,238 @@ def cmd_launch(args):
         os.environ['APPIMAGE'] = str(appimage)
         os.environ['APPDIR'] = str(target.parent)
     os.execv(str(target), [str(target), *args.rest])
+
+
+# --- Headless T3 server (Linux) -----------------------------------------------------
+
+def server_runtime():
+    """(version, folder) of the T3 server the systemd service runs, or None."""
+    if MAC:
+        return None
+    version = load(T3_HOME / 'runtime/service-state.json', {}).get('activeVersion')
+    folder = T3_HOME / 'runtime/versions' / str(version)
+    if not version or not (folder / 't3').is_file():
+        return None
+    return version, folder
+
+
+def server_installing(version, folder):
+    """True while T3 is still installing or trialling a version; a build then waits."""
+    sentinel = folder / '.install-complete'
+    if not sentinel.exists() or sentinel.read_text().strip() != version:
+        return True
+    update = load(T3_HOME / 'runtime/service-state.json', {}).get('update')
+    return isinstance(update, dict) and update.get('status') == 'pending'
+
+
+def inside_t3_service():
+    """True when this runs under the T3 server itself (a T3 agent on this box), which a restart kills."""
+    try:
+        return SERVICE_UNIT in Path('/proc/self/cgroup').read_text()
+    except OSError:
+        return False
+
+
+def contains(folder, marker):
+    return any(marker in path.read_bytes() for path in folder.rglob('*')
+               if path.suffix in ('.js', '.mjs', '.cjs') and path.is_file())
+
+
+def build_server(env, version, config, log):
+    step('Building the T3 server...')
+    env = dict(env, APP_VERSION=version, TMPDIR=str(CACHE / 'tmp'), **config)
+    Path(env['TMPDIR']).mkdir(parents=True, exist_ok=True)
+    pinned = re.search(r'SEA_NODE_VERSION\s*=\s*"([\d.]+)"', (SOURCE / 'apps/server/vite.config.ts').read_text())
+    if not pinned:
+        raise Stop('apps/server/vite.config.ts no longer pins SEA_NODE_VERSION; upstream changed how the'
+                   ' server executable is built. Update build_server in ' + NAME + '.')
+    with pinned_versions(version, ('web', 'server')):
+        build_web_and_server(env, version, log)
+        # Like upstream's release workflow: the repo builds on its own Node, the executable with
+        # the Node it embeds (25.7+ for --build-sea).
+        sea_bin = exact_node(pinned.group(1), log)
+        exe_env = dict(env, PATH=os.pathsep.join([str(sea_bin), env['PATH']]), VP_NODE_VERSION=pinned.group(1))
+        run([str(sea_bin / 'node'), 'scripts/cli.ts', 'build-exe'], cwd=SOURCE / 'apps/server', env=exe_env, log=log)
+    for folder, marker in (('apps/server/dist/client', b'statsForNerds'), ('apps/server/dist-exe', b'claude_observed')):
+        if not contains(SOURCE / folder, marker):
+            raise Stop(f'The build in {folder} is missing the patches (no {marker.decode()}).')
+
+
+def install_server_build(folder, version, commit, recipe):
+    """Swap the customized binary and web client into the runtime folder; the originals stay as *.stock."""
+    binary, client = folder / 't3', folder / 'client'
+    new_binary, new_client = folder / 't3.customize-new', folder / 'client.customize-new'
+    shutil.rmtree(new_client, ignore_errors=True)
+    shutil.copy2(SOURCE / 'apps/server/dist-exe/t3', new_binary)
+    shutil.copytree(SOURCE / 'apps/server/dist/client', new_client, ignore=shutil.ignore_patterns('*.map'))
+    probe = subprocess.run([str(new_binary), '--version'], cwd=folder, capture_output=True, text=True, timeout=120)
+    if probe.returncode or version not in probe.stdout:
+        new_binary.unlink(missing_ok=True)
+        shutil.rmtree(new_client, ignore_errors=True)
+        raise Stop(f'The customized server does not run: {(probe.stdout + probe.stderr).strip()[:300]}')
+    if not (folder / 't3.stock').exists():
+        shutil.copy2(binary, folder / 't3.stock')
+    os.replace(new_binary, binary)
+    old = folder / 'client.customize-old'
+    shutil.rmtree(old, ignore_errors=True)
+    os.rename(client, folder / 'client.stock' if not (folder / 'client.stock').exists() else old)
+    os.rename(new_client, client)
+    shutil.rmtree(old, ignore_errors=True)
+    save(folder / SERVER_MARK, {'version': version, 'commit': commit, 'recipe': recipe,
+                                'builtAt': time.strftime('%Y-%m-%dT%H:%M:%S')})
+
+
+def restore_server_stock(folder):
+    if (folder / 't3.stock').exists():
+        os.replace(folder / 't3.stock', folder / 't3')
+    if (folder / 'client.stock').exists():
+        old = folder / 'client.customize-old'
+        shutil.rmtree(old, ignore_errors=True)
+        if (folder / 'client').exists():
+            os.rename(folder / 'client', old)
+        os.rename(folder / 'client.stock', folder / 'client')
+        shutil.rmtree(old, ignore_errors=True)
+    (folder / SERVER_MARK).unlink(missing_ok=True)
+
+
+def systemctl(*args):
+    return subprocess.run(['systemctl', '--user', *args], capture_output=True, text=True)
+
+
+def server_healthy(timeout=120):
+    """The service is active and answers HTTP 200 on its port."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(3)
+        if systemctl('is-active', '--quiet', SERVICE_UNIT).returncode:
+            continue
+        try:
+            with urllib.request.urlopen(f'http://127.0.0.1:{SERVER_PORT}/', timeout=5) as response:
+                if response.status == 200:
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def restart_server(folder):
+    """Restart the service on the customized build; back to stock if it does not come up."""
+    step('Restarting the T3 server (open sessions on it reconnect)...')
+    systemctl('restart', SERVICE_UNIT)
+    if server_healthy():
+        return
+    say('The customized server did not come up; going back to stock T3.')
+    restore_server_stock(folder)
+    systemctl('restart', SERVICE_UNIT)
+    raise Stop('The customized server failed its health check and was rolled back to stock T3.'
+               f' See journalctl --user -u {SERVICE_UNIT} and ~/.t3/userdata/logs/boot-service.log.')
+
+
+def cmd_server(args):
+    """Build the customized server for the T3 version the service runs and switch the service to it."""
+    if MAC:
+        raise Stop(f'server is for a headless Linux T3 server; on macOS run {NAME} update.')
+    if inside_t3_service() and not args.no_restart:
+        # The restart would kill this very process; finish in a unit of its own.
+        argv = [sys.executable, str(REPO / NAME), *sys.argv[1:]]
+        run(['systemd-run', '--user', '--collect', '--unit', NAME + '-server-run',
+             '--setenv=PATH=' + os.environ.get('PATH', ''), *argv], capture=True)
+        say(f'Running outside the T3 server, since it restarts it. Follow it with:\n'
+            f'  journalctl --user -fu {NAME}-server-run')
+        return False
+    if not args.no_pull and not args.resume:
+        pull_latest()
+    runtime = server_runtime()
+    if not runtime:
+        raise Stop(f'No T3 server here: {T3_HOME}/runtime/service-state.json names no installed version.\n'
+                   'Install it first (npm install -g t3@nightly, then its service; see README.md).')
+    version, folder = runtime
+    say(f'T3 server: {version} in {folder}')
+    if 'nightly' not in version:
+        raise Stop(f'This is T3 {version}. The patches target Nightly; install t3@nightly and run again.')
+    if server_installing(version, folder):
+        say('T3 is installing or trying out this version; run again once it settles.')
+        return False
+    mark = load(folder / SERVER_MARK, {})
+    recipe = recipe_hash()
+    if not args.force and not args.resume and mark.get('recipe') == recipe and mark.get('version') == version:
+        say('Already up to date: the T3 server runs the customized build.')
+        return False
+    started = time.time()
+    logs = CACHE / 'logs'
+    logs.mkdir(parents=True, exist_ok=True)
+    with (logs / ('server-' + time.strftime('%Y%m%d-%H%M%S') + '.log')).open('w') as log:
+        say('Log: ' + log.name)
+        client = folder / ('client.stock' if (folder / 'client.stock').exists() else 'client')
+        config = public_config_from(path.read_bytes() for path in sorted(client.rglob('*.js')))
+        if len(config) != len(PUBLIC_CONFIG):
+            raise Stop('Could not read the T3 Connect config from the installed web client; a build without'
+                       ' it would sign this server out of T3 Connect. Nothing was changed.')
+        env = build_env(ensure_node(log))
+        # Server releases are tagged v<version>; that tag is the commit the binary was built from.
+        target = ensure_commit('v' + version, version, log)
+        say(f'    Nightly {version}, upstream commit {target[:12]}')
+        ported = apply_patches(args, target, version, env, log)
+        head = git('rev-parse', 'HEAD').strip()
+        build_server(env, version, config, log)
+        if git('rev-parse', 'HEAD').strip() != head:
+            raise Stop('The source checkout changed during the build.')
+        if ported:
+            export_patches(target)
+        step('Installing the customized server...')
+        install_server_build(folder, version, target, recipe_hash() if ported else recipe)
+    if args.no_restart:
+        say(f'\nInstalled; it starts with the next restart (systemctl --user restart {SERVICE_UNIT}).')
+    else:
+        restart_server(folder)
+        say(f'\nDone in {max(1, round((time.time() - started) / 60))} min: the T3 server runs {version} with the patches.')
+    if ported:
+        say(f'The ported patches were saved to {PORT} and {OWN_PATCHES}; commit them.')
+    return True
+
+
+def cmd_server_off(args):
+    """Put the stock T3 server back for the version the service runs."""
+    runtime = server_runtime()
+    if not runtime:
+        raise Stop('No T3 server here.')
+    _, folder = runtime
+    restore_server_stock(folder)
+    if not args.no_restart:
+        restart_server(folder)
+    say('The T3 server runs stock T3 again. ' + NAME + ' server switches it back.')
+
+
+def server_autoupdate(args):
+    """systemd units that rebuild when T3 switches versions, and nightly for patch changes."""
+    service, path, timer = SERVER_UNITS['.service'], SERVER_UNITS['.path'], SERVER_UNITS['.timer']
+    systemctl('disable', '--now', path.name, timer.name)
+    if args.state == 'off':
+        for unit in (service, path, timer):
+            unit.unlink(missing_ok=True)
+        systemctl('daemon-reload')
+        return say('Background updates off.')
+    command = [sys.executable, str(REPO / NAME), 'server', '--background'] + (['--fix', args.fix] if args.fix else [])
+    SYSTEMD_USER.mkdir(parents=True, exist_ok=True)
+    service.write_text('\n'.join([
+        '[Unit]', f'Description=Rebuild the customized T3 server ({NAME})', '',
+        '[Service]', 'Type=oneshot', f'Environment="PATH={os.environ.get("PATH", "/usr/bin:/bin")}"',
+        'ExecStart=' + ' '.join(f'"{part}"' for part in command), 'Nice=10', 'IOSchedulingClass=idle', '']))
+    path.write_text('\n'.join([
+        '[Unit]', 'Description=Rebuild the customized T3 server when T3 switches versions', '',
+        '[Path]', f'PathChanged={T3_HOME}/runtime/service-state.json', f'Unit={service.name}', '',
+        '[Install]', 'WantedBy=default.target', '']))
+    timer.write_text('\n'.join([
+        '[Unit]', 'Description=Check nightly for changed patches', '',
+        '[Timer]', 'OnCalendar=*-*-* 04:30', 'Persistent=true', f'Unit={service.name}', '',
+        '[Install]', 'WantedBy=timers.target', '']))
+    systemctl('daemon-reload')
+    result = systemctl('enable', '--now', path.name, timer.name)
+    if result.returncode:
+        raise Stop('Could not enable the systemd units: ' + result.stderr.strip())
+    say('Background updates on: the server is rebuilt when T3 switches to another version, and at 04:30'
+        ' when the patches changed.' + (f' Broken patches are ported by {AGENT_NAMES[args.fix]}.' if args.fix else ''))
+    say(f'Log: journalctl --user -u {service.name}')
 
 
 # --- Keeping up with Nightly on macOS -----------------------------------------------
@@ -1096,9 +1383,11 @@ def cmd_install_pending(args):
 
 
 def cmd_autoupdate(args):
-    """Turn the background updater (a LaunchAgent) on or off."""
+    """Turn the background updater (a LaunchAgent, or systemd units on a T3 server) on or off."""
     if not MAC:
-        raise Stop('autoupdate is macOS only; T3 Code updates its AppImage itself.')
+        if server_runtime() or SERVER_UNITS['.service'].exists():
+            return server_autoupdate(args)
+        raise Stop('On a Linux desktop T3 Code updates its AppImage itself; autoupdate is for macOS and T3 servers.')
     domain = f'gui/{os.getuid()}'
     subprocess.run(['launchctl', 'bootout', f'{domain}/{AUTOUPDATE_LABEL}'], check=False,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1125,6 +1414,19 @@ def cmd_autoupdate(args):
 
 
 def cmd_status(args):
+    runtime = server_runtime()
+    if runtime:
+        version, folder = runtime
+        mark = load(folder / SERVER_MARK, {})
+        say('T3 server:          ' + version)
+        say('Customized:         ' + (f"yes (built {mark['builtAt']})" if mark else f'no ({NAME} server)')
+            + (f'; patches changed since, run {NAME} server' if mark and mark.get('recipe') != recipe_hash() else ''))
+        say('Background updates: ' + ('on' if SERVER_UNITS['.path'].exists() else f'off ({NAME} autoupdate on)'))
+        try:
+            find_appimage()
+        except Stop:
+            return  # A headless server without a desktop app.
+        say()
     appimage = find_appimage()
     state = load(STATE, {})
     target, notice = launch_target()
@@ -1175,11 +1477,146 @@ def cmd_uninstall(args):
     say('Removed t3code-customize, its launcher, builds and caches. Your T3 Code and its data are untouched.' + tail)
 
 
+# --- Every machine at once ----------------------------------------------------------
+
+def identity():
+    """What a build depends on in this repo: the script and the patches. Equal on two
+    machines means they build the same thing."""
+    return {'script': sha256(REPO / NAME)[:12], 'recipe': recipe_hash()}
+
+
+def cmd_identity(args):
+    print(json.dumps(identity()))
+
+
+def this_machine(machines):
+    host = socket.gethostname().split('.')[0].lower()
+    return next((m for m in machines if m.get('hostname', '').lower() == host), None)
+
+
+def ssh_target(machine):
+    """The first SSH alias for machine that answers without a prompt."""
+    for alias in machine.get('ssh', []):
+        if subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', alias, 'true'],
+                          capture_output=True).returncode == 0:
+            return alias
+    return None
+
+
+def remote(alias, command, **kwargs):
+    """Run command in the machine's login shell, so PATH matches a terminal there."""
+    return subprocess.run(['ssh', '-o', 'BatchMode=yes', '-o', 'ServerAliveInterval=30', alias,
+                           'exec "$SHELL" -lc ' + shlex.quote(command)], **kwargs)
+
+
+def repo_files():
+    if (REPO / '.git').exists():
+        listed = subprocess.run(['git', 'ls-files', '-z'], cwd=REPO, capture_output=True, text=True, check=True)
+        return [name for name in listed.stdout.split('\0') if name and (REPO / name).exists()]
+    return [str(p.relative_to(REPO)) for p in REPO.rglob('*') if p.is_file() and '.git' not in p.parts]
+
+
+def remote_identity(alias, probe):
+    lines = remote(alias, probe, capture_output=True, text=True).stdout.strip().splitlines()
+    try:
+        return json.loads(lines[-1]) if lines else None
+    except ValueError:
+        return None
+
+
+def sync_repo(alias, path, wanted, say_as):
+    """Make the machine's copy of this repo match ours: wait for Syncthing, else copy the files."""
+    probe = f'python3 "$HOME"/{shlex.quote(path)}/{NAME} identity 2>/dev/null'
+    deadline = time.time() + 180
+    while True:
+        out = remote_identity(alias, probe)
+        if out == wanted:
+            return
+        if time.time() > deadline or not out:
+            break
+        say_as('waiting for Syncthing to bring the repo over...')
+        time.sleep(15)
+    say_as('copying the repo files over SSH...')
+    # No AppleDouble files from a Mac in the copy.
+    pack = subprocess.Popen(['tar', '-C', str(REPO), '-cf', '-', *repo_files()], stdout=subprocess.PIPE,
+                            env=dict(os.environ, COPYFILE_DISABLE='1'))
+    unpack = remote(alias, f'mkdir -p "$HOME"/{shlex.quote(path)} && tar -C "$HOME"/{shlex.quote(path)} -xf -',
+                    stdin=pack.stdout, capture_output=True, text=True)
+    pack.wait()
+    if unpack.returncode or remote_identity(alias, probe) != wanted:
+        raise Stop('could not bring the repo over: ' + (unpack.stderr.strip() or 'files still differ'))
+
+
+def cmd_fleet(args):
+    """Update every machine in machines.json: Macs install Nightly and rebuild, servers rebuild their T3 server."""
+    if not args.no_pull:
+        pull_latest()
+    machines = load(MACHINES, {}).get('machines', [])
+    if args.only:
+        unknown = set(args.only) - {m['name'] for m in machines}
+        if unknown:
+            raise Stop('Not in machines.json: ' + ', '.join(sorted(unknown)))
+        machines = [m for m in machines if m['name'] in args.only]
+    if not machines:
+        raise Stop(f'No machines in {MACHINES}.')
+    me = this_machine(machines)
+    path = str(REPO.relative_to(HOME))
+    wanted = identity()
+    printing = threading.Lock()
+    results = {}
+
+    def update(machine):
+        name = machine['name']
+
+        def say_as(line):
+            with printing:
+                say(f'[{name}] {line}')
+
+        command = ['update' if machine['kind'] == 'mac' else 'server', '--no-pull']
+        command += ['--fix', args.fix] if args.fix else []
+        command += ['--force'] if args.force else []
+        try:
+            if machine is me:
+                process = subprocess.Popen([sys.executable, str(REPO / NAME), *command], stdin=subprocess.DEVNULL,
+                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            else:
+                alias = ssh_target(machine)
+                if not alias:
+                    raise Stop('unreachable over SSH (' + ', '.join(machine.get('ssh', [])) + ')')
+                sync_repo(alias, path, wanted, say_as)
+                line = f'python3 "$HOME"/{shlex.quote(path)}/{NAME} ' + shlex.join(command)
+                process = subprocess.Popen(['ssh', '-o', 'BatchMode=yes', '-o', 'ServerAliveInterval=30', alias,
+                                            'exec "$SHELL" -lc ' + shlex.quote(line)], stdin=subprocess.DEVNULL,
+                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            last = ''
+            for line in process.stdout:
+                if line.strip():
+                    last = line.strip()
+                    say_as(last)
+            code = process.wait()
+            results[name] = ('ok' if code == 0 else 'needs a port (see AGENTS.md)' if code == 3
+                             else f'failed ({code})', last)
+        except (Stop, OSError, ValueError) as error:
+            results[name] = ('failed', str(error).strip().splitlines()[0])
+
+    threads = [threading.Thread(target=update, args=(m,)) for m in machines]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    say('\nFleet:')
+    for machine in machines:
+        status, last = results.get(machine['name'], ('failed', ''))
+        say(f"  {machine['name']:<10} {status:<28} {last[:90]}")
+    if any(status != 'ok' for status, _ in results.values()):
+        raise Stop('Not every machine is up to date.')
+
+
 def main():
     parser = argparse.ArgumentParser(prog=NAME, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
                                      epilog='With no command, it updates the patches and builds for your installed T3 Code'
                                             ' (on macOS it first installs a newer Nightly).')
-    sub = parser.add_subparsers(dest='command')
+    sub = parser.add_subparsers(dest='command', metavar='command')
 
     def build_options(p):
         p.add_argument('--appimage', '--app', dest='appimage', help='path to your T3 Code AppImage or .app (remembered)')
@@ -1204,22 +1641,39 @@ def main():
     sub.add_parser('off', help='go back to stock T3 Code')
     sub.add_parser('verify', help='apply the patches to their base and run the checks (for CI)')
     sub.add_parser('uninstall', help='remove the launcher, builds and caches')
-    sub.add_parser('install-pending', help=argparse.SUPPRESS)
+    server = sub.add_parser('server', help='Linux T3 server: build the patches into the server the service runs')
+    build_options(server)
+    server.add_argument('--no-restart', action='store_true', help='install without restarting the service')
+    server.add_argument('--background', action='store_true', help=argparse.SUPPRESS)
+    server_off = sub.add_parser('server-off', help='Linux T3 server: put the stock server back')
+    server_off.add_argument('--no-restart', action='store_true', help='do not restart the service')
+    fleet = sub.add_parser('fleet', help='update every machine in machines.json (run after changing this repo)')
+    fleet.add_argument('--only', action='append', metavar='NAME', help='just this machine (repeatable)')
+    fleet.add_argument('--fix', choices=sorted(AGENTS), help='let this agent port broken patches on each machine')
+    fleet.add_argument('--force', action='store_true', help='rebuild even if nothing changed')
+    fleet.add_argument('--no-pull', action='store_true', help='do not fetch newer patches first')
+    sub.add_parser('install-pending')
+    sub.add_parser('identity')
     argv = sys.argv[1:]
     if not argv or argv[0].startswith('-') and argv[0] not in ('-h', '--help'):
         argv = ['update' if MAC else 'build', *argv]
     args = parser.parse_args(argv)
     handler = globals()['cmd_' + args.command.replace('-', '_')]
-    if args.command in ('launch', 'status', 'on', 'off', 'autoupdate', 'install-pending'):
+    if args.command in ('launch', 'status', 'on', 'off', 'autoupdate', 'install-pending', 'fleet', 'identity'):
         return handler(args)
     CACHE.mkdir(parents=True, exist_ok=True)
     with (CACHE / 'lock').open('w') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            if getattr(args, 'background', False):
-                return
-            raise Stop(f'Another {NAME} is already running.')
+        # A few seconds of grace for a run that is just handing over (server relaunching itself).
+        for attempt in range(5):
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if attempt == 4:
+                    if getattr(args, 'background', False):
+                        return
+                    raise Stop(f'Another {NAME} is already running.')
+                time.sleep(1)
         handler(args)
 
 
