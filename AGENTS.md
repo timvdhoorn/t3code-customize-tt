@@ -104,9 +104,12 @@ run the same patches.
   Everything slow happens first: `t3 update` without `--yes` only stages the new version (no
   terminal, so the service keeps running until its next restart), and the customized server is
   built, copied and probed as `*.customize-new`. Then it checks every minute for up to 4 hours
-  (`T3CODE_CUSTOMIZE_IDLE_WAIT_MINUTES`), swaps the files in by renaming and checks once more right
-  before `systemctl restart`. Still busy: it stops with `deferred: threads busy` (exit 4, fleet says
-  the same) and restarts nothing; the next run tries again. A failed health check rolls back to stock
+  (`T3CODE_CUSTOMIZE_IDLE_WAIT_MINUTES`), swaps the files in by renaming, runs `daemon-reload` (the
+  unit `t3 update` rewrote) and checks once more right before `systemctl restart`. Still busy: it
+  stops with `deferred: threads busy` (exit 4, fleet says the same) and restarts nothing; the next run
+  tries again. A restart deferred after the swap leaves `~/.t3/runtime/.t3code-customize-restart-pending`,
+  and a run that finds the build already installed still restarts (gated) while that marker, or
+  T3's own `.restart-pending` for the active version, is there. A failed health check rolls back to stock
   and restarts only while idle; otherwise stock waits on disk for the next restart. Run from a T3
   agent on devbox1, `server` moves itself to a systemd unit, which waits for that agent's turn to
   end, so never wait on that unit in the same turn: end the turn and check
@@ -148,11 +151,12 @@ against `main`. It merges that PR (squash) and starts `fleet`, without asking, o
    matched by number) the files it changes, in order by their `diff --git` path, each with its
    added and removed lines in order, without blank and comment-only lines, are identical to the
    committed ones, and no patch was added or dropped. A comment-only line starts with `//`, is a
-   `/*` or `<!--` line that ends its comment or runs on, or a `*` continuation; `#` is code, and so
-   is `/* x */ code();`. A patch that changes a binary file or a file mode never qualifies. Only
+   `/*` or `<!--` line that ends its comment or runs on, or a line inside a `/*` block (its `*`
+   continuations up to `*/`); `#` is code, and so are `/* x */ code();` and a `*` line outside a block. A patch that changes a binary file or a file mode never qualifies. Only
    context, comments, hunk positions and line numbers moved (`code_unchanged`), and
 3. nothing else changed: `checks-tt.json`, `checks-ios.json`, the script and every other file are
-   byte-identical to `main`, and the repo was on `main`. The PR holds only the `*.patch` and
+   byte-identical to `main`, and the repo was on `main`. Untracked files count only inside the patch
+   folders (a checkout's own installed skills or lock files do not). The PR holds only the `*.patch` and
    `base.txt` files of the patch folders (a changed check list goes along, for review).
 
 The run publishes the port right after exporting it, before it waits for idle threads, so a

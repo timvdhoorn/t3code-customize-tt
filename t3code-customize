@@ -802,25 +802,29 @@ UNCOMPARABLE = ('old mode', 'new mode', 'GIT binary patch', 'Binary files')
 STRUCTURE = ('new file mode', 'deleted file mode', 'rename from', 'rename to', 'copy from', 'copy to')
 
 
-def is_comment(body):
-    """A line that holds only a comment: //, a /* or <!-- line that ends its comment or runs on,
-    or a * continuation. # is not one (private fields, shell, CSS colors are code)."""
+def is_comment(body, in_block=False):
+    """(holds only a comment, inside a /* block after it). A comment-only line is //, a /* or <!--
+    line that ends its comment or runs on, or a line inside a /* block up to its */. # is code
+    (private fields, shell, CSS colors), and so is a * line outside a block (*ptr = x)."""
+    if in_block:
+        return (not ('*/' in body and not body.endswith('*/')), '*/' not in body)
     if body.startswith('//'):
-        return True
-    for opener, closer in (('/*', '*/'), ('<!--', '-->')):
-        if body.startswith(opener):
-            return closer not in body or body.endswith(closer)
-    return body == '*' or body.startswith(('* ', '*/'))
+        return True, False
+    if body.startswith('/*'):
+        return ('*/' not in body or body.endswith('*/')), '*/' not in body
+    if body.startswith('<!--'):
+        return ('-->' not in body or body.endswith('-->')), False
+    return False, False
 
 
 def code_lines(patch_text):
     """Per changed file, in patch order: (diff --git path, its added and removed code lines in order),
     leaving out context, hunk positions, blank lines and comment-only lines. None when the patch
     changes a binary file or a file mode, which no line comparison covers."""
-    files, lines, header = [], None, False
+    files, lines, header, block = [], None, False, False
     for line in patch_text.splitlines():
         if line.startswith('diff --git '):
-            lines, header = [], True
+            lines, header, block = [], True, False
             files.append((line[len('diff --git '):], lines))
         elif lines is None:
             continue
@@ -832,10 +836,16 @@ def code_lines(patch_text):
             if line.startswith(STRUCTURE):
                 lines.append(line)
             header = not line.startswith('@@')
-        elif line[:1] in ('+', '-'):
+        elif line[:1] in ('+', '-', ' '):
+            # Context lines count for where a /* block opens and closes, not as changes.
             body = line[1:].strip()
-            if body and not is_comment(body):
+            if not body:
+                continue
+            comment, block = is_comment(body, block)
+            if line[0] != ' ' and not comment:
                 lines.append(line[0] + body)
+        elif line.startswith('@@'):
+            block = False
     return files
 
 
@@ -886,21 +896,25 @@ def is_port_file(path):
 
 
 def port_changes():
-    """(port files changed, other changed files) in REPO's working tree against HEAD, by path.
-    Syncthing's temporary files are not changes."""
-    out = subprocess.run(['git', 'status', '--porcelain', '-z', '--untracked-files=all'], cwd=REPO,
-                         capture_output=True, text=True, check=True).stdout
-    entries = iter(out.split('\0'))
-    port, other = [], []
+    """(port files changed, other changed files) in REPO's working tree against HEAD, by path: every
+    tracked change, and untracked files only inside the patch folders (a checkout keeps untracked
+    files of its own, such as installed skills). Syncthing's temporary files are not changes."""
+    def run(*args):
+        return subprocess.run(['git', *args], cwd=REPO, capture_output=True, text=True, check=True).stdout
+    entries = iter(run('status', '--porcelain', '-z', '--untracked-files=no').split('\0'))
+    paths = []
     for entry in entries:
         if not entry:
             continue
-        path = entry[3:]
+        paths.append(entry[3:])
         if entry[0] in 'RC':
-            other.append(next(entries, ''))  # where a rename came from changed too
+            paths.append(next(entries, ''))  # where a rename came from changed too
+    paths += run('ls-files', '--others', '--exclude-standard', '-z', '--', *PATCH_FOLDERS).split('\0')
+    port, other = [], []
+    for path in filter(None, paths):
         if '.syncthing.' not in Path(path).name:
             (port if is_port_file(path) else other).append(path)
-    return sorted(port), sorted(p for p in other if p)
+    return sorted(set(port)), sorted(set(other))
 
 
 def port_branch(version, title):
@@ -916,6 +930,10 @@ def port_branch(version, title):
     raise Stop(f'port/nightly-{version} and its suffixes all hold commits from someone else')
 
 
+class MergedButStuck(Stop):
+    """The port is merged, but this copy of the repo did not follow."""
+
+
 def publish_port(args, version):
     """Commit a port to a branch and open a PR; merge it and run fleet when the standing grant covers it."""
     if not getattr(args, 'agent_ported', False):
@@ -923,6 +941,9 @@ def publish_port(args, version):
         return
     try:
         url, merged = _publish_port(version, checked=not args.skip_checks)
+    except MergedButStuck as error:
+        notify(LAUNCHER_NAME, f'An agent ported the patches to {version}. {error}')
+        return
     except (Stop, OSError, subprocess.CalledProcessError) as error:
         notify(LAUNCHER_NAME, f'An agent ported the patches, but opening the PR failed: {error}'
                f' The port is in {REPO}; commit it by hand.')
@@ -988,7 +1009,11 @@ def _publish_port(version, checked):
             repo_run('git', 'checkout', '--quiet', 'HEAD', '--', path, check=False)
         else:
             (REPO / path).unlink(missing_ok=True)
-    repo_run('git', 'pull', '--quiet', '--ff-only')
+    try:
+        repo_run('git', 'pull', '--quiet', '--ff-only')
+    except Stop as error:
+        raise MergedButStuck(f'{url} is merged, but {REPO} could not fast-forward to it ({error}).'
+                             f' Run git pull there, then {NAME} fleet.')
     # fleet waits for this run's lock, then updates every machine, this one included. This run may
     # still build the iOS app after it (update --ios), so fleet waits longer than a normal run.
     spawn_detached([sys.executable, str(REPO / NAME), 'fleet', '--no-pull', '--wait-lock', str(PORT_FLEET_WAIT)],
@@ -1511,8 +1536,28 @@ def wait_until_idle(action, timeout=None, poll=IDLE_POLL, busy=busy_threads, sle
         sleep(poll)
 
 
+# A restart this tool owes the service: set before it tries one, cleared once the service came up,
+# so a restart deferred after the files were swapped is retried by the next run.
+OWED_RESTART = T3_HOME / 'runtime/.t3code-customize-restart-pending'
+# What `t3 update` leaves when it staged a version the service does not run yet (serviceProtocol.ts).
+T3_RESTART_PENDING = T3_HOME / 'runtime/.restart-pending'
+
+
+def restart_owed(version):
+    """True when the service has not restarted onto what is on disk for version. T3's marker counts
+    only when it waits for version: the launcher removes it once it starts on that version, so any
+    other one a restart would not clear."""
+    try:
+        staged = T3_RESTART_PENDING.read_text().strip() == version
+    except OSError:
+        staged = False
+    return OWED_RESTART.exists() or staged
+
+
 def restart_service(action, busy=busy_threads):
     """systemctl restart, but only when a last look right before it still finds no thread working."""
+    # `t3 update` rewrites the unit without a daemon-reload; the restart must start the new one.
+    systemctl('daemon-reload')
     threads = busy()
     if threads:
         raise Deferred(f'deferred: threads busy. Did not {action}: {", ".join(threads[:5])} started working'
@@ -1637,7 +1682,10 @@ def server_healthy(timeout=120):
 def restart_server(folder, action='restart the T3 server'):
     """Restart the service (only if still idle); back to stock if it does not come up."""
     step('Restarting the T3 server (open sessions on it reconnect)...')
+    OWED_RESTART.parent.mkdir(parents=True, exist_ok=True)
+    OWED_RESTART.write_text(time.strftime('%Y-%m-%dT%H:%M:%S') + '\n')
     restart_service(action)
+    OWED_RESTART.unlink(missing_ok=True)
     if server_healthy():
         return
     say('The customized server did not come up; going back to stock T3.')
@@ -1648,6 +1696,7 @@ def restart_server(folder, action='restart the T3 server'):
         systemctl('restart', SERVICE_UNIT)
         raise Stop('The customized server failed its health check and was rolled back to stock T3.'
                    f' See journalctl --user -u {SERVICE_UNIT} and ~/.t3/userdata/logs/boot-service.log.')
+    OWED_RESTART.write_text(time.strftime('%Y-%m-%dT%H:%M:%S') + '\n')
     raise Stop('The customized server was slow to answer and threads work on it now, so it was not'
                ' restarted; stock T3 is back on disk and starts with the next restart.'
                f' See journalctl --user -u {SERVICE_UNIT}.')
@@ -1686,8 +1735,15 @@ def cmd_server(args):
     mark = load(folder / SERVER_MARK, {})
     recipe = recipe_hash()
     if not args.force and not args.resume and mark.get('recipe') == recipe and mark.get('version') == version:
-        say('Already up to date: the T3 server runs the customized build.')
-        return False
+        if args.no_restart or not restart_owed(version):
+            say('Already up to date: the T3 server runs the customized build.')
+            return False
+        # Installed, but its restart was deferred (or `t3 update` staged this version): restart now.
+        say('The customized build is installed, but the service has not restarted onto it yet.')
+        wait_until_idle('restart the T3 server on the customized build')
+        restart_server(folder, 'restart the T3 server on the customized build')
+        say(f'The T3 server runs {version} with the patches.')
+        return True
     started = time.time()
     logs = CACHE / 'logs'
     logs.mkdir(parents=True, exist_ok=True)

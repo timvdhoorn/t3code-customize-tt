@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 from pathlib import Path
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -117,12 +118,13 @@ class RestartTest(unittest.TestCase):
     def test_a_thread_that_starts_just_before_the_restart_defers_it(self):
         with patch.object(customize, 'systemctl') as systemctl, self.assertRaises(customize.Deferred):
             customize.restart_service('restart', busy=lambda: ['New thread'])
-        systemctl.assert_not_called()
+        self.assertNotIn(('restart', customize.SERVICE_UNIT), [c.args for c in systemctl.call_args_list])
 
-    def test_idle_restarts(self):
+    def test_idle_restarts_after_reloading_the_unit(self):
         with patch.object(customize, 'systemctl') as systemctl:
             customize.restart_service('restart', busy=lambda: [])
-        systemctl.assert_called_once_with('restart', customize.SERVICE_UNIT)
+        self.assertEqual([c.args for c in systemctl.call_args_list],
+                         [('daemon-reload',), ('restart', customize.SERVICE_UNIT)])
 
     def test_rollback_does_not_restart_a_server_that_threads_use(self):
         restarts = []
@@ -135,6 +137,57 @@ class RestartTest(unittest.TestCase):
             customize.restart_server(Path('/x'))
         restore.assert_called_once()
         self.assertNotIn(('restart', customize.SERVICE_UNIT), restarts)
+
+
+class OwedRestartTest(unittest.TestCase):
+    """A restart deferred after the files were swapped must happen on the next run."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.runtime = Path(tmp.name)
+        for name, value in (('OWED_RESTART', self.runtime / '.owed'), ('T3_RESTART_PENDING', self.runtime / '.rp')):
+            patcher = patch.object(customize, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_server(self, mark_version='1.1-nightly'):
+        args = argparse.Namespace(no_restart=False, no_pull=True, resume=False, t3_update=False, force=False)
+        with patch.object(customize, 'MAC', False), patch.object(customize, 'inside_t3_service', return_value=False), \
+                patch.object(customize, 'server_runtime', return_value=('1.1-nightly', self.runtime)), \
+                patch.object(customize, 'server_installing', return_value=False), \
+                patch.object(customize, 'recipe_hash', return_value='r'), \
+                patch.object(customize, 'load', return_value={'version': mark_version, 'recipe': 'r'}), \
+                patch.object(customize, 'wait_until_idle') as gate, \
+                patch.object(customize, 'restart_server') as restart, patch.object(customize, 'say'):
+            customize.cmd_server(args)
+        return gate, restart
+
+    def test_up_to_date_without_an_owed_restart_does_nothing(self):
+        gate, restart = self.run_server()
+        restart.assert_not_called()
+
+    def test_a_deferred_restart_is_retried_when_the_build_is_already_installed(self):
+        customize.OWED_RESTART.write_text('x')
+        gate, restart = self.run_server()
+        gate.assert_called_once()
+        restart.assert_called_once()
+
+    def test_a_version_t3_update_staged_is_restarted_onto(self):
+        customize.T3_RESTART_PENDING.write_text('1.1-nightly\n')
+        self.assertTrue(customize.restart_owed('1.1-nightly'))
+        # A marker for another version is not cleared by a restart, so it does not count.
+        self.assertFalse(customize.restart_owed('1.2-nightly'))
+
+    def test_the_owed_restart_stays_until_a_restart_happened(self):
+        with patch.object(customize, 'restart_service', side_effect=customize.Deferred('busy')), \
+                patch.object(customize, 'step'), self.assertRaises(customize.Deferred):
+            customize.restart_server(self.runtime)
+        self.assertTrue(customize.OWED_RESTART.exists())
+        with patch.object(customize, 'restart_service'), patch.object(customize, 'server_healthy', return_value=True), \
+                patch.object(customize, 'step'):
+            customize.restart_server(self.runtime)
+        self.assertFalse(customize.OWED_RESTART.exists())
 
 
 class AcquireLockTest(unittest.TestCase):
@@ -238,7 +291,13 @@ class MergeDecisionTest(unittest.TestCase):
     def test_code_after_a_closed_comment_counts(self):
         self.assertFalse(self.same(patch_text(comment='x'), patch_text(comment='x').replace('+// x', '+/* x */ run();')))
         self.assertTrue(self.same(patch_text(comment='x').replace('+// x', '+/** x */'),
-                                  patch_text(comment='x').replace('+// x', '+ * y')))
+                                  patch_text(comment='x').replace('+// x', '+/* y */')))
+
+    def test_star_lines_are_comments_only_inside_a_block(self):
+        block = patch_text(comment='x').replace('+// x', '+/**\n+ * x\n+ */')
+        reworded = patch_text(comment='x').replace('+// x', '+/**\n+ * y\n+ */')
+        self.assertTrue(self.same(block, reworded))
+        self.assertFalse(self.same(patch_text(comment='x'), patch_text(comment='x').replace('+// x', '+* ptr;')))
 
     def test_binary_or_mode_changes_are_not_merged(self):
         binary = patch_text() + 'diff --git a/i.png b/i.png\nindex 1..2 100644\nGIT binary patch\nliteral 1\n'
@@ -286,6 +345,37 @@ class MergeDecisionTest(unittest.TestCase):
             self.assertEqual(staged, ['patches-tt/0001-a.patch'] + [p for p in other if p in customize.CHECK_FILES])
             if merged:
                 self.assertIn('--wait-lock', spawn.call_args.args[0])
+
+    def test_untracked_files_outside_the_patch_folders_do_not_block_a_merge(self):
+        with tempfile.TemporaryDirectory() as repo:
+            def git(*args):
+                subprocess.run(['git', *args], cwd=repo, check=True, capture_output=True)
+            git('init', '-q')
+            (Path(repo) / 'patches-tt').mkdir()
+            (Path(repo) / 'patches-tt/0001-a.patch').write_text('a')
+            (Path(repo) / 'checks-tt.json').write_text('[]')
+            git('add', '.')
+            git('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'init')
+            (Path(repo) / 'patches-tt/0001-a.patch').write_text('b')
+            (Path(repo) / 'patches-tt/0002-b.patch').write_text('new')
+            (Path(repo) / 'patches-tt/.syncthing.0002-b.patch.tmp').write_text('tmp')
+            (Path(repo) / 'skills-lock.json').write_text('{}')
+            (Path(repo) / '.agents/skills/x').mkdir(parents=True)
+            (Path(repo) / '.agents/skills/x/SKILL.md').write_text('x')
+            with patch.object(customize, 'REPO', Path(repo)):
+                self.assertEqual(customize.port_changes(),
+                                 (['patches-tt/0001-a.patch', 'patches-tt/0002-b.patch'], []))
+                (Path(repo) / 'checks-tt.json').write_text('["x"]')
+                (Path(repo) / 'patches-tt/notes.md').write_text('n')
+                self.assertEqual(customize.port_changes()[1], ['checks-tt.json', 'patches-tt/notes.md'])
+
+    def test_a_merge_the_repo_cannot_follow_says_it_merged(self):
+        notes = []
+        with patch.object(customize, '_publish_port', side_effect=customize.MergedButStuck('pull/9 is merged, but')), \
+                patch.object(customize, 'notify', lambda title, text: notes.append(text)):
+            customize.publish_port(argparse.Namespace(agent_ported=True, skip_checks=False), '1.0-nightly')
+        self.assertIn('is merged', notes[0])
+        self.assertNotIn('opening the PR failed', notes[0])
 
     def test_only_patch_files_are_port_files(self):
         self.assertTrue(customize.is_port_file('patches-tt/0001-a.patch'))
