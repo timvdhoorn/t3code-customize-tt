@@ -54,7 +54,10 @@ DESKTOP = (Path(os.environ.get('APPDATA') or HOME / 'AppData/Roaming') /
            SHARE / 'applications' / (NAME + '.desktop'))
 LAUNCHER_NAME = 'T3 Code (Customized)'
 MAC = SYSTEM == 'darwin'
-MAC_LAUNCHER = HOME / 'Applications' / (LAUNCHER_NAME + '.app')
+# Next to T3 Code in /Applications; ~/Applications only when this user cannot write there.
+MAC_LAUNCHER = (Path('/Applications') if os.access('/Applications', os.W_OK) else HOME / 'Applications') / (LAUNCHER_NAME + '.app')
+# Where earlier versions put the launcher (and before that a re-signed copy of the app).
+MAC_LEGACY_LAUNCHER = HOME / 'Applications' / (LAUNCHER_NAME + '.app')
 MAC_BUNDLE_ID = 'com.t3tools.t3code'
 AUTOUPDATE_LABEL = 'com.github.t3code-customize.update'
 AUTOUPDATE_PLIST = HOME / 'Library/LaunchAgents' / (AUTOUPDATE_LABEL + '.plist')
@@ -789,10 +792,13 @@ def install_launcher(app):
 
 
 def install_mac_launcher(app):
-    """A small app in ~/Applications that runs `launch`, so it shows up in Spotlight and Launchpad."""
+    """A small app in /Applications that runs `launch`, so it shows up in Spotlight and Launchpad."""
+    for old in dict.fromkeys((MAC_LEGACY_LAUNCHER, MAC_LAUNCHER)):
+        if (old / 'Contents/Frameworks').exists() and not retire_mac_copy(old):
+            return
+    if MAC_LEGACY_LAUNCHER != MAC_LAUNCHER and MAC_LEGACY_LAUNCHER.exists():
+        shutil.rmtree(MAC_LEGACY_LAUNCHER)
     contents = MAC_LAUNCHER / 'Contents'
-    if (contents / 'Frameworks').exists() and not retire_mac_copy():
-        return
     (contents / 'MacOS').mkdir(parents=True, exist_ok=True)
     (contents / 'Resources').mkdir(exist_ok=True)
     with (contents / 'Info.plist').open('wb') as plist:
@@ -817,7 +823,7 @@ def install_mac_launcher(app):
     os.utime(MAC_LAUNCHER, None)
 
 
-def retire_mac_copy():
+def retire_mac_copy(copy):
     """Older versions of this tool put a re-signed copy of the whole app where the launcher goes.
     Remove it, and the job that waited to swap in its next build, once it is closed."""
     label = AUTOUPDATE_LABEL.rsplit('.', 1)[0] + '.install-pending'
@@ -826,10 +832,10 @@ def retire_mac_copy():
     (CACHE / (label + '.plist')).unlink(missing_ok=True)
     shutil.rmtree(DATA / 'pending', ignore_errors=True)
     listing = subprocess.run(['ps', '-axo', 'command='], capture_output=True, text=True).stdout
-    if any(line.startswith(str(MAC_LAUNCHER) + '/Contents/') for line in listing.splitlines()):
+    if any(line.startswith(str(copy) + '/Contents/') for line in listing.splitlines()):
         say(f'Note: the old "{LAUNCHER_NAME}" copy is still open. Quit it and run {NAME} again to install the launcher.')
         return False
-    shutil.rmtree(MAC_LAUNCHER)
+    shutil.rmtree(copy)
     return True
 
 
@@ -1523,6 +1529,7 @@ def cmd_uninstall(args):
         args.state = 'off'
         cmd_autoupdate(args)
         shutil.rmtree(MAC_LAUNCHER, ignore_errors=True)
+        shutil.rmtree(MAC_LEGACY_LAUNCHER, ignore_errors=True)
     for folder in (DATA, CACHE, CONFIG):
         if folder.exists():
             shutil.rmtree(folder)

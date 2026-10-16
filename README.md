@@ -88,7 +88,7 @@ The command wrapper lives in `~/.local/bin` on Linux, or
 directory or use `python t3code-customize <command>` from the checkout
 (`python3` on Linux).
 
-On macOS, open **T3 Code (Customized)** from Spotlight, Launchpad or `~/Applications`. See the [macOS guide](docs/macos.md) for setup, day-to-day use and why it loads the patches into your app instead of rebuilding it. It looks for `T3 Code (Nightly).app` in `/Applications` and `~/Applications`; point it elsewhere once with `--app "/path/to/T3 Code (Nightly).app"`.
+On macOS, open **T3 Code (Customized)** from Spotlight, Launchpad or `/Applications`. See the [macOS guide](docs/macos.md) for setup, day-to-day use and why it loads the patches into your app instead of rebuilding it. It looks for `T3 Code (Nightly).app` in `/Applications` and `~/Applications`; point it elsewhere once with `--app "/path/to/T3 Code (Nightly).app"`.
 
 ## After every T3 Code update
 
@@ -115,7 +115,7 @@ Your current T3 Code keeps working the whole time.
 
 Your `T3 Code (Nightly).app` stays exactly as T3 ships it, so it keeps its signature, passkeys,
 keychain access and T3's own updater. Open **T3 Code (Customized)** from Spotlight, Launchpad or
-`~/Applications`: it starts your app and loads the rebuilt bundles into it. Started any other way
+`/Applications`: it starts your app and loads the rebuilt bundles into it. Started any other way
 (Dock, Finder, a `t3code://` link) T3 Code runs stock. See the [macOS guide](docs/macos.md).
 
 ```sh
