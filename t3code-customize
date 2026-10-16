@@ -521,10 +521,13 @@ def prepare(target, log, resume=False):
     """Leave SOURCE with the patches as commits on top of target."""
     base = shared_base()
     if not resume:
-        if rebase_in_progress():
-            # Start over from the repo's patches; a fresh build never continues an old port.
-            git('am', '--abort', check=False, capture=False, log=log)
-            git('rebase', '--abort', check=False, capture=False, log=log)
+        # A fresh build starts over from the repo's patches, which throws away a stopped rebase or
+        # git am and uncommitted edits. Those may be a port someone is still working on: stop.
+        if rebase_in_progress() or git('status', '--porcelain', '--untracked-files=no').strip():
+            raise Stop(f'{SOURCE} has a stopped rebase or git am, or uncommitted changes; a fresh build would'
+                       ' throw them away. If it is a port in progress, finish it and run again with --resume.'
+                       ' Otherwise clear it yourself (git rebase --abort, git am --abort, git checkout .)'
+                       ' and run again.')
         git('checkout', '--quiet', '--force', '--detach', base, capture=False, log=log)
         # Keep node_modules so dependency installs stay fast between builds.
         git('clean', '-ffdxq', '-e', 'node_modules', capture=False, log=log)
@@ -2006,7 +2009,8 @@ def main():
     if args.command in ('launch', 'status', 'on', 'off', 'autoupdate', 'install-pending', 'fleet', 'identity'):
         return handler(args)
     CACHE.mkdir(parents=True, exist_ok=True)
-    with (CACHE / 'lock').open('w') as lock:
+    # The lock file names its holder, so a second run (or an agent) can see who uses the checkout.
+    with (CACHE / 'lock').open('a+') as lock:
         # A few seconds of grace for a run that is just handing over (server relaunching itself).
         for attempt in range(5):
             try:
@@ -2016,8 +2020,14 @@ def main():
                 if attempt == 4:
                     if getattr(args, 'background', False):
                         return
-                    raise Stop(f'Another {NAME} is already running.')
+                    lock.seek(0)
+                    holder = lock.read().strip()
+                    raise Stop(f'Another {NAME} is already running' + (f' ({holder})' if holder else '')
+                               + f'; it uses {SOURCE}. Wait for it to finish.')
                 time.sleep(1)
+        lock.truncate(0)
+        lock.write(f'pid {os.getpid()}, {NAME} {" ".join(argv)}, since {time.strftime("%H:%M:%S")}\n')
+        lock.flush()
         handler(args)
 
 

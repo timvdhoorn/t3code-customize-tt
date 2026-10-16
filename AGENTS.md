@@ -84,6 +84,15 @@ run the same patches.
 - Never edit a machine's T3 install by hand; `server`, `server-off` and `update` own it.
 - Python must stay compatible with macOS's system Python 3.9.
 
+### Changing a patch yourself
+
+The source checkout is one per machine, shared by every thread and by `fleet`, `update` and
+`autoupdate`. Outside a tool run, check the other T3 threads first (`~/.agents/rules/t3-code.md`),
+then change patches in your own detached worktree:
+`git -C ~/.cache/t3code-customize/t3code worktree add --detach <dir> HEAD`, install as in "Fix",
+run the checks there, and regenerate the patch folder as `export_patches` does
+(`git format-patch --no-signature --zero-commit`, one file per commit). Remove the worktree when done.
+
 ### Porting own patches
 
 The tool applies the shared patches, rebases them onto the nightly, then applies
@@ -137,6 +146,7 @@ code, then run `python3 -m py_compile t3code-customize` and `./t3code-customize 
 | T3 server | `t3code-customize` (`cmd_server`, `build_server`, `install_server_build`, `restart_server`, `server_autoupdate`) | Patched `t3` and `client/` in `~/.t3/runtime/versions/<active>/`, built from tag `v<version>` with `VP_NODE_VERSION` = upstream's `SEA_NODE_VERSION`; originals kept as `*.stock`; health check on port 3773 or back to stock. Depends on upstream's `apps/server/scripts/cli.ts build-exe` and the runtime layout. | `./t3code-customize status` on devbox1 shows "Customized: yes"; `curl` on port 3773 gives 200; `t3 connect status --json` is still linked. |
 | Fleet | `t3code-customize` (`cmd_fleet`, `sync_repo`), `machines.json` | One command updates every machine from any machine; files arrive by Syncthing or SSH copy, identical script and recipe hash required before building. | `./t3code-customize fleet` ends with every machine `ok`. |
 | Hermetic checks | `t3code-customize` (`checks`) | Tests and typechecks run with `HOME` set to an empty temp dir, as in upstream's CI. Upstream's ClaudeAdapterV2 steer test "(never answers)" reads the real `~/.claude/skills` mid-steer and hangs once there are many skills (devbox1, 73). Upstream's `vp lint` also runs on every file the patches add or change: its `no-hermes-unsupported-apis` rule catches APIs Hermes lacks (`Array#toSorted` crashed the iOS composer stats), which tests on Node and typechecks miss. | `./t3code-customize build --resume` passes the checks on devbox1. |
+| Checkout guard | `t3code-customize` (`prepare`, `main`) | A fresh build stops instead of aborting a stopped rebase or `git am` or discarding uncommitted edits in the source checkout, since they may be a port in progress; the lock file `~/.cache/t3code-customize/lock` names the run that holds it, and a second run says so. | With a tracked edit in the checkout, `prepare` stops and the edit survives; with the lock held, a second run prints the holder. |
 | Upstream merge | `t3code-customize` (`pull_latest`) | Each run merges `upstream/main` when it merges cleanly, else continues with the patches it has. | `git log upstream/main..HEAD` shows only fork commits after a run. |
 
 ## Agent skills
