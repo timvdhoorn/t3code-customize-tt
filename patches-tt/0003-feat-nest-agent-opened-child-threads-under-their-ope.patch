@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: timvdhoorn <timvdhoorn@gmail.com>
 Date: Thu, 15 Oct 2026 14:33:02 +0200
-Subject: [PATCH 3/4] feat: nest agent-opened child threads under their opener
+Subject: [PATCH 3/5] feat: nest agent-opened child threads under their opener
  in the sidebar
 
 Ports the server side of pingdotgg/t3code#16699 (openedByThreadId on
@@ -18,6 +18,8 @@ guide line, context-menu collapse and a summary stub.
  .../orchestration-v2/ThreadLaunchService.ts   |   5 +
  .../ThreadManagementService.test.ts           |   9 +-
  .../ThreadManagementService.ts                |   2 +
+ .../ThreadSettlementService.test.ts           | 118 ++++++
+ .../ThreadSettlementService.ts                |  85 +++-
  .../src/orchestration-v2/runtimeLayer.test.ts |  15 +
  .../src/components/Sidebar.families.test.ts   | 245 ++++++++++++
  apps/web/src/components/Sidebar.families.ts   | 200 ++++++++++
@@ -29,7 +31,7 @@ guide line, context-menu collapse and a summary stub.
  .../src/state/threadCommands.ts               |  10 +-
  .../src/state/threadShell.test.ts             |  37 ++
  packages/contracts/src/orchestrationV2.ts     |  23 ++
- 20 files changed, 946 insertions(+), 69 deletions(-)
+ 22 files changed, 1147 insertions(+), 71 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.families.test.ts
  create mode 100644 apps/web/src/components/Sidebar.families.ts
 
@@ -267,6 +269,301 @@ index 3cc7a6ee4..8f7b88262 100644
      });
      return { sequence: result.sequence };
    });
+diff --git a/apps/server/src/orchestration-v2/ThreadSettlementService.test.ts b/apps/server/src/orchestration-v2/ThreadSettlementService.test.ts
+index 7016a17dc..32012b4e1 100644
+--- a/apps/server/src/orchestration-v2/ThreadSettlementService.test.ts
++++ b/apps/server/src/orchestration-v2/ThreadSettlementService.test.ts
+@@ -447,6 +447,7 @@ describe("autoSettlementSettingsKey", () => {
+ });
+ 
+ type AutoSettleCommand = Extract<OrchestrationV2Command, { readonly type: "thread.auto-settle" }>;
++type SettleCommand = Extract<OrchestrationV2Command, { readonly type: "thread.settle" }>;
+ 
+ const testCrypto = Crypto.make({
+   randomBytes: (size) => new Uint8Array(size).fill(1),
+@@ -548,6 +549,8 @@ interface HarnessOptions {
+   readonly onCloseIdle?: () => Effect.Effect<void>;
+   /** Threads `getThread` returns when a `thread.settled` event is handled. */
+   readonly currentThreads?: ReadonlyArray<OrchestrationV2AppThread>;
++  /** Shells `getThreadShell` returns instead of the snapshot's. */
++  readonly currentShells?: ReadonlyArray<SettlementShell>;
+ }
+ 
+ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options: HarnessOptions) {
+@@ -560,6 +563,7 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
+   const settingsChanges = yield* PubSub.unbounded<ContractServerSettings>();
+   const mergedPullRequests = yield* PubSub.unbounded<PullRequestService.PullRequestMergeEvent>();
+   const commands = yield* Ref.make<ReadonlyArray<AutoSettleCommand>>([]);
++  const settleCommands = yield* Ref.make<ReadonlyArray<SettleCommand>>([]);
+   const branchCalls = yield* Ref.make<
+     ReadonlyArray<{ readonly cwd: string; readonly branch: string }>
+   >([]);
+@@ -611,6 +615,11 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
+     });
+ 
+   const dispatch: Orchestrator.OrchestratorV2Shape["dispatch"] = (command) => {
++    if (command.type === "thread.settle") {
++      return Ref.update(settleCommands, (recorded) => [...recorded, command]).pipe(
++        Effect.as({ sequence: 1, storedEvents: [] }),
++      );
++    }
+     if (command.type !== "thread.auto-settle") {
+       return Effect.die(new Error(`Unexpected command: ${command.type}`));
+     }
+@@ -649,6 +658,24 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
+               : snapshot.threads.filter((thread) => thread.id === threadId),
+           ),
+         ),
++      getShellSnapshot: () =>
++        Ref.get(snapshots).pipe(
++          Effect.map((snapshot) => ({
++            schemaVersion: snapshot.schemaVersion,
++            snapshotSequence: snapshot.snapshotSequence,
++            threads: snapshot.threads,
++            archivedThreads: [],
++          })),
++        ),
++      getThreadShell: (threadId) =>
++        Ref.get(snapshots).pipe(
++          Effect.map(
++            (snapshot) =>
++              [...(options.currentShells ?? []), ...snapshot.threads].find(
++                (thread) => thread.id === threadId,
++              ) ?? null,
++          ),
++        ),
+       getThread: (threadId) => {
+         const thread = options.currentThreads?.find((candidate) => candidate.id === threadId);
+         return thread
+@@ -696,6 +723,7 @@ const makeHarness = Effect.fn("makeThreadSettlementHarness")(function* (options:
+     snapshotReads,
+     candidateReads,
+     commands,
++    settleCommands,
+     branchCalls,
+     summaryCalls,
+     summaryRecovery,
+@@ -1159,6 +1187,43 @@ describe("ThreadSettlementServiceV2 terminals", () => {
+     ),
+   );
+ 
++  it.effect("settles the idle threads its opener started along with it", () =>
++    Effect.scoped(
++      Effect.gen(function* () {
++        const opener = appThread("opener-thread", "settled");
++        const openerId = ThreadId.make("opener-thread");
++        const fixture = yield* makeHarness({
++          snapshot: makeSnapshot([
++            makeThread("opened-child", { openedByThreadId: openerId }),
++            makeThread("busy-child", { openedByThreadId: openerId, activityRunStatus: "running" }),
++            makeThread("pinned-since-snapshot", { openedByThreadId: openerId }),
++            makeThread("unrelated-thread"),
++          ]),
++          currentShells: [
++            makeThread("pinned-since-snapshot", {
++              openedByThreadId: openerId,
++              pinnedAt: DateTime.makeUnsafe(NOW),
++            }),
++          ],
++          currentThreads: [opener],
++        });
++
++        yield* Effect.gen(function* () {
++          const service = yield* ThreadSettlementService.ThreadSettlementServiceV2;
++          yield* startHarness(service, fixture.activation, fixture.snapshotReads);
++          yield* fixture.publishEvent(settledEvent(opener));
++          yield* Queue.take(fixture.closedIdle);
++          yield* service.drain;
++          const settled = yield* Ref.get(fixture.settleCommands);
++          assert.deepStrictEqual(
++            settled.map((command) => [command.threadId, command.settledBy]),
++            [[ThreadId.make("opened-child"), "auto"]],
++          );
++        }).pipe(Effect.provide(fixture.layer));
++      }),
++    ),
++  );
++
+   it.effect("runs the settle script in the thread's own worktree", () =>
+     Effect.scoped(
+       Effect.gen(function* () {
+@@ -1327,3 +1392,56 @@ describe("isSnoozed", () => {
+     ).toBe(false);
+   });
+ });
++
++describe("settlesWithOpener", () => {
++  const openerId = ThreadId.make("opener");
++  const opened = { openedByThreadId: openerId };
++  const settles = (overrides: Partial<SettlementShell>) =>
++    ThreadSettlementService.settlesWithOpener(shell(overrides), openerId, NOW_MS);
++
++  it("settles idle threads the opener launched or delegated", () => {
++    expect(settles(opened)).toBe(true);
++    expect(settles({ ...opened, status: "completed", settledOverride: "active" })).toBe(true);
++    expect(
++      settles({
++        lineage: {
++          rootThreadId: openerId,
++          parentThreadId: openerId,
++          relationshipToParent: "subagent",
++        },
++        createdBy: "agent",
++        creationSource: "server",
++      }),
++    ).toBe(true);
++  });
++
++  it("leaves other threads and provider-native subagents alone", () => {
++    expect(settles({})).toBe(false);
++    expect(settles({ openedByThreadId: ThreadId.make("someone-else") })).toBe(false);
++    expect(
++      settles({
++        lineage: {
++          rootThreadId: openerId,
++          parentThreadId: openerId,
++          relationshipToParent: "subagent",
++        },
++        creationSource: "provider",
++      }),
++    ).toBe(false);
++  });
++
++  it("keeps children that still work, wait on the user, or were kept on purpose", () => {
++    expect(settles({ ...opened, settledOverride: "settled" })).toBe(false);
++    expect(settles({ ...opened, archivedAt: at(-1) })).toBe(false);
++    expect(settles({ ...opened, pinnedAt: at(-1) })).toBe(false);
++    expect(settles({ ...opened, autoSettleDisabledAt: at(-1) })).toBe(false);
++    expect(settles({ ...opened, activityRunStatus: "running" })).toBe(false);
++    expect(settles({ ...opened, pendingRuntimeRequest: { kind: "user_input" } as never })).toBe(
++      false,
++    );
++    expect(
++      settles({ ...opened, pendingBackgroundTasks: [{ taskId: "review", kind: "subagent" }] }),
++    ).toBe(false);
++    expect(settles({ ...opened, snoozedAt: at(-DAY_MS), snoozedUntil: at(DAY_MS) })).toBe(false);
++  });
++});
+diff --git a/apps/server/src/orchestration-v2/ThreadSettlementService.ts b/apps/server/src/orchestration-v2/ThreadSettlementService.ts
+index 4a3540ef0..e3f3e15d0 100644
+--- a/apps/server/src/orchestration-v2/ThreadSettlementService.ts
++++ b/apps/server/src/orchestration-v2/ThreadSettlementService.ts
+@@ -3,6 +3,7 @@ import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
+ import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
+ import {
+   CommandId,
++  isProviderNativeSubagentThread,
+   type ThreadId,
+   type OrchestrationV2DomainEvent,
+   type OrchestrationV2ThreadShell,
+@@ -163,6 +164,31 @@ export function isAutoSettlementCandidate(
+   return wokeOnError || wokeOnCompletion;
+ }
+ 
++/**
++ * Whether a thread settles along with the thread that opened it: one an agent
++ * launched there (`openedByThreadId`) or a `delegate_task` worker it started.
++ * A child that still works, waits on the user, or that the user kept (pinned,
++ * snoozed, auto-settle off) stays where it is.
++ */
++export function settlesWithOpener(
++  thread: Omit<ProjectionStore.ProjectionSettlementCandidate, "latestUserAuthoredMessageAt"> &
++    Pick<OrchestrationV2ThreadShell, "openedByThreadId" | "lineage" | "creationSource">,
++  openerId: ThreadId,
++  nowMs: number,
++): boolean {
++  const delegated =
++    thread.lineage.relationshipToParent === "subagent" &&
++    thread.lineage.parentThreadId === openerId &&
++    !isProviderNativeSubagentThread(thread);
++  if (thread.openedByThreadId !== openerId && !delegated) return false;
++  if (thread.archivedAt !== null || thread.settledOverride === "settled") return false;
++  if (thread.pinnedAt != null || thread.autoSettleDisabledAt != null) return false;
++  if (thread.pendingRuntimeRequest !== null || thread.activityRunStatus != null) return false;
++  if (backgroundWorkHoldsCompletion(thread.pendingBackgroundTasks ?? [])) return false;
++  if (threadHasQueuedTurnStart(thread, nowMs)) return false;
++  return !isSnoozed(thread, nowMs);
++}
++
+ /**
+  * Whether a thread is parked on its snooze: its wake time is in the future and
+  * it has not raised its hand with a pending request, a fresh failure, or work
+@@ -611,10 +637,62 @@ export const make = Effect.gen(function* () {
+       ),
+   );
+ 
++  // Settling a thread settles the threads it opened. Each child's own
++  // thread.settled event then settles its children in turn.
++  const settleChildren = Effect.fn("ThreadSettlementServiceV2.settleChildren")(
++    function* (openerId: ThreadId) {
++      const opener = yield* projections.getThread(openerId);
++      if (opener.settledOverride !== "settled") return;
++      const settledAtMs = toMillis(opener.settledAt);
++      const { threads } = yield* projections.getShellSnapshot({ unsettledOnly: true });
++      const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
++      for (const candidate of threads) {
++        if (!settlesWithOpener(candidate, openerId, nowMs)) continue;
++        // Settling clears a pin, so a child pinned or snoozed since the snapshot must stay.
++        const child = yield* projections.getThreadShell(candidate.id);
++        if (child === null || !settlesWithOpener(child, openerId, nowMs)) continue;
++        yield* orchestrator
++          .dispatch({
++            type: "thread.settle",
++            commandId: CommandId.make(
++              `server:settle-with-opener:${openerId}:${settledAtMs}:${child.id}`,
++            ),
++            threadId: child.id,
++            settledBy: "auto",
++          })
++          .pipe(
++            // A child that started work since the snapshot refuses; it stays active.
++            Effect.catchCause((cause) =>
++              Cause.hasInterruptsOnly(cause)
++                ? Effect.failCause(cause)
++                : Effect.logInfo("child thread kept active", {
++                    threadId: child.id,
++                    cause: Cause.pretty(cause),
++                  }),
++            ),
++          );
++      }
++    },
++    (effect, openerId) =>
++      effect.pipe(
++        Effect.catchCause((cause) =>
++          Cause.hasInterruptsOnly(cause)
++            ? Effect.failCause(cause)
++            : Effect.logWarning("settling child threads failed", {
++                threadId: openerId,
++                cause: Cause.pretty(cause),
++              }),
++        ),
++      ),
++  );
++  const childWorker = yield* makeDrainableWorker(settleChildren);
++
+   const processEvent = (event: OrchestrationV2DomainEvent) => {
+     switch (event.type) {
+       case "thread.settled":
+-        return cleanUpSettledThread(event.threadId);
++        return cleanUpSettledThread(event.threadId).pipe(
++          Effect.andThen(childWorker.enqueue(event.threadId)),
++        );
+       case "thread.pull-request-link-updated":
+       case "thread.pull-request-synced":
+       case "provider-session.detached":
+@@ -668,7 +746,10 @@ export const make = Effect.gen(function* () {
+     );
+   });
+ 
+-  return { start, drain: worker.drain } satisfies ThreadSettlementServiceV2["Service"];
++  return {
++    start,
++    drain: Effect.andThen(worker.drain, childWorker.drain),
++  } satisfies ThreadSettlementServiceV2["Service"];
+ });
+ 
+ export const layer = Layer.effect(ThreadSettlementServiceV2, make);
 diff --git a/apps/server/src/orchestration-v2/runtimeLayer.test.ts b/apps/server/src/orchestration-v2/runtimeLayer.test.ts
 index d8ec9305c..c056dabbc 100644
 --- a/apps/server/src/orchestration-v2/runtimeLayer.test.ts
