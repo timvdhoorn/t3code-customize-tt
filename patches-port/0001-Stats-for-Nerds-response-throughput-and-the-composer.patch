@@ -1,0 +1,3425 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler South <tsouth2@gmail.com>
+Date: Thu, 8 Oct 2026 22:05:19 -0400
+Subject: [PATCH 1/5] Stats for Nerds: response throughput and the composer
+ stats line
+
+---
+ .../Adapters/ClaudeAdapterV2.test.ts          | 200 +++++++
+ .../Adapters/ClaudeAdapterV2.ts               |  38 +-
+ .../Adapters/ClaudeResponseThroughput.test.ts | 230 ++++++++
+ .../Adapters/ClaudeResponseThroughput.ts      | 155 +++++
+ .../Adapters/CodexAdapterV2.test.ts           | 222 +++++++
+ .../Adapters/CodexAdapterV2.ts                | 150 +++--
+ .../Adapters/CodexResponseThroughput.test.ts  | 203 +++++++
+ .../Adapters/CodexResponseThroughput.ts       | 150 +++++
+ .../orchestration-v2/ProjectionStore.test.ts  |  37 +-
+ .../src/orchestration-v2/ProjectionStore.ts   |   6 +-
+ apps/web/src/components/ChatView.tsx          |  39 +-
+ .../chat/ComposerStats.logic.test.ts          | 439 ++++++++++++++
+ .../components/chat/ComposerStats.logic.ts    | 250 ++++++++
+ .../web/src/components/chat/ComposerStats.tsx | 541 ++++++++++++++++++
+ .../components/settings/SettingsPanels.tsx    |  31 +
+ .../src/components/settings/settingsSearch.ts |   6 +
+ .../state/orchestrationV2Projection.test.ts   |  13 +
+ .../src/state/orchestrationV2Projection.ts    |  15 +-
+ .../contracts/src/orchestrationV2.test.ts     |  71 +++
+ packages/contracts/src/orchestrationV2.ts     |  10 +
+ packages/contracts/src/settings.ts            |   2 +
+ 21 files changed, 2757 insertions(+), 51 deletions(-)
+ create mode 100644 apps/server/src/orchestration-v2/Adapters/ClaudeResponseThroughput.test.ts
+ create mode 100644 apps/server/src/orchestration-v2/Adapters/ClaudeResponseThroughput.ts
+ create mode 100644 apps/server/src/orchestration-v2/Adapters/CodexResponseThroughput.test.ts
+ create mode 100644 apps/server/src/orchestration-v2/Adapters/CodexResponseThroughput.ts
+ create mode 100644 apps/web/src/components/chat/ComposerStats.logic.test.ts
+ create mode 100644 apps/web/src/components/chat/ComposerStats.logic.ts
+ create mode 100644 apps/web/src/components/chat/ComposerStats.tsx
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
+index b4991241e..8d38e92cc 100644
+--- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
+@@ -4,6 +4,7 @@ import * as NodeFS from "node:fs";
+ import * as NodeOS from "node:os";
+ import * as NodePath from "node:path";
+ import * as NodeStream from "node:stream";
++import { observeClaudeFrame } from "./ClaudeResponseThroughput.ts";
+ 
+ import type {
+   Query as ClaudeQuery,
+@@ -2731,6 +2732,205 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+       ),
+   );
+ 
++  it.effect(
++    "persists completed root response envelopes without counting snapshots or child output",
++    () =>
++      Effect.gen(function* () {
++        const harness = yield* makeWakeHarness;
++        yield* harness.runtime.startTurn(
++          makeClaudeTestTurnInput({
++            threadId: harness.threadId,
++            providerThread: harness.providerThread,
++            now: yield* DateTime.now,
++            attemptId: RunAttemptId.make("throughput-attempt"),
++            text: "Check throughput",
++            attachments: [],
++          }),
++        );
++        const send = Effect.fnUntraced(function* (
++          event: unknown,
++          at: number,
++          parent: string | null = null,
++        ) {
++          const message = claudeSdkFrame({
++            type: "stream_event",
++            event,
++            parent_tool_use_id: parent,
++            session_id: WAKE_NATIVE_SESSION,
++            uuid: `throughput-${at}`,
++          });
++          observeClaudeFrame(message, at);
++          yield* harness.offerAndWait(message);
++        });
++        yield* send({ type: "message_start", message: { id: "response-one" } }, 0);
++        for (const output_tokens of [20, 100, 100]) {
++          yield* send({ type: "message_delta", usage: { output_tokens } }, 900);
++        }
++        const snapshot = claudeSdkFrame({
++          type: "assistant",
++          uuid: "snapshot-one",
++          session_id: WAKE_NATIVE_SESSION,
++          parent_tool_use_id: null,
++          message: {
++            id: "response-one",
++            model: "claude-sonnet-4-6",
++            content: [],
++            usage: {
++              input_tokens: 100,
++              output_tokens: 9999,
++              cache_creation_input_tokens: 0,
++              cache_read_input_tokens: 0,
++            },
++          },
++        });
++        yield* harness.offerAndWait(snapshot);
++        yield* harness.offerAndWait(snapshot);
++        yield* send({ type: "message_stop" }, 1000);
++        yield* send({ type: "message_start", message: { id: "child" } }, 2000, "child-tool");
++        yield* send({ type: "message_delta", usage: { output_tokens: 10000 } }, 2100, "child-tool");
++        yield* send({ type: "message_stop" }, 2100, "child-tool");
++        yield* send({ type: "message_start", message: { id: "response-two" } }, 600000);
++        yield* send({ type: "message_delta", usage: { output_tokens: 300 } }, 603000);
++        yield* send({ type: "message_stop" }, 603000);
++        yield* harness.offerAndWait(
++          makeResultFrame({ uuid: "throughput-result", result: "", numTurns: 2 }),
++        );
++        yield* Queue.take(harness.terminalReceipts);
++        const turns = harness.events.filter((event) => event.type === "provider_turn.updated");
++        const final = turns.at(-1);
++        assert.equal(final?.type, "provider_turn.updated");
++        if (final?.type !== "provider_turn.updated") throw new Error("missing turn");
++        assert.deepEqual(final.providerTurn.responseThroughput, {
++          basis: "claude_observed",
++          outputTokens: 400,
++          elapsedMs: 4000,
++          responseCount: 2,
++          partial: false,
++        });
++        assert.equal(final.providerTurn.status, "completed");
++        assert.equal(final.providerTurn.tokenUsage, undefined);
++        assert.equal(final.providerTurn.turnTokenUsage?.outputTokens, 1);
++        assert.equal(
++          turns.filter((event) => event.providerTurn.responseThroughput !== undefined).length,
++          3,
++        );
++      }).pipe(
++        Effect.provide(
++          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
++        ),
++      ),
++  );
++
++  it.effect("measures held root frames at ingress while tracking live permission mode", () =>
++    Effect.gen(function* () {
++      const harness = yield* makeWakeHarness;
++      const now = yield* DateTime.now;
++      const firstAttempt = RunAttemptId.make("throughput-echo-1");
++      const secondAttempt = RunAttemptId.make("throughput-echo-2");
++      yield* harness.runtime.startTurn(
++        makeClaudeTestTurnInput({
++          threadId: harness.threadId,
++          providerThread: harness.providerThread,
++          now,
++          attemptId: firstAttempt,
++          text: "First",
++          attachments: [],
++        }),
++      );
++      const echoed = (message: SDKMessage, promptIndex: number) =>
++        claudeSdkFrame({
++          ...message,
++          user_message_uuid: harness.promptUuid(promptIndex),
++        });
++      yield* harness.offerAndWait(
++        echoed(makeAssistantTextFrame({ uuid: "echo-first", text: "First" }), 0),
++      );
++      yield* harness.offerAndWait(
++        echoed(makeResultFrame({ uuid: "echo-first-result", result: "" }), 0),
++      );
++      yield* Queue.take(harness.terminalReceipts);
++      yield* harness.runtime.startTurn(
++        makeClaudeTestTurnInput({
++          threadId: harness.threadId,
++          providerThread: harness.providerThread,
++          now,
++          attemptId: secondAttempt,
++          providerTurnOrdinal: 2,
++          text: "Second",
++          attachments: [],
++        }),
++      );
++      const frames = [
++        [{ type: "message_start", message: { id: "held-response" } }, 10],
++        [{ type: "message_delta", usage: { output_tokens: 100 } }, 1010],
++        [{ type: "message_stop" }, 1010],
++      ] as const;
++      for (const [event, at] of frames) {
++        const frame = claudeSdkFrame({
++          type: "stream_event",
++          event,
++          parent_tool_use_id: null,
++          session_id: WAKE_NATIVE_SESSION,
++          uuid: `held-${event.type}`,
++        });
++        observeClaudeFrame(frame, at);
++        yield* harness.offerAndWait(frame);
++      }
++      assert.equal(
++        harness.events.some(
++          (event) =>
++            event.type === "provider_turn.updated" &&
++            event.providerTurn.responseThroughput !== undefined,
++        ),
++        false,
++      );
++      yield* harness.offerAndWait(
++        claudeSdkFrame({
++          type: "system",
++          subtype: "status",
++          status: null,
++          permissionMode: "plan",
++          uuid: "held-permission-mode",
++          session_id: WAKE_NATIVE_SESSION,
++        }),
++      );
++      yield* harness.offerAndWait(
++        echoed(makeResultFrame({ uuid: "echo-second-result", result: "" }), 1),
++      );
++      yield* Queue.take(harness.terminalReceipts);
++      const final = harness.events.findLast((event) => event.type === "provider_turn.updated");
++      if (final?.type !== "provider_turn.updated") throw new Error("missing turn");
++      assert.deepEqual(final.providerTurn.responseThroughput, {
++        basis: "claude_observed",
++        outputTokens: 100,
++        elapsedMs: 1000,
++        responseCount: 1,
++        partial: false,
++      });
++      const thirdAttempt = RunAttemptId.make("throughput-echo-3");
++      yield* harness.runtime.startTurn(
++        makeClaudeTestTurnInput({
++          threadId: harness.threadId,
++          providerThread: harness.providerThread,
++          now,
++          attemptId: thirdAttempt,
++          providerTurnOrdinal: 3,
++          text: "Third",
++          attachments: [],
++        }),
++      );
++      assert.deepEqual(harness.permissionModeChanges, ["bypassPermissions"]);
++      yield* harness.offerAndWait(
++        echoed(makeResultFrame({ uuid: "echo-third-result", result: "" }), 2),
++      );
++      yield* Queue.take(harness.terminalReceipts);
++    }).pipe(
++      Effect.provide(
++        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
++      ),
++    ),
++  );
++
+   it.effect.each(["completed", "interrupted"] as const)(
+     "projects Claude thinking blocks when %s",
+     (status) =>
+diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
+index 897ac1922..f84a32191 100644
+--- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
+@@ -1,3 +1,5 @@
++import { ClaudeResponseThroughput, observeClaudeFrame } from "./ClaudeResponseThroughput.ts";
++
+ import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
+ import { claudeTaskOutputRoot, tailClaudeTaskOutput } from "./ClaudeTaskOutputTail.ts";
+ import {
+@@ -831,6 +833,10 @@ export const layerQueryRunner: Layer.Layer<
+           messages: Stream.fromAsyncIterable(claudeQueryMessages(queryRuntime), (cause) =>
+             queryRunnerError(cause, "fromAsyncIterable"),
+           ).pipe(
++            Stream.map((message) => {
++              observeClaudeFrame(message);
++              return message;
++            }),
+             Stream.tap((message) =>
+               logProtocolEvent({
+                 direction: "incoming",
+@@ -2953,6 +2959,7 @@ function formatClaudeUsageLimitWait(waitMs: number): string {
+ }
+ 
+ interface ActiveClaudeTurnContext {
++  readonly responseThroughput: ClaudeResponseThroughput;
+   readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
+   readonly nativeThreadId: string;
+   readonly nativeTurnId: string;
+@@ -4100,6 +4107,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+             return ordinal;
+           });
+ 
++        // Native message ids cannot be counted again after a query reconnect or wake replay.
++        const throughputMessageIds = new Set<string>();
+         const providerTurnPayload = (input: {
+           readonly context: ActiveClaudeTurnContext;
+           readonly status: OrchestrationV2ProviderTurn["status"];
+@@ -4118,6 +4127,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+           status: input.status,
+           startedAt: input.context.startedAt,
+           completedAt: input.completedAt,
++          ...(input.context.responseThroughput.aggregate() === undefined
++            ? {}
++            : { responseThroughput: input.context.responseThroughput.aggregate() }),
+         });
+ 
+         const buildToolCallArtifacts = (input: {
+@@ -5771,6 +5783,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+                   failure: null,
+                   threadDisposition,
+                 };
++          input.context.responseThroughput.finalize(input.status !== "completed");
+           yield* Effect.all(
+             [
+               emitProviderEvent({
+@@ -6563,6 +6576,20 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+           }
+           yield* trackClaudeGoal({ nativeThreadId: liveQuery.nativeThreadId, context, message });
+ 
++          const responseCompleted = context.responseThroughput.observe(
++            message,
++            throughputMessageIds,
++            input.query,
++          );
++          if (responseCompleted) {
++            yield* emitProviderEvent({
++              type: "provider_turn.updated",
++              driver: CLAUDE_PROVIDER,
++              threadId: context.input.threadId,
++              providerTurn: providerTurnPayload({ context, status: "running", completedAt: null }),
++            });
++          }
++
+           if (message.type === "stream_event" && !message.parent_tool_use_id) {
+             const event = message.event;
+             const reasoning = context.reasoning;
+@@ -8177,8 +8204,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+           };
+           yield* Ref.set(queryContext, context);
+           yield* querySession.messages.pipe(
+-            Stream.runForEach((message) =>
+-              sdkMessageLock.withPermits(1)(
++            Stream.runForEach((message) => {
++              // Test/custom runners also stamp at ingress; held replays keep the first stamp.
++              observeClaudeFrame(message, undefined, querySession);
++              return sdkMessageLock.withPermits(1)(
+                 Effect.suspend(() => {
+                   if (
+                     message.type === "system" &&
+@@ -8189,8 +8218,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+                   }
+                   return handleSdkMessage({ query: querySession, message });
+                 }),
+-              ),
+-            ),
++              );
++            }),
+             Effect.exit,
+             Effect.flatMap(
+               Effect.fnUntraced(function* (exit: ClaudeQueryStreamExit) {
+@@ -8270,6 +8299,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+               goalsByNativeThread.set(nativeThreadId, turnInput.providerThread.goal ?? null);
+             }
+             const context: ActiveClaudeTurnContext = {
++              responseThroughput: new ClaudeResponseThroughput(),
+               input: turnInput,
+               nativeThreadId,
+               nativeTurnId,
+diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeResponseThroughput.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeResponseThroughput.test.ts
+new file mode 100644
+index 000000000..948cefdf7
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/Adapters/ClaudeResponseThroughput.test.ts
+@@ -0,0 +1,230 @@
++import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
++import { describe, expect, it } from "vite-plus/test";
++import { ClaudeResponseThroughput, observeClaudeFrame } from "./ClaudeResponseThroughput.ts";
++
++function frame(event: unknown, at?: number, parent: string | null = null): SDKMessage {
++  const message = { type: "stream_event", event, parent_tool_use_id: parent } as SDKMessage;
++  if (at !== undefined) observeClaudeFrame(message, at);
++  return message;
++}
++function snapshot(id: string): SDKMessage {
++  return {
++    type: "assistant",
++    parent_tool_use_id: null,
++    message: { id, usage: { output_tokens: 9999 } },
++  } as SDKMessage;
++}
++function response(
++  tracker: ClaudeResponseThroughput,
++  epoch: Set<string>,
++  id: string,
++  start: number,
++  end: number,
++  tokens: number,
++  parent: string | null = null,
++) {
++  tracker.observe(frame({ type: "message_start", message: { id } }, start, parent), epoch);
++  tracker.observe(
++    frame({ type: "message_delta", usage: { output_tokens: tokens } }, end, parent),
++    epoch,
++  );
++  tracker.observe(frame({ type: "message_stop" }, end, parent), epoch);
++}
++
++describe("Claude observed response throughput", () => {
++  it("weights responses by envelopes and excludes a long local tool wait", () => {
++    const tracker = new ClaudeResponseThroughput();
++    const epoch = new Set<string>();
++    response(tracker, epoch, "one", 0, 1000, 100);
++    response(tracker, epoch, "two", 600000, 603000, 300);
++    tracker.finalize();
++    expect(tracker.aggregate()).toEqual({
++      basis: "claude_observed",
++      outputTokens: 400,
++      elapsedMs: 4000,
++      responseCount: 2,
++      partial: false,
++    });
++  });
++  it("replaces cumulative usage, ignores repeated nonfinal snapshots and excludes children", () => {
++    const tracker = new ClaudeResponseThroughput();
++    const epoch = new Set<string>();
++    tracker.observe(
++      frame({ type: "message_start", message: { id: "one", usage: { output_tokens: 10 } } }, 0),
++      epoch,
++    );
++    for (const tokens of [10, 50, 50, 100]) {
++      tracker.observe(
++        frame({ type: "message_delta", usage: { output_tokens: tokens } }, 900),
++        epoch,
++      );
++      tracker.observe(snapshot("one"), epoch);
++    }
++    response(tracker, epoch, "child", 0, 100, 10000, "tool");
++    expect(tracker.aggregate()).toBeUndefined();
++    tracker.observe(frame({ type: "message_stop" }, 1000), epoch);
++    expect(tracker.aggregate()).toEqual({
++      basis: "claude_observed",
++      outputTokens: 100,
++      elapsedMs: 1000,
++      responseCount: 1,
++      partial: false,
++    });
++  });
++  it("retains first-observation timestamps through held-frame replay", () => {
++    const tracker = new ClaudeResponseThroughput();
++    const epoch = new Set<string>();
++    const frames = [
++      frame({ type: "message_start", message: { id: "held" } }, 10),
++      frame({ type: "message_delta", usage: { output_tokens: 100 } }, 1010),
++      frame({ type: "message_stop" }, 1010),
++    ];
++    for (const message of frames) {
++      observeClaudeFrame(message, 100000);
++      tracker.observe(message, epoch);
++    }
++    expect(tracker.aggregate()?.elapsedMs).toBe(1000);
++  });
++  it("does not count a replayed message in this turn or a later turn of the same query", () => {
++    const tracker = new ClaudeResponseThroughput();
++    const epoch = new Set<string>();
++    response(tracker, epoch, "one", 0, 1000, 100);
++    response(tracker, epoch, "one", 2000, 3000, 100);
++    expect(tracker.aggregate()).toEqual({
++      basis: "claude_observed",
++      outputTokens: 100,
++      elapsedMs: 1000,
++      responseCount: 1,
++      partial: true,
++    });
++    const next = new ClaudeResponseThroughput();
++    response(next, epoch, "one", 5000, 6000, 100);
++    expect(next.aggregate()).toBeUndefined();
++  });
++  it.each([NaN, Infinity, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
++    "rejects invalid output %s",
++    (tokens) => {
++      const tracker = new ClaudeResponseThroughput();
++      response(tracker, new Set(), "bad", 0, 1000, tokens);
++      expect(tracker.aggregate()).toBeUndefined();
++    },
++  );
++  it("rejects decreasing cumulative usage and a missing final delta", () => {
++    for (const deltas of [[], [100, 50]]) {
++      const tracker = new ClaudeResponseThroughput();
++      const epoch = new Set<string>();
++      tracker.observe(
++        frame({ type: "message_start", message: { id: "bad", usage: { output_tokens: 100 } } }, 0),
++        epoch,
++      );
++      for (const tokens of deltas)
++        tracker.observe(
++          frame({ type: "message_delta", usage: { output_tokens: tokens } }, 500),
++          epoch,
++        );
++      tracker.observe(frame({ type: "message_stop" }, 1000), epoch);
++      expect(tracker.aggregate()).toBeUndefined();
++    }
++  });
++  it("omits zero/negative durations, missing starts, unstamped streams and snapshot-only history", () => {
++    for (const end of [0, -1]) {
++      const tracker = new ClaudeResponseThroughput();
++      response(tracker, new Set(), "bad", 0, end, 100);
++      expect(tracker.aggregate()).toBeUndefined();
++    }
++    const tracker = new ClaudeResponseThroughput();
++    const epoch = new Set<string>();
++    tracker.observe(snapshot("history"), epoch);
++    tracker.observe(frame({ type: "message_delta", usage: { output_tokens: 100 } }, 1000), epoch);
++    tracker.observe(frame({ type: "message_stop" }, 1000), epoch);
++    tracker.observe(frame({ type: "message_start", message: { id: "unstamped" } }), epoch);
++    tracker.observe(frame({ type: "message_delta", usage: { output_tokens: 100 } }), epoch);
++    tracker.observe(frame({ type: "message_stop" }), epoch);
++    tracker.finalize();
++    expect(tracker.aggregate()).toBeUndefined();
++  });
++  it("retains valid samples with partial coverage for interruption, unknown snapshots or query replacement", () => {
++    for (const missing of [
++      "interrupted",
++      "snapshot",
++      "epoch",
++      "invalid",
++      "missing-start",
++      "missing-usage",
++    ] as const) {
++      const tracker = new ClaudeResponseThroughput();
++      const epoch = new Set<string>();
++      response(tracker, epoch, "good", 0, 1000, 100);
++      if (missing === "snapshot") tracker.observe(snapshot("unobserved"), epoch);
++      else if (missing === "invalid") response(tracker, epoch, "invalid", 2000, 3000, -1);
++      else if (missing === "missing-start")
++        tracker.observe(frame({ type: "message_stop" }, 3000), epoch);
++      else if (missing === "missing-usage") {
++        tracker.observe(frame({ type: "message_start", message: { id: "no-usage" } }, 2000), epoch);
++        tracker.observe(frame({ type: "message_stop" }, 3000), epoch);
++      } else {
++        tracker.observe(
++          frame({ type: "message_start", message: { id: "interrupted" } }, 2000),
++          epoch,
++        );
++        tracker.observe(
++          frame({ type: "message_delta", usage: { output_tokens: 200 } }, 2500),
++          epoch,
++        );
++        if (missing === "epoch") tracker.observe(frame({ type: "message_stop" }, 3000), new Set());
++      }
++      tracker.finalize();
++      expect(tracker.aggregate()).toEqual({
++        basis: "claude_observed",
++        outputTokens: 100,
++        elapsedMs: 1000,
++        responseCount: 1,
++        partial: true,
++      });
++      response(tracker, epoch, "late", 4000, 5000, 100);
++      expect(tracker.aggregate()?.responseCount).toBe(1);
++    }
++  });
++});
++
++it("rejects decreasing start usage and old-epoch held frames across reconnects", () => {
++  const tracker = new ClaudeResponseThroughput();
++  const seen = new Set<string>();
++  const oldEpoch = {};
++  const nextEpoch = {};
++  const start = frame(
++    { type: "message_start", message: { id: "old", usage: { output_tokens: 100 } } },
++    0,
++  );
++  observeClaudeFrame(start, 5000, oldEpoch);
++  tracker.observe(start, seen, oldEpoch);
++  tracker.observe(
++    frame({ type: "message_delta", usage: { output_tokens: 50 } }, 500),
++    seen,
++    oldEpoch,
++  );
++  tracker.observe(frame({ type: "message_stop" }, 1000), seen, oldEpoch);
++  expect(tracker.aggregate()).toBeUndefined();
++  const reconnect = new ClaudeResponseThroughput();
++  observeClaudeFrame(start, 10000, nextEpoch);
++  reconnect.observe(start, seen, nextEpoch);
++  reconnect.observe(
++    frame({ type: "message_delta", usage: { output_tokens: 100 } }, 11000),
++    seen,
++    nextEpoch,
++  );
++  reconnect.observe(frame({ type: "message_stop" }, 12000), seen, nextEpoch);
++  expect(reconnect.aggregate()).toBeUndefined();
++});
++it("marks a turn interrupted during a tool wait as partial without losing completed responses", () => {
++  const tracker = new ClaudeResponseThroughput();
++  response(tracker, new Set(), "good", 0, 1000, 100);
++  tracker.finalize(true);
++  expect(tracker.aggregate()).toEqual({
++    basis: "claude_observed",
++    outputTokens: 100,
++    elapsedMs: 1000,
++    responseCount: 1,
++    partial: true,
++  });
++});
+diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeResponseThroughput.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeResponseThroughput.ts
+new file mode 100644
+index 000000000..4e2ee1812
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/Adapters/ClaudeResponseThroughput.ts
+@@ -0,0 +1,155 @@
++import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
++import type { OrchestrationV2ProviderTurn } from "@t3tools/contracts";
++
++// Keep SDK payloads unchanged. Object identity survives logging, echo gates and wake buffers.
++const observedAt = new WeakMap<SDKMessage, { at: number; epoch?: object }>();
++export function observeClaudeFrame(
++  message: SDKMessage,
++  at = performance.now(),
++  epoch?: object,
++): void {
++  const observation = observedAt.get(message);
++  if (observation === undefined) {
++    observedAt.set(message, { at, ...(epoch === undefined ? {} : { epoch }) });
++  } else if (observation.epoch === undefined && epoch !== undefined) {
++    observation.epoch = epoch;
++  }
++}
++
++type ResponseThroughput = NonNullable<OrchestrationV2ProviderTurn["responseThroughput"]>;
++
++/** Only message_stop finalizes cumulative message_delta usage. Assistant snapshots are nonfinal. */
++export class ClaudeResponseThroughput {
++  private active:
++    | {
++        id: string;
++        startedAt: number;
++        lastAt: number;
++        tokens?: number;
++        hasFinalUsage: boolean;
++        invalid: boolean;
++      }
++    | undefined;
++  private epoch: object | undefined;
++  private readonly completed = new Set<string>();
++  private readonly snapshots = new Set<string>();
++  private outputTokens = 0;
++  private elapsedMs = 0;
++  private partial = false;
++  private finalized = false;
++
++  observe(
++    message: SDKMessage,
++    seenMessageIds: Set<string>,
++    epoch: object = seenMessageIds,
++  ): boolean {
++    if (this.finalized) return false;
++    if (
++      (message.type !== "stream_event" && message.type !== "assistant") ||
++      message.parent_tool_use_id !== null
++    )
++      return false;
++    const observation = observedAt.get(message);
++    if (
++      (this.epoch !== undefined && this.epoch !== epoch) ||
++      (observation?.epoch !== undefined && observation.epoch !== epoch)
++    ) {
++      // A process replacement cannot complete an envelope from its predecessor.
++      this.partial = true;
++      this.active = undefined;
++      return false;
++    }
++    this.epoch = epoch;
++    if (message.type === "assistant") {
++      this.snapshots.add(message.message.id);
++      return false;
++    }
++    const event = message.event;
++    const at = observation?.at;
++    if (event.type === "message_start") {
++      if (this.active !== undefined) this.partial = true;
++      const id = event.message.id;
++      const duplicate = seenMessageIds.has(id);
++      seenMessageIds.add(id);
++      const tokens = event.message.usage?.output_tokens;
++      this.active = {
++        id,
++        startedAt: at ?? NaN,
++        lastAt: at ?? NaN,
++        ...(tokens === undefined ? {} : { tokens }),
++        hasFinalUsage: false,
++        invalid:
++          duplicate ||
++          !id ||
++          at === undefined ||
++          !Number.isFinite(at) ||
++          (tokens !== undefined && (!Number.isSafeInteger(tokens) || tokens < 0)),
++      };
++    } else if (event.type === "message_delta") {
++      if (this.active === undefined) {
++        this.partial = true;
++      } else {
++        const tokens = event.usage?.output_tokens;
++        if (
++          !Number.isSafeInteger(tokens) ||
++          tokens < 0 ||
++          (this.active.tokens !== undefined && tokens < this.active.tokens) ||
++          at === undefined ||
++          !Number.isFinite(at) ||
++          at < this.active.lastAt
++        )
++          this.active.invalid = true;
++        else {
++          this.active.tokens = tokens;
++          this.active.hasFinalUsage = true;
++          this.active.lastAt = at;
++        }
++      }
++    } else if (event.type === "message_stop") {
++      const response = this.active;
++      this.active = undefined;
++      const duration = at === undefined || response === undefined ? NaN : at - response.startedAt;
++      if (
++        response === undefined ||
++        response.invalid ||
++        response.tokens === undefined ||
++        !response.hasFinalUsage ||
++        at === undefined ||
++        !Number.isFinite(duration) ||
++        duration <= 0 ||
++        at < response.lastAt ||
++        !Number.isSafeInteger(this.outputTokens + response.tokens) ||
++        !Number.isFinite(this.elapsedMs + duration)
++      ) {
++        this.partial = true;
++        return false;
++      }
++      this.completed.add(response.id);
++      this.outputTokens += response.tokens;
++      this.elapsedMs += duration;
++      return true;
++    }
++    return false;
++  }
++
++  finalize(partial = false): void {
++    this.finalized = true;
++    this.partial ||= partial;
++    if (this.active !== undefined) this.partial = true;
++    this.active = undefined;
++  }
++
++  aggregate(): ResponseThroughput | undefined {
++    if (this.completed.size === 0) return undefined;
++    return {
++      basis: "claude_observed",
++      outputTokens: this.outputTokens,
++      elapsedMs: this.elapsedMs,
++      responseCount: this.completed.size,
++      partial:
++        this.partial ||
++        this.active !== undefined ||
++        [...this.snapshots].some((id) => !this.completed.has(id)),
++    };
++  }
++}
+diff --git a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
+index 6e4a6494f..e111b2826 100644
+--- a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
+@@ -1961,6 +1961,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
+       Effect.void,
+     onRequest: (method: string, params: unknown) => Effect.Effect<void> = () => Effect.void,
+     readChildMetadata?: Parameters<typeof withCodexReplayChildMetadata>[2],
++    hooks: Pick<CodexAdapterV2.CodexAdapterV2Options, "registerUsageLimitsReader"> = {},
+   ) =>
+     Effect.gen(function* () {
+       const fileSystem = yield* FileSystem.FileSystem;
+@@ -2005,6 +2006,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
+         environment: {},
+         clientFactory,
+         crypto: yield* Crypto.Crypto,
++        ...hooks,
+         fileSystem,
+         idAllocator,
+         serverConfig,
+@@ -2078,6 +2080,74 @@ describe("CodexAdapterV2 post-settle continuation", () => {
+       };
+     });
+ 
++  it.effect("reads fresh limits through the existing initialized session connection", () =>
++    Effect.scoped(
++      Effect.gen(function* () {
++        let reader:
++          | Effect.Effect<import("@t3tools/contracts").ServerProviderUsageLimits | undefined>
++          | undefined;
++        const methods: string[] = [];
++        const transcript = makeCodexReplayTranscript({
++          scenario: "limits-only-existing-client",
++          entries: [
++            ...codexReplayPreamble({
++              nativeThreadId: "limits-thread",
++              nativeTurnId: "unused",
++              prompt: "unused",
++            }).slice(0, 5),
++            {
++              type: "expect_outbound",
++              label: "limits-read",
++              frame: { id: 3, method: "account/rateLimits/read", params: null },
++            },
++            {
++              type: "emit_inbound",
++              label: "limits-result",
++              frame: {
++                id: 3,
++                result: {
++                  rateLimits: {
++                    limitId: "codex",
++                    primary: { usedPercent: 60, windowDurationMins: 300, resetsAt: 2000100000 },
++                  },
++                  rateLimitsByLimitId: null,
++                  rateLimitResetCredits: null,
++                },
++              },
++            },
++          ],
++        });
++        yield* makeCodexReplayHarness(
++          transcript,
++          () => Effect.void,
++          (method) =>
++            Effect.sync(() => {
++              methods.push(method);
++            }),
++          undefined,
++          {
++            registerUsageLimitsReader: (read) =>
++              Effect.gen(function* () {
++                reader = read;
++                // Reading before initialization must not initialize or spawn anything.
++                assert.isUndefined(yield* read);
++              }),
++          },
++        );
++        assert.isDefined(reader);
++        yield* TestClock.adjust("1 minute");
++        const limits = yield* reader!;
++        assert.strictEqual(limits?.windows[0]?.usedPercent, 60);
++        assert.strictEqual(limits?.checkedAt, "1970-01-01T00:01:00.000Z");
++        assert.deepStrictEqual(methods, ["initialize", "thread/start", "account/rateLimits/read"]);
++      }).pipe(
++        Effect.provide(
++          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
++        ),
++      ),
++    ),
++  );
++
+   it.effect.each(["supported", "unsupported", "invalid"] as const)(
+     "delivers native history with %s app-server protocol",
+     (response) =>
+@@ -2758,6 +2828,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
+         );
+         assert.equal(completed?.type, "provider_turn.updated");
+         if (completed?.type === "provider_turn.updated") {
++          assert.equal(completed.providerTurn.responseThroughput, undefined);
+           assert.deepEqual(completed.providerTurn.turnTokenUsage, {
+             usageStatus: "complete",
+             usageScope: "main_agent",
+@@ -2983,6 +3054,157 @@ describe("CodexAdapterV2 post-settle continuation", () => {
+     ),
+   );
+ 
++  it.effect(
++    "persists a stock Codex estimate across long waits without timing delayed usage or children",
++    () =>
++      Effect.scoped(
++        Effect.gen(function* () {
++          const nativeThreadId = "stock-stats-thread";
++          const nativeTurnId = "stock-stats-turn";
++          const epoch = 1782622440_000;
++          const entry = (
++            method: string,
++            params: Record<string, unknown>,
++          ): CodexReplay.CodexAppServerReplayEntry => ({
++            type: "emit_inbound",
++            label: method,
++            frame: { method, params },
++          });
++          const boundary = (
++            method: "item/started" | "item/completed",
++            item: Record<string, unknown>,
++            at: number,
++          ) =>
++            entry(method, {
++              threadId: nativeThreadId,
++              turnId: nativeTurnId,
++              item,
++              [method === "item/started" ? "startedAtMs" : "completedAtMs"]: epoch + at,
++            });
++          const tokens = (threadId: string, turnId: string, total: number, last: number) => {
++            const breakdown = (outputTokens: number) => ({
++              totalTokens: 10 + outputTokens,
++              inputTokens: 10,
++              cachedInputTokens: 0,
++              outputTokens,
++              reasoningOutputTokens: 0,
++            });
++            return entry("thread/tokenUsage/updated", {
++              threadId,
++              turnId,
++              tokenUsage: {
++                total: breakdown(total),
++                last: breakdown(last),
++                modelContextWindow: 200_000,
++              },
++            });
++          };
++          const reasoning = { type: "reasoning", id: "reasoning", summary: [], content: [] };
++          const first = { type: "agentMessage", id: "first", text: "Working", phase: "commentary" };
++          const final = { type: "agentMessage", id: "final", text: "Done", phase: "final_answer" };
++          const tool = {
++            type: "dynamicToolCall",
++            id: "tool",
++            tool: "test",
++            arguments: {},
++            status: "inProgress",
++          };
++          const transcript = makeCodexReplayTranscript({
++            scenario: "stock-response-stats",
++            entries: [
++              ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "Work" }),
++              boundary("item/started", reasoning, 0),
++              boundary("item/started", first, 500),
++              boundary("item/completed", reasoning, 1000),
++              boundary("item/completed", first, 2000),
++              boundary("item/started", tool, 2000),
++              boundary("item/started", { ...tool, id: "parallel" }, 3000),
++              entry("thread/status/changed", {
++                threadId: nativeThreadId,
++                status: {
++                  type: "active",
++                  activeFlags: ["waitingOnApproval", "waitingOnUserInput"],
++                },
++              }),
++              boundary(
++                "item/completed",
++                { ...tool, status: "completed", contentItems: [], success: true },
++                100_000,
++              ),
++              boundary(
++                "item/completed",
++                { ...tool, id: "parallel", status: "completed", contentItems: [], success: true },
++                200_000,
++              ),
++              tokens(nativeThreadId, nativeTurnId, 100, 100),
++              // Child and previous-turn usage/output must never borrow the root's windows or tokens.
++              tokens("child-thread", "child-turn", 9999, 9999),
++              entry("item/started", {
++                threadId: "child-thread",
++                turnId: "child-turn",
++                startedAtMs: epoch,
++                item: { ...final, id: "child" },
++              }),
++              entry("item/completed", {
++                threadId: "child-thread",
++                turnId: "child-turn",
++                completedAtMs: epoch + 999_000,
++                item: { ...final, id: "child" },
++              }),
++              boundary("item/started", final, 201_000),
++              boundary("item/completed", final, 203_000),
++              tokens(nativeThreadId, nativeTurnId, 400, 300),
++              entry("turn/completed", {
++                threadId: nativeThreadId,
++                turn: {
++                  ...makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
++                  completedAt: epoch / 1000 + 300,
++                },
++              }),
++            ],
++          });
++          const harness = yield* makeCodexReplayHarness(transcript);
++          yield* harness.runtime.startTurn(
++            makeCodexTestTurnInput({
++              threadId: harness.threadId,
++              providerThread: harness.providerThread,
++              now: yield* DateTime.now,
++              attemptId: RunAttemptId.make("stock-stats-attempt"),
++              text: "Work",
++            }),
++          );
++          yield* harness.firstTerminal;
++          const completed = harness.events.find(
++            (event) =>
++              event.type === "provider_turn.updated" && event.providerTurn.status === "completed",
++          );
++          assert.equal(completed?.type, "provider_turn.updated");
++          if (completed?.type === "provider_turn.updated") {
++            assert.equal(completed.providerTurn.turnTokenUsage?.outputTokens, 400);
++            assert.deepEqual(completed.providerTurn.responseThroughput, {
++              basis: "codex_active_windows_estimate",
++              outputTokens: 400,
++              elapsedMs: 4000,
++              responseCount: 2,
++              partial: true,
++            });
++          }
++          assert.equal(
++            harness.events.filter(
++              (event) =>
++                event.type === "provider_turn.updated" &&
++                event.providerTurn.responseThroughput !== undefined,
++            ).length,
++            1,
++          );
++        }).pipe(
++          Effect.provide(
++            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
++          ),
++        ),
++      ),
++  );
++
+   it.effect("preserves T3 context on the wire and restores it after compaction", () =>
+     Effect.scoped(
+       Effect.gen(function* () {
+diff --git a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
+index 19d1e7b7f..3e3e56614 100644
+--- a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
+@@ -1,3 +1,4 @@
++import { CodexResponseThroughput } from "./CodexResponseThroughput.ts";
+ import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
+ import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
+ import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
+@@ -20,6 +21,7 @@ import {
+ } from "../../provider/CodexProvider.ts";
+ import {
+   codexRateLimitsToUpdate,
++  codexRateLimitsToLimits,
+   mergeCodexRateLimits,
+   codexUsageLimitResetAt,
+   type CodexRateLimitSnapshot,
+@@ -66,6 +68,7 @@ import type {
+   ProviderThreadId,
+   ProviderTurnId,
+   ProviderInstanceId,
++  ServerProviderUsageLimits,
+   RuntimeMode,
+   RuntimeRequestId,
+   ThreadId,
+@@ -1106,6 +1109,7 @@ function codexErrorInfoCode(value: unknown): string | null {
+ }
+ 
+ interface ActiveCodexTurnContext {
++  readonly responseThroughput?: CodexResponseThroughput;
+   latestProviderFailure?: {
+     readonly nativeMessage: string;
+     readonly failure: OrchestrationV2ProviderFailure;
+@@ -1566,7 +1570,10 @@ export type CodexAdapterV2DriverEnv =
+ 
+ export const createCodexAdapterV2 = (
+   { instanceId, environment, enabled, config }: ProviderAdapterDriverCreateInput<CodexSettings>,
+-  hooks: Pick<CodexAdapterV2Options, "onUsageLimits" | "resolveRuntime"> = {},
++  hooks: Pick<
++    CodexAdapterV2Options,
++    "onUsageLimits" | "resolveRuntime" | "registerUsageLimitsReader"
++  > = {},
+ ) =>
+   Effect.gen(function* () {
+     const clientFactory = yield* CodexAppServerClientFactory;
+@@ -1653,6 +1660,9 @@ const layer: Layer.Layer<
+ );
+ 
+ export interface CodexAdapterV2Options {
++  readonly registerUsageLimitsReader?: (
++    reader: Effect.Effect<ServerProviderUsageLimits | undefined>,
++  ) => Effect.Effect<void, never, Scope.Scope>;
+   readonly instanceId: ProviderInstanceId;
+   readonly settings: CodexSettings;
+   readonly environment: NodeJS.ProcessEnv;
+@@ -1783,6 +1793,23 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+             yield* Ref.set(initialized, true);
+           }),
+         );
++        if (adapterOptions.registerUsageLimitsReader) {
++          yield* adapterOptions.registerUsageLimitsReader(
++            Effect.gen(function* () {
++              if (!(yield* Ref.get(initialized))) return undefined;
++              const response = yield* client.request("account/rateLimits/read", null);
++              return codexRateLimitsToLimits({
++                snapshot: response.rateLimits,
++                rateLimitsByLimitId: response.rateLimitsByLimitId,
++                resetCredits: response.rateLimitResetCredits,
++                checkedAt: DateTime.formatIso(yield* DateTime.now),
++              });
++            }).pipe(
++              Effect.timeout("3 seconds"),
++              Effect.orElseSucceed(() => undefined),
++            ),
++          );
++        }
+         const now = yield* DateTime.now;
+         const session = providerSession({
+           providerSessionId: input.providerSessionId,
+@@ -2007,6 +2034,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+               itemParentNodeId: input.turnInput.rootNodeId,
+               rootNodeId: input.turnInput.rootNodeId,
+               subagent: null,
++              responseThroughput: new CodexResponseThroughput(
++                DateTime.toEpochMillis(yield* DateTime.now),
++              ),
+               startedAt: input.startedAt,
+               itemPositions: new Map(),
+             };
+@@ -3303,12 +3333,15 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+           return key;
+         };
+         const appendReasoning = Effect.fn("CodexAdapterV2.appendReasoning")(function* (
+-          payload: { turnId: string; itemId: string; delta: string },
++          payload: { threadId: string; turnId: string; itemId: string; delta: string },
+           stream: "summary" | "content",
+           index: number,
++          receipt: number,
+         ) {
+           const context = yield* awaitActiveTurn(payload.turnId);
+           if (context === undefined || payload.delta.length === 0) return;
++          if (context.providerThread.nativeThreadRef?.nativeId === payload.threadId)
++            context.responseThroughput?.activity(payload.itemId, receipt);
+           yield* completeProviderRetry(context, yield* DateTime.now);
+           const itemId = reasoningPartKey(payload.turnId, payload.itemId, stream, index);
+           // Reserve the position before the delayed flush, ahead of later tool items.
+@@ -4029,6 +4062,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+           readonly options?: ReadonlyArray<ProviderApprovalOption>;
+         }) =>
+           Effect.gen(function* () {
++            input.context.responseThroughput?.wait();
+             const createdAt = yield* DateTime.now;
+             const { owner, subagent } = approvalOwnerCodexTurn(input.context);
+             const parentNodeId =
+@@ -4123,6 +4157,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+           readonly responseMode?: "message";
+         }) =>
+           Effect.gen(function* () {
++            if (input.responseMode !== "message") input.context.responseThroughput?.wait();
+             const createdAt = yield* DateTime.now;
+             const requestId = yield* idAllocator.allocate.runtimeRequest({
+               driver: CODEX_PROVIDER,
+@@ -4212,10 +4247,16 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+             return { node, request, turnItem };
+           });
+ 
+-        yield* client.handleServerNotification("item/agentMessage/delta", (payload) =>
+-          Effect.gen(function* () {
++        yield* client.handleServerNotification("item/agentMessage/delta", (payload) => {
++          const receipt = performance.now();
++          return Effect.gen(function* () {
+             const context = (yield* Ref.get(activeTurns)).get(payload.turnId);
+             if (context !== undefined) {
++              if (
++                payload.delta.length > 0 &&
++                context.providerThread.nativeThreadRef?.nativeId === payload.threadId
++              )
++                context.responseThroughput?.activity(payload.itemId, receipt);
+               yield* completeProviderRetry(context, yield* DateTime.now);
+             }
+             yield* agentMessageDeltas.append({
+@@ -4223,8 +4264,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+               itemId: payload.itemId,
+               delta: payload.delta,
+             });
+-          }),
+-        );
++          });
++        });
+ 
+         yield* client.handleServerNotification("item/commandExecution/outputDelta", (payload) =>
+           Effect.gen(function* () {
+@@ -4248,33 +4289,41 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+         );
+ 
+         yield* client.handleServerNotification("item/reasoning/summaryTextDelta", (payload) =>
+-          appendReasoning(payload, "summary", payload.summaryIndex),
++          appendReasoning(payload, "summary", payload.summaryIndex, performance.now()),
+         );
+         yield* client.handleServerNotification("item/reasoning/textDelta", (payload) =>
+-          appendReasoning(payload, "content", payload.contentIndex),
++          appendReasoning(payload, "content", payload.contentIndex, performance.now()),
+         );
+ 
+-        yield* client.handleServerNotification("item/plan/delta", (payload) =>
+-          Effect.gen(function* () {
++        yield* client.handleServerNotification("item/plan/delta", (payload) => {
++          const receipt = performance.now();
++          return Effect.gen(function* () {
+             const context = yield* awaitActiveTurn(payload.turnId);
+             if (context === undefined) {
+               return;
+             }
++            if (
++              payload.delta.length > 0 &&
++              context.providerThread.nativeThreadRef?.nativeId === payload.threadId
++            )
++              context.responseThroughput?.activity(payload.itemId, receipt);
+             yield* completeProviderRetry(context, yield* DateTime.now);
+             yield* planDeltas.append({
+               turnId: payload.turnId,
+               itemId: payload.itemId,
+               delta: payload.delta,
+             });
+-          }).pipe(Effect.orDie),
+-        );
++          }).pipe(Effect.orDie);
++        });
+ 
+-        yield* client.handleServerNotification("turn/plan/updated", (payload) =>
+-          Effect.gen(function* () {
++        yield* client.handleServerNotification("turn/plan/updated", (payload) => {
++          return Effect.gen(function* () {
+             const context = yield* awaitActiveTurn(payload.turnId);
+             if (context === undefined) {
+               return;
+             }
++            if (context.providerThread.nativeThreadRef?.nativeId === payload.threadId)
++              context.responseThroughput?.unmeasuredActivity();
+             yield* completeProviderRetry(context, yield* DateTime.now);
+             const steps = payload.plan.map((step, index) => ({
+               id: `step-${index + 1}`,
+@@ -4304,8 +4353,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+               driver: CODEX_PROVIDER,
+               turnItem: artifacts.turnItem,
+             });
+-          }).pipe(Effect.orDie),
+-        );
++          }).pipe(Effect.orDie);
++        });
+ 
+         yield* client.handleServerNotification("account/rateLimits/updated", (payload) =>
+           Effect.gen(function* () {
+@@ -4337,6 +4386,29 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+           }).pipe(Effect.orDie),
+         );
+ 
++        for (const method of [
++          "item/commandExecution/outputDelta",
++          "item/fileChange/outputDelta",
++        ] as const) {
++          yield* client.handleServerNotification(method, (payload) =>
++            Effect.gen(function* () {
++              const context = (yield* Ref.get(activeTurns)).get(payload.turnId);
++              if (context?.providerThread.nativeThreadRef?.nativeId === payload.threadId)
++                context.responseThroughput?.toolOutput(payload.itemId);
++            }),
++          );
++        }
++
++        yield* client.handleServerNotification("thread/status/changed", (payload) =>
++          Effect.gen(function* () {
++            if (payload.status.type !== "active" || payload.status.activeFlags.length === 0) return;
++            for (const context of (yield* Ref.get(activeTurns)).values()) {
++              if (context.providerThread.nativeThreadRef?.nativeId === payload.threadId)
++                context.responseThroughput?.wait();
++            }
++          }),
++        );
++
+         yield* client.handleServerNotification("thread/tokenUsage/updated", (payload) =>
+           Effect.gen(function* () {
+             accumulateCodexTurnTokenUsage(
+@@ -4610,13 +4682,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+           });
+         });
+ 
+-        yield* client.handleServerNotification("item/started", (payload) =>
+-          Effect.gen(function* () {
++        yield* client.handleServerNotification("item/started", (payload) => {
++          const receipt = performance.now();
++          return Effect.gen(function* () {
+             const context = yield* awaitActiveTurn(payload.turnId);
+             if (context === undefined) {
+               return;
+             }
+ 
++            if (context.providerThread.nativeThreadRef?.nativeId === payload.threadId)
++              context.responseThroughput?.itemStarted(payload.item, payload.startedAtMs, receipt);
++
+             if (payload.item.type === "contextCompaction") {
+               yield* emitCompactionItem(
+                 context,
+@@ -4732,11 +4808,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+               driver: CODEX_PROVIDER,
+               turnItem: artifacts.turnItem,
+             });
+-          }).pipe(Effect.orDie, turnTerminalizationPermit.withPermits(1)),
+-        );
++          }).pipe(Effect.orDie, turnTerminalizationPermit.withPermits(1));
++        });
+ 
+-        yield* client.handleServerNotification("item/completed", (payload) =>
+-          Effect.gen(function* () {
++        yield* client.handleServerNotification("item/completed", (payload) => {
++          const receipt = performance.now();
++          return Effect.gen(function* () {
+             if (payload.item.type === "contextCompaction")
+               // The notification callback runs on the input reader. Let it read
+               // the injection response while the session-scoped request waits.
+@@ -4763,6 +4840,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+               return;
+             }
+             const { context, settled } = resolved;
++            if (!settled && context.providerThread.nativeThreadRef?.nativeId === payload.threadId)
++              context.responseThroughput?.itemCompleted(
++                payload.item,
++                payload.completedAtMs,
++                receipt,
++              );
+ 
+             if (payload.item.type === "reasoning") {
+               yield* completeReasoning(payload.turnId, payload.item);
+@@ -5026,8 +5109,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+                 result: text,
+               });
+             }
+-          }).pipe(Effect.orDie, turnTerminalizationPermit.withPermits(1)),
+-        );
++          }).pipe(Effect.orDie, turnTerminalizationPermit.withPermits(1));
++        });
+ 
+         yield* client.handleServerRequest("item/commandExecution/requestApproval", (payload) =>
+           Effect.gen(function* () {
+@@ -5784,6 +5867,15 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+               for (const [key, part] of reasoningParts) {
+                 if (part.turnId === input.nativeTurnId) reasoningParts.delete(key);
+               }
++              const turnTokenUsage = completeCodexTurnTokenUsage(
++                usageStateForThread(
++                  input.context.providerThread.nativeThreadRef?.nativeId ??
++                    String(input.context.providerThread.id),
++                ),
++                input.nativeTurnId,
++                input.status === "completed",
++              );
++              const responseThroughput = input.context.responseThroughput?.finalize(turnTokenUsage);
+               const nativeThreadId = input.context.providerThread.nativeThreadRef?.nativeId;
+               const activation =
+                 nativeThreadId == null ? undefined : goalActivations.get(nativeThreadId);
+@@ -5808,14 +5900,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+                 status: input.status,
+                 startedAt: input.context.startedAt,
+                 completedAt: input.completedAt,
+-                turnTokenUsage: completeCodexTurnTokenUsage(
+-                  usageStateForThread(
+-                    input.context.providerThread.nativeThreadRef?.nativeId ??
+-                      String(input.context.providerThread.id),
+-                  ),
+-                  input.nativeTurnId,
+-                  input.status === "completed",
+-                ),
++                turnTokenUsage,
++                ...(responseThroughput === undefined ? {} : { responseThroughput }),
+               };
+               if (!holdsForGoal) {
+                 yield* emitProviderEvent({
+diff --git a/apps/server/src/orchestration-v2/Adapters/CodexResponseThroughput.test.ts b/apps/server/src/orchestration-v2/Adapters/CodexResponseThroughput.test.ts
+new file mode 100644
+index 000000000..9e6d8b284
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/Adapters/CodexResponseThroughput.test.ts
+@@ -0,0 +1,203 @@
++import type { TurnTokenUsage } from "@t3tools/contracts";
++import { describe, expect, it } from "@effect/vitest";
++
++import { CodexResponseThroughput } from "./CodexResponseThroughput.ts";
++
++const usage: TurnTokenUsage = {
++  usageStatus: "complete",
++  usageScope: "main_agent",
++  hasSubagents: false,
++  inputTokens: 100,
++  outputTokens: 400,
++  reasoningTokens: 100,
++};
++const origin = 1_800_000_000_000;
++const reasoning = { type: "reasoning", id: "reasoning" } as const;
++const text = { type: "agentMessage", id: "text", text: "Answer" } as const;
++const plan = { type: "plan", id: "plan", text: "Plan" } as const;
++const tool = { type: "sleep", id: "tool", durationMs: 100_000 } as const;
++const tracker = () => new CodexResponseThroughput(origin, 0);
++const expected = (elapsedMs: number, responseCount = 1, partial = false) => ({
++  basis: "codex_active_windows_estimate",
++  outputTokens: 400,
++  elapsedMs,
++  responseCount,
++  partial,
++});
++
++describe("stock Codex response activity estimate", () => {
++  it("includes reasoning and unions overlapping reasoning, text and plan intervals", () => {
++    const t = tracker();
++    t.itemStarted(reasoning, origin);
++    t.itemStarted(text, origin + 500);
++    t.itemStarted(plan, origin + 1000);
++    t.itemCompleted(reasoning, origin + 1500);
++    t.itemCompleted(text, origin + 2000);
++    t.itemCompleted(plan, origin + 3000);
++    expect(t.finalize(usage)).toEqual(expected(3000));
++  });
++
++  it("plan snapshots cannot turn the gap between updates into generation time", () => {
++    const t = tracker();
++    t.unmeasuredActivity();
++    t.unmeasuredActivity();
++    expect(t.finalize(usage)).toBeUndefined();
++    const covered = tracker();
++    covered.itemStarted(plan, origin);
++    covered.itemCompleted(plan, origin + 1000);
++    covered.unmeasuredActivity();
++    expect(covered.finalize(usage)).toEqual(expected(1000, 1, true));
++  });
++
++  it("excludes long tool, approval and user-input gaps between responses", () => {
++    const t = tracker();
++    t.itemStarted(reasoning, origin);
++    t.itemCompleted(reasoning, origin + 1000);
++    t.itemStarted(tool, origin + 1000);
++    t.wait(40_000);
++    t.wait(80_000);
++    t.itemCompleted(tool, origin + 100_000);
++    t.itemStarted(text, origin + 200_000);
++    t.itemCompleted(text, origin + 203_000);
++    expect(t.finalize(usage)).toEqual(expected(4000, 2));
++  });
++
++  it("cuts an unclosed response at tool start and never resumes on overlapping tool completions", () => {
++    const t = tracker();
++    t.itemStarted(text, origin);
++    t.activity(text.id, 500);
++    t.itemStarted(tool, origin + 1000);
++    t.itemStarted({ ...tool, id: "parallel" }, origin + 2000);
++    t.itemCompleted(tool, origin + 60_000);
++    t.itemCompleted({ ...tool, id: "parallel" }, origin + 100_000);
++    expect(t.finalize(usage)).toEqual(expected(1000, 1, true));
++  });
++
++  it("can observe model activity while background tools are still running", () => {
++    const t = tracker();
++    t.itemStarted(tool, origin);
++    t.itemStarted(text, origin + 1000);
++    t.itemCompleted(text, origin + 3000);
++    t.itemCompleted(tool, origin + 100_000);
++    expect(t.finalize(usage)).toEqual(expected(2000, 1, true));
++  });
++
++  it("background tool output and completion do not truncate observable concurrent generation", () => {
++    const t = tracker();
++    t.itemStarted(tool, origin);
++    t.itemStarted(reasoning, origin + 1000);
++    t.activity(reasoning.id, 1500);
++    t.toolOutput(tool.id);
++    t.itemCompleted(tool, origin + 2000);
++    t.activity(reasoning.id, 2500);
++    t.itemCompleted(reasoning, origin + 3000);
++    expect(t.finalize(usage)).toEqual(expected(2000, 1, true));
++  });
++
++  it("uses monotonic receipts when native timestamps are absent", () => {
++    const t = tracker();
++    t.itemStarted(reasoning, undefined, 1000);
++    t.activity(reasoning.id, 1500);
++    t.itemCompleted(reasoning, undefined, 2000);
++    expect(t.finalize(usage)).toEqual(expected(1000));
++  });
++
++  it("recovers missing starts from deltas as partial coverage", () => {
++    const t = tracker();
++    t.activity(text.id, 1000);
++    t.activity(text.id, 2000);
++    t.itemCompleted(text, undefined, 3000);
++    expect(t.finalize(usage)).toEqual(expected(2000, 1, true));
++  });
++
++  it("interruption or a missing completion retains only the last observed activity", () => {
++    const t = tracker();
++    t.itemStarted(reasoning, undefined, 1000);
++    t.activity(reasoning.id, 2000);
++    expect(t.finalize({ ...usage, usageStatus: "partial" })).toEqual(expected(1000, 1, true));
++  });
++
++  it("does not extend activity to delayed token usage or the turn terminal", () => {
++    const t = tracker();
++    t.itemStarted(text, origin);
++    t.itemCompleted(text, origin + 1000, 100_000);
++    t.itemStarted(tool, origin + 1000);
++    t.itemCompleted(tool, origin + 500_000);
++    expect(t.finalize(usage)).toEqual(expected(1000));
++  });
++
++  it("missing tool starts close at the last output observation, not tool output/completion", () => {
++    for (const complete of [false, true]) {
++      const t = tracker();
++      t.itemStarted(text, undefined, 1000);
++      t.activity(text.id, 2000);
++      if (complete) t.itemCompleted(tool, origin + 100_000);
++      else t.toolOutput();
++      expect(t.finalize(usage)).toEqual(expected(1000, 1, true));
++    }
++  });
++
++  it("omits old/no events, tools-only, snapshots-only and unmeasurable single deltas", () => {
++    for (const scenario of ["none", "tool", "snapshot", "delta", "zero", "reverse"] as const) {
++      const t = tracker();
++      if (scenario === "tool") {
++        t.itemStarted(tool, origin);
++        t.itemCompleted(tool, origin + 1000);
++      }
++      if (scenario === "snapshot") t.itemCompleted(text, origin + 1000);
++      if (scenario === "delta") t.activity(text.id, 1000);
++      if (scenario === "zero" || scenario === "reverse") {
++        t.itemStarted(text, origin + 1000);
++        t.itemCompleted(text, origin + (scenario === "zero" ? 1000 : 500));
++      }
++      expect(t.finalize(usage)).toBeUndefined();
++    }
++  });
++
++  it("marks a tools-only response or missing envelope partial while retaining measured windows", () => {
++    const t = tracker();
++    t.itemStarted(tool, origin);
++    t.itemCompleted(tool, origin + 1000);
++    t.itemCompleted(reasoning, origin + 2000);
++    t.itemStarted(text, origin + 3000);
++    t.itemCompleted(text, origin + 4000);
++    expect(t.finalize(usage)).toEqual(expected(1000, 1, true));
++  });
++
++  it("a fresh tracker after reconnect or a new turn cannot borrow previous intervals", () => {
++    const prior = tracker();
++    prior.itemStarted(text, origin);
++    prior.itemCompleted(text, origin + 1000);
++    expect(prior.finalize(usage)).toEqual(expected(1000));
++    prior.activity("late", 10_000);
++    expect(prior.finalize(usage)).toBeUndefined();
++    const resumed = tracker();
++    resumed.itemCompleted(text, origin + 20_000);
++    expect(resumed.finalize(usage)).toBeUndefined();
++    const suffix = tracker();
++    suffix.activity(text.id, 30_000);
++    suffix.itemCompleted(text, undefined, 31_000);
++    expect(suffix.finalize(usage)).toEqual(expected(1000, 1, true));
++  });
++
++  it("ignores duplicate completed items and asynchronous child relay messages", () => {
++    const t = tracker();
++    const child = { ...text, id: "relay", delivery: "async" } as const;
++    t.itemStarted(child, origin);
++    t.itemCompleted(child, origin + 100_000);
++    t.itemStarted(text, origin);
++    t.itemCompleted(text, origin + 1000);
++    t.itemStarted(text, origin + 100_000);
++    t.itemCompleted(text, origin + 200_000);
++    expect(t.finalize(usage)).toEqual(expected(1000));
++  });
++
++  it("omits a measured interval without valid provider turn usage", () => {
++    for (const outputTokens of [undefined, -1, NaN, Infinity, 1.5]) {
++      const t = tracker();
++      t.itemStarted(text, origin);
++      t.itemCompleted(text, origin + 1000);
++      expect(t.finalize({ ...usage, usageStatus: "partial", outputTokens })).toBeUndefined();
++    }
++  });
++});
+diff --git a/apps/server/src/orchestration-v2/Adapters/CodexResponseThroughput.ts b/apps/server/src/orchestration-v2/Adapters/CodexResponseThroughput.ts
+new file mode 100644
+index 000000000..1df8c4443
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/Adapters/CodexResponseThroughput.ts
+@@ -0,0 +1,150 @@
++import type { OrchestrationV2ProviderTurn, TurnTokenUsage } from "@t3tools/contracts";
++import type * as CodexSchema from "effect-codex-app-server/schema";
++
++type Item = CodexSchema.V2ItemStartedNotification["item"];
++type ResponseThroughput = NonNullable<OrchestrationV2ProviderTurn["responseThroughput"]>;
++
++/** Stock Codex has item boundaries, not model-response boundaries. Never time token usage. */
++export class CodexResponseThroughput {
++  private readonly active = new Map<string, { start: number; last: number }>();
++  private readonly completed = new Set<string>();
++  private readonly runningTools = new Set<string>();
++  private readonly unixOrigin: number;
++  private readonly monotonicOrigin: number;
++  private readonly intervals: Array<{ start: number; end: number }> = [];
++  private partial = false;
++  private finalized = false;
++  private outputSinceWait = false;
++
++  constructor(unixOrigin: number, monotonicOrigin = performance.now()) {
++    this.unixOrigin = unixOrigin;
++    this.monotonicOrigin = monotonicOrigin;
++  }
++
++  private at(nativeMs: number | undefined, receipt: number): number {
++    // A fixed mapping keeps wall-clock changes from moving receipt timestamps.
++    if (nativeMs !== undefined && Number.isFinite(nativeMs) && nativeMs > 0)
++      return nativeMs - this.unixOrigin + this.monotonicOrigin;
++    return receipt;
++  }
++
++  private record(start: number, end: number): void {
++    if (Number.isFinite(start) && Number.isFinite(end) && end > start)
++      this.intervals.push({ start, end });
++    else this.partial = true;
++  }
++
++  activity(itemId: string, receipt = performance.now()): void {
++    if (this.finalized || this.completed.has(itemId)) return;
++    if (!Number.isFinite(receipt)) {
++      this.partial = true;
++      return;
++    }
++    const active = this.active.get(itemId);
++    if (active === undefined) {
++      // A delta can recover a missing start, but only its observed suffix is timed.
++      this.partial = true;
++      this.active.set(itemId, { start: receipt, last: receipt });
++    } else active.last = Math.max(active.last, receipt);
++    this.outputSinceWait = true;
++  }
++
++  /** Plan snapshots have no output envelope; their spacing may include tool work. */
++  unmeasuredActivity(): void {
++    if (!this.finalized) this.partial = true;
++  }
++
++  itemStarted(item: Item, nativeMs?: number, receipt = performance.now()): void {
++    if (this.finalized) return;
++    if (item.type === "agentMessage" && item.delivery === "async") return;
++    if (item.type === "reasoning" || item.type === "agentMessage" || item.type === "plan") {
++      if (this.completed.has(item.id) || this.active.has(item.id)) return;
++      const at = this.at(nativeMs, receipt);
++      this.active.set(item.id, { start: at, last: at });
++      this.outputSinceWait = true;
++    } else if (
++      item.type !== "userMessage" &&
++      item.type !== "hookPrompt" &&
++      item.type !== "subAgentActivity"
++    ) {
++      // Tool execution, sleep, compaction and provider work cannot open a response window.
++      this.runningTools.add(item.id);
++      if (!this.outputSinceWait) this.partial = true;
++      this.wait(this.at(nativeMs, receipt));
++    }
++  }
++
++  itemCompleted(item: Item, nativeMs?: number, receipt = performance.now()): void {
++    if (this.finalized || this.completed.has(item.id)) return;
++    if (item.type === "agentMessage" && item.delivery === "async") return;
++    if (item.type !== "reasoning" && item.type !== "agentMessage" && item.type !== "plan") {
++      if (
++        item.type !== "userMessage" &&
++        item.type !== "hookPrompt" &&
++        item.type !== "subAgentActivity" &&
++        !this.runningTools.delete(item.id)
++      )
++        this.toolOutput();
++      return;
++    }
++    const active = this.active.get(item.id);
++    this.active.delete(item.id);
++    this.completed.add(item.id);
++    if (active === undefined) this.partial = true;
++    else this.record(active.start, this.at(nativeMs, receipt));
++  }
++
++  /** A wait closes windows; returning from it does not imply new model activity. */
++  wait(at = performance.now()): void {
++    if (this.finalized) return;
++    for (const active of this.active.values()) this.record(active.start, at);
++    if (this.active.size > 0) this.partial = true;
++    this.active.clear();
++    this.outputSinceWait = false;
++  }
++
++  /** Without a tool start, its output/completion cannot identify when generation stopped. */
++  toolOutput(itemId?: string): void {
++    if (this.finalized || (itemId !== undefined && this.runningTools.has(itemId))) return;
++    for (const active of this.active.values()) this.record(active.start, active.last);
++    if (this.active.size > 0) this.partial = true;
++    this.active.clear();
++    this.outputSinceWait = false;
++  }
++
++  finalize(usage: TurnTokenUsage): ResponseThroughput | undefined {
++    if (this.finalized) return undefined;
++    this.finalized = true;
++    // Missing completion/interruption: retain only the observed suffix, never the terminal wait.
++    for (const active of this.active.values()) this.record(active.start, active.last);
++    this.partial ||= this.active.size > 0;
++    this.active.clear();
++    this.runningTools.clear();
++    if (
++      usage.usageStatus === "unavailable" ||
++      usage.outputTokens === undefined ||
++      !Number.isSafeInteger(usage.outputTokens) ||
++      usage.outputTokens < 0
++    )
++      return undefined;
++
++    // Union output intervals, including reasoning/text that overlap. Tool durations are not summed
++    // or subtracted from whole-turn wall time; only observable response activity is timed.
++    const windows: Array<{ start: number; end: number }> = [];
++    for (const interval of this.intervals.toSorted((a, b) => a.start - b.start)) {
++      const previous = windows.at(-1);
++      if (previous !== undefined && interval.start <= previous.end)
++        previous.end = Math.max(previous.end, interval.end);
++      else windows.push({ ...interval });
++    }
++    const elapsedMs = windows.reduce((sum, window) => sum + window.end - window.start, 0);
++    if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) return undefined;
++    return {
++      basis: "codex_active_windows_estimate",
++      outputTokens: usage.outputTokens,
++      elapsedMs,
++      responseCount: windows.length,
++      partial: this.partial || usage.usageStatus === "partial",
++    };
++  }
++}
+diff --git a/apps/server/src/orchestration-v2/ProjectionStore.test.ts b/apps/server/src/orchestration-v2/ProjectionStore.test.ts
+index 9a7d56511..75c12c761 100644
+--- a/apps/server/src/orchestration-v2/ProjectionStore.test.ts
++++ b/apps/server/src/orchestration-v2/ProjectionStore.test.ts
+@@ -766,6 +766,13 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
+         outputTokens: 1_000,
+         updatedAt: "2026-08-29T12:00:00.000Z",
+       } as const;
++      const throughput = {
++        basis: "codex_active_windows_estimate" as const,
++        outputTokens: 400,
++        elapsedMs: 4000,
++        responseCount: 2,
++        partial: false,
++      };
+       const replacementUsage = {
+         usedTokens: 18_000,
+         maxTokens: 200_000,
+@@ -822,10 +829,10 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
+         nodeId,
+         driver,
+         occurredAt: now,
+-        payload: { ...providerTurn, tokenUsage: initialUsage },
++        payload: { ...providerTurn, tokenUsage: initialUsage, responseThroughput: throughput },
+       });
+       yield* projectionStore.apply({
+-        id: EventId.make("event:provider-usage-reload:completed"),
++        id: EventId.make("event:provider-usage-reload:without-usage"),
+         type: "provider-turn.updated",
+         threadId,
+         nodeId,
+@@ -833,9 +840,28 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
+         occurredAt: now,
+         payload: { ...providerTurn, status: "completed", completedAt: now },
+       });
++      const withoutUsage = yield* projectionStore.getThreadProjection(threadId);
++      assert.deepEqual(withoutUsage.providerTurns[0]?.tokenUsage, initialUsage);
++      assert.deepEqual(withoutUsage.providerTurns[0]?.responseThroughput, throughput);
++
++      yield* projectionStore.apply({
++        id: EventId.make("event:provider-usage-reload:completed"),
++        type: "provider-turn.updated",
++        threadId,
++        nodeId,
++        driver,
++        occurredAt: now,
++        payload: {
++          ...providerTurn,
++          status: "completed",
++          completedAt: now,
++          tokenUsage: replacementUsage,
++        },
++      });
+ 
+       const reloaded = yield* projectionStore.getThreadProjection(threadId);
+-      assert.deepEqual(reloaded.providerTurns[0]?.tokenUsage, initialUsage);
++      assert.deepEqual(reloaded.providerTurns[0]?.tokenUsage, replacementUsage);
++      assert.deepEqual(reloaded.providerTurns[0]?.responseThroughput, throughput);
+       assert.strictEqual(reloaded.providerTurns[0]?.status, "completed");
+ 
+       yield* projectionStore.apply({
+@@ -850,11 +876,16 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
+           status: "completed",
+           completedAt: now,
+           tokenUsage: replacementUsage,
++          responseThroughput: { ...throughput, partial: true },
+         },
+       });
+ 
+       const replaced = yield* projectionStore.getThreadProjection(threadId);
+       assert.deepEqual(replaced.providerTurns[0]?.tokenUsage, replacementUsage);
++      assert.deepEqual(replaced.providerTurns[0]?.responseThroughput, {
++        ...throughput,
++        partial: true,
++      });
+     }),
+   );
+ 
+diff --git a/apps/server/src/orchestration-v2/ProjectionStore.ts b/apps/server/src/orchestration-v2/ProjectionStore.ts
+index 1a1cdff54..7f3e224ad 100644
+--- a/apps/server/src/orchestration-v2/ProjectionStore.ts
++++ b/apps/server/src/orchestration-v2/ProjectionStore.ts
+@@ -651,6 +651,9 @@ export function upsertProviderTurn(
+     ...((next.tokenUsage ?? current?.tokenUsage) === undefined
+       ? {}
+       : { tokenUsage: next.tokenUsage ?? current?.tokenUsage }),
++    ...((next.responseThroughput ?? current?.responseThroughput) === undefined
++      ? {}
++      : { responseThroughput: next.responseThroughput ?? current?.responseThroughput }),
+   });
+ }
+ 
+@@ -2264,7 +2267,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+           }
+           case "provider-turn.updated": {
+             const existingRows =
+-              event.payload.tokenUsage === undefined
++              event.payload.tokenUsage === undefined ||
++              event.payload.responseThroughput === undefined
+                 ? yield* sql<PayloadRow>`
+                     SELECT payload_json
+                     FROM orchestration_v2_projection_provider_turns
+diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
+index d5599f8c4..d7ce16f85 100644
+--- a/apps/web/src/components/ChatView.tsx
++++ b/apps/web/src/components/ChatView.tsx
+@@ -500,6 +500,8 @@ import { useLinkedThreadPullRequest } from "./ThreadStatusIndicators";
+ import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
+ import { ThreadStatusLine } from "./chat/ThreadStatusLine";
+ import { formatRelativeTimeLabel, formatRelativeTimeUntilLabel } from "../timestampFormat";
++import { ComposerStats } from "./chat/ComposerStats";
++import { selectComposerStatsTurns, selectRecordedCompactions } from "./chat/ComposerStats.logic";
+ import { ComposerSurface } from "./chat/ComposerSurface";
+ import { resolveThreadSyncPhase } from "../threadSync";
+ import {
+@@ -3602,6 +3604,31 @@ export default function ChatView(props: ChatViewProps) {
+       ),
+     [activeThreadLiveTokenUsage, serverVisibleTurnItems, serverProjection],
+   );
++  const activeUsageLimits = activeProviderStatus?.usageLimits;
++  const activeProviderName =
++    activeProviderStatus?.displayName?.trim() || activeProviderStatus?.instanceId || "";
++  const composerStats = useMemo(() => {
++    if (!settings.statsForNerdsEnabled) return null;
++    const usageLimits = activeUsageLimits
++      ? { limits: activeUsageLimits, providerName: activeProviderName }
++      : null;
++    if (!serverProjection) return { turn: null, compactions: [], context: null, usageLimits };
++    const turns = selectComposerStatsTurns(serverProjection);
++    const contextUsage = turns.findLast((turn) => turn.tokenUsage !== undefined)?.tokenUsage;
++    const compactions = selectRecordedCompactions(serverProjection.turnItems, turns);
++    return {
++      turn: turns.at(-1) ?? null,
++      compactions,
++      usageLimits,
++      context: deriveLatestContextWindowSnapshot(
++        compactions.map((item) => ({ item })),
++        contextUsage,
++        serverProjection.providerThreads.find(
++          (thread) => thread.id === serverProjection.thread.activeProviderThreadId,
++        ),
++      ),
++    };
++  }, [settings.statsForNerdsEnabled, serverProjection, activeUsageLimits, activeProviderName]);
+   const pendingBackgroundTasks = useMemo(() => {
+     if (serverProjection === null || serverProjection === undefined) {
+       return [];
+@@ -11396,10 +11423,14 @@ export default function ChatView(props: ChatViewProps) {
+                         </div>
+                       </div>
+                     </ComposerSurface.Shell>
+-                    <div
+-                      aria-hidden
+-                      className="h-[calc(env(safe-area-inset-bottom)+1rem)] sm:h-[calc(env(safe-area-inset-bottom)+1.25rem)]"
+-                    />
++                    {/* Opaque so timeline content scrolling under the overlay can't show through the stats line. */}
++                    <div className={composerStats !== null ? "bg-background" : undefined}>
++                      {composerStats !== null && <ComposerStats {...composerStats} />}
++                      <div
++                        aria-hidden
++                        className="h-[calc(env(safe-area-inset-bottom)+1rem)] sm:h-[calc(env(safe-area-inset-bottom)+1.25rem)]"
++                      />
++                    </div>
+                   </div>
+                 </div>
+               </div>
+diff --git a/apps/web/src/components/chat/ComposerStats.logic.test.ts b/apps/web/src/components/chat/ComposerStats.logic.test.ts
+new file mode 100644
+index 000000000..479e94b19
+--- /dev/null
++++ b/apps/web/src/components/chat/ComposerStats.logic.test.ts
+@@ -0,0 +1,439 @@
++import {
++  NodeId,
++  ProviderDriverKind,
++  ThreadId,
++  TurnItemId,
++  type OrchestrationV2TurnItem,
++  ProviderThreadId,
++  ProviderTurnId,
++  type OrchestrationV2ProviderTurn,
++} from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++import { describe, expect, it } from "vite-plus/test";
++
++import {
++  composerLimitDisplay,
++  composerLimitsFreshness,
++  deriveResponseRate,
++  deriveTurnCachePercentage,
++  formatCachePercentage,
++  deriveTurnElapsedMs,
++  selectComposerLimitWindows,
++  selectComposerStatsTurns,
++  selectRecordedCompactions,
++} from "./ComposerStats.logic";
++
++const start = DateTime.makeUnsafe("2026-10-03T10:00:00Z");
++const end = DateTime.makeUnsafe("2026-10-03T10:00:48Z");
++const nowMs = DateTime.toEpochMillis(end);
++
++function turn(ordinal: number, node = "main", thread = "active"): OrchestrationV2ProviderTurn {
++  return {
++    id: ProviderTurnId.make(`turn-${ordinal}-${node}`),
++    providerThreadId: ProviderThreadId.make(thread),
++    nodeId: NodeId.make(node),
++    runAttemptId: null,
++    nativeTurnRef: null,
++    ordinal,
++    status: "completed",
++    startedAt: start,
++    completedAt: end,
++  };
++}
++
++describe("composer stats scope", () => {
++  it("excludes child agents and old provider sessions and orders the main turns", () => {
++    const latest = turn(2);
++    expect(
++      selectComposerStatsTurns({
++        thread: { activeProviderThreadId: ProviderThreadId.make("active") },
++        nodes: [
++          { id: NodeId.make("main"), kind: "root_turn", parentNodeId: null },
++          { id: NodeId.make("child"), kind: "root_turn", parentNodeId: NodeId.make("main") },
++        ],
++        providerTurns: [latest, turn(99, "child"), turn(100, "main", "old"), turn(1)],
++      }),
++    ).toEqual([turn(1), latest]);
++  });
++
++  it("keeps a newest turn with missing usage instead of borrowing a previous turn's counts", () => {
++    const previous = {
++      ...turn(1),
++      turnTokenUsage: {
++        usageStatus: "complete",
++        usageScope: "main_agent",
++        inputTokens: 1000,
++        outputTokens: 200,
++        hasSubagents: false,
++      },
++    } as const;
++    const turns = selectComposerStatsTurns({
++      thread: { activeProviderThreadId: ProviderThreadId.make("active") },
++      nodes: [{ id: NodeId.make("main"), kind: "root_turn", parentNodeId: null }],
++      providerTurns: [previous, turn(2)],
++    });
++    expect(turns.at(-1)?.turnTokenUsage).toBeUndefined();
++  });
++});
++
++describe("turn cache share", () => {
++  it("uses normalized input including reads and writes, for complete or partial reports", () => {
++    for (const usageStatus of ["complete", "partial"] as const) {
++      expect(
++        deriveTurnCachePercentage({
++          usageStatus,
++          usageScope: "main_agent",
++          inputTokens: 1000,
++          cachedInputTokens: 810,
++          cacheCreationTokens: 100,
++          outputTokens: 25,
++          hasSubagents: true,
++        }),
++      ).toBe(81);
++    }
++  });
++
++  it("distinguishes a known zero cache rate from unavailable or inconsistent counters", () => {
++    const usage = {
++      usageStatus: "partial",
++      usageScope: "main_agent",
++      inputTokens: 1000,
++      hasSubagents: false,
++    } as const;
++    expect(deriveTurnCachePercentage({ ...usage, cachedInputTokens: 0 })).toBe(0);
++    expect(deriveTurnCachePercentage(usage)).toBeNull();
++    expect(
++      deriveTurnCachePercentage({ ...usage, inputTokens: 0, cachedInputTokens: 0 }),
++    ).toBeNull();
++    expect(deriveTurnCachePercentage({ ...usage, cachedInputTokens: 1001 })).toBeNull();
++    expect(
++      deriveTurnCachePercentage({ ...usage, usageStatus: "unavailable", cachedInputTokens: 100 }),
++    ).toBeNull();
++    expect(deriveTurnCachePercentage(undefined)).toBeNull();
++  });
++
++  it("shows cache rates to one decimal without rounding up to 100%", () => {
++    expect(formatCachePercentage((998 / 1000) * 100)).toBe("99.8%");
++    expect(formatCachePercentage((9996 / 10000) * 100)).toBe("99.9%");
++    expect(formatCachePercentage(100)).toBe("100%");
++    expect(formatCachePercentage((873 / 1000) * 100)).toBe("87.3%");
++    expect(formatCachePercentage(0)).toBe("0%");
++  });
++});
++
++describe("turn wall time", () => {
++  it("ticks only running turns and freezes settled turns at their reported end", () => {
++    expect(deriveTurnElapsedMs({ ...turn(1), status: "running", completedAt: null }, nowMs)).toBe(
++      48_000,
++    );
++    for (const status of ["completed", "interrupted", "failed", "cancelled"] as const) {
++      expect(deriveTurnElapsedMs({ ...turn(1), status }, nowMs + 60_000)).toBe(48_000);
++      expect(deriveTurnElapsedMs({ ...turn(1), status, completedAt: null }, nowMs)).toBeNull();
++    }
++  });
++
++  it("does not turn pending age, missing start times, or reversed timestamps into duration", () => {
++    expect(
++      deriveTurnElapsedMs({ ...turn(1), status: "pending", completedAt: null }, nowMs),
++    ).toBeNull();
++    expect(deriveTurnElapsedMs({ ...turn(1), startedAt: null }, nowMs)).toBeNull();
++    expect(
++      deriveTurnElapsedMs({ ...turn(1), startedAt: end, completedAt: start }, nowMs),
++    ).toBeNull();
++  });
++});
++
++describe("recorded compactions", () => {
++  function compaction(
++    id: string,
++    node = "main",
++    thread = "active",
++    status: "completed" | "running" = "completed",
++  ): Extract<OrchestrationV2TurnItem, { type: "compaction" }> {
++    return {
++      id: TurnItemId.make(id),
++      threadId: ThreadId.make("thread"),
++      runId: null,
++      nodeId: NodeId.make(node),
++      providerThreadId: ProviderThreadId.make(thread),
++      providerTurnId: null,
++      nativeItemRef: null,
++      parentItemId: null,
++      ordinal: 0,
++      status,
++      title: null,
++      startedAt: start,
++      completedAt: end,
++      updatedAt: end,
++      type: "compaction",
++      driver: null,
++      beforeTokenCount: 100000,
++      afterTokenCount: 20000,
++    };
++  }
++  it("counts completed main-session events once and excludes children, old sessions and pending events", () => {
++    const item = compaction("one");
++    expect(
++      selectRecordedCompactions(
++        [
++          item,
++          item,
++          compaction("child", "child"),
++          compaction("old", "main", "old"),
++          compaction("pending", "main", "active", "running"),
++        ],
++        [turn(1)],
++      ),
++    ).toEqual([item]);
++  });
++  it("includes native tool-node compactions and suppresses ACP's duplicate command completion", () => {
++    const main = turn(1);
++    const native = {
++      ...compaction("native", "tool"),
++      providerTurnId: main.id,
++      nativeItemRef: {
++        driver: ProviderDriverKind.make("grok"),
++        nativeId: "acp-compaction:one",
++        strength: "strong",
++      },
++    } as const;
++    const synthetic = {
++      ...compaction("synthetic"),
++      providerTurnId: main.id,
++      nativeItemRef: {
++        driver: ProviderDriverKind.make("grok"),
++        nativeId: "turn:compaction",
++        strength: "weak",
++      },
++    } as const;
++    expect(selectRecordedCompactions([synthetic, native], [main])).toEqual([native]);
++    expect(selectRecordedCompactions([synthetic], [main])).toEqual([synthetic]);
++  });
++  it("orders events by report time rather than item ordinals from different turns", () => {
++    const older = { ...compaction("older"), ordinal: 99, updatedAt: start };
++    const newer = compaction("newer");
++    expect(selectRecordedCompactions([newer, older], [turn(1)])).toEqual([older, newer]);
++  });
++});
++
++describe("observed response rate", () => {
++  const measured = {
++    ...turn(1),
++    nativeTurnRef: {
++      driver: ProviderDriverKind.make("claudeAgent"),
++      nativeId: "root",
++      strength: "strong",
++    },
++    responseThroughput: { outputTokens: 400, elapsedMs: 4000, responseCount: 2, partial: false },
++  } as const;
++  it("uses persisted envelopes, including partial coverage, without turn wall time", () => {
++    expect(deriveResponseRate(measured)).toBe(100);
++    expect(
++      deriveResponseRate({
++        ...measured,
++        responseThroughput: { ...measured.responseThroughput, partial: true },
++      }),
++    ).toBe(100);
++    expect(
++      deriveResponseRate({
++        ...measured,
++        responseThroughput: { ...measured.responseThroughput, outputTokens: 0 },
++      }),
++    ).toBe(0);
++  });
++  it("distinguishes Codex estimates from observed Claude and legacy payloads", () => {
++    const codex = {
++      ...measured,
++      nativeTurnRef: { ...measured.nativeTurnRef, driver: ProviderDriverKind.make("codex") },
++      responseThroughput: {
++        ...measured.responseThroughput,
++        basis: "codex_active_windows_estimate",
++      },
++    } as const;
++    expect(deriveResponseRate(codex)).toBe(100);
++    expect(
++      deriveResponseRate({
++        ...codex,
++        status: "interrupted",
++        responseThroughput: { ...codex.responseThroughput, partial: true },
++      }),
++    ).toBe(100);
++    expect(
++      deriveResponseRate({ ...measured, responseThroughput: codex.responseThroughput }),
++    ).toBeNull();
++    expect(
++      deriveResponseRate({
++        ...measured,
++        responseThroughput: { ...measured.responseThroughput, basis: "claude_observed" },
++      }),
++    ).toBe(100);
++  });
++  it("omits historical, unsupported and invalid telemetry", () => {
++    expect(deriveResponseRate(null)).toBeNull();
++    expect(deriveResponseRate(turn(1))).toBeNull();
++    expect(
++      deriveResponseRate({
++        ...measured,
++        nativeTurnRef: { ...measured.nativeTurnRef, driver: ProviderDriverKind.make("codex") },
++      }),
++    ).toBeNull();
++    for (const elapsedMs of [0, -1, NaN, Infinity]) {
++      expect(
++        deriveResponseRate({
++          ...measured,
++          responseThroughput: { ...measured.responseThroughput, elapsedMs },
++        }),
++      ).toBeNull();
++    }
++  });
++});
++
++describe("selectComposerLimitWindows", () => {
++  const checkedAt = "2026-10-04T16:00:00.000Z";
++  const window = (
++    id: string,
++    kind: "session" | "weekly" | "monthly" | "other",
++    windowDurationMins?: number,
++  ) => ({
++    id,
++    kind,
++    label: id,
++    usedPercent: 12,
++    ...(windowDurationMins === undefined ? {} : { windowDurationMins }),
++  });
++
++  it("picks the account-wide session then weekly window with short labels", () => {
++    const selected = selectComposerLimitWindows({
++      checkedAt,
++      windows: [
++        window("seven_day", "weekly", 10_080),
++        window("five_hour", "session", 300),
++        window("seven_day_fable", "weekly", 10_080),
++      ],
++    });
++    expect(selected.map(({ window, shortLabel }) => [window.id, shortLabel])).toEqual([
++      ["five_hour", "5h"],
++      ["seven_day", "Week"],
++    ]);
++  });
++
++  it("falls back to the kind when the provider omits the duration", () => {
++    expect(
++      selectComposerLimitWindows({ checkedAt, windows: [window("primary", "session")] }).map(
++        ({ shortLabel }) => shortLabel,
++      ),
++    ).toEqual(["Session"]);
++  });
++
++  it("shows nothing for missing, unsupported or empty limits", () => {
++    expect(selectComposerLimitWindows(undefined)).toEqual([]);
++    expect(selectComposerLimitWindows({ checkedAt, windows: [] })).toEqual([]);
++    expect(
++      selectComposerLimitWindows({
++        checkedAt,
++        windows: [window("five_hour", "session", 300)],
++        unavailable: { reason: "unsupported" },
++      }),
++    ).toEqual([]);
++  });
++
++  it("keeps the last reported windows when a later probe failed", () => {
++    expect(
++      selectComposerLimitWindows({
++        checkedAt,
++        windows: [window("five_hour", "session", 300)],
++        unavailable: { reason: "probeFailed" },
++      }),
++    ).toHaveLength(1);
++  });
++});
++
++describe("composer limit freshness", () => {
++  const now = Date.parse("2026-10-04T12:00:00Z");
++  const ago = (ms: number) => new Date(now - ms).toISOString();
++  it("keeps fresh meters through 3 minutes, dims through 15, then hides percentages", () => {
++    for (const [age, status] of [
++      [0, "fresh"],
++      [180000, "fresh"],
++      [180001, "stale"],
++      [900000, "stale"],
++      [900001, "expired"],
++    ] as const) {
++      expect(composerLimitsFreshness([ago(age)], now)).toEqual({
++        status,
++        ageMins: Math.floor(age / 60000),
++        checkedAt: ago(age),
++      });
++    }
++  });
++  it("uses the newest displayed fetch and treats unknown or invalid times as expired", () => {
++    expect(composerLimitsFreshness([ago(20 * 60000), ago(4 * 60000)], now).ageMins).toBe(4);
++    for (const checkedAts of [[], [undefined], ["invalid"], [ago(-60000)]]) {
++      expect(composerLimitsFreshness(checkedAts, now)).toEqual({
++        status: "expired",
++        ageMins: null,
++        checkedAt: undefined,
++      });
++    }
++  });
++});
++
++it("keeps newly fetched data visible before the next render-clock tick", () => {
++  const now = Date.parse("2026-10-04T12:00:00Z");
++  const checkedAt = "2026-10-04T12:00:25Z";
++  expect(composerLimitsFreshness([checkedAt], now)).toEqual({
++    status: "fresh",
++    ageMins: 0,
++    checkedAt,
++  });
++});
++
++describe("composer limit display", () => {
++  const now = Date.parse("2026-10-04T12:00:00Z");
++  const window = {
++    id: "five_hour",
++    kind: "session" as const,
++    label: "Session",
++    source: "probe" as const,
++    usedPercent: 63,
++    windowDurationMins: 300,
++  };
++
++  it("shows zero and waits for a new reading after the reset", () => {
++    expect(
++      composerLimitDisplay(
++        {
++          ...window,
++          checkedAt: "2026-10-04T11:59:30Z",
++          resetsAt: "2026-10-04T11:59:00Z",
++        },
++        undefined,
++        now,
++      ),
++    ).toEqual({
++      freshness: { status: "fresh", ageMins: 0, checkedAt: "2026-10-04T11:59:30Z" },
++      resetPending: true,
++      displayPercent: 0,
++      percentText: "0%",
++      dimmed: true,
++    });
++  });
++
++  it("shows the reading age inline while a value is stale", () => {
++    expect(
++      composerLimitDisplay({ ...window, checkedAt: "2026-10-04T11:53:00Z" }, undefined, now)
++        .percentText,
++    ).toBe("63% · 7m");
++  });
++
++  it("hides a percentage once the reading is expired", () => {
++    const display = composerLimitDisplay(
++      { ...window, checkedAt: "2026-10-04T11:44:00Z" },
++      undefined,
++      now,
++    );
++    expect(display.displayPercent).toBeNull();
++    expect(display.percentText).toBe("—");
++    expect(display.dimmed).toBe(true);
++  });
++});
+diff --git a/apps/web/src/components/chat/ComposerStats.logic.ts b/apps/web/src/components/chat/ComposerStats.logic.ts
+new file mode 100644
+index 000000000..b4f72291f
+--- /dev/null
++++ b/apps/web/src/components/chat/ComposerStats.logic.ts
+@@ -0,0 +1,250 @@
++import type {
++  OrchestrationV2ProviderTurn,
++  OrchestrationV2ThreadProjection,
++  OrchestrationV2TurnItem,
++  ServerProviderUsageLimits,
++  ServerProviderUsageWindow,
++  TurnTokenUsage,
++} from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++
++/** Provider turn ordinals are scoped to a provider thread; children have their own nodes. */
++export function selectComposerStatsTurns(projection: {
++  readonly thread: Pick<OrchestrationV2ThreadProjection["thread"], "activeProviderThreadId">;
++  readonly nodes: ReadonlyArray<
++    Pick<OrchestrationV2ThreadProjection["nodes"][number], "id" | "kind" | "parentNodeId">
++  >;
++  readonly providerTurns: ReadonlyArray<OrchestrationV2ProviderTurn>;
++}): ReadonlyArray<OrchestrationV2ProviderTurn> {
++  const mainNodes = new Set(
++    projection.nodes
++      .filter((node) => node.kind === "root_turn" && node.parentNodeId === null)
++      .map((node) => node.id),
++  );
++  return projection.providerTurns
++    .filter(
++      (turn) =>
++        turn.providerThreadId === projection.thread.activeProviderThreadId &&
++        mainNodes.has(turn.nodeId),
++    )
++    .toSorted((a, b) => a.ordinal - b.ordinal);
++}
++
++/** Cache reads are a subset of normalized input (which includes cache writes). */
++export function deriveTurnCachePercentage(usage: TurnTokenUsage | undefined): number | null {
++  if (
++    usage === undefined ||
++    usage.usageStatus === "unavailable" ||
++    usage.inputTokens === undefined ||
++    usage.inputTokens <= 0 ||
++    usage.cachedInputTokens === undefined ||
++    usage.cachedInputTokens > usage.inputTokens
++  ) {
++    return null;
++  }
++  return (usage.cachedInputTokens / usage.inputTokens) * 100;
++}
++
++/**
++ * One decimal, truncated: 99.96% reads 99.9%, so 100% means every input token was cached.
++ * The epsilon keeps exact tenths (99.8) from flooring to the tenth below.
++ */
++export function formatCachePercentage(percentage: number): string {
++  if (percentage >= 100) return "100%";
++  if (percentage <= 0) return "0%";
++  return `${(Math.floor(percentage * 10 + 1e-9) / 10).toFixed(1)}%`;
++}
++
++/** Wall time includes tools and waits. It must never be used as generation time for TPS. */
++export function deriveTurnElapsedMs(
++  turn: Pick<OrchestrationV2ProviderTurn, "status" | "startedAt" | "completedAt">,
++  nowMs: number,
++): number | null {
++  if (turn.startedAt === null) return null;
++  const end =
++    turn.status === "running"
++      ? nowMs
++      : turn.completedAt === null
++        ? null
++        : DateTime.toEpochMillis(turn.completedAt);
++  const start = DateTime.toEpochMillis(turn.startedAt);
++  return end !== null && Number.isFinite(end) && end >= start ? end - start : null;
++}
++
++/** These are observed completed events, not a lifetime count for a provider. */
++export function selectRecordedCompactions(
++  items: ReadonlyArray<OrchestrationV2TurnItem>,
++  turns: ReadonlyArray<OrchestrationV2ProviderTurn>,
++): ReadonlyArray<Extract<OrchestrationV2TurnItem, { type: "compaction" }>> {
++  const nodes = new Set(turns.map((turn) => turn.nodeId));
++  const threads = new Set(turns.map((turn) => turn.providerThreadId));
++  const turnIds = new Set(turns.map((turn) => turn.id));
++  const nativeAcpTurns = new Set(
++    items
++      .filter(
++        (item) =>
++          item.type === "compaction" &&
++          item.status === "completed" &&
++          item.nativeItemRef?.nativeId?.startsWith("acp-compaction:"),
++      )
++      .map((item) => item.providerTurnId),
++  );
++  const seen = new Set<string>();
++  return items
++    .filter((item): item is Extract<OrchestrationV2TurnItem, { type: "compaction" }> => {
++      if (
++        item.type !== "compaction" ||
++        item.status !== "completed" ||
++        !(
++          (item.nodeId !== null && nodes.has(item.nodeId)) ||
++          (item.providerTurnId !== null && turnIds.has(item.providerTurnId))
++        ) ||
++        item.providerThreadId === null ||
++        !threads.has(item.providerThreadId) ||
++        // ACP may report the native event as well as a synthetic /compact completion.
++        (item.providerTurnId !== null &&
++          nativeAcpTurns.has(item.providerTurnId) &&
++          item.nativeItemRef?.strength === "weak" &&
++          item.nativeItemRef.nativeId?.endsWith(":compaction")) ||
++        seen.has(item.id)
++      )
++        return false;
++      seen.add(item.id);
++      return true;
++    })
++    .toSorted((a, b) => DateTime.toEpochMillis(a.updatedAt) - DateTime.toEpochMillis(b.updatedAt));
++}
++
++/** Persisted provider telemetry is independent of whole-turn wall time. */
++export function deriveResponseRate(turn: OrchestrationV2ProviderTurn | null): number | null {
++  const throughput = turn?.responseThroughput;
++  if (
++    !(
++      (turn?.nativeTurnRef?.driver === "claudeAgent" &&
++        (throughput?.basis === undefined || throughput.basis === "claude_observed")) ||
++      (turn?.nativeTurnRef?.driver === "codex" &&
++        throughput?.basis === "codex_active_windows_estimate")
++    ) ||
++    throughput === undefined ||
++    throughput.responseCount <= 0 ||
++    !Number.isSafeInteger(throughput.responseCount) ||
++    !Number.isSafeInteger(throughput.outputTokens) ||
++    throughput.outputTokens < 0 ||
++    !Number.isFinite(throughput.elapsedMs) ||
++    throughput.elapsedMs <= 0
++  )
++    return null;
++  return throughput.outputTokens / (throughput.elapsedMs / 1000);
++}
++
++function windowShortLabel(window: ServerProviderUsageWindow): string {
++  const mins = window.windowDurationMins;
++  if (mins !== undefined && mins > 0) {
++    if (mins % 10_080 === 0) return mins === 10_080 ? "Week" : `${mins / 10_080}wk`;
++    if (mins % 1_440 === 0) return `${mins / 1_440}d`;
++    if (mins % 60 === 0) return `${mins / 60}h`;
++    return `${mins}m`;
++  }
++  return window.kind === "session" ? "Session" : window.kind === "weekly" ? "Week" : window.label;
++}
++
++/**
++ * The account-wide session and weekly windows for the inline stats line, in
++ * that order. Model-scoped weeklies stay in the popover; providers list the
++ * account-wide window of each kind first.
++ */
++export function selectComposerLimitWindows(
++  limits: ServerProviderUsageLimits | undefined,
++): ReadonlyArray<{ readonly window: ServerProviderUsageWindow; readonly shortLabel: string }> {
++  if (!limits || limits.unavailable?.reason === "unsupported") return [];
++  return (["session", "weekly"] as const).flatMap((kind) => {
++    const window = limits.windows.find((candidate) => candidate.kind === kind);
++    return window ? [{ window, shortLabel: windowShortLabel(window) }] : [];
++  });
++}
++
++export const COMPOSER_STATS_CLOCK_MS = 30_000;
++
++/** Age of the newest valid fetch among the displayed windows. */
++export function composerLimitsFreshness(
++  checkedAts: ReadonlyArray<string | undefined>,
++  nowMs: number,
++): {
++  readonly status: "fresh" | "stale" | "expired";
++  readonly ageMins: number | null;
++  readonly checkedAt: string | undefined;
++} {
++  const times = checkedAts.flatMap((checkedAt) => {
++    const time = checkedAt === undefined ? NaN : Date.parse(checkedAt);
++    // The render clock can trail a newly received fetch by one interval.
++    return Number.isFinite(time) && time <= nowMs + COMPOSER_STATS_CLOCK_MS
++      ? [{ time, checkedAt }]
++      : [];
++  });
++  const newest = times.toSorted((a, b) => b.time - a.time)[0];
++  if (!newest) return { status: "expired", ageMins: null, checkedAt: undefined };
++  const ageMs = Math.max(0, nowMs - newest.time);
++  return {
++    status: ageMs <= 3 * 60_000 ? "fresh" : ageMs <= 15 * 60_000 ? "stale" : "expired",
++    ageMins: Math.floor(ageMs / 60_000),
++    checkedAt: newest.checkedAt,
++  };
++}
++
++export function composerLimitResetPending(
++  window: Pick<ServerProviderUsageWindow, "resetPending" | "resetsAt">,
++  nowMs: number,
++): boolean {
++  if (window.resetPending === true) return true;
++  if (window.resetsAt === undefined) return false;
++  const resetMs = Date.parse(window.resetsAt);
++  return Number.isFinite(resetMs) && resetMs <= nowMs;
++}
++
++export function composerLimitSourceLabel(
++  source: ServerProviderUsageWindow["source"],
++): "account" | "turn" | "CLI estimate" {
++  return source === "account" ? "account" : source === "turn" ? "turn" : "CLI estimate";
++}
++
++export function composerLimitDisplay(
++  window: ServerProviderUsageWindow,
++  fallbackCheckedAt: string | undefined,
++  nowMs: number,
++): {
++  readonly freshness: ReturnType<typeof composerLimitsFreshness>;
++  readonly resetPending: boolean;
++  readonly displayPercent: number | null;
++  readonly percentText: string;
++  readonly dimmed: boolean;
++} {
++  const freshness = composerLimitsFreshness([window.checkedAt ?? fallbackCheckedAt], nowMs);
++  const resetPending = composerLimitResetPending(window, nowMs);
++  if (resetPending) {
++    return {
++      freshness,
++      resetPending: true,
++      displayPercent: 0,
++      percentText: "0%",
++      dimmed: true,
++    };
++  }
++  if (freshness.status === "expired") {
++    return {
++      freshness,
++      resetPending: false,
++      displayPercent: null,
++      percentText: "—",
++      dimmed: true,
++    };
++  }
++  const age =
++    freshness.status === "stale" && freshness.ageMins !== null ? ` · ${freshness.ageMins}m` : "";
++  return {
++    freshness,
++    resetPending: false,
++    displayPercent: window.usedPercent,
++    percentText: `${Math.round(window.usedPercent)}%${age}`,
++    dimmed: freshness.status !== "fresh",
++  };
++}
+diff --git a/apps/web/src/components/chat/ComposerStats.tsx b/apps/web/src/components/chat/ComposerStats.tsx
+new file mode 100644
+index 000000000..025f57253
+--- /dev/null
++++ b/apps/web/src/components/chat/ComposerStats.tsx
+@@ -0,0 +1,541 @@
++import type {
++  OrchestrationV2ProviderTurn,
++  OrchestrationV2TurnItem,
++  ServerProviderUsageLimits,
++  ServerProviderUsageWindow,
++} from "@t3tools/contracts";
++import { formatDuration } from "@t3tools/shared/orchestrationTiming";
++import { formatResetsIn } from "@t3tools/shared/usageLimits";
++import * as DateTime from "effect/DateTime";
++import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
++
++import { type ContextWindowSnapshot, formatContextWindowTokens } from "~/lib/contextWindow";
++import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
++import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
++import { composerFloatingLayerProps } from "./composerEventScope";
++import {
++  COMPOSER_STATS_CLOCK_MS,
++  composerLimitDisplay,
++  composerLimitSourceLabel,
++  composerLimitsFreshness,
++  deriveResponseRate,
++  deriveTurnCachePercentage,
++  formatCachePercentage,
++  deriveTurnElapsedMs,
++  selectComposerLimitWindows,
++} from "./ComposerStats.logic";
++
++function ElapsedTime({ turn }: { turn: OrchestrationV2ProviderTurn }) {
++  const textRef = useRef<HTMLSpanElement>(null);
++  const initialElapsed = turn.status === "running" ? 0 : deriveTurnElapsedMs(turn, 0);
++  useEffect(() => {
++    const update = () => {
++      if (textRef.current) {
++        const elapsed = deriveTurnElapsedMs(turn, Date.now());
++        textRef.current.textContent = elapsed === null ? "" : formatDuration(elapsed);
++      }
++    };
++    update();
++    if (turn.status !== "running") return;
++    const timer = window.setInterval(update, 1000);
++    return () => window.clearInterval(timer);
++  }, [turn]);
++  return <span ref={textRef}>{initialElapsed === null ? "" : formatDuration(initialElapsed)}</span>;
++}
++
++function Detail({ label, children }: { label: string; children: ReactNode }) {
++  return (
++    <div className="flex items-baseline justify-between gap-4">
++      <dt className="text-muted-foreground">{label}</dt>
++      <dd className="text-right tabular-nums">{children}</dd>
++    </div>
++  );
++}
++
++function ContextBar({ percentage }: { percentage: number }) {
++  return (
++    <span aria-hidden="true" className="block h-2 w-full overflow-hidden rounded-sm bg-muted">
++      <span
++        className="block h-full bg-muted-foreground/60"
++        style={{ width: `${Math.max(0, Math.min(100, percentage))}%` }}
++      />
++    </span>
++  );
++}
++
++type Tone = "normal" | "warning" | "critical";
++
++function toneOf(usedPercent: number): Tone {
++  return usedPercent >= 90 ? "critical" : usedPercent >= 75 ? "warning" : "normal";
++}
++
++const TONE_TEXT: Record<Tone, string> = {
++  normal: "text-foreground/80",
++  warning: "text-warning",
++  critical: "text-destructive",
++};
++const TONE_FILL: Record<Tone, string> = {
++  normal: "bg-foreground/45",
++  warning: "bg-warning",
++  critical: "bg-destructive",
++};
++
++function Label({ children }: { children: ReactNode }) {
++  return <span className="text-muted-foreground/70">{children}</span>;
++}
++
++function Value({ children }: { children: ReactNode }) {
++  return <span className="text-foreground/80">{children}</span>;
++}
++
++/** The stats line's one shape for anything that runs out: label, small track, percent used. */
++function Meter({
++  label,
++  percent,
++  displayPercent,
++  percentText,
++  dimmed,
++}: {
++  label: string;
++  percent: number;
++  displayPercent: number | null;
++  percentText: string;
++  dimmed: boolean;
++}) {
++  const tone = toneOf(percent);
++  return (
++    <span className={`inline-flex items-center gap-1.5 ${dimmed ? "opacity-50" : ""}`}>
++      <Label>{label}</Label>
++      <span
++        aria-hidden="true"
++        className="block h-[3px] w-7 overflow-hidden rounded-full bg-foreground/10"
++      >
++        <span
++          className={`block h-full ${dimmed ? "bg-muted-foreground/60" : TONE_FILL[tone]}`}
++          style={{
++            width: `${displayPercent === null ? 0 : Math.max(0, Math.min(100, displayPercent))}%`,
++          }}
++        />
++      </span>
++      <span className={dimmed ? "text-muted-foreground" : TONE_TEXT[tone]}>{percentText}</span>
++    </span>
++  );
++}
++
++function formatUsageTimestamp(value: string | undefined): string {
++  if (value === undefined) return "unknown time";
++  const timeMs = Date.parse(value);
++  if (!Number.isFinite(timeMs)) return "unknown time";
++  return new Intl.DateTimeFormat(undefined, {
++    month: "short",
++    day: "numeric",
++    hour: "numeric",
++    minute: "2-digit",
++  }).format(new Date(timeMs));
++}
++
++function usageReadingLabel(
++  window: ServerProviderUsageWindow,
++  fallbackCheckedAt: string | undefined,
++  now: number,
++): string {
++  const checkedAt = window.checkedAt ?? fallbackCheckedAt;
++  const freshness = composerLimitsFreshness([checkedAt], now);
++  const age =
++    freshness.ageMins === null
++      ? "age unknown"
++      : freshness.ageMins === 0
++        ? "just now"
++        : `${freshness.ageMins}m ago`;
++  return `as of ${formatUsageTimestamp(checkedAt)} (${age}) · ${composerLimitSourceLabel(
++    window.source,
++  )}`;
++}
++
++/** Ages and reset countdowns share the summary clock while the popover is open. */
++function UsageLimitRows({
++  windows,
++  checkedAt,
++  now,
++}: {
++  windows: ReadonlyArray<ServerProviderUsageWindow>;
++  checkedAt: string | undefined;
++  now: number;
++}) {
++  return (
++    <dl className="space-y-2">
++      {windows.map((window) => {
++        const display = composerLimitDisplay(window, checkedAt, now);
++        return (
++          <div key={window.id} className="space-y-1">
++            <div className="flex items-baseline justify-between gap-4">
++              <dt className="text-muted-foreground">{window.label}</dt>
++              <dd
++                className={`text-right tabular-nums ${display.dimmed ? "text-muted-foreground opacity-50" : toneOf(window.usedPercent) === "normal" ? "" : TONE_TEXT[toneOf(window.usedPercent)]}`}
++              >
++                {display.resetPending
++                  ? "0% used"
++                  : display.freshness.status === "expired"
++                    ? "—"
++                    : `${Math.round(window.usedPercent)}% used`}
++              </dd>
++            </div>
++            <div className={display.dimmed ? "opacity-50" : ""}>
++              <ContextBar percentage={display.displayPercent ?? 0} />
++            </div>
++            <p className="text-right text-muted-foreground tabular-nums">
++              {usageReadingLabel(window, checkedAt, now)}
++            </p>
++            {display.resetPending ? (
++              <p className="text-right text-muted-foreground tabular-nums">
++                {window.resetsAt
++                  ? `Reset at ${formatUsageTimestamp(window.resetsAt)}, waiting for a new reading`
++                  : "Waiting for a new reading"}
++              </p>
++            ) : (
++              formatResetsIn(window, now) && (
++                <p className="text-right text-muted-foreground tabular-nums">
++                  {formatResetsIn(window, now)}
++                </p>
++              )
++            )}
++          </div>
++        );
++      })}
++    </dl>
++  );
++}
++
++function UsageLimitsSummary({
++  limits,
++  providerName,
++}: {
++  limits: ServerProviderUsageLimits;
++  providerName: string;
++}) {
++  const [now, setNow] = useState(Date.now);
++  useEffect(() => {
++    const timer = window.setInterval(() => setNow(Date.now()), COMPOSER_STATS_CLOCK_MS);
++    return () => window.clearInterval(timer);
++  }, []);
++  const chips = selectComposerLimitWindows(limits);
++  const freshness = composerLimitsFreshness(
++    chips.map(({ window }) => window.checkedAt ?? limits.checkedAt),
++    now,
++  );
++  if (chips.length === 0) return null;
++  return (
++    <Popover>
++      <PopoverTrigger
++        openOnHover
++        delay={150}
++        closeDelay={150}
++        render={
++          <button
++            type="button"
++            aria-label="Usage limit details"
++            className="inline-flex flex-wrap items-center gap-x-4 rounded-sm text-left outline-offset-2"
++          />
++        }
++      >
++        {chips.map(({ window, shortLabel }) => {
++          const display = composerLimitDisplay(window, limits.checkedAt, now);
++          return (
++            <Meter
++              key={window.id}
++              label={shortLabel}
++              percent={window.usedPercent}
++              displayPercent={display.displayPercent}
++              percentText={display.percentText}
++              dimmed={display.dimmed}
++            />
++          );
++        })}
++      </PopoverTrigger>
++      <PopoverPopup {...composerFloatingLayerProps} side="top" align="start" width="md">
++        <div className="flex flex-col gap-3 text-xs">
++          <div className="flex items-baseline justify-between gap-4">
++            <h3 className="font-medium">Usage limits</h3>
++            <span className="truncate text-muted-foreground">{providerName}</span>
++          </div>
++          <UsageLimitRows windows={limits.windows} checkedAt={limits.checkedAt} now={now} />
++          <p className="text-muted-foreground">
++            Usage comes from account and turn readings, with CLI estimates filling gaps. Stale
++            values show their age; readings older than 15 minutes are hidden.
++            {freshness.ageMins === null
++              ? " Check time unavailable."
++              : ` Checked ${freshness.ageMins === 0 ? "just now" : `${freshness.ageMins} min ago`}.`}
++            {" At reset time a window shows 0% until a new reading arrives."}
++          </p>
++        </div>
++      </PopoverPopup>
++    </Popover>
++  );
++}
++
++export function ComposerStats({
++  context,
++  turn,
++  compactions,
++  usageLimits,
++}: {
++  context: ContextWindowSnapshot | null;
++  turn: OrchestrationV2ProviderTurn | null;
++  compactions: ReadonlyArray<Extract<OrchestrationV2TurnItem, { type: "compaction" }>>;
++  usageLimits: { limits: ServerProviderUsageLimits; providerName: string } | null;
++}) {
++  const responseRate = deriveResponseRate(turn);
++  const estimated = turn?.responseThroughput?.basis === "codex_active_windows_estimate";
++  const usage = turn?.turnTokenUsage;
++  const availableUsage = usage?.usageStatus !== "unavailable" ? usage : undefined;
++  const cachePercentage = deriveTurnCachePercentage(availableUsage);
++  const hasElapsed =
++    turn !== null &&
++    turn.startedAt !== null &&
++    (turn.status === "running" || deriveTurnElapsedMs(turn, 0) !== null);
++  const hasTokens =
++    availableUsage?.inputTokens !== undefined || availableUsage?.outputTokens !== undefined;
++  if (
++    context === null &&
++    !hasElapsed &&
++    !hasTokens &&
++    responseRate === null &&
++    compactions.length === 0 &&
++    selectComposerLimitWindows(usageLimits?.limits).length === 0
++  )
++    return null;
++  const count = (value: number | undefined) =>
++    value === undefined ? "Not reported" : value.toLocaleString("en-US");
++  const stats: Array<{ key: string; node: ReactNode }> = [];
++  const throughput = turn?.responseThroughput;
++  const rateText =
++    responseRate === null
++      ? null
++      : `${estimated ? "≈" : ""}${responseRate.toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
++  // T3 already shows turn time inline in the timeline, so the line shows tok/s and
++  // keeps elapsed time in the details popover.
++  if (turn !== null && (hasElapsed || hasTokens || rateText !== null)) {
++    stats.push({
++      key: "turn",
++      node: (
++        <Popover>
++          <PopoverTrigger
++            openOnHover
++            delay={150}
++            closeDelay={150}
++            render={
++              <button
++                type="button"
++                aria-label="Turn token details"
++                className="inline-flex items-center gap-1 rounded-sm text-left outline-offset-2"
++              />
++            }
++          >
++            {rateText !== null ? (
++              <>
++                <Value>{rateText}</Value>
++                <Label>tok/s{throughput?.partial && " partial"}</Label>
++              </>
++            ) : (
++              <Label>Tokens</Label>
++            )}
++          </PopoverTrigger>
++          <PopoverPopup {...composerFloatingLayerProps} side="top" align="start" width="md">
++            <div className="flex flex-col gap-3 text-xs">
++              <h3 className="font-medium">
++                {turn.status === "running" ? "Current" : "Latest"} main-agent turn
++              </h3>
++              <dl className="space-y-1.5">
++                <Detail label="Status">{turn.status}</Detail>
++                {rateText !== null && <Detail label="Output rate">{rateText} tok/s</Detail>}
++                {hasElapsed && (
++                  <Detail label="Elapsed wall time">
++                    <ElapsedTime turn={turn} />
++                  </Detail>
++                )}
++                <Detail label="Input tokens">{count(availableUsage?.inputTokens)}</Detail>
++                <Detail label="Cache reads">{count(availableUsage?.cachedInputTokens)}</Detail>
++                <Detail label="Cache writes">{count(availableUsage?.cacheCreationTokens)}</Detail>
++                <Detail label="Output tokens">{count(availableUsage?.outputTokens)}</Detail>
++                <Detail label="Reasoning tokens">{count(availableUsage?.reasoningTokens)}</Detail>
++              </dl>
++              <p className="text-muted-foreground">
++                Input includes cache reads and writes; output includes reasoning. Elapsed time
++                includes tools and waits. Child-agent usage is excluded.
++                {usage?.hasSubagents && " This turn used subagents."}
++              </p>
++              {rateText !== null && (
++                <p className="text-muted-foreground">
++                  {estimated
++                    ? "Output rate: Codex-reported turn output tokens, including reasoning and tool arguments, divided by estimated response-active time. Observed reasoning, text and plan windows exclude local tool, approval and input waits where visible. Silent reasoning, queue time and tool argument generation may be missed."
++                    : "Output rate: Claude-reported output tokens, including reasoning and tool arguments, divided by observed response start-to-stop time. Includes network, buffering and server-side waits; excludes local tool waits between responses."}
++                  {throughput?.partial && " Partial coverage: some activity could not be measured."}
++                </p>
++              )}
++              {availableUsage?.usageStatus === "partial" && (
++                <p className="text-muted-foreground">
++                  Partial report: counts cover only the usage this provider reported.
++                </p>
++              )}
++            </div>
++          </PopoverPopup>
++        </Popover>
++      ),
++    });
++  }
++  if (cachePercentage !== null) {
++    stats.push({
++      key: "cache",
++      node: (
++        <Tooltip>
++          <TooltipTrigger
++            render={
++              <span
++                tabIndex={0}
++                className="inline-flex items-center gap-1 rounded-sm outline-offset-2"
++              />
++            }
++          >
++            <Value>{formatCachePercentage(cachePercentage)}</Value>
++            <Label>cached</Label>
++          </TooltipTrigger>
++          <TooltipPopup>
++            Input served from cache on this main-agent turn:{" "}
++            {count(availableUsage?.cachedInputTokens)} of {count(availableUsage?.inputTokens)}{" "}
++            tokens. Cached input generally costs less; this is not a session-wide cache rate.
++          </TooltipPopup>
++        </Tooltip>
++      ),
++    });
++  }
++
++  // Context is per thread, so it sits with the turn stats; the left side is account limits.
++  if (context !== null || compactions.length > 0) {
++    stats.unshift({
++      key: "context",
++      node: (
++        <Popover>
++          <PopoverTrigger
++            openOnHover
++            delay={150}
++            closeDelay={150}
++            render={
++              <button
++                type="button"
++                aria-label="Context usage details"
++                className="inline-flex items-center rounded-sm text-left outline-offset-2"
++              />
++            }
++          >
++            <span className="inline-flex items-center gap-1">
++              {context?.usedPercentage != null ? (
++                <span className={TONE_TEXT[toneOf(context.usedPercentage)]}>
++                  {Math.round(context.usedPercentage)}%
++                </span>
++              ) : (
++                <Value>{context ? formatContextWindowTokens(context.usedTokens) : "—"}</Value>
++              )}
++              <Label>context</Label>
++            </span>
++          </PopoverTrigger>
++          <PopoverPopup {...composerFloatingLayerProps} side="top" align="end" width="md">
++            <div className="flex flex-col gap-3 text-xs">
++              <div className="flex items-baseline justify-between gap-4">
++                <h3 className="font-medium">Context usage</h3>
++                <span className="text-muted-foreground tabular-nums">
++                  {context?.usedPercentage != null
++                    ? `${Math.round(context.usedPercentage)}% full`
++                    : "Not reported"}
++                </span>
++              </div>
++              {context?.usedPercentage != null && (
++                <ContextBar percentage={context.usedPercentage} />
++              )}
++              <dl className="space-y-1.5">
++                <Detail label="Used tokens">
++                  {context ? count(context.usedTokens) : "Not reported"}
++                </Detail>
++                <Detail label="Window size">{count(context?.maxTokens ?? undefined)}</Detail>
++                <Detail label="Remaining tokens">
++                  {count(context?.remainingTokens ?? undefined)}
++                </Detail>
++                <Detail label="Recorded compactions">{compactions.length}</Detail>
++              </dl>
++              {compactions.length > 0 && (
++                <div className="space-y-1.5">
++                  <p className="font-medium">Recent compactions</p>
++                  {compactions.slice(-3).map((item) => (
++                    <div key={item.id} className="flex justify-between gap-4 text-muted-foreground">
++                      <span>
++                        {item.beforeTokenCount !== undefined
++                          ? formatContextWindowTokens(item.beforeTokenCount)
++                          : "Unknown"}{" "}
++                        →{" "}
++                        {item.afterTokenCount !== undefined
++                          ? formatContextWindowTokens(item.afterTokenCount)
++                          : "Unknown"}{" "}
++                        tokens
++                      </span>
++                      <span>
++                        {item.completedAt != null
++                          ? new Date(DateTime.toEpochMillis(item.completedAt)).toLocaleTimeString(
++                              [],
++                              {
++                                hour: "numeric",
++                                minute: "2-digit",
++                              },
++                            )
++                          : ""}
++                      </span>
++                    </div>
++                  ))}
++                </div>
++              )}
++              <p className="text-muted-foreground">
++                {context
++                  ? "Latest provider report, not a live token estimate or a quality score."
++                  : "This provider has not reported context occupancy yet."}{" "}
++                Compactions count completed events in the loaded main-agent history for this
++                provider session.
++              </p>
++              {context && (
++                <p className="text-muted-foreground">
++                  Reported{" "}
++                  <time dateTime={context.updatedAt}>
++                    {new Date(context.updatedAt).toLocaleString()}
++                  </time>
++                </p>
++              )}
++            </div>
++          </PopoverPopup>
++        </Popover>
++      ),
++    });
++  }
++
++  return (
++    <div
++      data-composer-stats="true"
++      aria-label="Stats for nerds"
++      className="flex flex-wrap items-center gap-x-4 gap-y-1 px-5 pt-1.5 text-2xs leading-4 text-muted-foreground tabular-nums"
++    >
++      {usageLimits && (
++        <UsageLimitsSummary limits={usageLimits.limits} providerName={usageLimits.providerName} />
++      )}
++      {stats.length > 0 && (
++        <span className="ms-auto inline-flex flex-wrap items-center gap-x-2.5">
++          {stats.map(({ key, node }, index) => (
++            <Fragment key={key}>
++              {index > 0 && (
++                <span aria-hidden="true" className="text-muted-foreground/40">
++                  ·
++                </span>
++              )}
++              {node}
++            </Fragment>
++          ))}
++        </span>
++      )}
++    </div>
++  );
++}
+diff --git a/apps/web/src/components/settings/SettingsPanels.tsx b/apps/web/src/components/settings/SettingsPanels.tsx
+index fcdc35b3c..439072651 100644
+--- a/apps/web/src/components/settings/SettingsPanels.tsx
++++ b/apps/web/src/components/settings/SettingsPanels.tsx
+@@ -620,6 +620,9 @@ export function useSettingsRestore(onRestored?: () => void) {
+       ...(settings.followUpBehavior !== DEFAULT_UNIFIED_SETTINGS.followUpBehavior
+         ? ["Follow-up behavior"]
+         : []),
++      ...(settings.statsForNerdsEnabled !== DEFAULT_UNIFIED_SETTINGS.statsForNerdsEnabled
++        ? ["Stats for nerds"]
++        : []),
+       ...(settings.contextWindowMeterEnabled !== DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled
+         ? ["Context window indicator"]
+         : []),
+@@ -693,6 +696,7 @@ export function useSettingsRestore(onRestored?: () => void) {
+       settings.diffLayout,
+       settings.proactivePanelsEnabled,
+       settings.environmentIdentificationMode,
++      settings.statsForNerdsEnabled,
+       settings.contextWindowMeterEnabled,
+       settings.fontFamilyCode,
+       settings.fontFamilyComposer,
+@@ -802,6 +806,7 @@ export function useSettingsRestore(onRestored?: () => void) {
+       composerRichTextEnabled: DEFAULT_UNIFIED_SETTINGS.composerRichTextEnabled,
+       sendShortcut: DEFAULT_UNIFIED_SETTINGS.sendShortcut,
+       followUpBehavior: DEFAULT_UNIFIED_SETTINGS.followUpBehavior,
++      statsForNerdsEnabled: DEFAULT_UNIFIED_SETTINGS.statsForNerdsEnabled,
+       contextWindowMeterEnabled: DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled,
+       environmentIdentificationMode: DEFAULT_UNIFIED_SETTINGS.environmentIdentificationMode,
+       glassOpacity: DEFAULT_UNIFIED_SETTINGS.glassOpacity,
+@@ -2761,6 +2766,32 @@ export function GeneralSettingsPanel() {
+           }
+         />
+ 
++        <SettingsRow
++          {...searchableSetting("stats-for-nerds")}
++          description="Show reported context, main-agent turn tokens, cache rate, and elapsed time below the composer. Available stats depend on the provider."
++          resetAction={
++            settings.statsForNerdsEnabled !== DEFAULT_UNIFIED_SETTINGS.statsForNerdsEnabled ? (
++              <SettingResetButton
++                label="stats for nerds"
++                onClick={() =>
++                  updateSettings({
++                    statsForNerdsEnabled: DEFAULT_UNIFIED_SETTINGS.statsForNerdsEnabled,
++                  })
++                }
++              />
++            ) : null
++          }
++          control={
++            <Switch
++              checked={settings.statsForNerdsEnabled}
++              onCheckedChange={(checked) =>
++                updateSettings({ statsForNerdsEnabled: Boolean(checked) })
++              }
++              aria-label="Stats for nerds"
++            />
++          }
++        />
++
+         <SettingsRow
+           {...searchableSetting("send-shortcut")}
+           description="Choose when Enter sends a prompt or inserts a new line"
+diff --git a/apps/web/src/components/settings/settingsSearch.ts b/apps/web/src/components/settings/settingsSearch.ts
+index 53032977f..c5458e54c 100644
+--- a/apps/web/src/components/settings/settingsSearch.ts
++++ b/apps/web/src/components/settings/settingsSearch.ts
+@@ -414,6 +414,12 @@ export const SETTINGS_SEARCH_ITEMS = [
+     to: "/settings/general",
+     searchTerms: ["composer rest resting scroll wheel conversation timeline shrink minimize"],
+   },
++  {
++    id: "stats-for-nerds",
++    title: "Stats for nerds",
++    to: "/settings/general",
++    searchTerms: ["context tokens cache elapsed telemetry composer usage"],
++  },
+   {
+     id: "send-shortcut",
+     title: "Send shortcut",
+diff --git a/packages/client-runtime/src/state/orchestrationV2Projection.test.ts b/packages/client-runtime/src/state/orchestrationV2Projection.test.ts
+index eb7a6217c..019239a72 100644
+--- a/packages/client-runtime/src/state/orchestrationV2Projection.test.ts
++++ b/packages/client-runtime/src/state/orchestrationV2Projection.test.ts
+@@ -146,6 +146,13 @@ describe("applyOrchestrationV2ProjectionEvent", () => {
+       status: "running" as const,
+       startedAt: now,
+       completedAt: null,
++      responseThroughput: {
++        basis: "codex_active_windows_estimate" as const,
++        outputTokens: 400,
++        elapsedMs: 4000,
++        responseCount: 2,
++        partial: true,
++      },
+       tokenUsage: {
+         usedTokens: 50_000,
+         maxTokens: 200_000,
+@@ -164,6 +171,7 @@ describe("applyOrchestrationV2ProjectionEvent", () => {
+         status: "completed",
+         completedAt: now,
+         tokenUsage: undefined,
++        responseThroughput: undefined,
+       },
+     } as OrchestrationV2DomainEvent;
+ 
+@@ -171,6 +179,11 @@ describe("applyOrchestrationV2ProjectionEvent", () => {
+ 
+     expect(next?.providerTurns[0]?.status).toBe("completed");
+     expect(next?.providerTurns[0]?.tokenUsage).toEqual(running.tokenUsage);
++    expect(next?.providerTurns[0]?.responseThroughput).toEqual(running.responseThroughput);
++    // Reapplying an event after subscription replay must not accumulate samples.
++    expect(
++      applyOrchestrationV2ProjectionEvent(next!, event)?.providerTurns[0]?.responseThroughput,
++    ).toEqual(running.responseThroughput);
+   });
+ 
+   it("applies thread lifecycle payloads instead of leaving stale metadata", () => {
+diff --git a/packages/client-runtime/src/state/orchestrationV2Projection.ts b/packages/client-runtime/src/state/orchestrationV2Projection.ts
+index c93044e93..065caf434 100644
+--- a/packages/client-runtime/src/state/orchestrationV2Projection.ts
++++ b/packages/client-runtime/src/state/orchestrationV2Projection.ts
+@@ -270,22 +270,23 @@ export function applyOrchestrationV2ProjectionEvent(
+       };
+     case "provider-thread.updated":
+       return { ...base, providerThreads: upsertEntity(base.providerThreads, event.payload) };
+-    case "provider-turn.updated":
++    case "provider-turn.updated": {
++      const current = base.providerTurns.find((turn) => turn.id === event.payload.id);
+       return {
+         ...base,
+         providerTurns: upsertEntity(base.providerTurns, {
+           ...event.payload,
+-          ...((event.payload.tokenUsage ??
+-            base.providerTurns.find((turn) => turn.id === event.payload.id)?.tokenUsage) ===
+-          undefined
++          ...((event.payload.tokenUsage ?? current?.tokenUsage) === undefined
++            ? {}
++            : { tokenUsage: event.payload.tokenUsage ?? current?.tokenUsage }),
++          ...((event.payload.responseThroughput ?? current?.responseThroughput) === undefined
+             ? {}
+             : {
+-                tokenUsage:
+-                  event.payload.tokenUsage ??
+-                  base.providerTurns.find((turn) => turn.id === event.payload.id)?.tokenUsage,
++                responseThroughput: event.payload.responseThroughput ?? current?.responseThroughput,
+               }),
+         }),
+       };
++    }
+     case "runtime-request.updated":
+       return { ...base, runtimeRequests: upsertEntity(base.runtimeRequests, event.payload) };
+     case "message.updated":
+diff --git a/packages/contracts/src/orchestrationV2.test.ts b/packages/contracts/src/orchestrationV2.test.ts
+index 7f31463a1..42de3f6f3 100644
+--- a/packages/contracts/src/orchestrationV2.test.ts
++++ b/packages/contracts/src/orchestrationV2.test.ts
+@@ -17,6 +17,7 @@ import {
+   ProviderReplayTranscript,
+   ProviderThreadId,
+   RunAttemptId,
++  ProviderTurnId,
+   RunId,
+   ThreadId,
+   TrimmedNonEmptyString,
+@@ -32,6 +33,7 @@ import {
+   OrchestrationV2ProviderCapabilities,
+   OrchestrationV2ProviderThread,
+   OrchestrationV2ProviderThreadJson,
++  OrchestrationV2ProviderTurnJson,
+   OrchestrationV2RpcSchemas,
+   OrchestrationV2ShellSnapshot,
+   OrchestrationV2SubscribeThreadInput,
+@@ -1551,3 +1553,72 @@ describe("latestProviderTurnForAttempt", () => {
+     expect(latestProviderTurnForAttempt(turns, null)).toBeUndefined();
+   });
+ });
++
++describe("provider response throughput wire persistence", () => {
++  const base = {
++    id: ProviderTurnId.make("response-turn"),
++    providerThreadId: ProviderThreadId.make("response-thread"),
++    nodeId: NodeId.make("response-node"),
++    runAttemptId: null,
++    nativeTurnRef: null,
++    ordinal: 1,
++    status: "completed" as const,
++    startedAt: now,
++    completedAt: now,
++  };
++  const codec = Schema.fromJsonString(OrchestrationV2ProviderTurnJson);
++  const decodeTurn = Schema.decodeUnknownSync(OrchestrationV2ProviderTurnJson);
++  it("round-trips aggregates and reads historical payloads without inventing telemetry", () => {
++    const responseThroughput = {
++      outputTokens: 400,
++      elapsedMs: 4000.5,
++      responseCount: 2,
++      partial: true,
++    };
++    const encode = Schema.encodeSync(codec);
++    const decode = Schema.decodeUnknownSync(codec);
++    expect(decode(encode({ ...base, responseThroughput })).responseThroughput).toEqual(
++      responseThroughput,
++    );
++    expect(decode(encode(base)).responseThroughput).toBeUndefined();
++  });
++  it("round-trips both measurement bases and accepts pre-basis Claude telemetry", () => {
++    const encode = Schema.encodeSync(codec);
++    const decode = Schema.decodeUnknownSync(codec);
++    for (const basis of ["claude_observed", "codex_active_windows_estimate"] as const) {
++      const responseThroughput = {
++        basis,
++        outputTokens: 400,
++        elapsedMs: 4000,
++        responseCount: 2,
++        partial: true,
++      };
++      expect(decode(encode({ ...base, responseThroughput })).responseThroughput).toEqual(
++        responseThroughput,
++      );
++    }
++    expect(() =>
++      decodeTurn({
++        ...base,
++        responseThroughput: {
++          basis: "whole_turn",
++          outputTokens: 400,
++          elapsedMs: 4000,
++          responseCount: 2,
++          partial: false,
++        },
++      }),
++    ).toThrow();
++  });
++  it("rejects invalid aggregate durations and counts", () => {
++    const decode = Schema.decodeUnknownSync(OrchestrationV2ProviderTurnJson);
++    for (const elapsedMs of [0, -1, NaN, Infinity]) {
++      expect(() =>
++        decode({
++          ...base,
++          responseThroughput: { outputTokens: 400, elapsedMs, responseCount: 2, partial: false },
++        }),
++      ).toThrow();
++    }
++  });
++});
+diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
+index fa4b7738e..d66b643be 100644
+--- a/packages/contracts/src/orchestrationV2.ts
++++ b/packages/contracts/src/orchestrationV2.ts
+@@ -977,6 +977,16 @@ export const OrchestrationV2ProviderTurn = Schema.Struct({
+   completedAt: Schema.NullOr(Schema.DateTimeUtc),
+   tokenUsage: Schema.optional(OrchestrationV2ProviderTurnTokenUsage),
+   turnTokenUsage: Schema.optional(TurnTokenUsage),
++  /** Provider output over response activity. Missing basis is legacy Claude observed telemetry. */
++  responseThroughput: Schema.optional(
++    Schema.Struct({
++      basis: Schema.optional(Schema.Literals(["claude_observed", "codex_active_windows_estimate"])),
++      outputTokens: NonNegativeInt,
++      elapsedMs: Schema.Number.check(Schema.isFinite(), Schema.isGreaterThan(0)),
++      responseCount: PositiveInt,
++      partial: Schema.Boolean,
++    }),
++  ),
+ });
+ export type OrchestrationV2ProviderTurn = typeof OrchestrationV2ProviderTurn.Type;
+ 
+diff --git a/packages/contracts/src/settings.ts b/packages/contracts/src/settings.ts
+index 60d2aceed..1b7b4099e 100644
+--- a/packages/contracts/src/settings.ts
++++ b/packages/contracts/src/settings.ts
+@@ -404,6 +404,7 @@ export const ClientSettingsSchema = Schema.Struct({
+ 
+   planModeEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+   contextWindowMeterEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
++  statsForNerdsEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+   composerCollapseOnScroll: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+   composerRichTextEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+   sendShortcut: Schema.Literals(["enter", "mod-enter-multiline", "mod-enter"]).pipe(
+@@ -1562,6 +1563,7 @@ export const ClientSettingsPatch = Schema.Struct({
+   pullRequestLinksOpenInApp: Schema.optionalKey(Schema.Boolean),
+   planModeEnabled: Schema.optionalKey(Schema.Boolean),
+   contextWindowMeterEnabled: Schema.optionalKey(Schema.Boolean),
++  statsForNerdsEnabled: Schema.optionalKey(Schema.Boolean),
+   composerCollapseOnScroll: Schema.optionalKey(Schema.Boolean),
+   composerRichTextEnabled: Schema.optionalKey(Schema.Boolean),
+   sendShortcut: Schema.optionalKey(Schema.Literals(["enter", "mod-enter-multiline", "mod-enter"])),

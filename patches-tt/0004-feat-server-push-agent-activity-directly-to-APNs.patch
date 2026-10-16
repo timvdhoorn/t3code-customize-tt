@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: timvdhoorn <timvdhoorn@gmail.com>
 Date: Thu, 15 Oct 2026 20:29:15 +0200
-Subject: [PATCH 4/5] feat(server): push agent activity directly to APNs
+Subject: [PATCH 4/6] feat(server): push agent activity directly to APNs
 
 A server with an APNs auth key in its secret store (direct-push-apns) sends
 agent notifications and Live Activity updates to APNs itself, for an app
@@ -23,21 +23,21 @@ Activity it filled itself. Without a key the server behaves as upstream.
  .../src/environment/ServerEnvironment.ts      |   8 +-
  .../src/observability/RpcInstrumentation.ts   |   3 +
  .../src/relay/AgentAwarenessRelay.test.ts     |  67 +++
- apps/server/src/relay/AgentAwarenessRelay.ts  |  78 ++-
+ apps/server/src/relay/AgentAwarenessRelay.ts  |  76 ++-
  apps/server/src/server.ts                     |   4 +
  apps/server/src/ws.ts                         |  14 +
  packages/contracts/src/rpc.ts                 |  37 ++
- 12 files changed, 1753 insertions(+), 27 deletions(-)
+ 12 files changed, 1753 insertions(+), 25 deletions(-)
  create mode 100644 apps/server/src/directPush/ApnsTransport.ts
  create mode 100644 apps/server/src/directPush/DirectPush.test.ts
  create mode 100644 apps/server/src/directPush/DirectPush.ts
  create mode 100644 apps/server/src/directPush/agentActivityDelivery.ts
 
 diff --git a/apps/server/src/auth/RpcAuthorization.ts b/apps/server/src/auth/RpcAuthorization.ts
-index b9b7f1e59..f46392b20 100644
+index b558c08bc..704583ba5 100644
 --- a/apps/server/src/auth/RpcAuthorization.ts
 +++ b/apps/server/src/auth/RpcAuthorization.ts
-@@ -113,6 +113,9 @@ export const RPC_REQUIRED_SCOPES = {
+@@ -108,6 +108,9 @@ export const RPC_REQUIRED_SCOPES = {
    [WS_METHODS.serverRefreshUsageRates]: AuthDiagnosticsReadScope,
    [WS_METHODS.serverSignalProcess]: AuthEnvironmentMaintainScope,
    [WS_METHODS.serverReportClientActivity]: AuthOrchestrationReadScope,
@@ -1638,7 +1638,7 @@ index 000000000..1bfc077a8
 +  );
 +}
 diff --git a/apps/server/src/environment/ServerEnvironment.ts b/apps/server/src/environment/ServerEnvironment.ts
-index 4667be737..10d51bc37 100644
+index cef5d9358..2693e78f8 100644
 --- a/apps/server/src/environment/ServerEnvironment.ts
 +++ b/apps/server/src/environment/ServerEnvironment.ts
 @@ -17,6 +17,7 @@ import packageJson from "../../package.json" with { type: "json" };
@@ -1649,7 +1649,7 @@ index 4667be737..10d51bc37 100644
  import { resolveServerSelfUpdateCapability } from "../cloud/selfUpdate.ts";
  import { resolveServiceLauncherMode } from "../cloud/serviceLauncherClient.ts";
  import * as ServerConfig from "../config.ts";
-@@ -274,7 +275,12 @@ export const make = Effect.gen(function* () {
+@@ -272,7 +273,12 @@ export const make = Effect.gen(function* () {
      // The publish opt-in and relay link change at runtime (`t3 connect
      // publish`, the client settings toggle), so the capability is read per
      // descriptor request rather than baked in at startup.
@@ -1664,10 +1664,10 @@ index 4667be737..10d51bc37 100644
          ...descriptor,
          capabilities: { ...descriptor.capabilities, agentActivityPublishing },
 diff --git a/apps/server/src/observability/RpcInstrumentation.ts b/apps/server/src/observability/RpcInstrumentation.ts
-index 6b0522431..63c45e2c3 100644
+index 161694d55..6c5963b35 100644
 --- a/apps/server/src/observability/RpcInstrumentation.ts
 +++ b/apps/server/src/observability/RpcInstrumentation.ts
-@@ -84,6 +84,9 @@ const RPC_AGGREGATES = {
+@@ -83,6 +83,9 @@ const RPC_AGGREGATES = {
    [WS_METHODS.serverRefreshUsageRates]: "server",
    [WS_METHODS.serverSignalProcess]: "server",
    [WS_METHODS.serverReportClientActivity]: "server",
@@ -1678,7 +1678,7 @@ index 6b0522431..63c45e2c3 100644
    [WS_METHODS.serverGetBackgroundPolicy]: "server",
    [WS_METHODS.scheduledTasksList]: "scheduledTasks",
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.test.ts b/apps/server/src/relay/AgentAwarenessRelay.test.ts
-index 944f58c79..cf58912f1 100644
+index 285f2cfe1..055f9d52f 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.test.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.test.ts
 @@ -34,6 +34,7 @@ import {
@@ -1689,15 +1689,15 @@ index 944f58c79..cf58912f1 100644
  import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
  import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
  import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
-@@ -144,6 +145,7 @@ const makeTestRelay = Effect.fnUntraced(function* (
-     /** Serves shells from this source instead of `currentShell`. */
+@@ -142,6 +143,7 @@ const makeTestRelay = Effect.fnUntraced(function* (
+     readonly linked?: boolean;
      readonly readShell?: (threadId: ThreadId) => Effect.Effect<OrchestrationV2ThreadShell | null>;
      readonly domainEvents?: Stream.Stream<OrchestrationV2DomainEvent>;
 +    readonly directPush?: DirectPush.DirectPush["Service"];
    } = {},
  ) {
    const values = new Map<string, Uint8Array>(
-@@ -285,6 +287,10 @@ const makeTestRelay = Effect.fnUntraced(function* (
+@@ -282,6 +284,10 @@ const makeTestRelay = Effect.fnUntraced(function* (
      }),
      Effect.provideService(FetchHttpClient.Fetch, fetch),
      Effect.provide(NodeCrypto.layer),
@@ -1708,7 +1708,7 @@ index 944f58c79..cf58912f1 100644
    );
    return { relay, secrets, secretReads, currentShell, shellReads, publications, catchUp };
  });
-@@ -377,6 +383,67 @@ describe("AgentAwarenessRelay", () => {
+@@ -373,6 +379,67 @@ describe("AgentAwarenessRelay", () => {
      }),
    );
  
@@ -1777,7 +1777,7 @@ index 944f58c79..cf58912f1 100644
      Effect.gen(function* () {
        const { relay, currentShell, publications } = yield* makeTestRelay();
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.ts b/apps/server/src/relay/AgentAwarenessRelay.ts
-index ae9d053ac..b191fa353 100644
+index fb21aa6e7..d79231fdb 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.ts
 @@ -46,6 +46,7 @@ import {
@@ -1788,8 +1788,8 @@ index ae9d053ac..b191fa353 100644
  import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
  import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
  import * as ProjectService from "../project/ProjectService.ts";
-@@ -379,6 +380,12 @@ export const make = Effect.gen(function* () {
-   // Holds at most one pending wake, so a burst of requests costs one retry.
+@@ -371,6 +372,12 @@ export const make = Effect.gen(function* () {
+   const activeSnapshotPublishedRef = yield* Ref.make(false);
    const catchUpRequests = yield* Queue.dropping<void>(1);
    const publishedStateByThreadRef = yield* Ref.make(new Map<ThreadId, string>());
 +  // Direct push (an APNs key in the secret store) publishes without the relay.
@@ -1801,7 +1801,7 @@ index ae9d053ac..b191fa353 100644
  
    const readSecretString = (name: string) =>
      secrets
-@@ -444,8 +451,9 @@ export const make = Effect.gen(function* () {
+@@ -434,8 +441,9 @@ export const make = Effect.gen(function* () {
    });
  
    const publishThreadUnsafe = Effect.fn("publishThreadUnsafe")(function* (threadId: ThreadId) {
@@ -1812,7 +1812,7 @@ index ae9d053ac..b191fa353 100644
        yield* cancelPublishRetries;
        yield* resetPublishedConnection;
        yield* Effect.logDebug("agent activity publish skipped; publication disabled", {
-@@ -453,8 +461,8 @@ export const make = Effect.gen(function* () {
+@@ -443,8 +451,8 @@ export const make = Effect.gen(function* () {
        });
        return;
      }
@@ -1823,7 +1823,7 @@ index ae9d053ac..b191fa353 100644
        yield* cancelPublishRetries;
        yield* resetPublishedConnection;
        yield* Effect.logDebug("agent activity publish skipped; relay link credentials unavailable", {
-@@ -463,9 +471,10 @@ export const make = Effect.gen(function* () {
+@@ -453,9 +461,10 @@ export const make = Effect.gen(function* () {
        return;
      }
      if (
@@ -1837,7 +1837,7 @@ index ae9d053ac..b191fa353 100644
      ) {
        yield* resetPublishedConnection;
        publishedRelayConfig = relayConfig;
-@@ -478,8 +487,17 @@ export const make = Effect.gen(function* () {
+@@ -466,8 +475,17 @@ export const make = Effect.gen(function* () {
        readonly projectId: string | null;
        readonly state: RelayAgentActivityState | null;
        readonly reason: string;
@@ -1855,7 +1855,7 @@ index ae9d053ac..b191fa353 100644
          if (cachedRelayClient === undefined) {
            cachedRelayClient = yield* makeRelayClient(relayConfig);
          }
-@@ -634,6 +652,7 @@ export const make = Effect.gen(function* () {
+@@ -614,6 +632,7 @@ export const make = Effect.gen(function* () {
        projectId: snapshot.projectId,
        state: snapshot.state,
        reason: snapshot.reason,
@@ -1863,12 +1863,10 @@ index ae9d053ac..b191fa353 100644
      });
      publishConfirmDeadlines.delete(threadId);
      yield* Ref.update(publishedStateByThreadRef, (publishedStates) => {
-@@ -707,26 +726,33 @@ export const make = Effect.gen(function* () {
-   // Publishes the active threads once. Returns why it did not, so the retry
-   // knows whether it is waiting on a link or on the publish setting.
+@@ -685,24 +704,33 @@ export const make = Effect.gen(function* () {
+   });
+ 
    const publishActiveThreadsUnsafe = Effect.gen(function* () {
--    // One secret read settles the common never-linked case; the full link
--    // config is read only once publishing is on.
 -    const relayUrl = yield* readSecretString(RELAY_URL_SECRET).pipe(
 -      Effect.orElseSucceed(() => null),
 -    );
@@ -1918,7 +1916,7 @@ index ae9d053ac..b191fa353 100644
      const environmentId = yield* serverEnvironment.getEnvironmentId;
      const [projectSnapshot, shellSnapshot] = yield* Effect.all([
 diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
-index cd3cfafec..10eea8ed1 100644
+index 104541ea4..638abcb3e 100644
 --- a/apps/server/src/server.ts
 +++ b/apps/server/src/server.ts
 @@ -80,6 +80,7 @@ import * as Keybindings from "./keybindings.ts";
@@ -1929,7 +1927,7 @@ index cd3cfafec..10eea8ed1 100644
  import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
  import * as ServerSettings from "./serverSettings.ts";
  import * as ProjectEnrichmentService from "./project/ProjectEnrichmentService.ts";
-@@ -670,6 +671,9 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
+@@ -630,6 +631,9 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
    Layer.provideMerge(layerRepositoryIdentityResolver),
    Layer.provideMerge(layerServerEnvironment),
    Layer.provideMerge(layerAuth),
@@ -1940,7 +1938,7 @@ index cd3cfafec..10eea8ed1 100644
    Layer.provideMerge(
      Layer.mergeAll(
 diff --git a/apps/server/src/ws.ts b/apps/server/src/ws.ts
-index 21f74d94b..fd341c3d2 100644
+index 84cfb8430..5091cd1ca 100644
 --- a/apps/server/src/ws.ts
 +++ b/apps/server/src/ws.ts
 @@ -218,6 +218,7 @@ import * as DirectEndpoints from "./environment/DirectEndpoints.ts";
@@ -1951,7 +1949,7 @@ index 21f74d94b..fd341c3d2 100644
  import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
  import { requiredScopeForDeviceList, rpcAuthorizationError } from "./auth/RpcAuthorization.ts";
  import * as RpcAuthorization from "./auth/RpcAuthorization.ts";
-@@ -1309,6 +1310,7 @@ const layerWsRpc = (
+@@ -1263,6 +1264,7 @@ const layerWsRpc = (
        const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
        const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
        const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
@@ -1959,7 +1957,7 @@ index 21f74d94b..fd341c3d2 100644
        const rpcClientIds = yield* Ref.make(new Set<RpcClientId>());
        yield* Effect.addFinalizer(() =>
          Ref.get(rpcClientIds).pipe(
-@@ -2471,6 +2473,18 @@ const layerWsRpc = (
+@@ -2415,6 +2417,18 @@ const layerWsRpc = (
                ),
              ),
            ),
@@ -1979,7 +1977,7 @@ index 21f74d94b..fd341c3d2 100644
            backgroundPolicy.reportHostPowerState(input),
          [WS_METHODS.serverGetBackgroundPolicy]: (_input) => backgroundPolicy.snapshot,
 diff --git a/packages/contracts/src/rpc.ts b/packages/contracts/src/rpc.ts
-index fc99d1238..958caee4f 100644
+index 9536aa93a..7eaf11106 100644
 --- a/packages/contracts/src/rpc.ts
 +++ b/packages/contracts/src/rpc.ts
 @@ -26,6 +26,11 @@ import * as Rpc from "effect/rpc/Rpc";
@@ -1994,7 +1992,7 @@ index fc99d1238..958caee4f 100644
  import {
    CodexAuthCallbackInput,
    CodexAuthCallbackState,
-@@ -510,6 +515,11 @@ export const WS_METHODS = {
+@@ -498,6 +503,11 @@ export const WS_METHODS = {
    serverSignalProcess: "server.signalProcess",
    serverReportClientActivity: "server.reportClientActivity",
    serverReportHostPowerState: "server.reportHostPowerState",
@@ -2006,7 +2004,7 @@ index fc99d1238..958caee4f 100644
    serverGetBackgroundPolicy: "server.getBackgroundPolicy",
    serverGetUsageSummary: "server.getUsageSummary",
    serverRefreshUsageRates: "server.refreshUsageRates",
-@@ -949,6 +959,30 @@ const WsServerReportClientActivityRpc = Rpc.make(WS_METHODS.serverReportClientAc
+@@ -920,6 +930,30 @@ const WsServerReportClientActivityRpc = Rpc.make(WS_METHODS.serverReportClientAc
    error: EnvironmentAuthorizationError,
  });
  
@@ -2037,7 +2035,7 @@ index fc99d1238..958caee4f 100644
  const WsServerReportHostPowerStateRpc = Rpc.make(WS_METHODS.serverReportHostPowerState, {
    payload: HostPowerSnapshot,
    error: EnvironmentAuthorizationError,
-@@ -1958,6 +1992,9 @@ export const WsRpcGroup = RpcGroup.make(
+@@ -1912,6 +1946,9 @@ export const WsRpcGroup = RpcGroup.make(
    WsScheduledTasksListWebhookDeliveriesRpc,
    WsScheduledTasksGetWebhookDeliveryRpc,
    WsServerReportClientActivityRpc,

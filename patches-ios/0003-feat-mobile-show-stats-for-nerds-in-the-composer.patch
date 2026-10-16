@@ -19,13 +19,13 @@ Subject: [PATCH 3/6] feat(mobile): show stats for nerds in the composer
  .../components/chat/ComposerStats.logic.ts    | 303 +-------
  .../web/src/components/chat/ComposerStats.tsx |  57 +-
  .../components/chat/ContextWindowMeter.tsx    |   5 +-
- apps/web/src/lib/contextWindow.ts             | 180 +----
+ apps/web/src/lib/contextWindow.ts             | 178 +----
  packages/client-runtime/package.json          |   8 +
  .../src/state/composerStats.test.ts           | 668 ++++++++++++++++++
  .../client-runtime/src/state/composerStats.ts | 427 +++++++++++
  .../src/state/contextWindow.test.ts           | 158 +++++
- .../client-runtime/src/state/contextWindow.ts | 179 +++++
- 21 files changed, 2208 insertions(+), 578 deletions(-)
+ .../client-runtime/src/state/contextWindow.ts | 177 +++++
+ 21 files changed, 2206 insertions(+), 576 deletions(-)
  create mode 100644 apps/mobile/src/features/threads/ComposerStats.tsx
  create mode 100644 apps/mobile/src/state/use-composer-stats.ts
  create mode 100644 packages/client-runtime/src/state/composerStats.test.ts
@@ -34,7 +34,7 @@ Subject: [PATCH 3/6] feat(mobile): show stats for nerds in the composer
  create mode 100644 packages/client-runtime/src/state/contextWindow.ts
 
 diff --git a/apps/mobile/src/features/settings/SettingsThreadsRouteScreen.tsx b/apps/mobile/src/features/settings/SettingsThreadsRouteScreen.tsx
-index 92fce122c..c9517bdb4 100644
+index dea74b2cd..f5839abdd 100644
 --- a/apps/mobile/src/features/settings/SettingsThreadsRouteScreen.tsx
 +++ b/apps/mobile/src/features/settings/SettingsThreadsRouteScreen.tsx
 @@ -47,6 +47,7 @@ export function SettingsThreadsRouteScreen() {
@@ -45,7 +45,7 @@ index 92fce122c..c9517bdb4 100644
            <BetaSettingsSection />
            <LegacySettingsSection />
          </ScrollView>
-@@ -260,6 +261,31 @@ function AutoSettleSettingsRows() {
+@@ -257,6 +258,31 @@ function AutoSettleSettingsRows() {
    );
  }
  
@@ -74,9 +74,9 @@ index 92fce122c..c9517bdb4 100644
 +  );
 +}
 +
- /**
-  * Device-local beta toggles, the counterpart of web's Working section (beta)
-  * in Settings → General.
+ function BetaSettingsSection() {
+   const savePreferences = useAtomSet(updateMobilePreferencesAtom);
+   const preferences = useAtomValue(mobilePreferencesAtom);
 diff --git a/apps/mobile/src/features/threads/ComposerStats.tsx b/apps/mobile/src/features/threads/ComposerStats.tsx
 new file mode 100644
 index 000000000..31689075a
@@ -649,10 +649,10 @@ index 000000000..31689075a
 +  );
 +}
 diff --git a/apps/mobile/src/features/threads/ThreadComposer.tsx b/apps/mobile/src/features/threads/ThreadComposer.tsx
-index 235ebb661..1072618e5 100644
+index eac7ce224..9c5c0e0fd 100644
 --- a/apps/mobile/src/features/threads/ThreadComposer.tsx
 +++ b/apps/mobile/src/features/threads/ThreadComposer.tsx
-@@ -161,6 +161,8 @@ export interface ThreadComposerProps {
+@@ -148,6 +148,8 @@ export interface ThreadComposerProps {
    readonly selectedThread: EnvironmentThreadShell;
    readonly reportedModelSelection?: ModelSelection | null;
    readonly hasCompactableConversation: boolean;
@@ -661,7 +661,7 @@ index 235ebb661..1072618e5 100644
    readonly serverConfig: T3ServerConfig | null;
    readonly queueCount: number;
    readonly activeThreadBusy: boolean;
-@@ -1205,6 +1207,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
+@@ -1134,6 +1136,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
              This connection cannot control this task. You can still edit your draft.
            </Text>
          ) : null}
@@ -670,7 +670,7 @@ index 235ebb661..1072618e5 100644
  
        <VideoPreviewModal source={previewVideo} onRequestClose={closePreview} />
 diff --git a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
-index 844311d5a..6950c4d5f 100644
+index d9da5f506..c5d771980 100644
 --- a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
 +++ b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
 @@ -145,6 +145,9 @@ import {
@@ -683,16 +683,16 @@ index 844311d5a..6950c4d5f 100644
  import { ThreadFeed, type ThreadFeedHistoryControls } from "./ThreadFeed";
  import { useThreadTurnSubagents } from "./ThreadAgentsSheet";
  import { ComposerQueuedEditBanner } from "./ComposerQueuedEdit";
-@@ -235,6 +238,8 @@ export interface ThreadDetailScreenProps {
+@@ -223,6 +226,8 @@ export interface ThreadDetailScreenProps {
    readonly onRemoveDraftImage: (imageId: string) => void;
    readonly onStopThread: () => void;
    readonly onSendMessage: (followUp?: ActiveTurnComposerAction) => Promise<MessageId | null>;
 +  /** Sends "/compact" without touching the draft. */
 +  readonly onCompactContext: () => void;
    readonly onReconnectEnvironment: () => void;
-   /** Whether the model picker may offer providers other than this thread's. */
    readonly canSwitchThreadProvider: boolean;
-@@ -583,7 +588,14 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
+   readonly onUpdateThreadModelSelection: (modelSelection: ModelSelection) => void;
+@@ -547,7 +552,14 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
      ) ||
      (props.historyControls?.hasMoreHistory === true &&
        props.selectedThread.latestUserMessageAt !== null);
@@ -706,9 +706,9 @@ index 844311d5a..6950c4d5f 100644
 +    (composerExpanded ? COMPOSER_EXPANDED_CHROME : COMPOSER_COLLAPSED_CHROME) +
 +    (composerStatsVisible ? COMPOSER_STATS_ROW_HEIGHT : 0);
    const composerOverlapHeight = composerChrome + composerBottomInset;
-   // While a user-input request is pending, the questionnaire owns the
-   // composer slot outright: expanded it is the full card, collapsed it is a
-@@ -1437,6 +1449,32 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
+   const [collapsedUserInputRequestId, setCollapsedUserInputRequestId] =
+     useState<RuntimeRequestId | null>(null);
+@@ -1347,6 +1359,32 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                          hasCompactableConversation={
                            hasCompactableConversation && !props.isCompacting
                          }
@@ -742,10 +742,10 @@ index 844311d5a..6950c4d5f 100644
                          queueCount={props.selectedThreadQueueCount}
                          activeThreadBusy={props.activeThreadBusy}
 diff --git a/apps/mobile/src/features/threads/ThreadRouteScreen.tsx b/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
-index 211cc032d..664c9727b 100644
+index 690973578..7e9aadc5a 100644
 --- a/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
 +++ b/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
-@@ -1069,6 +1069,7 @@ function ThreadRouteContent(
+@@ -1048,6 +1048,7 @@ function ThreadRouteContent(
            serverConfig={serverConfig}
            onStopThread={awaitingBootstrapTurn ? handleCancelWorktreeSetup : handleStopThread}
            onSendMessage={composer.onSendMessage}
@@ -775,19 +775,19 @@ index b9f7a17b4..8aa03e229 100644
      mocks.setPreferencesJson(
        JSON.stringify({
 diff --git a/apps/mobile/src/persistence/mobile-preferences.ts b/apps/mobile/src/persistence/mobile-preferences.ts
-index 72e163c74..e1894e817 100644
+index 4ec0f9ea8..bc7f04d89 100644
 --- a/apps/mobile/src/persistence/mobile-preferences.ts
 +++ b/apps/mobile/src/persistence/mobile-preferences.ts
-@@ -85,6 +85,8 @@ export interface Preferences {
+@@ -75,6 +75,8 @@ export interface Preferences {
+   readonly projectGroupingMode?: SidebarProjectGroupingMode;
    readonly planModeEnabled?: boolean;
-   /** Device-local counterpart of web's `sidebarWorkingShelfEnabled` beta. */
    readonly workingShelfEnabled?: boolean;
 +  /** Device-local counterpart of web's `statsForNerdsEnabled`; off by default. */
 +  readonly statsForNerdsEnabled?: boolean;
-   /** @deprecated Retained to migrate favorites to the connected environment. */
    readonly modelFavorites?: ReadonlyArray<{
      readonly provider: ProviderInstanceId;
-@@ -160,6 +162,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
+     readonly model: string;
+@@ -147,6 +149,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
      projectGroupingMode?: SidebarProjectGroupingMode;
      planModeEnabled?: boolean;
      workingShelfEnabled?: boolean;
@@ -795,7 +795,7 @@ index 72e163c74..e1894e817 100644
      modelFavorites?: Preferences["modelFavorites"];
      threadListSettledShelfExpanded?: boolean;
      threadListSnoozedShelfExpanded?: boolean;
-@@ -265,6 +268,9 @@ function sanitizePreferences(parsed: Preferences): Preferences {
+@@ -252,6 +255,9 @@ function sanitizePreferences(parsed: Preferences): Preferences {
    if (typeof parsed.workingShelfEnabled === "boolean") {
      preferences.workingShelfEnabled = parsed.workingShelfEnabled;
    }
@@ -854,10 +854,10 @@ index 000000000..c8207d610
 +  }, [enabled, projection, serverConfig, instanceId]);
 +}
 diff --git a/apps/mobile/src/state/use-thread-composer-state.ts b/apps/mobile/src/state/use-thread-composer-state.ts
-index 870f76afc..2fed5fbd6 100644
+index 438b41967..e25caf3fc 100644
 --- a/apps/mobile/src/state/use-thread-composer-state.ts
 +++ b/apps/mobile/src/state/use-thread-composer-state.ts
-@@ -768,6 +768,45 @@ export function useThreadComposerState() {
+@@ -738,6 +738,45 @@ export function useThreadComposerState() {
      ],
    );
  
@@ -903,7 +903,7 @@ index 870f76afc..2fed5fbd6 100644
    const onChangeDraftMessage = useCallback(
      (value: string) => {
        if (!selectedThreadShell) {
-@@ -1113,6 +1152,7 @@ export function useThreadComposerState() {
+@@ -1075,6 +1114,7 @@ export function useThreadComposerState() {
      onNativePasteText,
      onRemoveDraftImage,
      onSendMessage,
@@ -912,10 +912,10 @@ index 870f76afc..2fed5fbd6 100644
      onUpdateRuntimeMode,
      onUpdateInteractionMode,
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index e83ab52a9..ed62d4a89 100644
+index 3fc00dad8..0e5ea09e2 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -502,7 +502,10 @@ import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
+@@ -503,7 +503,10 @@ import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
  import { ThreadStatusLine } from "./chat/ThreadStatusLine";
  import { formatRelativeTimeLabel, formatRelativeTimeUntilLabel } from "../timestampFormat";
  import { ComposerStats } from "./chat/ComposerStats";
@@ -927,7 +927,7 @@ index e83ab52a9..ed62d4a89 100644
  import { ComposerSurface } from "./chat/ComposerSurface";
  import { resolveThreadSyncPhase } from "../threadSync";
  import {
-@@ -513,7 +516,7 @@ import {
+@@ -514,7 +517,7 @@ import {
  import {
    deriveLatestContextWindowSnapshot,
    latestProviderTurnTokenUsage,
@@ -936,7 +936,7 @@ index e83ab52a9..ed62d4a89 100644
  import {
    DRAFT_HERO_TRANSITION_ANIMATION_ID,
    DRAFT_HERO_TRANSITION_EASING,
-@@ -3738,45 +3741,11 @@ export default function ChatView(props: ChatViewProps) {
+@@ -3627,45 +3630,11 @@ export default function ChatView(props: ChatViewProps) {
      activeProviderStatus?.displayName?.trim() || activeProviderStatus?.instanceId || "";
    const composerStats = useMemo(() => {
      if (!settings.statsForNerdsEnabled) return null;
@@ -986,7 +986,7 @@ index e83ab52a9..ed62d4a89 100644
    }, [
      settings.statsForNerdsEnabled,
      settings.providerInstances,
-@@ -11801,15 +11770,12 @@ export default function ChatView(props: ChatViewProps) {
+@@ -11477,15 +11446,12 @@ export default function ChatView(props: ChatViewProps) {
                            {...composerStats}
                            onCompact={() => composerRef.current?.compactContext()}
                            compactDisabled={compactDisabled}
@@ -1009,10 +1009,10 @@ index e83ab52a9..ed62d4a89 100644
                            subscriptionSwitch={{
                              providers: providerStatuses,
 diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
-index 323efb3db..c026c9ff4 100644
+index 017705a86..af48aa622 100644
 --- a/apps/web/src/components/chat/ChatComposer.tsx
 +++ b/apps/web/src/components/chat/ChatComposer.tsx
-@@ -1144,7 +1144,7 @@ import {
+@@ -1102,7 +1102,7 @@ import {
    resolveComposerDispatchMode,
    type ComposerDispatchMode,
  } from "@t3tools/client-runtime/state/composer-dispatch";
@@ -1022,7 +1022,7 @@ index 323efb3db..c026c9ff4 100644
    getProviderSlashCommandsForSlashMenu,
    getProviderSkillsForSlashMenu,
 diff --git a/apps/web/src/components/chat/ComposerPrimaryActions.tsx b/apps/web/src/components/chat/ComposerPrimaryActions.tsx
-index fc811118a..e9b34d9ad 100644
+index 6317a090d..501fb75bd 100644
 --- a/apps/web/src/components/chat/ComposerPrimaryActions.tsx
 +++ b/apps/web/src/components/chat/ComposerPrimaryActions.tsx
 @@ -3,7 +3,7 @@ import { CheckIcon, ChevronDownIcon, ChevronLeftIcon, Minimize2Icon, PlayIcon }
@@ -1442,7 +1442,7 @@ index 4a4b72fcd..63fcc5f5b 100644
    // keeps elapsed time in the details popover.
    if (turn !== null && (hasElapsed || hasTokens || rateText !== null)) {
 diff --git a/apps/web/src/components/chat/ContextWindowMeter.tsx b/apps/web/src/components/chat/ContextWindowMeter.tsx
-index 5c9fc8bb7..12ed7c05d 100644
+index e7f4042f5..bba073eb5 100644
 --- a/apps/web/src/components/chat/ContextWindowMeter.tsx
 +++ b/apps/web/src/components/chat/ContextWindowMeter.tsx
 @@ -1,5 +1,8 @@
@@ -1456,10 +1456,10 @@ index 5c9fc8bb7..12ed7c05d 100644
  import {
    formatContextWindowCompactionMessage,
 diff --git a/apps/web/src/lib/contextWindow.ts b/apps/web/src/lib/contextWindow.ts
-index 1eca0df91..b4e8bb564 100644
+index 5bad05664..b4e8bb564 100644
 --- a/apps/web/src/lib/contextWindow.ts
 +++ b/apps/web/src/lib/contextWindow.ts
-@@ -1,179 +1 @@
+@@ -1,177 +1 @@
 -import type {
 -  OrchestrationV2ProviderTurn,
 -  OrchestrationV2ProviderTurnTokenUsage,
@@ -1502,7 +1502,6 @@ index 1eca0df91..b4e8bb564 100644
 -  return latest;
 -}
 -
--/** Prefers the provider's live usage report (#8144); falls back to the last compaction item. */
 -export function deriveLatestContextWindowSnapshot(
 -  entries: ReadonlyArray<{
 -    readonly item: OrchestrationV2TurnItem;
@@ -1633,7 +1632,6 @@ index 1eca0df91..b4e8bb564 100644
 -  if (value < 10_000) {
 -    return `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
 -  }
--  // Anything from 999,500 rounds to 1000k, so it belongs to the next unit.
 -  if (value < 999_500) {
 -    return `${Math.round(value / 1_000)}k`;
 -  }
@@ -2932,10 +2930,10 @@ index 000000000..45a882ab4
 +});
 diff --git a/packages/client-runtime/src/state/contextWindow.ts b/packages/client-runtime/src/state/contextWindow.ts
 new file mode 100644
-index 000000000..1eca0df91
+index 000000000..5bad05664
 --- /dev/null
 +++ b/packages/client-runtime/src/state/contextWindow.ts
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,177 @@
 +import type {
 +  OrchestrationV2ProviderTurn,
 +  OrchestrationV2ProviderTurnTokenUsage,
@@ -2978,7 +2976,6 @@ index 000000000..1eca0df91
 +  return latest;
 +}
 +
-+/** Prefers the provider's live usage report (#8144); falls back to the last compaction item. */
 +export function deriveLatestContextWindowSnapshot(
 +  entries: ReadonlyArray<{
 +    readonly item: OrchestrationV2TurnItem;
@@ -3109,7 +3106,6 @@ index 000000000..1eca0df91
 +  if (value < 10_000) {
 +    return `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
 +  }
-+  // Anything from 999,500 rounds to 1000k, so it belongs to the next unit.
 +  if (value < 999_500) {
 +    return `${Math.round(value / 1_000)}k`;
 +  }

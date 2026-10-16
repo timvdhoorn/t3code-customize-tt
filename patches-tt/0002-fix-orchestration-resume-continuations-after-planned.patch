@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jake Leventhal <jakeleventhal@me.com>
 Date: Thu, 15 Oct 2026 13:05:36 +0200
-Subject: [PATCH 2/5] fix(orchestration): resume continuations after planned
+Subject: [PATCH 2/6] fix(orchestration): resume continuations after planned
  worktree handoffs
 
 Port of pingdotgg/t3code#15203 (head 19f7ff972e13) until it is merged upstream. Fixes #15136.
@@ -10,8 +10,8 @@ The PR's last commit also ends the run's open root items, such as the
 t3_worktree_handoff call itself, as interrupted when the planned detach
 closes ingestion.
 ---
- .../server/src/mcp/WorktreeMcpService.test.ts | 134 ++--
- apps/server/src/mcp/WorktreeMcpService.ts     |  60 +-
+ .../server/src/mcp/WorktreeMcpService.test.ts | 133 ++--
+ apps/server/src/mcp/WorktreeMcpService.ts     |  52 +-
  .../src/orchestration-v2/EffectOutbox.ts      |   1 +
  .../src/orchestration-v2/EffectWorker.ts      |   1 +
  .../src/orchestration-v2/Orchestrator.ts      |  43 +-
@@ -23,10 +23,10 @@ closes ingestion.
  docs/user/composer.md                         |   4 +
  packages/contracts/src/orchestrationV2.ts     |   4 +
  .../src/server/ProviderAdapter.ts             |  12 +
- 13 files changed, 1088 insertions(+), 97 deletions(-)
+ 13 files changed, 1088 insertions(+), 88 deletions(-)
 
 diff --git a/apps/server/src/mcp/WorktreeMcpService.test.ts b/apps/server/src/mcp/WorktreeMcpService.test.ts
-index a2c259a5e..cdcdc4d94 100644
+index 513471134..a7a730955 100644
 --- a/apps/server/src/mcp/WorktreeMcpService.test.ts
 +++ b/apps/server/src/mcp/WorktreeMcpService.test.ts
 @@ -3,7 +3,10 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -147,7 +147,7 @@ index a2c259a5e..cdcdc4d94 100644
    const getById = vi.fn((id: ProjectId) =>
      options.projectReadFails
        ? (Effect.fail("simulated project read failure") as never)
-@@ -448,47 +478,58 @@ describe("t3_worktree_handoff", () => {
+@@ -446,46 +476,57 @@ describe("t3_worktree_handoff", () => {
        });
  
        expect(result.continuation).toEqual({ status: "scheduled", delivery: "queued" });
@@ -169,9 +169,8 @@ index a2c259a5e..cdcdc4d94 100644
 +          },
          }),
        );
-+      expect(harness.sendToThread).not.toHaveBeenCalled();
-       // The continuation must be durably queued before anything slower runs.
 -      expect(harness.sendToThread.mock.invocationCallOrder[0]).toBeLessThan(
++      expect(harness.sendToThread).not.toHaveBeenCalled();
 +      expect(harness.dispatch.mock.invocationCallOrder[0]).toBeLessThan(
          harness.runForThread.mock.invocationCallOrder[0]!,
        );
@@ -229,16 +228,15 @@ index a2c259a5e..cdcdc4d94 100644
  
    it.effect("does not queue a continuation when the thread update fails", () => {
      const harness = makeHarness({ dispatchFails: true });
-@@ -793,7 +834,7 @@ describe("t3_worktree_handoff", () => {
+@@ -780,6 +821,7 @@ describe("t3_worktree_handoff", () => {
+       const gate = yield* Deferred.make<void>();
+       const harness = makeHarness({ dispatchGate: Deferred.await(gate) });
  
-       // Interrupt arrives while the metadata dispatch is in flight; the
-       // binding-plus-continuation section must run to completion anyway so the
--      // continuation is never lost between the commit and the queue.
 +      // atomic binding and continuation commit survives the pending interruption.
        const fiber = yield* Effect.forkChild(
          runHandoff(harness, {
            branch: "feature/interrupted",
-@@ -808,7 +849,12 @@ describe("t3_worktree_handoff", () => {
+@@ -794,7 +836,12 @@ describe("t3_worktree_handoff", () => {
        yield* Fiber.join(interruption);
  
        expect(harness.dispatch).toHaveBeenCalledTimes(1);
@@ -249,14 +247,14 @@ index a2c259a5e..cdcdc4d94 100644
 +        }),
 +      );
 +      expect(harness.sendToThread).not.toHaveBeenCalled();
-       // The setup script must also survive the pending interrupt; otherwise
-       // the continuation run starts in a worktree that was never set up.
        expect(harness.runForThread).toHaveBeenCalledTimes(1);
+     }),
+   );
 diff --git a/apps/server/src/mcp/WorktreeMcpService.ts b/apps/server/src/mcp/WorktreeMcpService.ts
-index 6c471249c..f4d7cde1c 100644
+index 15cf334d6..ef41751c5 100644
 --- a/apps/server/src/mcp/WorktreeMcpService.ts
 +++ b/apps/server/src/mcp/WorktreeMcpService.ts
-@@ -135,7 +135,6 @@ const make = Effect.gen(function* () {
+@@ -134,7 +134,6 @@ const make = Effect.gen(function* () {
            );
          return {
            commandId: CommandId.make(part("command", "worktree-handoff")),
@@ -264,17 +262,15 @@ index 6c471249c..f4d7cde1c 100644
            continuationMessageId: MessageId.make(part("message", "worktree-continuation")),
          };
        }),
-@@ -270,8 +269,7 @@ const make = Effect.gen(function* () {
+@@ -258,6 +257,7 @@ const make = Effect.gen(function* () {
          );
          const worktreePath = worktree.worktree.path;
  
--        // Shared shape for "the handoff already succeeded, so report the failure
--        // in the result instead of failing the call" (continuation, setup script).
 +        // Setup errors are reported after the handoff has already committed.
          const reportFailed = (logMessage: string) =>
            Effect.catchCause((cause: Cause.Cause<unknown>) => {
              const detail = errorMessage(Cause.squash(cause));
-@@ -317,7 +315,7 @@ const make = Effect.gen(function* () {
+@@ -297,7 +297,7 @@ const make = Effect.gen(function* () {
                `Thread '${scope.thread.threadId}' was archived while the worktree was being created; the handoff was rolled back.`,
              );
            }
@@ -283,7 +279,7 @@ index 6c471249c..f4d7cde1c 100644
              .dispatch({
                type: "thread.metadata.update",
                commandId: ids.commandId,
-@@ -325,6 +323,14 @@ const make = Effect.gen(function* () {
+@@ -305,6 +305,14 @@ const make = Effect.gen(function* () {
                branch: worktree.worktree.refName,
                worktreePath,
                expectedWorktreePath: null,
@@ -298,18 +294,14 @@ index 6c471249c..f4d7cde1c 100644
              })
              .pipe(
                Effect.catchCause((cause) =>
-@@ -354,42 +360,16 @@ const make = Effect.gen(function* () {
+@@ -327,36 +335,16 @@ const make = Effect.gen(function* () {
            ),
          );
  
 -        // Queue the continuation right after the binding commits: the detach
 -        // that the metadata update schedules will terminate the calling
 -        // session, and a durably queued message is what guarantees the thread
--        // re-launches inside the worktree. When the dying run reaches a
--        // terminal state the orchestrator promotes the queued run, which
--        // derives its cwd from the updated projection.
--        // suspend: build the send effect only when the binding has succeeded,
--        // so a failed dispatch never even constructs the continuation call.
+-        // re-launches inside the worktree.
 -        const queueContinuation: Effect.Effect<WorktreeMcpContinuationStatus, WorktreeMcpFailure> =
 -          Effect.suspend(() =>
 -            input.continuationPrompt === undefined
@@ -331,8 +323,6 @@ index 6c471249c..f4d7cde1c 100644
 -                      status: "scheduled",
 -                      delivery: sendResult.delivery,
 -                    })),
--                    // catchCause via reportFailed: the binding is already recorded,
--                    // so a failed continuation must be reported, not fail the handoff.
 -                    reportFailed("worktree handoff continuation failed to queue"),
 -                  ),
 -          );
@@ -352,7 +342,7 @@ index 6c471249c..f4d7cde1c 100644
          yield* vcsStatusBroadcaster
            .refreshStatus(worktreePath)
 diff --git a/apps/server/src/orchestration-v2/EffectOutbox.ts b/apps/server/src/orchestration-v2/EffectOutbox.ts
-index c50429f3e..d7fe9c474 100644
+index cb41dc736..6f5bed979 100644
 --- a/apps/server/src/orchestration-v2/EffectOutbox.ts
 +++ b/apps/server/src/orchestration-v2/EffectOutbox.ts
 @@ -37,6 +37,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
@@ -360,14 +350,14 @@ index c50429f3e..d7fe9c474 100644
      providerSessionId: ProviderSessionId,
      detail: Schema.optional(Schema.String),
 +    reason: Schema.optional(Schema.Literal("workspace_changed")),
-     /** Set on terminal detaches (thread archive/delete): revoke the thread's MCP credentials. */
      revokeMcpCredential: Schema.optional(Schema.Boolean),
    }),
+   Schema.Struct({
 diff --git a/apps/server/src/orchestration-v2/EffectWorker.ts b/apps/server/src/orchestration-v2/EffectWorker.ts
-index aaf4507ca..085a6b568 100644
+index 6227e3a5d..5abec5a67 100644
 --- a/apps/server/src/orchestration-v2/EffectWorker.ts
 +++ b/apps/server/src/orchestration-v2/EffectWorker.ts
-@@ -135,6 +135,7 @@ export const layerExecutor: Layer.Layer<
+@@ -127,6 +127,7 @@ export const layerExecutor: Layer.Layer<
                  providerSessionId: effect.request.providerSessionId,
                  threadId: effect.threadId,
                  ...(effect.request.detail === undefined ? {} : { detail: effect.request.detail }),
@@ -376,10 +366,10 @@ index aaf4507ca..085a6b568 100644
                    ? {}
                    : { revokeMcpCredential: effect.request.revokeMcpCredential }),
 diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
-index 5e889b17e..266cbdb5f 100644
+index 8369af77f..584433ea3 100644
 --- a/apps/server/src/orchestration-v2/Orchestrator.ts
 +++ b/apps/server/src/orchestration-v2/Orchestrator.ts
-@@ -2550,6 +2550,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -2511,6 +2511,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
          cause: `Thread ${command.threadId} branch changed before the metadata update could be applied.`,
        });
      }
@@ -406,7 +396,7 @@ index 5e889b17e..266cbdb5f 100644
      if (command.type === "thread.metadata.update" && command.expectedEmpty === true) {
        const records = yield* projectionStore
          .getThreadRecords(command.threadId, ["runs"])
-@@ -3504,6 +3524,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -3435,6 +3455,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                  // Terminal detaches revoke the thread's MCP credentials; other
                  // detach reasons keep them so a re-attaching provider process
                  // stays authorized.
@@ -416,7 +406,7 @@ index 5e889b17e..266cbdb5f 100644
                  ...(command.type === "thread.archive" ? { revokeMcpCredential: true } : {}),
                },
              } satisfies PendingOrchestrationEffectV2;
-@@ -10897,7 +10920,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -10726,7 +10749,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
        case "thread.pin.reorder":
        case "thread.active.reorder":
        case "thread.mark-unread":
@@ -424,7 +414,7 @@ index 5e889b17e..266cbdb5f 100644
        case "thread.pull-request.link":
        case "thread.pull-request.unlink":
        case "thread.pull-request-link.sync":
-@@ -10910,6 +10932,25 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -10739,6 +10761,25 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
        case "provider.switch":
          yield* dispatchThreadMutation(command, events, effects);
          break;
@@ -451,18 +441,18 @@ index 5e889b17e..266cbdb5f 100644
          yield* dispatchPullRequestWatchSync(command, events, effects);
          break;
 diff --git a/apps/server/src/orchestration-v2/ProviderSessionManager.ts b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
-index 32428d81e..dcc01f252 100644
+index edcaecfa8..593488961 100644
 --- a/apps/server/src/orchestration-v2/ProviderSessionManager.ts
 +++ b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
-@@ -189,6 +189,7 @@ export interface ProviderSessionManagerV2Shape {
+@@ -178,6 +178,7 @@ export interface ProviderSessionManagerV2Shape {
      readonly providerSessionId: ProviderSessionId;
      readonly threadId: ThreadId;
      readonly detail?: string;
 +    readonly reason?: "workspace_changed";
-     /**
-      * True for terminal detaches (thread archived or deleted): the thread's
-      * MCP credentials are revoked immediately instead of surviving for a
-@@ -578,13 +579,24 @@ export const layerWithOptions = (
+     readonly revokeMcpCredential?: boolean;
+   }) => Effect.Effect<void, ProviderSessionManagerV2Error>;
+ }
+@@ -525,13 +526,24 @@ export const layerWithOptions = (
            ),
          );
  
@@ -493,7 +483,7 @@ index 32428d81e..dcc01f252 100644
            const subscribers = yield* Ref.getAndSet(entry.eventSubscribers, new Map());
            yield* Effect.forEach(
              subscribers.values(),
-@@ -1064,6 +1076,7 @@ export const layerWithOptions = (
+@@ -989,6 +1001,7 @@ export const layerWithOptions = (
          readonly cancelIdleFiber?: boolean;
          readonly onlyIfIdleGeneration?: number;
          readonly gracefulSubscribers?: boolean;
@@ -501,7 +491,7 @@ index 32428d81e..dcc01f252 100644
        }) =>
          Effect.acquireUseRelease(
            removeLiveEntry(input),
-@@ -1090,6 +1103,7 @@ export const layerWithOptions = (
+@@ -1015,6 +1028,7 @@ export const layerWithOptions = (
                      yield* failSubscribers(
                        entry,
                        input.detail ?? `Provider session released: ${input.reason}.`,
@@ -509,7 +499,7 @@ index 32428d81e..dcc01f252 100644
                      );
                    }
                    const closeExit = yield* closeScopeWithin(entry.scope, {
-@@ -2561,6 +2575,9 @@ export const layerWithOptions = (
+@@ -2420,6 +2434,9 @@ export const layerWithOptions = (
                  reason: "manual_shutdown",
                  ...(input.detail === undefined ? {} : { detail: input.detail }),
                  detachedThreadId: input.threadId,
@@ -520,10 +510,10 @@ index 32428d81e..dcc01f252 100644
                return;
              }
 diff --git a/apps/server/src/orchestration-v2/RunExecutionService.test.ts b/apps/server/src/orchestration-v2/RunExecutionService.test.ts
-index 592886e0b..1583cced6 100644
+index 0e68d9f56..df76234e9 100644
 --- a/apps/server/src/orchestration-v2/RunExecutionService.test.ts
 +++ b/apps/server/src/orchestration-v2/RunExecutionService.test.ts
-@@ -3750,6 +3750,151 @@ it.effect("does not refresh pull requests for auxiliary or stale provider termin
+@@ -3713,6 +3713,151 @@ it.effect("does not refresh pull requests for auxiliary or stale provider termin
    }),
  );
  
@@ -675,7 +665,7 @@ index 592886e0b..1583cced6 100644
  it.effect("refreshes pull requests after a provider stream exits with an error", () =>
    Effect.gen(function* () {
      const { written, observed } = yield* captureRootRunTermination({
-@@ -3874,6 +4019,7 @@ function captureRootRunTermination(input: {
+@@ -3837,6 +3982,7 @@ function captureRootRunTermination(input: {
    readonly rejectTerminalWrite?: boolean;
    readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
    readonly seedOpenSubagent?: boolean;
@@ -683,7 +673,7 @@ index 592886e0b..1583cced6 100644
    readonly events?: (
      ids: BackgroundScenarioIds,
    ) => Stream.Stream<
-@@ -3897,6 +4043,7 @@ function captureRootRunTermination(input: {
+@@ -3860,6 +4006,7 @@ function captureRootRunTermination(input: {
      });
      const writtenItems = yield* Ref.make<ReadonlyArray<OrchestrationV2TurnItem>>([]);
      const finalEvents = yield* Ref.make<ReadonlyArray<OrchestrationV2DomainEvent>>([]);
@@ -691,7 +681,7 @@ index 592886e0b..1583cced6 100644
      const observed = yield* Ref.make<ReadonlyArray<string>>([]);
      const submittedEffects = yield* Ref.make<ReadonlyArray<PendingOrchestrationEffectV2>>([]);
      const committedEffects = yield* Ref.make<ReadonlyArray<PendingOrchestrationEffectV2>>([]);
-@@ -3953,7 +4100,8 @@ function captureRootRunTermination(input: {
+@@ -3916,7 +4063,8 @@ function captureRootRunTermination(input: {
            }),
            IdAllocator.layer,
            Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
@@ -701,7 +691,7 @@ index 592886e0b..1583cced6 100644
            }),
            ServerSettings.layerTest(),
            Layer.succeed(RunFinalizationService.RunFinalizationObserver, {
-@@ -4014,7 +4162,7 @@ function captureRootRunTermination(input: {
+@@ -3977,7 +4125,7 @@ function captureRootRunTermination(input: {
          } as OrchestrationV2Run,
          rootNode: {
            id: ids.rootNodeId,
@@ -710,7 +700,7 @@ index 592886e0b..1583cced6 100644
          } as OrchestrationV2ExecutionNode,
          checkpointScope: {
            id: CheckpointScopeId.make(`checkpoint-scope:${input.key}`),
-@@ -4025,7 +4173,7 @@ function captureRootRunTermination(input: {
+@@ -3988,7 +4136,7 @@ function captureRootRunTermination(input: {
          } as OrchestrationV2ProviderThread,
          attempt: {
            id: ids.attemptId,
@@ -719,7 +709,7 @@ index 592886e0b..1583cced6 100644
          } as OrchestrationV2RunAttempt,
          attemptId: ids.attemptId,
          providerTurnOrdinal: 1,
-@@ -4064,6 +4212,7 @@ function captureRootRunTermination(input: {
+@@ -4027,6 +4175,7 @@ function captureRootRunTermination(input: {
      return {
        written: yield* Ref.get(writtenItems),
        finalEvents: yield* Ref.get(finalEvents),
@@ -727,7 +717,7 @@ index 592886e0b..1583cced6 100644
        observed: yield* Ref.get(observed),
        submittedEffects: yield* Ref.get(submittedEffects),
        committedEffects: yield* Ref.get(committedEffects),
-@@ -4139,7 +4288,7 @@ function childBackgroundTurnItemEvent(
+@@ -4102,7 +4251,7 @@ function childBackgroundTurnItemEvent(
  function backgroundTurnItemEvent(
    ids: BackgroundScenarioIds,
    type: "command_execution" | "dynamic_tool" | "subagent",
@@ -737,10 +727,10 @@ index 592886e0b..1583cced6 100644
    itemId?: TurnItemId,
  ): ProviderAdapter.ProviderAdapterV2Event {
 diff --git a/apps/server/src/orchestration-v2/RunExecutionService.ts b/apps/server/src/orchestration-v2/RunExecutionService.ts
-index 510d18391..b271dca1a 100644
+index 61ab0a3f0..0ff489445 100644
 --- a/apps/server/src/orchestration-v2/RunExecutionService.ts
 +++ b/apps/server/src/orchestration-v2/RunExecutionService.ts
-@@ -609,6 +609,7 @@ export const layer: Layer.Layer<
+@@ -585,6 +585,7 @@ export const layer: Layer.Layer<
        readonly hasUnpairedRunInterruptRequest?: () => Effect.Effect<boolean, never>;
        readonly openRunOwnedSubagents?: OpenRunOwnedSubagentProjection;
        readonly terminal: ProviderTerminalEvent;
@@ -748,7 +738,7 @@ index 510d18391..b271dca1a 100644
        readonly failureItemPersisted: boolean;
        readonly refreshAfterTurn: Effect.Effect<void>;
        readonly writeIfRunCurrent?: {
-@@ -762,6 +763,9 @@ export const layer: Layer.Layer<
+@@ -733,6 +734,9 @@ export const layer: Layer.Layer<
                        rootNode: input.rootNode,
                        providerThread: input.providerThread,
                        completedAt,
@@ -758,7 +748,7 @@ index 510d18391..b271dca1a 100644
                      }),
                    },
                  ]
-@@ -953,6 +957,11 @@ export const layer: Layer.Layer<
+@@ -922,6 +926,11 @@ export const layer: Layer.Layer<
            const terminalEvent = yield* Ref.make<ProviderTerminalEvent | null>(null);
            const latestTurnItemOrdinal = yield* Ref.make(input.providerTurnOrdinal * 100);
            const latestProviderThread = yield* Ref.make(input.providerThread);
@@ -770,7 +760,7 @@ index 510d18391..b271dca1a 100644
            const routeIdentity: ProviderEventRouteIdentity = {
              threadId: input.run.threadId,
              runId: input.run.id,
-@@ -994,6 +1003,7 @@ export const layer: Layer.Layer<
+@@ -963,6 +972,7 @@ export const layer: Layer.Layer<
            );
            const rootTerminalSeen = yield* Ref.make(false);
            const rootRunFinalized = yield* Ref.make(false);
@@ -778,7 +768,7 @@ index 510d18391..b271dca1a 100644
            const providerThreadOwnerLost = yield* Ref.make(false);
            const activeChildProviderTurns = yield* Ref.make<ReadonlySet<ProviderTurnId>>(new Set());
            const activeChildSubagents = yield* Ref.make<ReadonlySet<NodeId>>(new Set());
-@@ -1008,6 +1018,7 @@ export const layer: Layer.Layer<
+@@ -977,6 +987,7 @@ export const layer: Layer.Layer<
                }
                const providerThread = yield* Ref.get(latestProviderThread);
                const openSubagents = yield* Ref.get(openRunOwnedSubagents);
@@ -786,7 +776,7 @@ index 510d18391..b271dca1a 100644
                yield* writeFinalRunEvents({
                  run: input.run,
                  rootNode: input.rootNode,
-@@ -1032,6 +1043,7 @@ export const layer: Layer.Layer<
+@@ -1001,6 +1012,7 @@ export const layer: Layer.Layer<
                      }),
                  openRunOwnedSubagents: openSubagents,
                  terminal,
@@ -794,7 +784,7 @@ index 510d18391..b271dca1a 100644
                  failureItemPersisted: terminal.status === "failed",
                  refreshAfterTurn,
                }).pipe(
-@@ -1244,6 +1256,81 @@ export const layer: Layer.Layer<
+@@ -1196,6 +1208,81 @@ export const layer: Layer.Layer<
            });
            const filterAssistantEvent = makeAssistantStreamingFilter(responseStreamingMode);
            const providerEventFiber = yield* eventSubscription.events.pipe(
@@ -876,7 +866,7 @@ index 510d18391..b271dca1a 100644
              Stream.filterEffect((event) =>
                Ref.modify(eventRouting, (state) => routeProviderEvent(event, routeIdentity, state)),
              ),
-@@ -1311,6 +1398,13 @@ export const layer: Layer.Layer<
+@@ -1256,6 +1343,13 @@ export const layer: Layer.Layer<
                      yield* Ref.set(latestProviderThread, event.providerThread);
                    }
                  }
@@ -890,7 +880,7 @@ index 510d18391..b271dca1a 100644
                  if (
                    event.type === "turn_item.updated" &&
                    event.turnItem.providerTurnId ===
-@@ -1319,6 +1413,18 @@ export const layer: Layer.Layer<
+@@ -1264,6 +1358,18 @@ export const layer: Layer.Layer<
                    yield* Ref.update(latestTurnItemOrdinal, (current) =>
                      Math.max(current, event.turnItem.ordinal),
                    );
@@ -909,7 +899,7 @@ index 510d18391..b271dca1a 100644
                  }
                  if (event.type === "turn.terminal") {
                    yield* Ref.set(terminalEvent, event);
-@@ -1547,6 +1653,7 @@ export function makeInterruptResultTurnItem(input: {
+@@ -1485,6 +1591,7 @@ export function makeInterruptResultTurnItem(input: {
    readonly rootNode: OrchestrationV2ExecutionNode;
    readonly providerThread: OrchestrationV2ProviderThread;
    readonly completedAt: DateTime.Utc;
@@ -917,7 +907,7 @@ index 510d18391..b271dca1a 100644
  }): OrchestrationV2TurnItem {
    return {
      id: input.idAllocator.derive.runSignalTurnItem({
-@@ -1570,6 +1677,6 @@ export function makeInterruptResultTurnItem(input: {
+@@ -1508,6 +1615,6 @@ export function makeInterruptResultTurnItem(input: {
      completedAt: input.completedAt,
      updatedAt: input.completedAt,
      type: "run_interrupt_result",
@@ -926,7 +916,7 @@ index 510d18391..b271dca1a 100644
    };
  }
 diff --git a/apps/server/src/orchestration-v2/SelectionRestart.integration.test.ts b/apps/server/src/orchestration-v2/SelectionRestart.integration.test.ts
-index 03fbfa593..124b3714d 100644
+index 1ea4f2407..957ad9d9b 100644
 --- a/apps/server/src/orchestration-v2/SelectionRestart.integration.test.ts
 +++ b/apps/server/src/orchestration-v2/SelectionRestart.integration.test.ts
 @@ -15,8 +15,10 @@ import {
@@ -1034,7 +1024,7 @@ index 03fbfa593..124b3714d 100644
                yield* publishTerminal(active, "completed");
              }),
            steerTurn: () => Effect.void,
-@@ -1006,3 +1079,552 @@ it.live.each(["active", "idle", "selection-command", "pooled", "separate-home"]
+@@ -997,3 +1070,552 @@ it.live.each(["active", "idle", "selection-command", "pooled", "separate-home"]
        }),
      ),
  );
@@ -1621,10 +1611,10 @@ index 3492e1612..d27aa04de 100644
  the oldest queued message as a steer. This leaves the current draft intact and
  requires an active turn that supports steering. Change
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
-index 27d8cb6d1..f61efca6d 100644
+index d66b643be..695daf1d3 100644
 --- a/packages/contracts/src/orchestrationV2.ts
 +++ b/packages/contracts/src/orchestrationV2.ts
-@@ -2867,6 +2867,10 @@ export const OrchestrationV2Command = Schema.Union([
+@@ -2673,6 +2673,10 @@ export const OrchestrationV2Command = Schema.Union([
      worktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
      expectedWorktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
      expectedBranch: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
@@ -1636,10 +1626,10 @@ index 27d8cb6d1..f61efca6d 100644
      expectedEmpty: Schema.optional(Schema.Boolean),
      limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecoveryUpdate)),
 diff --git a/packages/provider-core/src/server/ProviderAdapter.ts b/packages/provider-core/src/server/ProviderAdapter.ts
-index 4d7cc3136..e2ac2abda 100644
+index 1cc66c77f..d6f19918c 100644
 --- a/packages/provider-core/src/server/ProviderAdapter.ts
 +++ b/packages/provider-core/src/server/ProviderAdapter.ts
-@@ -360,6 +360,17 @@ export class ProviderAdapterEventStreamError extends Schema.TaggedError<Provider
+@@ -354,6 +354,17 @@ export class ProviderAdapterEventStreamError extends Schema.TaggedError<Provider
    }
  }
  
@@ -1657,7 +1647,7 @@ index 4d7cc3136..e2ac2abda 100644
  export class ProviderAdapterProtocolError extends Schema.TaggedError<ProviderAdapterProtocolError>()(
    "ProviderAdapterProtocolError",
    {
-@@ -389,6 +400,7 @@ export const ProviderAdapterV2Error = Schema.Union([
+@@ -383,6 +394,7 @@ export const ProviderAdapterV2Error = Schema.Union([
    ProviderAdapterInterruptError,
    ProviderAdapterRuntimeRequestResponseError,
    ProviderAdapterEventStreamError,
