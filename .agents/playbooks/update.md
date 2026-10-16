@@ -1,0 +1,34 @@
+---
+when: Tim wants T3 Code updated or asks whether there are updates ("update", "zijn er updates", "update alles", "update T3").
+extends:
+---
+
+# Update T3 Code everywhere
+
+Bring every machine in `machines.json` and the iOS app on TestFlight to the newest T3 nightly
+with the patches. Never interrupt a running thread, and never ask Tim to click what the tooling
+can do. AGENTS.md "Machines" and "Unattended ports" are the rules; this is the order.
+
+1. Status per machine. Run `./t3code-customize status` here and over SSH on each other machine
+   (`ssh <alias> 'exec "$SHELL" -lc "python3 ~/<repo path>/t3code-customize status"'`, aliases in
+   `machines.json`). Compare with the newest nightly: `gh release list --repo pingdotgg/t3code
+   --limit 5` (desktop) and `npm view t3@nightly version` (devbox1). Note the ported-PR lines
+   `status` prints and act on them per "Checking that an update did not break a fork change".
+2. Nothing newer and nothing behind: report that per machine and stop.
+3. A Mac whose app is older than the newest nightly gets it from T3's own updater: the customized
+   build downloads it itself and installs on quit (`patches-tt/0007`). Do not quit or relaunch the
+   app; tell Tim it installs the next time he quits T3 Code, unless he asks you to wait for it.
+4. Port when the patches no longer apply: `./t3code-customize build` (or `server` on devbox1)
+   reports a conflict or failing check. Port per "Porting own patches" in your own detached
+   worktree when another run holds the checkout, then export and commit to a branch and open a PR.
+5. Merge only under the standing grant in "Unattended ports": all checks passed and every patch
+   keeps the same code lines. Otherwise leave the PR open and report it as needing Tim's review.
+6. Run `./t3code-customize fleet` once the patches on `main` fit the newest nightly. It waits for a
+   held lock, moves devbox1 to the newest nightly and restarts its server only when no thread works
+   there, and turns `autoupdate on` everywhere. Run it in the background and wait on its exit; from
+   a thread on devbox1, `server` detaches into its own unit, so your own turn never blocks it.
+   `deferred: threads busy` is a valid result: report which threads, do not interrupt them.
+7. iOS: on the MacBook Pro run `./t3code-customize ios` when `status` says the iOS app is behind
+   (its `autoupdate --ios` also does this after each rebuild).
+8. Report per machine (mbp, mba, devbox1, TestFlight): nightly before and after, customized yes or
+   no, `deferred` with the busy threads, any PR left open, and what still waits for Tim's quit.
