@@ -9,20 +9,20 @@ Subject: [PATCH 4/6] feat(mobile): nest child threads under their opener in
  apps/mobile/src/features/home/HomeScreen.tsx  |  23 +
  .../threads/ThreadNavigationSidebar.tsx       |  26 +-
  .../features/threads/thread-list-v2-items.tsx | 208 +++++++-
- .../src/features/threads/threadListV2.test.ts | 165 ++++++
- .../src/features/threads/threadListV2.ts      | 472 ++++++++++++------
+ .../src/features/threads/threadListV2.test.ts | 174 +++++++
+ .../src/features/threads/threadListV2.ts      | 473 +++++++++++++-----
  .../use-thread-list-v2-shelf-preferences.ts   |  22 +
  apps/mobile/src/lib/storage.test.ts           |  13 +
  .../src/persistence/mobile-preferences.ts     |   9 +
  apps/mobile/src/state/entities.ts             |   5 +
- apps/web/src/components/Sidebar.families.ts   | 197 +-------
+ apps/web/src/components/Sidebar.families.ts   | 203 +-------
  apps/web/src/components/Sidebar.tsx           |  26 +-
  packages/client-runtime/package.json          |   4 +
- .../src/state/threadFamilies.test.ts          | 232 +++++++++
- .../src/state/threadFamilies.ts               | 229 +++++++++
+ .../src/state/threadFamilies.test.ts          | 245 +++++++++
+ .../src/state/threadFamilies.ts               | 235 +++++++++
  .../src/state/threadShell.test.ts             |  37 ++
  .../client-runtime/src/state/threadShell.ts   |  24 +
- 17 files changed, 1340 insertions(+), 357 deletions(-)
+ 17 files changed, 1369 insertions(+), 363 deletions(-)
  create mode 100644 packages/client-runtime/src/state/threadFamilies.test.ts
  create mode 100644 packages/client-runtime/src/state/threadFamilies.ts
 
@@ -467,10 +467,10 @@ index 4b9e2d327..807cb5639 100644
                  ? snoozedMenuActions
                  : !props.settlementSupported
 diff --git a/apps/mobile/src/features/threads/threadListV2.test.ts b/apps/mobile/src/features/threads/threadListV2.test.ts
-index d5946e62c..bd0392e27 100644
+index d5946e62c..5ce1c4847 100644
 --- a/apps/mobile/src/features/threads/threadListV2.test.ts
 +++ b/apps/mobile/src/features/threads/threadListV2.test.ts
-@@ -2437,3 +2437,168 @@ describe("Working section beta", () => {
+@@ -2437,3 +2437,177 @@ describe("Working section beta", () => {
      ]);
    });
  });
@@ -512,10 +512,19 @@ index d5946e62c..bd0392e27 100644
 +    expect(layout.items[1]?.familyEdge).toBe("last");
 +  });
 +
-+  it("moves an agent-settled child into its live opener's section", () => {
++  it("keeps an agent-settled finished child in Settled", () => {
 +    const layout = build([
 +      opener("boss"),
 +      child("kid", "boss", { ...settledAt, settledBy: "agent" }),
++    ]);
++    expect(ids(layout)).toEqual(["boss", "kid"]);
++    expect(layout.settledCount).toBe(1);
++  });
++
++  it("moves a settled child that waits on the user into its live opener's section", () => {
++    const layout = build([
++      opener("boss"),
++      child("kid", "boss", { ...settledAt, settledBy: "agent", hasPendingUserInput: true }),
 +    ]);
 +    expect(ids(layout)).toEqual(["boss", ">kid"]);
 +    expect(layout.settledCount).toBe(0);
@@ -640,16 +649,17 @@ index d5946e62c..bd0392e27 100644
 +  });
 +});
 diff --git a/apps/mobile/src/features/threads/threadListV2.ts b/apps/mobile/src/features/threads/threadListV2.ts
-index 4024af958..616b5e5d3 100644
+index 4024af958..391677ccc 100644
 --- a/apps/mobile/src/features/threads/threadListV2.ts
 +++ b/apps/mobile/src/features/threads/threadListV2.ts
-@@ -11,6 +11,17 @@ import type { SnoozePreset } from "@t3tools/client-runtime/state/thread-settled"
+@@ -11,6 +11,18 @@ import type { SnoozePreset } from "@t3tools/client-runtime/state/thread-settled"
  import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
  import { resolveThreadProviderStack } from "@t3tools/client-runtime/state/models";
  import { threadSearchMatchKey } from "@t3tools/client-runtime/state/thread-search";
 +import {
 +  buildSidebarThreadFamilies,
 +  childThreadNeedsUser,
++  childThreadStillRuns,
 +  foldSidebarThreadFamily,
 +  formatHiddenChildThreadsLabel,
 +  placeDelegatedChildThreads,
@@ -661,7 +671,7 @@ index 4024af958..616b5e5d3 100644
  import {
    createInboxReturnTracker,
    isThreadWorking,
-@@ -236,36 +247,164 @@ export function sortThreadsForListV2<
+@@ -236,36 +248,164 @@ export function sortThreadsForListV2<
    return sortActiveThreadsByOrderKey(threads);
  }
  
@@ -778,8 +788,8 @@ index 4024af958..616b5e5d3 100644
      }
 -    return (thread.pinnedAt != null) === (input.section === "pinned");
 +  }
-+  // A child an agent or auto-settle settled stays under an opener that is
-+  // still live; one the user settled goes to Settled.
++  // A settled child goes to Settled, whoever settled it; one that still runs
++  // or waits on the user stays under an opener that is still live.
 +  const liveSectionByKey = new Map<string, EnvironmentThreadShell[]>();
 +  for (const list of [pinned, active, working]) {
 +    for (const thread of list) liveSectionByKey.set(threadFamilyKeyOf(thread), list);
@@ -789,7 +799,7 @@ index 4024af958..616b5e5d3 100644
 +    threadFamilyKeyOf,
 +    threadOpenerKeyOf,
 +    (key) => liveSectionByKey.get(key) ?? null,
-+    (thread) => thread.settledBy === undefined,
++    (thread) => childThreadStillRuns(resolveThreadListV2Status(thread)),
 +  );
 +  settled.splice(0, settled.length, ...placedSettled.settled);
 +  for (const { thread, section } of placedSettled.moved) section.push(thread);
@@ -846,7 +856,7 @@ index 4024af958..616b5e5d3 100644
    const ordered =
      input.section === "pinned"
        ? sortPinnedThreadsByOrderKey(threads)
-@@ -277,6 +416,19 @@ export function getThreadListV2OrderedSection(input: {
+@@ -277,6 +417,19 @@ export function getThreadListV2OrderedSection(input: {
    return applyPendingThreadOrder(ordered, input.section, pending);
  }
  
@@ -866,7 +876,7 @@ index 4024af958..616b5e5d3 100644
  export interface ThreadListV2Item {
    readonly thread: EnvironmentThreadShell;
    readonly variant: "card" | "slim";
-@@ -285,6 +437,20 @@ export interface ThreadListV2Item {
+@@ -285,6 +438,20 @@ export interface ThreadListV2Item {
    /** Pinned-block row: renders the pin glyph and offers Unpin. */
    readonly pinned: boolean;
    readonly isLast: boolean;
@@ -887,7 +897,7 @@ index 4024af958..616b5e5d3 100644
  }
  
  export interface ThreadListV2Layout {
-@@ -340,6 +506,17 @@ export interface ThreadListV2ThreadListItem {
+@@ -340,6 +507,17 @@ export interface ThreadListV2ThreadListItem {
    readonly canMoveDown: boolean;
  }
  
@@ -905,7 +915,7 @@ index 4024af958..616b5e5d3 100644
  export interface ThreadListV2PendingListItem {
    readonly type: "v2-pending";
    readonly key: string;
-@@ -383,6 +560,7 @@ export interface ThreadListV2SettledShelfListItem {
+@@ -383,6 +561,7 @@ export interface ThreadListV2SettledShelfListItem {
  
  export type ThreadListV2ListItem =
    | ThreadListV2ThreadListItem
@@ -913,7 +923,7 @@ index 4024af958..616b5e5d3 100644
    | ThreadListV2PendingListItem
    | ThreadListV2WorkingShelfListItem
    | ThreadListV2SnoozedShelfListItem
-@@ -395,6 +573,7 @@ export function isThreadListV2ListItem(value: {
+@@ -395,6 +574,7 @@ export function isThreadListV2ListItem(value: {
  }): value is ThreadListV2ListItem {
    return (
      value.type === "v2-thread" ||
@@ -921,7 +931,7 @@ index 4024af958..616b5e5d3 100644
      value.type === "v2-pending" ||
      value.type === "v2-working-shelf" ||
      value.type === "v2-snoozed-shelf" ||
-@@ -422,6 +601,12 @@ export function threadListV2ListItemsAreEqual(
+@@ -422,6 +602,12 @@ export function threadListV2ListItemsAreEqual(
          previous.item.variant === item.item.variant &&
          previous.item.snoozed === item.item.snoozed &&
          previous.item.pinned === item.item.pinned &&
@@ -934,7 +944,7 @@ index 4024af958..616b5e5d3 100644
          previous.snoozeWakeLabelText === item.snoozeWakeLabelText &&
          previous.timeLabel === item.timeLabel &&
          previous.snoozePresetMinute === item.snoozePresetMinute &&
-@@ -430,6 +615,15 @@ export function threadListV2ListItemsAreEqual(
+@@ -430,6 +616,15 @@ export function threadListV2ListItemsAreEqual(
          previous.canMoveUp === item.canMoveUp &&
          previous.canMoveDown === item.canMoveDown
        );
@@ -950,7 +960,7 @@ index 4024af958..616b5e5d3 100644
      case "v2-pending":
        return (
          previous.type === "v2-pending" &&
-@@ -522,7 +716,9 @@ export function buildThreadListV2ListItems(input: {
+@@ -522,7 +717,9 @@ export function buildThreadListV2ListItems(input: {
  }): ThreadListV2ListItem[] {
    // An empty set is treated as absent so `?.` skips building the key.
    const queuedThreadKeys = input.queuedThreadKeys?.size ? input.queuedThreadKeys : undefined;
@@ -961,7 +971,7 @@ index 4024af958..616b5e5d3 100644
      const snoozeWakeLabelText =
        item.snoozed && item.thread.snoozedUntil != null && input.snoozeLabelNow !== undefined
          ? snoozeWakeLabel(item.thread.snoozedUntil, { now: input.snoozeLabelNow })
-@@ -543,7 +739,7 @@ export function buildThreadListV2ListItems(input: {
+@@ -543,7 +740,7 @@ export function buildThreadListV2ListItems(input: {
        item.variant === "card"
          ? input.moveAvailability?.get(`${item.thread.environmentId}:${item.thread.id}`)
          : undefined;
@@ -970,7 +980,7 @@ index 4024af958..616b5e5d3 100644
        type: "v2-thread",
        key: `v2-thread:${item.thread.environmentId}:${item.thread.id}`,
        item,
-@@ -556,7 +752,21 @@ export function buildThreadListV2ListItems(input: {
+@@ -556,7 +753,21 @@ export function buildThreadListV2ListItems(input: {
        canMoveUp: move?.canMoveUp === true,
        canMoveDown: move?.canMoveDown === true,
      };
@@ -992,7 +1002,7 @@ index 4024af958..616b5e5d3 100644
    const pendingItems = input.pendingTasks.map((pendingTask, index): ThreadListV2ListItem => ({
      type: "v2-pending",
      key: `v2-${pendingTask.key}`,
-@@ -570,10 +780,10 @@ export function buildThreadListV2ListItems(input: {
+@@ -570,10 +781,10 @@ export function buildThreadListV2ListItems(input: {
    const snoozedShelfHeaderIndex = input.snoozedShelfHeaderIndex ?? null;
    const settledCount = input.settledCount ?? 0;
    const settledShelfHeaderIndex = input.settledShelfHeaderIndex ?? null;
@@ -1005,7 +1015,7 @@ index 4024af958..616b5e5d3 100644
    const shelfDisabled = input.shelfPreferencesLoading === true;
    if (workingShelfHeaderIndex !== null && workingCount > 0) {
      result.push({
-@@ -583,7 +793,7 @@ export function buildThreadListV2ListItems(input: {
+@@ -583,7 +794,7 @@ export function buildThreadListV2ListItems(input: {
        expanded: input.workingShelfExpanded === true,
        disabled: shelfDisabled,
      });
@@ -1014,7 +1024,7 @@ index 4024af958..616b5e5d3 100644
    }
    if (snoozedShelfHeaderIndex !== null && snoozedCount > 0) {
      result.push({
-@@ -593,7 +803,7 @@ export function buildThreadListV2ListItems(input: {
+@@ -593,7 +804,7 @@ export function buildThreadListV2ListItems(input: {
        expanded: input.snoozedShelfExpanded === true,
        disabled: shelfDisabled,
      });
@@ -1023,7 +1033,7 @@ index 4024af958..616b5e5d3 100644
    }
    if (settledShelfHeaderIndex !== null && settledCount > 0) {
      result.push({
-@@ -603,15 +813,25 @@ export function buildThreadListV2ListItems(input: {
+@@ -603,15 +814,25 @@ export function buildThreadListV2ListItems(input: {
        expanded: input.settledShelfExpanded !== false,
        disabled: shelfDisabled,
      });
@@ -1052,7 +1062,7 @@ index 4024af958..616b5e5d3 100644
      return showTrailingDivider === entry.showTrailingDivider
        ? entry
        : { ...entry, showTrailingDivider };
-@@ -689,6 +909,10 @@ export function buildThreadListV2Items(input: {
+@@ -689,6 +910,10 @@ export function buildThreadListV2Items(input: {
        outbox. Such a thread has work the user is waiting on, so it stays in
        the active block even when the server has settled it. */
    readonly queuedThreadKeys?: ReadonlySet<string>;
@@ -1063,7 +1073,7 @@ index 4024af958..616b5e5d3 100644
  }): ThreadListV2Layout {
    const now = input.now;
    const pending =
-@@ -702,68 +926,9 @@ export function buildThreadListV2Items(input: {
+@@ -702,68 +927,9 @@ export function buildThreadListV2Items(input: {
              pendingOrder: null,
            }),
          );
@@ -1134,7 +1144,7 @@ index 4024af958..616b5e5d3 100644
  
    // The beta inbox is time-ordered, so the saved arrangement (and any move in
    // flight) is kept but not applied until the beta is off again.
-@@ -809,58 +974,87 @@ export function buildThreadListV2Items(input: {
+@@ -809,58 +975,87 @@ export function buildThreadListV2Items(input: {
          );
  
    const items: ThreadListV2Item[] = [];
@@ -1396,17 +1406,17 @@ index 31b19d857..3ff38a8ca 100644
    return useAtomValue(ref === null ? EMPTY_PROJECT_ATOM : environmentProjects.projectAtom(ref));
  }
 diff --git a/apps/web/src/components/Sidebar.families.ts b/apps/web/src/components/Sidebar.families.ts
-index 6e34c3f71..c36543a6f 100644
+index 9d4864706..c36543a6f 100644
 --- a/apps/web/src/components/Sidebar.families.ts
 +++ b/apps/web/src/components/Sidebar.families.ts
-@@ -1,194 +1,3 @@
+@@ -1,200 +1,3 @@
 -// Child threads in the sidebar, after Claude.app's nested sessions: a thread
 -// an agent opened through T3 tools renders under the thread that opened it.
--// Nesting is a view inside one section. A child an agent or auto-settle
--// settled follows an opener that is still live (pinned, active, working), so
--// finished children stay under the thread that runs them; a child the user
--// settled goes to Settled. Otherwise every thread keeps the section its own
--// state puts it in: a live child under a settled opener stays live on its
+-// Nesting is a view inside one section. A settled child goes to Settled, so
+-// finished work leaves its opener's family; only a settled child that still
+-// runs or waits on the user follows an opener that is still live (pinned,
+-// active, working). Otherwise every thread keeps the section its own state
+-// puts it in: a live child under a settled opener stays live on its
 -// own, and a child whose opener is archived, hidden, or paged out renders on
 -// its own. Families are one level deep: a grandchild hangs under the
 -// topmost ancestor in its section.
@@ -1471,8 +1481,9 @@ index 6e34c3f71..c36543a6f 100644
 -}
 -
 -/**
-- * Settled threads whose opener chain reaches a live thread move to that
-- * thread's section, unless the user settled them (`userSettled`). The walk
+- * Settled threads that still run or wait on the user (`stillRuns`) and whose
+- * opener chain reaches a live thread move to that thread's section; finished
+- * ones stay in Settled, whoever settled them. The walk
 - * passes through settled openers only, so a settled grandchild follows its
 - * settled parent up to the live root, and a snoozed or missing opener keeps
 - * the child settled.
@@ -1482,13 +1493,13 @@ index 6e34c3f71..c36543a6f 100644
 -  keyOf: (thread: T) => string,
 -  parentKeyOf: (thread: T) => string | null,
 -  liveSectionOf: (key: string) => S | null,
--  userSettled: (thread: T) => boolean,
+-  stillRuns: (thread: T) => boolean,
 -): { readonly settled: T[]; readonly moved: { readonly thread: T; readonly section: S }[] } {
 -  const settledByKey = new Map(settled.map((thread) => [keyOf(thread), thread] as const));
 -  const stay: T[] = [];
 -  const moved: { thread: T; section: S }[] = [];
 -  for (const thread of settled) {
--    if (userSettled(thread)) {
+-    if (!stillRuns(thread)) {
 -      stay.push(thread);
 -      continue;
 -    }
@@ -1573,6 +1584,11 @@ index 6e34c3f71..c36543a6f 100644
 -  return status === "approval" || status === "input";
 -}
 -
+-/** A child that is still working or waits on the user keeps its family. */
+-export function childThreadStillRuns(status: SidebarThreadStatus): boolean {
+-  return status === "working" || childThreadNeedsUser(status);
+-}
+-
 -/** The collapsed family's stub: "3 child threads · 1 failed · 2 working". */
 -export function formatHiddenChildThreadsLabel(
 -  hidden: readonly { readonly status: SidebarThreadStatus; readonly isUnread: boolean }[],
@@ -1598,10 +1614,10 @@ index 6e34c3f71..c36543a6f 100644
 +// the mobile thread list nest threads the same way.
 +export * from "@t3tools/client-runtime/state/thread-families";
 diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
-index b9a34facd..20b652a6f 100644
+index 5719bfd16..ce2838081 100644
 --- a/apps/web/src/components/Sidebar.tsx
 +++ b/apps/web/src/components/Sidebar.tsx
-@@ -242,8 +242,11 @@ import {
+@@ -243,8 +243,11 @@ import {
    formatHiddenChildThreadsLabel,
    placeDelegatedChildThreads,
    placeSettledChildThreads,
@@ -1614,7 +1630,7 @@ index b9a34facd..20b652a6f 100644
  import { resolveLocalCheckoutBranchMismatch } from "./BranchToolbar.logic";
  import {
    createSidebarCollisionDetection,
-@@ -330,18 +333,9 @@ interface RenderedChildThreadFamily extends SidebarThreadFamily<EnvironmentThrea
+@@ -331,18 +334,9 @@ interface RenderedChildThreadFamily extends SidebarThreadFamily<EnvironmentThrea
    readonly hasChildren: boolean;
  }
  
@@ -1636,16 +1652,16 @@ index b9a34facd..20b652a6f 100644
  
  // Working beta: when this client saw each thread leave the Working shelf.
  // Module scope keeps the inbox order across routes that unmount the sidebar.
-@@ -3011,7 +3005,7 @@ export default function Sidebar() {
+@@ -3012,7 +3006,7 @@ export default function Sidebar() {
        }
      }
-     // A child an agent or auto-settle settled stays under an opener that is
--    // still live; one the user settled goes to Settled (Sidebar.families.ts).
-+    // still live; one the user settled goes to Settled (threadFamilies.ts).
+     // A settled child goes to Settled, whoever settled it; one that still runs
+-    // or waits on the user stays under an opener that is still live (Sidebar.families.ts).
++    // or waits on the user stays under an opener that is still live (threadFamilies.ts).
      const liveSectionByKey = new Map<string, EnvironmentThreadShell[]>();
      for (const list of [pinned, active, working]) {
        for (const thread of list) liveSectionByKey.set(threadKeyOf(thread), list);
-@@ -3026,7 +3020,7 @@ export default function Sidebar() {
+@@ -3027,7 +3021,7 @@ export default function Sidebar() {
      settled.splice(0, settled.length, ...placed.settled);
      for (const { thread, section } of placed.moved) section.push(thread);
      // Delegated tasks render under the thread that delegated them, in its
@@ -1654,7 +1670,7 @@ index b9a34facd..20b652a6f 100644
      const sectionByKey = new Map<string, EnvironmentThreadShell[]>();
      for (const list of [pinned, active, working, snoozed, settled]) {
        for (const thread of list) sectionByKey.set(threadKeyOf(thread), list);
-@@ -3259,7 +3253,7 @@ export default function Sidebar() {
+@@ -3260,7 +3254,7 @@ export default function Sidebar() {
      return routeThread === undefined ? EMPTY_THREADS : [routeThread];
    }, [routeThreadKey, workingShelfExpanded, workingThreads]);
  
@@ -1680,14 +1696,15 @@ index 3f9e48dfa..5cb38913a 100644
        "default": "./src/state/threadInbox.ts"
 diff --git a/packages/client-runtime/src/state/threadFamilies.test.ts b/packages/client-runtime/src/state/threadFamilies.test.ts
 new file mode 100644
-index 000000000..042134273
+index 000000000..350e3c6a1
 --- /dev/null
 +++ b/packages/client-runtime/src/state/threadFamilies.test.ts
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,245 @@
 +import { describe, expect, it } from "vite-plus/test";
 +import {
 +  buildSidebarThreadFamilies,
 +  childThreadNeedsUser,
++  childThreadStillRuns,
 +  flattenSidebarThreadFamilies,
 +  foldSidebarThreadFamily,
 +  formatHiddenChildThreadsLabel,
@@ -1698,7 +1715,7 @@ index 000000000..042134273
 +interface Row {
 +  readonly key: string;
 +  readonly openedBy: string | null;
-+  readonly userSettled?: boolean;
++  readonly running?: boolean;
 +}
 +
 +const row = (key: string, openedBy: string | null = null): Row => ({ key, openedBy });
@@ -1766,7 +1783,7 @@ index 000000000..042134273
 +      (thread) => thread.key,
 +      (thread) => thread.openedBy,
 +      (key) => live[key] ?? null,
-+      (thread) => thread.userSettled === true,
++      (thread) => thread.running === true,
 +    );
 +    return {
 +      settled: placed.settled.map((thread) => thread.key),
@@ -1774,28 +1791,30 @@ index 000000000..042134273
 +    };
 +  };
 +
-+  it("moves a finished child to its live opener's section", () => {
++  it("leaves a finished child in Settled under a live opener", () => {
++    // Whoever settled it (agent, auto-settle or the user): done work leaves the family.
 +    expect(place([row("done", "parent"), row("old")], { parent: "working" })).toEqual({
-+      settled: ["old"],
-+      moved: [["done", "working"]],
++      settled: ["done", "old"],
++      moved: [],
 +    });
 +  });
 +
-+  it("leaves a child the user settled in Settled", () => {
++  it("keeps a settled child that still runs under its live opener", () => {
 +    expect(
-+      place([{ ...row("mine", "parent"), userSettled: true }, row("agent", "parent")], {
++      place([{ ...row("busy", "parent"), running: true }, row("done", "parent")], {
 +        parent: "active",
 +      }),
-+    ).toEqual({ settled: ["mine"], moved: [["agent", "active"]] });
++    ).toEqual({ settled: ["done"], moved: [["busy", "active"]] });
 +  });
 +
 +  it("follows settled openers up to the live root", () => {
-+    expect(place([row("child", "root"), row("grandchild", "child")], { root: "active" })).toEqual({
-+      settled: [],
-+      moved: [
-+        ["child", "active"],
-+        ["grandchild", "active"],
-+      ],
++    expect(
++      place([row("child", "root"), { ...row("grandchild", "child"), running: true }], {
++        root: "active",
++      }),
++    ).toEqual({
++      settled: ["child"],
++      moved: [["grandchild", "active"]],
 +    });
 +  });
 +
@@ -1895,6 +1914,16 @@ index 000000000..042134273
 +  });
 +});
 +
++describe("childThreadStillRuns", () => {
++  it("counts working and waiting on the user, not finished or idle", () => {
++    expect(
++      (["working", "approval", "input", "waiting", "ready", "failed", "limited"] as const).filter(
++        childThreadStillRuns,
++      ),
++    ).toEqual(["working", "approval", "input"]);
++  });
++});
++
 +describe("formatHiddenChildThreadsLabel", () => {
 +  it("counts hidden children and their news", () => {
 +    expect(
@@ -1918,17 +1947,17 @@ index 000000000..042134273
 +});
 diff --git a/packages/client-runtime/src/state/threadFamilies.ts b/packages/client-runtime/src/state/threadFamilies.ts
 new file mode 100644
-index 000000000..619018739
+index 000000000..0a575b56b
 --- /dev/null
 +++ b/packages/client-runtime/src/state/threadFamilies.ts
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,235 @@
 +// Child threads in the sidebar, after Claude.app's nested sessions: a thread
 +// an agent opened through T3 tools renders under the thread that opened it.
-+// Nesting is a view inside one section. A child an agent or auto-settle
-+// settled follows an opener that is still live (pinned, active, working), so
-+// finished children stay under the thread that runs them; a child the user
-+// settled goes to Settled. Otherwise every thread keeps the section its own
-+// state puts it in: a live child under a settled opener stays live on its
++// Nesting is a view inside one section. A settled child goes to Settled, so
++// finished work leaves its opener's family; only a settled child that still
++// runs or waits on the user follows an opener that is still live (pinned,
++// active, working). Otherwise every thread keeps the section its own state
++// puts it in: a live child under a settled opener stays live on its
 +// own, and a child whose opener is archived, hidden, or paged out renders on
 +// its own. Families are one level deep: a grandchild hangs under the
 +// topmost ancestor in its section.
@@ -2004,8 +2033,9 @@ index 000000000..619018739
 +}
 +
 +/**
-+ * Settled threads whose opener chain reaches a live thread move to that
-+ * thread's section, unless the user settled them (`userSettled`). The walk
++ * Settled threads that still run or wait on the user (`stillRuns`) and whose
++ * opener chain reaches a live thread move to that thread's section; finished
++ * ones stay in Settled, whoever settled them. The walk
 + * passes through settled openers only, so a settled grandchild follows its
 + * settled parent up to the live root, and a snoozed or missing opener keeps
 + * the child settled.
@@ -2015,13 +2045,13 @@ index 000000000..619018739
 +  keyOf: (thread: T) => string,
 +  parentKeyOf: (thread: T) => string | null,
 +  liveSectionOf: (key: string) => S | null,
-+  userSettled: (thread: T) => boolean,
++  stillRuns: (thread: T) => boolean,
 +): { readonly settled: T[]; readonly moved: { readonly thread: T; readonly section: S }[] } {
 +  const settledByKey = new Map(settled.map((thread) => [keyOf(thread), thread] as const));
 +  const stay: T[] = [];
 +  const moved: { thread: T; section: S }[] = [];
 +  for (const thread of settled) {
-+    if (userSettled(thread)) {
++    if (!stillRuns(thread)) {
 +      stay.push(thread);
 +      continue;
 +    }
@@ -2104,6 +2134,11 @@ index 000000000..619018739
 +
 +export function childThreadNeedsUser(status: ThreadFamilyStatus): boolean {
 +  return status === "approval" || status === "input";
++}
++
++/** A child that is still working or waits on the user keeps its family. */
++export function childThreadStillRuns(status: ThreadFamilyStatus): boolean {
++  return status === "working" || childThreadNeedsUser(status);
 +}
 +
 +/** The collapsed family's stub: "3 child threads · 1 failed · 2 working". */
