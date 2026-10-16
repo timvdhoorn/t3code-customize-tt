@@ -127,7 +127,7 @@ t3code-customize status          versions, what the launcher opens, background u
 T3 Code updates itself as usual. With `autoupdate on`, the rebuild starts as soon as T3 has
 installed the update, and a notification tells you when to quit T3 Code and reopen the
 launcher. Until then T3 Code runs stock; a launcher opened in between starts the rebuild itself.
-Settings > About shows which customized build you run (recipe and build time, as in `status`).
+The label next to the T3 logo shows which customized build you run (the first characters of the recipe in `status`; hover it for the build time). Settings > General > About and the macOS About panel show it too.
 
 When a nightly changes code the patches touch, you get a notification and T3 Code stays stock.
 Ask a coding agent in this repo to port the patches (see [AGENTS.md](AGENTS.md)), or turn on
