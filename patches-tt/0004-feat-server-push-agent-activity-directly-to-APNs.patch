@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: timvdhoorn <timvdhoorn@gmail.com>
 Date: Thu, 15 Oct 2026 20:29:15 +0200
-Subject: [PATCH 4/4] feat(server): push agent activity directly to APNs
+Subject: [PATCH 4/5] feat(server): push agent activity directly to APNs
 
 A server with an APNs auth key in its secret store (direct-push-apns) sends
 agent notifications and Live Activity updates to APNs itself, for an app
@@ -17,17 +17,17 @@ Activity it filled itself. Without a key the server behaves as upstream.
 ---
  apps/server/src/auth/RpcAuthorization.ts      |   3 +
  apps/server/src/directPush/ApnsTransport.ts   | 196 ++++++
- apps/server/src/directPush/DirectPush.test.ts | 262 ++++++++
- apps/server/src/directPush/DirectPush.ts      | 415 +++++++++++++
+ apps/server/src/directPush/DirectPush.test.ts | 331 ++++++++++
+ apps/server/src/directPush/DirectPush.ts      | 470 +++++++++++++++
  .../src/directPush/agentActivityDelivery.ts   | 569 ++++++++++++++++++
  .../src/environment/ServerEnvironment.ts      |   8 +-
  .../src/observability/RpcInstrumentation.ts   |   3 +
- .../src/relay/AgentAwarenessRelay.test.ts     |  47 ++
- apps/server/src/relay/AgentAwarenessRelay.ts  |  72 ++-
+ .../src/relay/AgentAwarenessRelay.test.ts     |  67 +++
+ apps/server/src/relay/AgentAwarenessRelay.ts  |  78 ++-
  apps/server/src/server.ts                     |   4 +
  apps/server/src/ws.ts                         |  14 +
  packages/contracts/src/rpc.ts                 |  37 ++
- 12 files changed, 1603 insertions(+), 27 deletions(-)
+ 12 files changed, 1753 insertions(+), 27 deletions(-)
  create mode 100644 apps/server/src/directPush/ApnsTransport.ts
  create mode 100644 apps/server/src/directPush/DirectPush.test.ts
  create mode 100644 apps/server/src/directPush/DirectPush.ts
@@ -251,10 +251,10 @@ index 000000000..cc7ec0e04
 +export const layer = Layer.effect(ApnsTransport, make);
 diff --git a/apps/server/src/directPush/DirectPush.test.ts b/apps/server/src/directPush/DirectPush.test.ts
 new file mode 100644
-index 000000000..8a32b39a7
+index 000000000..d729012f4
 --- /dev/null
 +++ b/apps/server/src/directPush/DirectPush.test.ts
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,331 @@
 +// @effect-diagnostics nodeBuiltinImport:off -- the tests generate and verify a real P-256 key.
 +import * as NodeCrypto from "node:crypto";
 +
@@ -267,6 +267,7 @@ index 000000000..8a32b39a7
 +import * as DateTime from "effect/DateTime";
 +import * as Effect from "effect/Effect";
 +import * as Option from "effect/Option";
++import * as TestClock from "effect/testing/TestClock";
 +
 +import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 +import * as ApnsTransport from "./ApnsTransport.ts";
@@ -394,13 +395,81 @@ index 000000000..8a32b39a7
 +    }),
 +  );
 +
-+  it.live("sends a completion push for a fresh finish", () =>
++  it.effect("sends a completion push once the thread has stayed finished", () =>
++    Effect.gen(function* () {
++      const { push, sent } = yield* makeHarness();
++      yield* push.registerDevice(device());
++      const completed = activity("completed");
++      yield* push.publish({ threadId: THREAD_ID, state: completed });
++      // A relay retry while the completion waits must not restart or double it.
++      yield* push.publish({ threadId: THREAD_ID, state: { ...completed, updatedAt: "later" } });
++      yield* TestClock.adjust(DirectPush.COMPLETION_SETTLE_MS - 1_000);
++      assert.strictEqual(sent.length, 0);
++      yield* TestClock.adjust(1_000);
++      assert.strictEqual(sent.length, 1);
++      assert.deepStrictEqual(aps(sent[0]!).alert, { title: "Fix the bug", body: "Done: Project" });
++      yield* TestClock.adjust(DirectPush.COMPLETION_SETTLE_MS);
++      assert.strictEqual(sent.length, 1);
++    }),
++  );
++
++  it.effect("drops a completion when the thread runs again before it settles", () =>
 +    Effect.gen(function* () {
 +      const { push, sent } = yield* makeHarness();
 +      yield* push.registerDevice(device());
 +      yield* push.publish({ threadId: THREAD_ID, state: activity("completed") });
++      yield* TestClock.adjust(DirectPush.COMPLETION_SETTLE_MS / 2);
++      // A background task or a delegated worker wakes the agent.
++      yield* push.publish({ threadId: THREAD_ID, state: activity("running") });
++      yield* TestClock.adjust(DirectPush.COMPLETION_SETTLE_MS);
++      assert.strictEqual(sent.length, 0);
++      yield* push.publish({
++        threadId: THREAD_ID,
++        state: activity("completed", { headline: "done" }),
++      });
++      yield* TestClock.adjust(DirectPush.COMPLETION_SETTLE_MS);
 +      assert.strictEqual(sent.length, 1);
 +      assert.deepStrictEqual(aps(sent[0]!).alert, { title: "Fix the bug", body: "Done: Project" });
++    }),
++  );
++
++  it.effect("sends failures and questions at once", () =>
++    Effect.gen(function* () {
++      const { push, sent } = yield* makeHarness();
++      yield* push.registerDevice(device());
++      yield* push.publish({ threadId: THREAD_ID, state: activity("failed") });
++      assert.strictEqual(sent.length, 1);
++      assert.deepStrictEqual(aps(sent[0]!).alert, {
++        title: "Fix the bug",
++        body: "Failed: Project",
++      });
++    }),
++  );
++
++  it.effect("keeps a thread an agent opened quiet when it finishes, not when it asks", () =>
++    Effect.gen(function* () {
++      const { push, sent } = yield* makeHarness();
++      yield* push.registerDevice(device());
++      yield* push.publish({
++        threadId: THREAD_ID,
++        state: activity("completed"),
++        openedByThread: true,
++      });
++      yield* TestClock.adjust(DirectPush.COMPLETION_SETTLE_MS * 2);
++      assert.strictEqual(sent.length, 0);
++      yield* push.publish({
++        threadId: THREAD_ID,
++        state: activity("waiting_for_approval"),
++        openedByThread: true,
++      });
++      yield* push.publish({ threadId: THREAD_ID, state: activity("failed"), openedByThread: true });
++      assert.deepStrictEqual(
++        sent.map((request) => aps(request).alert),
++        [
++          { title: "Fix the bug", body: "Approval: Project" },
++          { title: "Fix the bug", body: "Failed: Project" },
++        ],
++      );
 +    }),
 +  );
 +
@@ -519,10 +588,10 @@ index 000000000..8a32b39a7
 +});
 diff --git a/apps/server/src/directPush/DirectPush.ts b/apps/server/src/directPush/DirectPush.ts
 new file mode 100644
-index 000000000..0e0e33334
+index 000000000..61d42bf49
 --- /dev/null
 +++ b/apps/server/src/directPush/DirectPush.ts
-@@ -0,0 +1,415 @@
+@@ -0,0 +1,470 @@
 +/**
 + * Direct push: this server sends agent activity (alert notifications and Live
 + * Activity updates) to APNs itself, for apps built under their own bundle id
@@ -541,6 +610,7 @@ index 000000000..0e0e33334
 +import * as Context from "effect/Context";
 +import * as DateTime from "effect/DateTime";
 +import * as Effect from "effect/Effect";
++import * as Fiber from "effect/Fiber";
 +import * as Layer from "effect/Layer";
 +import * as Option from "effect/Option";
 +import * as Schema from "effect/Schema";
@@ -562,6 +632,13 @@ index 000000000..0e0e33334
 +export const DIRECT_PUSH_APNS_SECRET = "direct-push-apns";
 +/** `<stateDir>/secrets/direct-push-devices.bin`: devices registered for direct push. */
 +export const DIRECT_PUSH_DEVICES_SECRET = "direct-push-devices";
++
++/**
++ * How long a finished thread stays finished before its Done push goes out. A
++ * thread that runs again in the meantime (a wake from a background task or a
++ * delegated worker, a queued message) does not ring for the run it left.
++ */
++export const COMPLETION_SETTLE_MS = 60_000;
 +
 +const ApnsEnvironmentSchema = Schema.Literals(["sandbox", "production"]);
 +
@@ -633,10 +710,15 @@ index 000000000..0e0e33334
 +      request: RelayLiveActivityRegistrationRequest,
 +    ) => Effect.Effect<DirectPushRegistrationResult>;
 +    readonly snapshot: Effect.Effect<RelayAgentActivityAggregateState | null>;
-+    /** Delivers one thread's new activity state (null when it no longer shows). */
++    /**
++     * Delivers one thread's new activity state (null when it no longer shows).
++     * A completion waits `COMPLETION_SETTLE_MS`; a thread an agent opened
++     * (`openedByThread`) never reports one, it reports to its opener instead.
++     */
 +    readonly publish: (input: {
 +      readonly threadId: ThreadId;
 +      readonly state: RelayAgentActivityState | null;
++      readonly openedByThread?: boolean;
 +    }) => Effect.Effect<void>;
 +  }
 +>()("t3/directPush/DirectPush") {}
@@ -675,6 +757,10 @@ index 000000000..0e0e33334
 +  const lock = yield* Semaphore.make(1);
 +  const states = new Map<ThreadId, RelayAgentActivityState>();
 +  const publishedIdentities = new Map<ThreadId, string>();
++  const pendingCompletions = new Map<
++    ThreadId,
++    { readonly identity: string; readonly timer: Fiber.Fiber<void> }
++  >();
 +  let devices: Map<string, DirectPushDevice> | undefined;
 +
 +  const readSecretString = (name: string) =>
@@ -914,23 +1000,61 @@ index 000000000..0e0e33334
 +    return makeAggregateState({ states: [...states.values()], terminalState: null, nowMs });
 +  });
 +
-+  const publish: DirectPush["Service"]["publish"] = ({ threadId, state }) =>
++  // Callers hold the lock.
++  const deliverState = Effect.fnUntraced(function* (
++    config: DirectPushApnsConfig,
++    threadId: ThreadId,
++    state: RelayAgentActivityState | null,
++    identity: string,
++  ) {
++    publishedIdentities.set(threadId, identity);
++    if (state === null) {
++      states.delete(threadId);
++    } else {
++      states.set(threadId, state);
++    }
++    const current = yield* loadDevices;
++    yield* deliverToDevices({ config, deviceIds: [...current.keys()], state, replay: false });
++  });
++
++  const publish: DirectPush["Service"]["publish"] = ({
++    threadId,
++    state: published,
++    openedByThread,
++  }) =>
 +    lock.withPermits(1)(
 +      Effect.gen(function* () {
 +        const config = yield* readConfig;
 +        if (config === null) return;
++        const state = openedByThread && published?.phase === "completed" ? null : published;
 +        // The relay publisher retries failed relay calls; a retry must not
 +        // deliver the same state to the device twice.
 +        const identity = publishIdentity(state);
-+        if (publishedIdentities.get(threadId) === identity) return;
-+        publishedIdentities.set(threadId, identity);
-+        if (state === null) {
-+          states.delete(threadId);
-+        } else {
-+          states.set(threadId, state);
++        const pending = pendingCompletions.get(threadId);
++        if (pending?.identity === identity) return;
++        if (pending !== undefined) {
++          pendingCompletions.delete(threadId);
++          yield* Fiber.interrupt(pending.timer);
 +        }
-+        const current = yield* loadDevices;
-+        yield* deliverToDevices({ config, deviceIds: [...current.keys()], state, replay: false });
++        if (publishedIdentities.get(threadId) === identity) return;
++        if (state?.phase !== "completed") {
++          yield* deliverState(config, threadId, state, identity);
++          return;
++        }
++        const timer = yield* Effect.sleep(COMPLETION_SETTLE_MS).pipe(
++          Effect.andThen(
++            lock.withPermits(1)(
++              Effect.gen(function* () {
++                if (pendingCompletions.get(threadId)?.identity !== identity) return;
++                pendingCompletions.delete(threadId);
++                const latest = yield* readConfig;
++                if (latest !== null) yield* deliverState(latest, threadId, state, identity);
++              }),
++            ),
++          ),
++          Effect.forkDetach,
++        );
++        pendingCompletions.set(threadId, { identity, timer });
 +      }),
 +    );
 +
@@ -1554,7 +1678,7 @@ index 6b0522431..63c45e2c3 100644
    [WS_METHODS.serverGetBackgroundPolicy]: "server",
    [WS_METHODS.scheduledTasksList]: "scheduledTasks",
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.test.ts b/apps/server/src/relay/AgentAwarenessRelay.test.ts
-index 944f58c79..fb51aab44 100644
+index 944f58c79..cf58912f1 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.test.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.test.ts
 @@ -34,6 +34,7 @@ import {
@@ -1584,7 +1708,7 @@ index 944f58c79..fb51aab44 100644
    );
    return { relay, secrets, secretReads, currentShell, shellReads, publications, catchUp };
  });
-@@ -377,6 +383,47 @@ describe("AgentAwarenessRelay", () => {
+@@ -377,6 +383,67 @@ describe("AgentAwarenessRelay", () => {
      }),
    );
  
@@ -1606,6 +1730,26 @@ index 944f58c79..fb51aab44 100644
 +      assert.equal(direct.length, 1);
 +      assert.equal(direct[0]?.threadId, THREAD_ID);
 +      assert.equal(direct[0]?.phase, "running");
++    }),
++  );
++
++  it.effect("tells direct push which threads an agent opened", () =>
++    Effect.gen(function* () {
++      const direct: Array<boolean | undefined> = [];
++      const { relay, currentShell } = yield* makeTestRelay({
++        linked: false,
++        directPush: {
++          isEnabled: Effect.succeed(true),
++          registerDevice: () => Effect.die("unused"),
++          registerLiveActivity: () => Effect.die("unused"),
++          snapshot: Effect.die("unused"),
++          publish: ({ openedByThread }) => Effect.sync(() => void direct.push(openedByThread)),
++        },
++      });
++      yield* relay.publishThread(THREAD_ID);
++      yield* Ref.set(currentShell, shell({ title: "Child", openedByThreadId: SECOND_THREAD_ID }));
++      yield* relay.publishThread(THREAD_ID);
++      assert.deepEqual(direct, [false, true]);
 +    }),
 +  );
 +
@@ -1633,7 +1777,7 @@ index 944f58c79..fb51aab44 100644
      Effect.gen(function* () {
        const { relay, currentShell, publications } = yield* makeTestRelay();
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.ts b/apps/server/src/relay/AgentAwarenessRelay.ts
-index ae9d053ac..68016cd3e 100644
+index ae9d053ac..b191fa353 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.ts
 @@ -46,6 +46,7 @@ import {
@@ -1693,18 +1837,33 @@ index ae9d053ac..68016cd3e 100644
      ) {
        yield* resetPublishedConnection;
        publishedRelayConfig = relayConfig;
-@@ -480,6 +489,10 @@ export const make = Effect.gen(function* () {
+@@ -478,8 +487,17 @@ export const make = Effect.gen(function* () {
+       readonly projectId: string | null;
+       readonly state: RelayAgentActivityState | null;
        readonly reason: string;
++      readonly openedByThread: boolean;
      }) =>
        Effect.gen(function* () {
 +        if (directPushEnabled && Option.isSome(directPush)) {
-+          yield* directPush.value.publish({ threadId, state: input.state });
++          yield* directPush.value.publish({
++            threadId,
++            state: input.state,
++            openedByThread: input.openedByThread,
++          });
 +        }
 +        if (!relayConfig) return;
          if (cachedRelayClient === undefined) {
            cachedRelayClient = yield* makeRelayClient(relayConfig);
          }
-@@ -707,26 +720,33 @@ export const make = Effect.gen(function* () {
+@@ -634,6 +652,7 @@ export const make = Effect.gen(function* () {
+       projectId: snapshot.projectId,
+       state: snapshot.state,
+       reason: snapshot.reason,
++      openedByThread: threadShell?.openedByThreadId !== undefined,
+     });
+     publishConfirmDeadlines.delete(threadId);
+     yield* Ref.update(publishedStateByThreadRef, (publishedStates) => {
+@@ -707,26 +726,33 @@ export const make = Effect.gen(function* () {
    // Publishes the active threads once. Returns why it did not, so the retry
    // knows whether it is waiting on a link or on the publish setting.
    const publishActiveThreadsUnsafe = Effect.gen(function* () {
