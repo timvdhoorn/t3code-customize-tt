@@ -627,8 +627,12 @@ def checks(env, log, target):
         steps.append((['vp', 'lint', *changed], 'Lint failed on files the patches change.'))
     # Run against an empty home, as upstream's CI does: the server tests read the user's
     # real ~/.claude/skills, and a large set of skills races their TestClock steps.
-    with tempfile.TemporaryDirectory(prefix='t3code-checks-home-') as home:
-        check_env = dict(os.environ if env is None else env, HOME=home)
+    # Temporary files go to disk under the cache, as in the build: a tmpfs /tmp with a user
+    # quota (devbox1) fills up halfway through the test transforms (EDQUOT).
+    tmp = CACHE / 'tmp'
+    tmp.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='t3code-checks-home-', dir=tmp) as home:
+        check_env = dict(os.environ if env is None else env, HOME=home, TMPDIR=str(tmp))
         for args, message in steps:
             if run(args, cwd=SOURCE, env=check_env, log=log, check=False).returncode:
                 raise NeedsFix(message + ' Command: ' + ' '.join(args))
