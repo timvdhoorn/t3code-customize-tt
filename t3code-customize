@@ -649,6 +649,8 @@ def pinned_versions(version, apps, extra=()):
 
 
 def build_web_and_server(env, version, log):
+    # Settings > About shows which customized build this is (patches-tt/0005).
+    env = dict(env, T3CODE_CUSTOMIZED_BUILD=f"{recipe_hash()} {time.strftime('%Y-%m-%dT%H:%M:%S')}")
     run(['vp', 'build'], cwd=SOURCE / 'apps/web', env=env, log=log)
     run(['node', 'scripts/cli.ts', 'build'], cwd=SOURCE / 'apps/server', env=env, log=log)
     brand = 'nightly' if 'nightly' in version else 'production'
@@ -1106,6 +1108,8 @@ def launch_mac(app, target, rest):
 def cmd_launch(args):
     app = installed_app()
     target, notice = launch_target()
+    if notice and MAC and not DISABLED.exists():
+        notice = start_background_update() or notice
     if notice:
         notify('Opening stock T3 Code', notice)
     rest = args.rest[1:] if args.rest[:1] == ['--'] else args.rest
@@ -1365,13 +1369,65 @@ def bundle_version(app):
     return plistlib.loads((app / 'Contents/Info.plist').read_bytes()).get('CFBundleShortVersionString', '')
 
 
+def start_background_update():
+    """Start the rebuild now (the LaunchAgent if autoupdate is on, else a detached run). Returns
+    what to tell the user, or None if it could not start."""
+    try:
+        if AUTOUPDATE_PLIST.exists():
+            subprocess.run(['launchctl', 'kickstart', f'gui/{os.getuid()}/{AUTOUPDATE_LABEL}'],
+                           check=True, capture_output=True)
+        else:
+            (CACHE / 'logs').mkdir(parents=True, exist_ok=True)
+            with (CACHE / 'logs/autoupdate.log').open('a') as log:
+                subprocess.Popen([sys.executable, str(REPO / NAME), 'update', '--background'],
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return ('T3 Code was updated, so this time it opens stock. The customization is being rebuilt;'
+            ' a notification says when to reopen.')
+
+
+def uncommitted_patches():
+    """True when this repo holds patch changes an unattended port wrote and nobody committed yet."""
+    if not (REPO / '.git').exists():
+        return False
+    listed = subprocess.run(['git', 'status', '--porcelain', '--', 'patches-port', 'patches-tt', 'patches-ios'],
+                            cwd=REPO, capture_output=True, text=True)
+    return bool(listed.stdout.strip())
+
+
+def app_settled(app, quiet=60, timeout=900):
+    """Wait until T3's updater has stopped changing the app, so the build reads a finished install."""
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        try:
+            current = installed_app(str(app.path)).fingerprint()
+        except (PlatformError, OSError):
+            current = None
+        if current is not None and current == last:
+            return True
+        last = current
+        time.sleep(quiet)
+    return False
+
+
 def cmd_update(args):
     """Rebuild for the T3 Code installed now. On macOS T3's own updater installs new
     releases into the untouched app; this brings the customization back afterwards."""
     try:
+        if MAC and args.background and not app_settled(installed_app(args.app)):
+            raise Stop('T3 Code kept changing for 15 minutes; the next check tries again.')
         if cmd_build(args) and args.background:
+            ported = uncommitted_patches()
             notify(LAUNCHER_NAME, 'Rebuilt for ' + load(STATE, {}).get('version', 'the latest Nightly')
-                   + f'. Quit T3 Code and open "{LAUNCHER_NAME}" to use it.')
+                   + f'. Quit T3 Code and open "{LAUNCHER_NAME}" to use it.'
+                   + (' An agent ported the patches; ask it to commit them and run fleet.' if ported else ''))
+    except NeedsFix:
+        if args.background:
+            notify(LAUNCHER_NAME, 'This nightly changed code the patches touch, so T3 Code stays stock for now.'
+                   ' Ask an agent in the t3code-customize-tt repo to port the patches.')
+        raise
     except (Stop, PlatformError) as stop:
         if args.background:
             first = str(stop).strip().splitlines()[0]
@@ -1397,16 +1453,21 @@ def cmd_autoupdate(args):
         command += ['--fix', args.fix]
     (CACHE / 'logs').mkdir(parents=True, exist_ok=True)
     AUTOUPDATE_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    app = installed_app()
     AUTOUPDATE_PLIST.write_bytes(plistlib.dumps({
         'Label': AUTOUPDATE_LABEL, 'ProgramArguments': command,
+        # T3's updater replaces the app; a rebuild starts as soon as it does, the interval catches
+        # patch changes. The run waits until T3 has stopped writing (see cmd_update).
+        'WatchPaths': [str(app.path / 'Contents/Info.plist'), str(app.resources / 'app.asar')],
+        'ThrottleInterval': 120,
         # The build needs the same git, node and agents you have in a terminal.
         'EnvironmentVariables': {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(HOME)},
         'StartInterval': args.every * 60, 'RunAtLoad': True, 'ProcessType': 'Background', 'LowPriorityIO': True,
         'StandardOutPath': str(CACHE / 'logs/autoupdate.log'), 'StandardErrorPath': str(CACHE / 'logs/autoupdate.log'),
     }))
     run(['launchctl', 'bootstrap', domain, str(AUTOUPDATE_PLIST)])
-    say(f'Background updates on: every {args.every} minutes it rebuilds once T3 Code has updated itself'
-        ' or the patches changed.' + (f' Broken patches are ported by {AGENT_NAMES[args.fix]}.' if args.fix else ''))
+    say(f'Background updates on: it rebuilds as soon as T3 Code has updated itself, and every {args.every}'
+        ' minutes when the patches changed.' + (f' Broken patches are ported by {AGENT_NAMES[args.fix]}.' if args.fix else ''))
     say(f'Log: {CACHE / "logs/autoupdate.log"}')
 
 

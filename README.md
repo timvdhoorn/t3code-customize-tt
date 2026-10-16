@@ -120,16 +120,19 @@ keychain access and T3's own updater. Open **T3 Code (Customized)** from Spotlig
 
 ```sh
 t3code-customize                 rebuild for the T3 Code installed now
-t3code-customize autoupdate on   do that every hour in the background (LaunchAgent)
+t3code-customize autoupdate on   rebuild by itself whenever T3 Code updates (LaunchAgent)
 t3code-customize status          versions, what the launcher opens, background updates
 ```
 
-T3 Code updates itself as usual. After an update the launcher opens stock until the next
-rebuild, which `autoupdate on` starts within the hour; it then notifies you to quit T3 Code
-and reopen the launcher.
+T3 Code updates itself as usual. With `autoupdate on`, the rebuild starts as soon as T3 has
+installed the update, and a notification tells you when to quit T3 Code and reopen the
+launcher. Until then T3 Code runs stock; a launcher opened in between starts the rebuild itself.
+Settings > About shows which customized build you run (recipe and build time, as in `status`).
 
-With `autoupdate on --fix claude`, Claude Code ports the patches unattended when a nightly
-breaks them. Without it you get a notification and run `t3code-customize --fix claude` yourself.
+When a nightly changes code the patches touch, you get a notification and T3 Code stays stock.
+Ask a coding agent in this repo to port the patches (see [AGENTS.md](AGENTS.md)), or turn on
+`autoupdate on --fix claude` so Claude Code ports them unattended; afterwards commit the ported
+patches and run `t3code-customize fleet`.
 
 ## iOS app (TestFlight)
 
