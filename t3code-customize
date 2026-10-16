@@ -1528,7 +1528,15 @@ PORTED_PRS = REPO / 'ported-prs.json'
 
 def report_ported_prs():
     """Say, for each upstream PR an own patch ports (ported-prs.json), whether upstream
-    merged, moved or closed it, so an update never misses that a patch can go."""
+    merged, moved or closed it, so an update never misses that a patch can go. Never
+    raises: it runs in `finally` and must not replace a build's own error or exit code."""
+    try:
+        _report_ported_prs()
+    except Exception as error:
+        say(f'Ported upstream PRs: skipped ({error.__class__.__name__}: {error}).')
+
+
+def _report_ported_prs():
     listed = load(PORTED_PRS, {})
     prs = listed.get('prs', [])
     if not prs:
@@ -2015,7 +2023,12 @@ def main():
     CACHE.mkdir(parents=True, exist_ok=True)
     if SYSTEM == 'win32':
         with build_lock(LOCK):
-            return handler(args)
+            if args.command not in ('build', 'update', 'server'):
+                return handler(args)
+            try:
+                return handler(args)
+            finally:
+                report_ported_prs()
     import fcntl
     # The lock file names its holder, so a second run (or an agent) can see who uses the checkout.
     with (CACHE / 'lock').open('a+') as lock:
