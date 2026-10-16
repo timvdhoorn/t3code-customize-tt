@@ -8,21 +8,24 @@ is to carry them onto the user's nightly with every feature still working.
 
 ## Start
 
-1. Run `./t3code-customize build` from this repo. It finds the installed AppImage,
-   reads the exact upstream commit it was built from, and applies the patches to
-   that commit in the source checkout at `~/.cache/t3code-customize/t3code`.
+1. Run `python t3code-customize build` from this repo on Windows, or
+   `python3 ./t3code-customize build` on Linux and macOS. It finds the installed
+   application (AppImage, macOS app or Windows executable), reads its exact upstream
+   commit, and applies the patches in the private source checkout. Use `--app` for a
+   nonstandard installed path. The source checkout is `<cache>/t3code`; platform cache
+   locations are in [README.md](README.md#good-to-know), and the build prints its log path.
 2. If it reports a conflict, a rebase is stopped in that checkout. If it reports a
    failing test or typecheck, the commits are in place and the checks failed.
 
 ## Fix
 
-Work only in `~/.cache/t3code-customize/t3code` and this repo.
+Work only in that private source checkout and this repo.
 
-- Conflicts: resolve each file, `git add` it, then `GIT_EDITOR=true git rebase --continue`.
+- Conflicts: resolve each file, `git add` it, then `git -c core.editor=true rebase --continue`.
   Keep upstream's change and port the patch on top of it. When upstream moved or split
   a file, carry the change to the new location and follow the new APIs.
 - Failing checks: fix the relevant commit with `git commit --fixup=<sha>`, then
-  `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash <nightly commit>`. Keep one
+  `git -c sequence.editor=true rebase -i --autosquash <nightly commit>`. Keep one
   commit per patch.
 - If a test file moved upstream, update its path in `checks.json`.
 - `git log <base>..<nightly commit>` and `git show` explain what changed upstream.
@@ -38,12 +41,13 @@ If `t3code-customize` started you, stop once the tests and typechecks in `checks
 pass (run them from the source checkout with `node_modules/.bin/vp test run <files>` and
 `node_modules/.bin/tsc --noEmit -p <package>/tsconfig.json`). It continues the build itself.
 
-Otherwise run `./t3code-customize build --resume`. It reruns the checks on the checkout as you
+Otherwise run the same Python entry with `build --resume`. It reruns the checks on the checkout as you
 left it, builds, installs the result and writes the ported commits back to
 `patches/`. Leave the checkout clean with no rebase in progress.
 
 End with a short report: what changed upstream, what you changed and in which files,
-and whether the final build succeeded.
+and whether the final build succeeded. Separate fixture tests, native process
+checks and real desktop startup evidence.
 
 ## Fork changes
 
@@ -56,7 +60,7 @@ upstream did not break or duplicate them. This section says how.
 | Upstream owns (never commit changes) | The fork owns (commit changes) |
 | --- | --- |
 | `patches/*.patch`, `patches/base.txt`, `checks.json` | `patches-port/`, `patches-tt/`, `checks-tt.json`, `patches-ios/`, `checks-ios.json`, `ios.json`, this section, `CLAUDE.md` |
-| the Linux code paths in `t3code-customize` | macOS, update, server and fleet code in `t3code-customize`, `machines.json`, the `README.md` macOS, server and machines sections |
+| the Linux, Windows and macOS build and launch paths in `t3code-customize`, `platform_support.py`, `macos/`, `install.ps1`, `tests/`, `docs/macos.md` | update, autoupdate, server, fleet and ios code in `t3code-customize`, `machines.json`, the `README.md` macOS, server and machines sections |
 
 - A port of the shared patches goes to `patches-port/` (with its own `base.txt`), never to
   `patches/`; the tool writes it there. Builds use it while it targets a newer nightly than
@@ -81,7 +85,9 @@ run the same patches.
   devbox1's T3 server, which reconnects open sessions; say so when you report.
 - **A new machine:** follow "A new machine" in `README.md`. A new Linux box is first set up
   with `~/Devops/Personal/playbook-new-box`; this repo only adds the patches.
-- Never edit a machine's T3 install by hand; `server`, `server-off` and `update` own it.
+- Never edit a machine's T3 install by hand; `server`, `server-off` and `update` own it. On a Mac,
+  T3's own updater installs new releases into the untouched app; `update` (and `autoupdate`) only
+  rebuild the overlay for it, and until then the launcher opens stock.
 - Python must stay compatible with macOS's system Python 3.9.
 
 ### Changing a patch yourself
@@ -123,8 +129,8 @@ reporting done:
 5. Report per row: unaffected, ported (what changed), or needs a decision.
 
 When upstream changes `t3code-customize`, merge it by hand if `pull_latest` could not:
-keep every `MAC` branch and the `update`, `autoupdate`, `install-pending` and own-patch
-code, then run `python3 -m py_compile t3code-customize` and `./t3code-customize status`.
+keep the `update`, `autoupdate`, `server`, `fleet`, `ios` and own-patch code, the lock that
+names its holder and Python 3.9 compatibility, then run `python3 -m py_compile t3code-customize` and `./t3code-customize status`.
 
 ### Fork changes and their checks
 
@@ -141,8 +147,7 @@ code, then run `python3 -m py_compile t3code-customize` and `./t3code-customize 
 | iOS direct push (`patches-ios/0005`) | `apps/mobile/app.config.ts`, `apps/mobile/src/connection/{direct-push,runtime}.ts`, `apps/mobile/src/features/agent-awareness/{capabilities,remoteRegistration,directPushSnapshot}.ts`, `apps/mobile/src/features/settings/{SettingsNotificationsRouteScreen,SettingsRouteScreen,DirectPushSettingsNotificationsRouteScreen}.tsx` | A custom-identity build (`extra.directServerPush`) registers its push token, Live Activity token and preferences with every paired server, again whenever a server connects, with no Clerk or relay involved. Settings > Notifications shows a screen with two stock switches. The official build keeps the relay path. Depends on `patches-tt/0004`. | Tests in `checks-ios.json`. In the app, Settings > Notifications shows both switches on once a server with the key has accepted the device. |
 | iOS Claude theme (`patches-ios/0006`) | `packages/shared/src/themePalettes.ts`, `apps/mobile/src/lib/{mobileTheme,mobileThemeRuntime}.ts`, `apps/mobile/scripts/generate-uniwind-themes.mts`, `apps/mobile/{generated-uniwind-themes.css,generated-uniwind-theme-names.json,uniwind-types.d.ts}` | The desktops' `claude` environment theme (`~/.t3/userdata/themes/claude.json`) as a mobile palette in Settings > Appearance, light and dark; roles the file omits fall back to T3 Chat as on desktop; `messageAction` is `#ba5b3b` so white button text keeps 4.5:1. Not a web built-in, so desktops can still publish `claude.json`. If `claude.json` changes, update `CLAUDE_THEME`; if upstream mobile starts following environment themes, propose dropping this patch. | Tests in `checks-ios.json`. In the app, Appearance shows a Claude card; selecting it gives a `#151515` canvas in dark and `#fcfcfb` in light with terracotta primary buttons. |
 | iOS build | `t3code-customize` (`cmd_ios`, `build_ios`, `ios_app_id`, `ios_testers`), `ios.json` | Builds `apps/mobile` for the nightly commit installed on the Mac with `expo prebuild` and `xcodebuild archive` (automatic signing with the App Store Connect API key), uploads with asc-cli and keeps the internal TestFlight group and its testers. Depends on upstream's `apps/mobile/app.config.ts` version field and Expo prebuild layout. | `./t3code-customize ios` ends with the build on TestFlight; `asccli builds list --app-id <id>` shows it. |
-| macOS build | `t3code-customize` (`find_mac_app`, `finish_mac_app`, `stage_mac_build`, `install_pending`) | Copy of the installed `.app` at `~/Applications/T3 Code (Customized).app`: rebuilt `app.asar`, matching `ElectronAsarIntegrity`, `T3CODE_DISABLE_AUTO_UPDATE` in `LSEnvironment`, signed with this Mac's self-signed identity (`signing_identity`, keychain `~/.config/t3code-customize/signing.keychain-db`) so keychain "Always Allow" survives rebuilds; ad hoc only as fallback. Swapped in only while closed. | `./t3code-customize status`; `codesign --verify --deep --strict` on the copy; `codesign -d -r-` shows `certificate leaf = H"…"`, not a cdhash. |
-| macOS updates | `t3code-customize` (`update_stock`, `cmd_update`, `cmd_autoupdate`, `cmd_install_pending`) | Installs newer releases the way T3's updater does: feed from the app's `app-update.yml`, a zip T3 already downloaded when it matches, sha512 from the feed, the installed app's designated requirement, swap only while closed. | `./t3code-customize` reports "Already up to date" or installs; a foreign or ad-hoc signed app must fail the requirement check. |
+| macOS launcher | `t3code-customize` (`install_mac_launcher`, `cmd_update`, `cmd_autoupdate`) | Upstream's overlay: the signed `T3 Code (Nightly).app` stays untouched (passkeys, keychain, T3's updater work); the launcher in `~/Applications/T3 Code (Customized).app` starts it with `--inspect-brk` and loads the build from `~/.local/share/t3code-customize/builds/<build>/overlay`. The fork adds: the launcher replaces the re-signed app copy older versions put at the same path; `update` (what `autoupdate` runs every hour) rebuilds after T3 updated itself and notifies. | `./t3code-customize status` says the next launch opens the customized build; opening the launcher logs "Opened T3 Code with the customization" in `~/.cache/t3code-customize/logs/launch.log`, and the app shows the stats and child threads. |
 | T3 server | `t3code-customize` (`cmd_server`, `build_server`, `install_server_build`, `restart_server`, `server_autoupdate`) | Patched `t3` and `client/` in `~/.t3/runtime/versions/<active>/`, built from tag `v<version>` with `VP_NODE_VERSION` = upstream's `SEA_NODE_VERSION`; originals kept as `*.stock`; health check on port 3773 or back to stock. Depends on upstream's `apps/server/scripts/cli.ts build-exe` and the runtime layout. | `./t3code-customize status` on devbox1 shows "Customized: yes"; `curl` on port 3773 gives 200; `t3 connect status --json` is still linked. |
 | Fleet | `t3code-customize` (`cmd_fleet`, `sync_repo`), `machines.json` | One command updates every machine from any machine; files arrive by Syncthing or SSH copy, identical script and recipe hash required before building. | `./t3code-customize fleet` ends with every machine `ok`. |
 | Hermetic checks | `t3code-customize` (`checks`) | Tests and typechecks run with `HOME` set to an empty temp dir, as in upstream's CI. Upstream's ClaudeAdapterV2 steer test "(never answers)" reads the real `~/.claude/skills` mid-steer and hangs once there are many skills (devbox1, 73). Upstream's `vp lint` also runs on every file the patches add or change: its `no-hermes-unsupported-apis` rule catches APIs Hermes lacks (`Array#toSorted` crashed the iOS composer stats), which tests on Node and typechecks miss. | `./t3code-customize build --resume` passes the checks on devbox1. |

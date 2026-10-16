@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
-"""Rebuild your installed T3 Code Nightly (Linux AppImage or macOS app) with a stats bar under the composer.
+"""Rebuild your installed T3 Code Nightly with a stats bar under the composer.
 
 Run it after every T3 Code update. Everything happens on this machine: the
-patches in this repo are applied to the exact upstream commit your app was
-built from, the web, server and desktop bundles are rebuilt, and the result is
-laid over a copy of your app. Your T3 data is never modified; on Linux neither is your
-AppImage. On macOS, `update` also installs newer T3 Code releases the way T3's own updater
-does (same feed, same download, same signature check), because the customized copy cannot.
+patches in this repo are applied to the exact upstream commit your application was
+built from and the web, server and desktop bundles are rebuilt. On Linux and
+Windows the result is laid over a copy of your app. On macOS your signed app is
+left as it is and the launcher loads the rebuilt bundles into it at startup.
+Your installed app and your T3 data are never modified. `server` does the same
+for a headless T3 server, `ios` for the iOS app and `fleet` for every machine.
 """
 import argparse
-import base64
 import contextlib
 import copy
-import fcntl
 import hashlib
 import json
 import os
-import plistlib
 from pathlib import Path
+import plistlib
 import re
-import secrets
 import shlex
 import shutil
 import socket
@@ -31,32 +29,35 @@ import tempfile
 import threading
 import time
 import urllib.request
+import zipfile
+
+from platform_support import (PlatformError, InstalledApp, storage_paths, find_app,
+                              host_platform, host_arch, node_target, node_bin,
+                              command_args, build_lock, finalize_copy, write_cli,
+                              write_windows_shortcut)
 
 NAME = 't3code-customize'
 REPO = Path(__file__).resolve().parent
 UPSTREAM = 'https://github.com/pingdotgg/t3code.git'
 HOME = Path.home()
-SHARE = Path(os.environ.get('XDG_DATA_HOME') or HOME / '.local/share')
-DATA = SHARE / NAME
-CACHE = Path(os.environ.get('XDG_CACHE_HOME') or HOME / '.cache') / NAME
-CONFIG = Path(os.environ.get('XDG_CONFIG_HOME') or HOME / '.config') / NAME
+SYSTEM = host_platform()
+DATA, CACHE, CONFIG = storage_paths(HOME, SYSTEM)
+SHARE = DATA.parent
 SOURCE = CACHE / 't3code'
 STATE = DATA / 'state.json'
 CURRENT = DATA / 'current'
+LOCK = DATA.parent / (NAME + '.lock')
 DISABLED = DATA / 'disabled'
-BIN = HOME / '.local/bin' / NAME
-DESKTOP = SHARE / 'applications' / (NAME + '.desktop')
+BIN = (DATA / 'bin' / (NAME + '.cmd') if SYSTEM == 'win32' else HOME / '.local/bin' / NAME)
+DESKTOP = (Path(os.environ.get('APPDATA') or HOME / 'AppData/Roaming') /
+           'Microsoft/Windows/Start Menu/Programs/T3 Code (Customized).lnk' if SYSTEM == 'win32' else
+           SHARE / 'applications' / (NAME + '.desktop'))
 LAUNCHER_NAME = 'T3 Code (Customized)'
-SEARCH = ['Applications', 'Downloads', 'AppImages', 'Apps', '.local/bin', 'bin', 'opt']
-MAC = sys.platform == 'darwin'
-# On macOS the customized build is a signed copy of your app next to it, opened like any other app.
-MAC_APP = HOME / 'Applications' / (LAUNCHER_NAME + '.app')
-MAC_SEARCH = [Path('/Applications'), HOME / 'Applications']
-# A finished build waits here while the customized app is still open.
-PENDING = DATA / 'pending' / MAC_APP.name
+MAC = SYSTEM == 'darwin'
+MAC_LAUNCHER = HOME / 'Applications' / (LAUNCHER_NAME + '.app')
+MAC_BUNDLE_ID = 'com.t3tools.t3code'
 AUTOUPDATE_LABEL = 'com.github.t3code-customize.update'
 AUTOUPDATE_PLIST = HOME / 'Library/LaunchAgents' / (AUTOUPDATE_LABEL + '.plist')
-ARCH = {'x86_64': 'x64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(os.uname().machine)
 # A headless T3 server (npm `t3` with the t3code systemd user service) runs the binary in
 # ~/.t3/runtime/versions/<active version>/. `server` swaps that binary and its web client
 # for customized ones and keeps the originals beside them.
@@ -109,7 +110,9 @@ def step(message):
 
 
 def run(args, cwd=None, env=None, log=None, check=True, capture=False):
-    result = subprocess.run(args, cwd=cwd, env=env, text=capture,
+    # Output goes to the log, so nothing may wait for an answer the user cannot see.
+    result = subprocess.run(command_args(args, env), cwd=cwd, env=env, text=capture,
+                            encoding='utf-8' if capture else None, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE if capture else log,
                             stderr=log if not capture else None)
     if check and result.returncode:
@@ -119,7 +122,8 @@ def run(args, cwd=None, env=None, log=None, check=True, capture=False):
 
 def git(*args, check=True, capture=True, log=None):
     env = {**os.environ, **GIT_ENV}
-    return run(['git', '-c', 'core.hooksPath=/dev/null', *args], cwd=SOURCE, env=env, check=check, capture=capture, log=log)
+    return run(['git', '-c', f'core.hooksPath={os.devnull}', '-c', 'core.longpaths=true',
+                '-c', 'core.autocrlf=false', *args], cwd=SOURCE, env=env, check=check, capture=capture, log=log)
 
 
 def sha256(path):
@@ -207,7 +211,8 @@ def recipe_hash():
     digest = hashlib.sha256()
     # Only real files: sync tools leave hidden temporary files beside the patches.
     shared = [p for p in sorted((REPO / 'patches').glob('*')) + sorted(PORT.glob('*')) if not p.name.startswith('.')]
-    for path in shared + own_patches() + [REPO / 'checks.json'] + [c for c in own_checks() if c.exists()]:
+    for path in (shared + own_patches() + [REPO / 'checks.json'] + [c for c in own_checks() if c.exists()]
+                 + [REPO / NAME, REPO / 'platform_support.py'] + sorted((REPO / 'macos').glob('*'))):
         digest.update(path.name.encode() + path.read_bytes())
     return digest.hexdigest()[:12]
 
@@ -230,52 +235,8 @@ def version_key(path):
     return [int(part) if part.isdigit() else part for part in re.split(r'(\d+)', path.name)]
 
 
-def find_mac_app(explicit=None):
-    if explicit:
-        path = Path(explicit).expanduser().resolve()
-        if not (path / 'Contents/Resources/app.asar').is_file():
-            raise Stop(f'No T3 Code app at {path}.')
-        return path
-    configured = load(CONFIG / 'config.json', {}).get('appimage')
-    if configured and (Path(configured) / 'Contents/Resources/app.asar').is_file():
-        return Path(configured)
-    found = [p for folder in MAC_SEARCH for p in folder.glob('T3 Code*.app')
-             if p.name != MAC_APP.name and (p / 'Contents/Resources/app.asar').is_file()]
-    if not found:
-        raise Stop('Could not find T3 Code (Nightly).app in /Applications or ~/Applications.\n'
-                   f'Point to it once with: {NAME} --appimage "/path/to/T3 Code (Nightly).app"')
-    # Prefer Nightly, the build the patches target.
-    return sorted(found, key=lambda p: ('Nightly' in p.name, version_key(p)))[-1]
-
-
-def find_appimage(explicit=None):
-    if MAC:
-        return find_mac_app(explicit)
-    if explicit:
-        path = Path(explicit).expanduser().resolve()
-        if not path.is_file():
-            raise Stop(f'No AppImage at {path}.')
-        return path
-    configured = load(CONFIG / 'config.json', {}).get('appimage')
-    if configured:
-        path = Path(configured)
-        if path.is_file():
-            return path.resolve()
-        # T3's updater replaces versioned files; look again in the same folder.
-        found = sorted((p for p in path.parent.glob('T3-Code*.AppImage') if p.is_file()), key=version_key)
-        if found:
-            return found[-1].resolve()
-    found = [p for folder in SEARCH for p in (HOME / folder).glob('T3-Code*.AppImage') if p.is_file()]
-    if not found:
-        raise Stop('Could not find your T3 Code AppImage in ~/' + ', ~/'.join(SEARCH) + '.\n'
-                   f'Point to it once with: {NAME} --appimage /path/to/T3-Code-....AppImage')
-    return sorted(found, key=version_key)[-1].resolve()
-
-
-def fingerprint(path):
-    # An app bundle is a folder; its archive changes with every update.
-    stat = (path / 'Contents/Resources/app.asar').stat() if MAC else path.stat()
-    return {'path': str(path), 'size': stat.st_size, 'mtime': stat.st_mtime_ns}
+def installed_app(explicit=None):
+    return find_app(HOME, load(CONFIG / 'config.json', {}), explicit, SYSTEM)
 
 
 # --- Electron asar archives ---------------------------------------------------------
@@ -332,7 +293,7 @@ def public_config_from(scripts):
     return {PUBLIC_CONFIG[name]: value for name, value in found.items()}
 
 
-def overlay(stock_path, output, build, config):
+def overlay(stock_path, output, build, config, prefixes=None):
     """Write stock_path with the server and desktop bundles replaced by build's, then verify it."""
     stock = Archive(stock_path)
     try:
@@ -344,9 +305,11 @@ def overlay(stock_path, output, build, config):
                 current = current['files'][part]
             return current
 
-        node('apps/server/dist')['files']['client'] = {'files': {}}
+        prefixes = prefixes or ('apps/server/dist', 'apps/desktop/dist-electron')
+        for prefix in prefixes:
+            node(prefix)['files'] = {}
         overlays = {}
-        for prefix in ('apps/server/dist', 'apps/desktop/dist-electron'):
+        for prefix in prefixes:
             source = build / prefix
             for path in sorted(source.rglob('*')):
                 if path.is_symlink():
@@ -366,7 +329,7 @@ def overlay(stock_path, output, build, config):
                 overlays[prefix + '/' + relative] = path
         for required in ('apps/server/dist/bin.mjs', 'apps/server/dist/client/index.html',
                          'apps/desktop/dist-electron/main.cjs'):
-            if required not in overlays:
+            if any(required.startswith(prefix + '/') for prefix in prefixes) and required not in overlays:
                 raise Stop('The build did not produce ' + required)
         records, cursor = [], 0
         for key, entry in Archive.walk(tree):
@@ -389,28 +352,89 @@ def overlay(stock_path, output, build, config):
                 if patched.read(key) != path.read_bytes():
                     raise Stop('Archive verification failed for ' + key)
             for key, entry in stock.entries.items():
-                if key in overlays or key.startswith('apps/server/dist/client/'):
+                if any(key.startswith(prefix + '/') for prefix in prefixes):
                     continue
                 same = (entry == patched.entries.get(key) if entry.get('unpacked') or 'link' in entry
                         else key in patched.entries and stock.read(key) == patched.read(key))
                 if not same:
                     raise Stop('Archive verification failed for stock entry ' + key)
-            for prefix, marker in MARKERS:
-                if not any(marker in data for _, data in patched.scripts(prefix)):
-                    raise Stop(f'The rebuilt bundle under {prefix} is missing the stats bar.')
-            # Connect needs the same public config as stock in every bundle that carries it.
-            for prefix in ('apps/server/dist/client/', 'apps/server/dist/', 'apps/desktop/dist-electron/'):
-                def contents(archive):
-                    return b''.join(data for key, data in archive.scripts(prefix)
-                                    if prefix.endswith('client/') or '/client/' not in key)
-                stock_data, patched_data = contents(stock), contents(patched)
-                for key, value in config.items():
-                    if value.encode() in stock_data and value.encode() not in patched_data:
-                        raise Stop(f'The rebuilt bundle under {prefix} is missing T3 Connect config ({key}).')
+            check_bundles(stock, patched, config, prefixes)
         finally:
             patched.close()
     finally:
         stock.close()
+
+
+class Folder:
+    """A build output folder, read like an Archive."""
+
+    def __init__(self, root):
+        self.root = Path(root)
+
+    def scripts(self, prefix):
+        for path in sorted((self.root / prefix).rglob('*')):
+            if path.is_file() and path.suffix in ('.js', '.mjs', '.cjs'):
+                yield path.relative_to(self.root).as_posix(), path.read_bytes()
+
+
+def check_bundles(stock, patched, config, prefixes):
+    """The rebuilt bundles carry the patches and the same T3 Connect config as stock."""
+    for prefix, marker in MARKERS:
+        if (any(prefix.startswith(p + '/') for p in prefixes) and
+                not any(marker in data for _, data in patched.scripts(prefix))):
+            raise Stop(f'The rebuilt bundle under {prefix} is missing the stats bar.')
+    # Connect needs the same public config as stock in every bundle that carries it.
+    for prefix in ('apps/server/dist/client/', 'apps/server/dist/', 'apps/desktop/dist-electron/'):
+        if not any(prefix.startswith(p + '/') for p in prefixes):
+            continue
+        def contents(archive):
+            return b''.join(data for key, data in archive.scripts(prefix)
+                            if prefix.endswith('client/') or '/client/' not in key)
+        stock_data, patched_data = contents(stock), contents(patched)
+        for key, value in config.items():
+            if value.encode() in stock_data and value.encode() not in patched_data:
+                raise Stop(f'The rebuilt bundle under {prefix} is missing T3 Connect config ({key}).')
+
+
+def assemble_mac(app, output, build, config):
+    """Write the rebuilt bundles and the loader to output, then verify them against stock."""
+    if (app.resources / 'server.asar').is_file():
+        raise Stop('This T3 Code keeps its server in a separate archive, which the macOS loader does not support yet.')
+    prefixes = ('apps/server/dist', 'apps/desktop/dist-electron')
+    overlay = output / 'overlay'
+    for prefix in prefixes:
+        for path in (build / prefix).rglob('*'):
+            if path.is_symlink():
+                raise Stop('Unexpected symlink in the build output: ' + str(path))
+        shutil.copytree(build / prefix, overlay / prefix)
+    for required in ('apps/server/dist/bin.mjs', 'apps/server/dist/client/index.html',
+                     'apps/desktop/dist-electron/boot.cjs', 'apps/desktop/dist-electron/main.cjs'):
+        if not (overlay / required).is_file():
+            raise Stop('The build did not produce ' + required)
+    for name in ('inject.cjs', 'connect.mjs'):
+        shutil.copy2(REPO / 'macos' / name, output / name)
+    stock = Archive(app.resources / 'app.asar')
+    try:
+        # The app loads boot.cjs before the customization exists, so it must stay as shipped.
+        if stock.read('apps/desktop/dist-electron/boot.cjs') != (overlay / 'apps/desktop/dist-electron/boot.cjs').read_bytes():
+            raise Stop('The rebuilt boot.cjs differs from your app; the customization cannot load into it.')
+        check_bundles(stock, Folder(overlay), config, prefixes)
+    finally:
+        stock.close()
+
+
+def electron_fuses(app):
+    """Electron's fuse wire from the app's framework binary, e.g. {'EnableNodeCliInspectArguments': '1'}."""
+    names = ['RunAsNode', 'EnableCookieEncryption', 'EnableNodeOptionsEnvironmentVariable',
+             'EnableNodeCliInspectArguments', 'EnableEmbeddedAsarIntegrityValidation', 'OnlyLoadAppFromAsar',
+             'LoadBrowserProcessSpecificV8Snapshot', 'GrantFileProtocolExtraPrivileges']
+    data = (app / 'Contents/Frameworks/Electron Framework.framework/Electron Framework').read_bytes()
+    start = data.find(b'dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX')
+    if start < 0:
+        return {}
+    start += 32
+    wire = data[start + 2:start + 2 + data[start + 1]].decode('ascii', 'replace')
+    return dict(zip(names, wire))
 
 
 # --- Tools --------------------------------------------------------------------------
@@ -428,54 +452,64 @@ def ensure_node(log):
     system = shutil.which('node')
     if system and node_major(system) >= 24:
         return None
-    arch = ARCH
-    if not arch:
-        raise Stop('Node 24 or newer is required. Install it and run again.')
-    platform, listing = ('darwin', f'osx-{arch}-tar') if MAC else ('linux', f'linux-{arch}')
-    private = sorted((CACHE / 'node').glob(f'node-v24.*-{platform}-{arch}'), key=version_key)
-    if private and node_major(str(private[-1] / 'bin/node')) >= 24:
-        return private[-1] / 'bin'
+    target, extension = node_target()
+    private = sorted((CACHE / 'node').glob(f'node-v24.*-{target}'), key=version_key)
+    executable = 'node.exe' if SYSTEM == 'win32' else 'node'
+    if private and node_major(str(node_bin(private[-1]) / executable)) >= 24:
+        return node_bin(private[-1])
     step('Downloading Node 24 (one time, private to this tool)...')
     with urllib.request.urlopen('https://nodejs.org/dist/index.json', timeout=30) as response:
         releases = json.load(response)
-    version = next(r['version'] for r in releases if r['version'].startswith('v24.') and listing in r['files'])
+    # nodejs.org lists the Windows zips as win-*-zip and the macOS builds as osx-*-tar.
+    release_target = {'win32': target + '-zip', 'darwin': target.replace('darwin-', 'osx-') + '-tar'}.get(SYSTEM, target)
+    version = next(r['version'] for r in releases if r['version'].startswith('v24.') and release_target in r['files'])
     return download_node(version)
 
 
 def exact_node(version, log):
     """bin folder of exactly Node version (e.g. 26.8.2), downloaded once."""
-    if not ARCH:
-        raise Stop(f'Node {version} is required on this architecture; install it and run again.')
-    folder = CACHE / 'node' / f"node-v{version}-{'darwin' if MAC else 'linux'}-{ARCH}" / 'bin'
-    if (folder / 'node').exists():
+    target, _ = node_target()
+    folder = node_bin(CACHE / 'node' / f'node-v{version}-{target}')
+    if (folder / ('node.exe' if SYSTEM == 'win32' else 'node')).exists():
         return folder
     step(f'Downloading Node {version} (one time, private to this tool)...')
     return download_node('v' + version)
 
 
 def download_node(version):
-    platform, arch = ('darwin' if MAC else 'linux'), ARCH
-    name = f'node-{version}-{platform}-{arch}'
+    target, extension = node_target()
+    name = f'node-{version}-{target}'
     base = f'https://nodejs.org/dist/{version}/'
     with urllib.request.urlopen(base + 'SHASUMS256.txt', timeout=30) as response:
         sums = dict(reversed(line.split()) for line in response.read().decode().splitlines() if line.strip())
     folder = CACHE / 'node'
     folder.mkdir(parents=True, exist_ok=True)
-    archive = folder / (name + '.tar.xz')
+    archive = folder / (name + extension)
     urllib.request.urlretrieve(base + archive.name, archive)
     if sha256(archive) != sums.get(archive.name):
         archive.unlink()
         raise Stop('The Node download did not match its published checksum.')
-    extract_tar(archive, folder)
+    if extension == '.zip':
+        with zipfile.ZipFile(archive) as bundle:
+            for entry in bundle.namelist():
+                destination = (folder / entry).resolve()
+                if not destination.is_relative_to(folder.resolve()):
+                    raise Stop('Unsafe path in the Node archive.')
+            bundle.extractall(folder)
+    else:
+        extract_tar(archive, folder)
     archive.unlink()
-    return folder / name / 'bin'
+    return node_bin(folder / name)
 
 
 def build_env(node_bin):
     env = os.environ.copy()
     paths = [str(SOURCE / 'node_modules/.bin')] + ([str(node_bin)] if node_bin else [])
     env['PATH'] = os.pathsep.join(paths + [env.get('PATH', '')])
-    for key in ('T3CODE_DESKTOP_DEV', 'VITE_HTTP_URL', 'VITE_WS_URL', 'NODE_ENV'):
+    # Corepack otherwise asks before fetching the pnpm version the source pins.
+    env['COREPACK_ENABLE_DOWNLOAD_PROMPT'] = '0'
+    # ELECTRON_RUN_AS_NODE leaks in when this runs from a terminal inside T3 Code.
+    for key in ('T3CODE_DESKTOP_DEV', 'VITE_HTTP_URL', 'VITE_WS_URL', 'NODE_ENV', 'ELECTRON_RUN_AS_NODE'):
         env.pop(key, None)
     # Nothing from the user's shell may stand in for upstream config.
     for key in list(env):
@@ -507,7 +541,8 @@ def ensure_commit(commit, version, log):
         step('Downloading T3 Code source history (one time)...')
         shutil.rmtree(SOURCE, ignore_errors=True)
         SOURCE.parent.mkdir(parents=True, exist_ok=True)
-        run(['git', 'clone', '--filter=blob:none', '--no-checkout', UPSTREAM, str(SOURCE)], log=log)
+        run(['git', '-c', 'core.longpaths=true', '-c', 'core.autocrlf=false',
+             'clone', '--filter=blob:none', '--no-checkout', UPSTREAM, str(SOURCE)], log=log)
     if not has_commit(commit):
         git('fetch', '--quiet', 'origin', capture=False, log=log, check=False)
         if version and not has_commit(commit):
@@ -629,7 +664,7 @@ def build_bundles(env, version, resources, config, log):
     with pinned_versions(version, ('web', 'server', 'desktop'), generated):
         build_web_and_server(env, version, log)
         # Reuse the native helper from your own app instead of compiling it.
-        helper = SOURCE / f'native/browser-secret/build/{ARCH or "x64"}/t3-browser-secret'
+        helper = SOURCE / f'native/browser-secret/build/{host_arch()}/t3-browser-secret'
         stock_helper = resources / 'browser-secret/t3-browser-secret'
         if stock_helper.exists():
             helper.parent.mkdir(parents=True, exist_ok=True)
@@ -671,7 +706,8 @@ def agent_fix(agent, problem, target, version, log):
     step(f'{AGENT_NAMES[agent]} is porting the patches. Transcript: {log.name}')
     log.write('\n--- agent prompt ---\n' + prompt + '\n')
     log.flush()
-    result = subprocess.run(AGENTS[agent], cwd=SOURCE, input=prompt, text=True, stdout=log, stderr=log)
+    result = subprocess.run(command_args(AGENTS[agent]), cwd=SOURCE, input=prompt,
+                            text=True, encoding='utf-8', stdout=log, stderr=log)
     if result.returncode:
         say(f'{AGENT_NAMES[agent]} exited with {result.returncode}; checking what it left.')
 
@@ -738,152 +774,64 @@ def pull_latest():
         os.execv(sys.executable, [sys.executable, str(REPO / NAME), *sys.argv[1:], '--no-pull'])
 
 
-# A self-signed code signing identity of this tool's own, one per Mac, in a keychain only it
-# uses. macOS remembers "Always Allow" for T3's keychain item ("t3code Safe Storage") per
-# signing identity; an ad-hoc signature differs with every build, so it would ask after
-# every update.
-SIGNING_NAME = 't3code-customize local signing'
-SIGNING_KEYCHAIN = CONFIG / 'signing.keychain-db'
-SIGNING_SECRET = CONFIG / 'signing.secret'
-SIGNING_CONFIG = f"""[req]
-distinguished_name = dn
-x509_extensions = ext
-prompt = no
-[dn]
-CN = {SIGNING_NAME}
-[ext]
-basicConstraints = critical,CA:false
-keyUsage = critical,digitalSignature
-extendedKeyUsage = critical,codeSigning
-"""
+def install_launcher(app):
+    write_cli(BIN, REPO, sys.executable)
+    if SYSTEM == 'win32':
+        write_windows_shortcut(DESKTOP, REPO, sys.executable, run)
+    elif MAC:
+        install_mac_launcher(app)
+    else:
+        install_linux_launcher()
+    if str(BIN.parent) not in os.environ.get('PATH', '').split(os.pathsep):
+        say(f'Note: {BIN.parent} is not on your PATH. Add it to run {NAME} from anywhere.')
 
 
-def create_signing_keychain():
-    CONFIG.mkdir(parents=True, exist_ok=True)
-    password = secrets.token_hex(24)
-    SIGNING_SECRET.touch(mode=0o600)
-    SIGNING_SECRET.write_text(password + '\n')
-    work = Path(tempfile.mkdtemp(dir=CONFIG))
-    keychain = str(SIGNING_KEYCHAIN)
-    try:
-        os.chmod(work, 0o700)
-        (work / 'openssl.cnf').write_text(SIGNING_CONFIG)
-        transfer = secrets.token_hex(12)
-        quiet = dict(capture_output=True, check=True)
-        subprocess.run(['/usr/bin/openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '7300',
-             '-keyout', str(work / 'key.pem'), '-out', str(work / 'cert.pem'), '-config', str(work / 'openssl.cnf')], **quiet)
-        subprocess.run(['/usr/bin/openssl', 'pkcs12', '-export', '-inkey', str(work / 'key.pem'), '-in', str(work / 'cert.pem'),
-             '-out', str(work / 'identity.p12'), '-passout', 'pass:' + transfer, '-name', SIGNING_NAME], **quiet)
-        run(['security', 'create-keychain', '-p', password, keychain], capture=True)
-        run(['security', 'set-keychain-settings', keychain], capture=True)  # never locks itself
-        run(['security', 'unlock-keychain', '-p', password, keychain], capture=True)
-        run(['security', 'import', str(work / 'identity.p12'), '-k', keychain, '-P', transfer,
-             '-T', '/usr/bin/codesign'], capture=True)
-        # Lets codesign use the key without a dialog.
-        run(['security', 'set-key-partition-list', '-S', 'apple-tool:,apple:', '-s', '-k', password, keychain], capture=True)
-    except BaseException:
-        subprocess.run(['security', 'delete-keychain', keychain], capture_output=True)
-        SIGNING_SECRET.unlink(missing_ok=True)
-        raise
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+def install_mac_launcher(app):
+    """A small app in ~/Applications that runs `launch`, so it shows up in Spotlight and Launchpad."""
+    contents = MAC_LAUNCHER / 'Contents'
+    if (contents / 'Frameworks').exists() and not retire_mac_copy():
+        return
+    (contents / 'MacOS').mkdir(parents=True, exist_ok=True)
+    (contents / 'Resources').mkdir(exist_ok=True)
+    with (contents / 'Info.plist').open('wb') as plist:
+        plistlib.dump({
+            'CFBundleName': LAUNCHER_NAME, 'CFBundleDisplayName': LAUNCHER_NAME,
+            'CFBundleIdentifier': 'io.github.btsouth.t3code-customize', 'CFBundleExecutable': 'launch',
+            'CFBundleIconFile': 'icon', 'CFBundlePackageType': 'APPL', 'CFBundleVersion': '1',
+            # The launcher exits once T3 Code is up; keep it out of the Dock.
+            'LSUIElement': True,
+        }, plist)
+    script = contents / 'MacOS/launch'
+    logs = CACHE / 'logs'
+    # Apps opened from Finder do not see the shell's environment; keep the folders this build used.
+    exports = ''.join(f'export {key}="{os.environ[key]}"\n' for key in ('XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME')
+                      if os.environ.get(key))
+    script.write_text(f'#!/bin/sh\n{exports}mkdir -p "{logs}"\n'
+                      f'exec "{sys.executable}" "{REPO / NAME}" launch >>"{logs}/launch.log" 2>&1\n')
+    script.chmod(0o755)
+    icon = app.resources / 'icon.icns'
+    if icon.exists():
+        shutil.copy2(icon, contents / 'Resources/icon.icns')
+    os.utime(MAC_LAUNCHER, None)
 
 
-def signing_identity():
-    """SHA-1 of this Mac's local signing certificate, made on first use; None to sign ad hoc."""
-    try:
-        if not (SIGNING_KEYCHAIN.exists() and SIGNING_SECRET.exists()):
-            step('Creating a local code signing identity (one time, so macOS remembers keychain access)...')
-            create_signing_keychain()
-        run(['security', 'unlock-keychain', '-p', SIGNING_SECRET.read_text().strip(), str(SIGNING_KEYCHAIN)], capture=True)
-        found = run(['security', 'find-certificate', '-c', SIGNING_NAME, '-Z', str(SIGNING_KEYCHAIN)], capture=True)
-        return re.search(r'SHA-1 hash: ([0-9A-F]{40})', found).group(1)
-    except (Stop, OSError, AttributeError, subprocess.CalledProcessError) as error:
-        say(f'    Note: signing ad hoc ({str(error).splitlines()[0][:120]}); macOS may ask for keychain'
-            ' access after each update.')
-        return None
-
-
-def finish_mac_app(app, asar):
-    """Record the new archive in Info.plist and sign the copy for this Mac only."""
-    info_path = app / 'Contents/Info.plist'
-    info = plistlib.loads(info_path.read_bytes())
-    with asar.open('rb') as archive:
-        _, _, _, json_size = struct.unpack('<4I', archive.read(16))
-        header_hash = hashlib.sha256(archive.read(json_size)).hexdigest()
-    info.setdefault('ElectronAsarIntegrity', {})['Resources/app.asar'] = {'algorithm': 'SHA256', 'hash': header_hash}
-    # T3's updater can't replace a locally signed copy; updates come through your own app and a rebuild.
-    info.setdefault('LSEnvironment', {})['T3CODE_DISABLE_AUTO_UPDATE'] = 'true'
-    info_path.write_bytes(plistlib.dumps(info))
-    run(['xattr', '-cr', str(app)])
-    # Local signing drops T3's team entitlements (passkeys, keychain group); nothing else needs them.
-    identity = signing_identity()
-    sign = ['--sign', identity, '--keychain', str(SIGNING_KEYCHAIN)] if identity else ['--sign', '-']
-    run(['codesign', '--force', '--deep', *sign, str(app)], capture=True)
-    if run(['codesign', '--verify', '--deep', '--strict', str(app)], check=False).returncode:
-        raise Stop('The customized app failed its code signature check.')
-
-
-def app_running(app):
-    """True while any process runs from inside this app bundle."""
-    prefix = str(app) + '/Contents/'
+def retire_mac_copy():
+    """Older versions of this tool put a re-signed copy of the whole app where the launcher goes.
+    Remove it, and the job that waited to swap in its next build, once it is closed."""
+    label = AUTOUPDATE_LABEL.rsplit('.', 1)[0] + '.install-pending'
+    subprocess.run(['launchctl', 'bootout', f'gui/{os.getuid()}/{label}'], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    (CACHE / (label + '.plist')).unlink(missing_ok=True)
+    shutil.rmtree(DATA / 'pending', ignore_errors=True)
     listing = subprocess.run(['ps', '-axo', 'command='], capture_output=True, text=True).stdout
-    return any(line.startswith(prefix) for line in listing.splitlines())
-
-
-def replace_app(new, installed):
-    """Swap an app bundle in place; the old one is removed only after the new one is there."""
-    old = installed.with_name(installed.name + '.old')
-    shutil.rmtree(old, ignore_errors=True)
-    if installed.exists():
-        os.rename(installed, old)
-    try:
-        shutil.move(str(new), installed)
-    except BaseException:
-        if old.exists() and not installed.exists():
-            os.rename(old, installed)
-        raise
-    shutil.rmtree(old, ignore_errors=True)
-    subprocess.run(['/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister',
-                    '-f', str(installed)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-
-def stage_mac_build(app):
-    """Install the build in ~/Applications, or keep it pending while the customized app is open."""
-    shutil.rmtree(PENDING.parent, ignore_errors=True)
-    PENDING.parent.mkdir(parents=True)
-    shutil.move(str(app), PENDING)
-    install_pending()
-    return MAC_APP
-
-
-def install_pending():
-    """Move a pending build into place once the customized app is closed. True if it did."""
-    if not PENDING.exists() or app_running(MAC_APP):
+    if any(line.startswith(str(MAC_LAUNCHER) + '/Contents/') for line in listing.splitlines()):
+        say(f'Note: the old "{LAUNCHER_NAME}" copy is still open. Quit it and run {NAME} again to install the launcher.')
         return False
-    MAC_APP.parent.mkdir(parents=True, exist_ok=True)
-    replace_app(PENDING, MAC_APP)
-    shutil.rmtree(PENDING.parent, ignore_errors=True)
+    shutil.rmtree(MAC_LAUNCHER)
     return True
 
 
-def notify(message):
-    if MAC:
-        script = f'display notification {json.dumps(message)} with title {json.dumps(LAUNCHER_NAME)}'
-        subprocess.run(['osascript', '-e', script], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    elif shutil.which('notify-send'):
-        subprocess.run(['notify-send', '-a', 'T3 Code', LAUNCHER_NAME, message], check=False)
-
-
-def install_launcher(appimage_dir):
-    BIN.parent.mkdir(parents=True, exist_ok=True)
-    if BIN.is_symlink() or not BIN.exists():
-        BIN.unlink(missing_ok=True)
-        BIN.symlink_to(REPO / NAME)
-    if MAC:
-        if str(BIN.parent) not in os.environ.get('PATH', '').split(os.pathsep):
-            say(f'Note: {BIN.parent} is not on your PATH. Add it to run {NAME} from anywhere.')
-        return
+def install_linux_launcher():
     DESKTOP.parent.mkdir(parents=True, exist_ok=True)
     DESKTOP.write_text('\n'.join([
         '[Desktop Entry]', 'Type=Application', f'Name={LAUNCHER_NAME}',
@@ -893,8 +841,29 @@ def install_launcher(appimage_dir):
     if shutil.which('update-desktop-database'):
         subprocess.run(['update-desktop-database', str(DESKTOP.parent)], check=False,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if str(BIN.parent) not in os.environ.get('PATH', '').split(os.pathsep):
-        say(f'Note: {BIN.parent} is not on your PATH. Add it to run {NAME} from anywhere.')
+
+
+def overlay_app(app, job, config):
+    desktop = app.resources / 'app.asar'
+    server = app.resources / 'server.asar'
+    archives = ([(desktop, ('apps/desktop/dist-electron',)), (server, ('apps/server/dist',))]
+                if server.is_file() else [(desktop, ('apps/server/dist', 'apps/desktop/dist-electron'))])
+    for path, prefixes in archives:
+        output = job / (path.name + '.new')
+        overlay(path, output, SOURCE, config, prefixes)
+        os.replace(output, path)
+
+
+def current_executable(state):
+    if state.get('build'):
+        root = Path(state['build'])
+        if SYSTEM == 'linux':
+            return root / 'AppRun'
+        if MAC:
+            return root / 'inject.cjs'
+        if root.exists():
+            return InstalledApp.inspect(root, SYSTEM).executable
+    return CURRENT / 'AppRun' if SYSTEM == 'linux' else DATA / 'missing-build'
 
 
 def apply_patches(args, target, version, env, log):
@@ -930,16 +899,19 @@ def cmd_build(args):
         raise Stop('git is required. Install it and run again.')
     if not args.no_pull and not args.resume:
         pull_latest()
-    appimage = find_appimage(args.appimage)
-    if args.appimage:
-        save(CONFIG / 'config.json', {**load(CONFIG / 'config.json', {}), 'appimage': str(appimage)})
-    say('T3 Code: ' + str(appimage))
+    app = installed_app(args.app)
+    if args.app:
+        save(CONFIG / 'config.json', {**load(CONFIG / 'config.json', {}), 'app': str(app.path)})
+    say('T3 Code: ' + str(app.path))
+    if MAC and electron_fuses(app.path).get('EnableNodeCliInspectArguments') != '1':
+        raise Stop('This T3 Code no longer lets a launcher hook into its startup, so the customization cannot load\n'
+                   'into the signed app. Your current T3 Code is untouched.')
+    stock_fingerprint = app.fingerprint()
     state = load(STATE, {})
     recipe = recipe_hash()
-    built = (PENDING if PENDING.exists() else MAC_APP) / 'Contents/Info.plist' if MAC else CURRENT / 'AppRun'
-    if (not args.force and not args.resume and state.get('stock') == fingerprint(appimage)
-            and state.get('recipe') == recipe and built.exists()):
-        install_launcher(appimage.parent)
+    if (not args.force and not args.resume and state.get('stock') == stock_fingerprint
+            and state.get('recipe') == recipe and current_executable(state).exists()):
+        install_launcher(app)
         say(f'\nAlready up to date. Open "{LAUNCHER_NAME}" from your app launcher.')
         return False
     DATA.mkdir(parents=True, exist_ok=True)
@@ -947,20 +919,19 @@ def cmd_build(args):
     logs.mkdir(parents=True, exist_ok=True)
     job = CACHE / 'work' / time.strftime('%Y%m%d-%H%M%S')
     job.mkdir(parents=True)
-    with (logs / (job.name + '.log')).open('w') as log:
+    with (logs / (job.name + '.log')).open('w', encoding='utf-8') as log:
         say('Log: ' + log.name)
         step('Reading your T3 Code...')
-        if MAC:
-            stock_root = job / MAC_APP.name
-            run(['ditto', str(appimage), str(stock_root)], log=log)
-            resources = stock_root / 'Contents/Resources'
-        else:
-            run([str(appimage), '--appimage-extract'], cwd=job, log=log)
-            stock_root = job / 'squashfs-root'
-            resources = stock_root / 'resources'
-        archive = Archive(resources / 'app.asar')
+        # On macOS the signed app is read in place and never copied or changed.
+        stock_root = app if MAC else app.copy_to(job, run, log)
+        archive = Archive(stock_root.resources / 'app.asar')
         try:
             metadata = json.loads(archive.read('package.json'))
+        finally:
+            archive.close()
+        server = stock_root.resources / 'server.asar'
+        archive = Archive(server if server.is_file() else stock_root.resources / 'app.asar')
+        try:
             config = read_public_config(archive)
         finally:
             archive.close()
@@ -968,7 +939,7 @@ def cmd_build(args):
         if 'nightly' not in version:
             raise Stop(f'This is T3 Code {version}. The patches target T3 Code Nightly; install Nightly and run again.')
         if not re.fullmatch(r'[0-9a-f]{7,40}', commit):
-            raise Stop('This app does not record its source commit, so it cannot be rebuilt exactly.')
+            raise Stop('This application does not record its source commit, so it cannot be rebuilt exactly.')
         say(f'    Nightly {version}, upstream commit {commit[:12]}')
         if len(config) != len(PUBLIC_CONFIG):
             say('    Note: could not read T3 Connect config from your app; sign-in may not work in this build.')
@@ -977,61 +948,46 @@ def cmd_build(args):
         target = ensure_commit(commit, version, log)
         ported = apply_patches(args, target, version, env, log)
         head = git('rev-parse', 'HEAD').strip()
-        build_bundles(env, version, resources, config, log)
+        build_bundles(env, version, stock_root.resources, config, log)
         if git('rev-parse', 'HEAD').strip() != head:
             raise Stop('The source checkout changed during the build.')
         step('Assembling and verifying your customized app...')
-        output = job / 'app.asar'
-        overlay(resources / 'app.asar', output, SOURCE, config)
-        shutil.move(str(output), resources / 'app.asar')
         if MAC:
-            finish_mac_app(stock_root, resources / 'app.asar')
+            assembled = job / 'build'
+            assemble_mac(app, assembled, SOURCE, config)
+        else:
+            overlay_app(stock_root, job, config)
+            finalize_copy(stock_root, run, log)
+            assembled = stock_root.path
+        if app.fingerprint() != stock_fingerprint:
+            raise Stop('The installed T3 Code changed during the build. Run again for its new version.')
         if ported:
             export_patches(target)
-        if MAC:
-            destination = stage_mac_build(stock_root)
-        else:
-            destination = install_linux_build(stock_root, version, job)
+        build_dir = DATA / 'builds' / f'{version}-{recipe_hash()}-{job.name}'
+        build_dir.mkdir(parents=True)
+        destination = build_dir / assembled.name
+        shutil.move(str(assembled), destination)
         # The recipe this build was made from; a port changes it, a sync during the build must not.
-        save(STATE, {'stock': fingerprint(appimage), 'version': version, 'commit': target,
+        save(STATE, {'stock': stock_fingerprint, 'version': version, 'commit': target,
                      'recipe': recipe_hash() if ported else recipe,
                      'build': str(destination), 'connect': len(config) == len(PUBLIC_CONFIG),
                      'builtAt': time.strftime('%Y-%m-%dT%H:%M:%S')})
+        icon = destination / 't3code.png'
+        if icon.exists():
+            shutil.copy2(icon, DATA / 'icon.png')
+        prune()
     shutil.rmtree(job, ignore_errors=True)
-    install_launcher(appimage.parent)
+    install_launcher(app)
     minutes = max(1, round((time.time() - started) / 60))
     say(f'\nDone in {minutes} min: T3 Code {version} with the stats bar.')
     if ported:
         say(f'The ported patches were saved to {PORT} and {OWN_PATCHES}; commit them.')
-    if MAC:
-        if PENDING.exists():
-            start_install_waiter()
-            say(f'"{LAUNCHER_NAME}" is open; the new build installs when you quit it. Then reopen it.')
-        else:
-            say(f'Quit T3 Code fully, then open "{LAUNCHER_NAME}" from ~/Applications.')
-            say('First time? Turn on Settings > General > Stats for nerds.')
-    elif DISABLED.exists():
+    if DISABLED.exists():
         say(f'Customization is switched off. Run {NAME} on to use it.')
     else:
         say(f'Quit T3 Code fully, then open "{LAUNCHER_NAME}" from your app launcher.')
         say('First time? Turn on Settings > General > Stats for nerds.')
     return True
-
-
-def install_linux_build(stock_root, version, job):
-    destination = DATA / 'builds' / f'{version}-{recipe_hash()}-{job.name}'
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(stock_root), destination)
-    link = DATA / 'current.new'
-    if link.is_symlink():
-        link.unlink()
-    link.symlink_to(destination.relative_to(DATA))
-    os.replace(link, CURRENT)
-    icon = destination / 't3code.png'
-    if icon.exists():
-        shutil.copy2(icon, DATA / 'icon.png')
-    prune()
-    return destination
 
 
 def export_patches(target):
@@ -1064,7 +1020,8 @@ def export_patches(target):
 
 def prune(keep=3):
     """Drop old builds, keeping the newest few so a running instance never loses its files."""
-    current = CURRENT.resolve()
+    state = load(STATE, {})
+    current = Path(state['build']).parent if state.get('build') else CURRENT.resolve()
     builds = sorted((DATA / 'builds').iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
     for old in builds[keep:]:
         if old.resolve() != current:
@@ -1072,10 +1029,10 @@ def prune(keep=3):
 
 
 def cmd_verify(args):
-    """Apply the patches to their base and run the checks. No AppImage needed (used by CI)."""
+    """Apply the patches to their base and run the checks. No installed app needed."""
     logs = CACHE / 'logs'
     logs.mkdir(parents=True, exist_ok=True)
-    with (logs / ('verify-' + time.strftime('%Y%m%d-%H%M%S') + '.log')).open('w') as log:
+    with (logs / ('verify-' + time.strftime('%Y%m%d-%H%M%S') + '.log')).open('w', encoding='utf-8') as log:
         say('Log: ' + log.name)
         env = build_env(ensure_node(log))
         ensure_commit((REPO / 'patches/base.txt').read_text().strip(), None, log)
@@ -1088,31 +1045,86 @@ def cmd_verify(args):
     say('Patches apply and pass their checks on ' + base[:12] + '.')
 
 
+def stock_target(app):
+    """What launching stock means: the app bundle on macOS, its executable elsewhere."""
+    return app.path if MAC else app.executable
+
+
 def launch_target():
-    """The customized build if it was made from the AppImage installed right now, else stock."""
-    appimage = find_appimage()
+    """Use the customized build only while it matches the installed application."""
+    app = installed_app()
     state = load(STATE, {})
-    built = MAC_APP if MAC else CURRENT / 'AppRun'
+    built = current_executable(state)
     if DISABLED.exists() or not built.exists():
-        return appimage, None
-    if state.get('stock') != fingerprint(appimage):
-        return appimage, f'T3 Code was updated. Run {NAME} in a terminal to bring the stats bar back.'
-    return built.resolve(), None
+        return stock_target(app), None
+    if state.get('stock') != app.fingerprint():
+        return stock_target(app), f'T3 Code was updated. Run {NAME} in a terminal to bring the stats bar back.'
+    # On macOS the target is the build folder holding the loader and the overlay.
+    return (built.parent if MAC else built).resolve(), None
+
+
+def notify(title, message):
+    say(message)
+    if MAC:
+        script = f'display notification {json.dumps(message)} with title {json.dumps(title)}'
+        subprocess.run(['osascript', '-e', script], check=False)
+    elif shutil.which('notify-send'):
+        subprocess.run(['notify-send', '-a', 'T3 Code', title, message], check=False)
+
+
+def mac_running():
+    script = f'application id "{MAC_BUNDLE_ID}" is running'
+    return subprocess.run(['osascript', '-e', script], capture_output=True, text=True).stdout.strip() == 'true'
+
+
+def free_port():
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        return probe.getsockname()[1]
+
+
+def launch_mac(app, target, rest):
+    rest = [arg for arg in rest if not arg.startswith('-psn_')]
+    if mac_running():
+        # A running T3 Code keeps what it started with; this only brings it forward.
+        subprocess.run(['open', str(app.path)], check=False)
+        return
+    if target == app.path:
+        os.execvp('open', ['open', str(app.path), *(['--args', *rest] if rest else [])])
+    # T3 Code waits at its first line until connect.mjs has loaded the build into it.
+    port = free_port()
+    subprocess.run(['open', str(app.path), '--args', f'--inspect-brk=127.0.0.1:{port}', *rest], check=True)
+    result = subprocess.run([str(app.executable), str(target / 'connect.mjs'), str(port),
+                             str(target / 'inject.cjs'), str(target / 'overlay')],
+                            env={**os.environ, 'ELECTRON_RUN_AS_NODE': '1'}, capture_output=True, text=True)
+    if result.returncode:
+        notify('Opened stock T3 Code', (result.stderr.strip().splitlines() or ['The customization did not load.'])[-1])
+    else:
+        say(f'Opened T3 Code with the customization from {target}.')
 
 
 def cmd_launch(args):
-    appimage = find_appimage()
+    app = installed_app()
     target, notice = launch_target()
     if notice:
-        say(notice)
-        notify(notice)
+        notify('Opening stock T3 Code', notice)
+    rest = args.rest[1:] if args.rest[:1] == ['--'] else args.rest
     if MAC:
-        os.execv('/usr/bin/open', ['/usr/bin/open', '-a', str(target), *(['--args', *args.rest] if args.rest else [])])
-    if target != appimage:
+        return launch_mac(app, target, rest)
+    env = os.environ.copy()
+    for key in ('ELECTRON_RUN_AS_NODE', 'ELECTRON_NO_ASAR', 'NODE_OPTIONS'):
+        env.pop(key, None)
+    if target != app.executable and SYSTEM == 'linux':
         # Run the extracted copy as if it were the AppImage, so T3's own updater still updates the real file.
-        os.environ['APPIMAGE'] = str(appimage)
-        os.environ['APPDIR'] = str(target.parent)
-    os.execv(str(target), [str(target), *args.rest])
+        env['APPIMAGE'] = str(app.path)
+        env['APPDIR'] = str(target.parent)
+    elif target != app.executable:
+        env['T3CODE_DISABLE_AUTO_UPDATE'] = 'true'
+    if SYSTEM == 'win32':
+        # DETACHED_PROCESS only exists on Windows builds of Python.
+        subprocess.Popen([str(target), *rest], env=env, creationflags=getattr(subprocess, 'DETACHED_PROCESS', 0x8))
+    else:
+        os.execve(str(target), [str(target), *rest], env)
 
 
 # --- Headless T3 server (Linux) -----------------------------------------------------
@@ -1349,159 +1361,22 @@ def server_autoupdate(args):
 
 # --- Keeping up with Nightly on macOS -----------------------------------------------
 
-def nightly_number(version):
-    """0.0.46-nightly.20261015.3145 -> comparable parts."""
-    return [int(part) for part in re.findall(r'\d+', version or '')]
-
-
 def bundle_version(app):
     return plistlib.loads((app / 'Contents/Info.plist').read_bytes()).get('CFBundleShortVersionString', '')
 
 
-def updater_config(app):
-    """The feed T3's own updater uses, from the app-update.yml it ships with (electron-updater)."""
-    text = (app / 'Contents/Resources/app-update.yml').read_text()
-    config = dict(re.findall(r'^(\w+):\s*(\S+)\s*$', text, re.M))
-    if config.get('provider') != 'github' or not config.get('owner') or not config.get('repo'):
-        raise Stop('Your T3 Code has an update feed this tool does not know.')
-    return config
-
-
-def fetch(url):
-    request = urllib.request.Request(url, headers={'User-Agent': NAME, 'Accept': 'application/vnd.github+json'})
-    with urllib.request.urlopen(request, timeout=60) as response:
-        return response.read()
-
-
-def latest_release(config):
-    """Newest release on the updater's channel as (version, zip url, sha512), read from <channel>-mac.yml."""
-    repo = f"{config['owner']}/{config['repo']}"
-    channel = config.get('channel', 'latest')
-    releases = json.loads(fetch(f'https://api.github.com/repos/{repo}/releases?per_page=20'))
-    tag = next(r['tag_name'] for r in releases if channel in r['tag_name'] and not r.get('draft'))
-    base = f'https://github.com/{repo}/releases/download/{tag}/'
-    feed = fetch(base + channel + '-mac.yml').decode()
-    version = re.search(r"^version:\s*'?([^'\n]+)'?", feed, re.M).group(1).strip()
-    for name, digest in re.findall(r'-\s*url:\s*(\S+)\s+sha512:\s*(\S+)', feed):
-        if name.endswith(f'-{ARCH}.zip'):
-            return version, base + name, digest
-    raise Stop(f'T3 Code {version} has no macOS {ARCH} zip.')
-
-
-def sha512_base64(path):
-    digest = hashlib.sha512()
-    with path.open('rb') as source:
-        for chunk in iter(lambda: source.read(1 << 20), b''):
-            digest.update(chunk)
-    return base64.b64encode(digest.digest()).decode()
-
-
-def downloaded_by_t3(config, digest):
-    """The zip T3's updater already downloaded and verified for this release, if any."""
-    pending = HOME / 'Library/Caches' / config.get('updaterCacheDirName', 't3code-updater') / 'pending'
-    info = load(pending / 'update-info.json', {})
-    candidate = pending / info.get('fileName', '-')
-    if info.get('sha512') == digest and candidate.is_file() and sha512_base64(candidate) == digest:
-        return candidate
-    return None
-
-
-def update_stock(app, log):
-    """Install a newer release over the stock app, checked the way T3's updater checks it. True if it did."""
-    config = updater_config(app)
-    version, url, digest = latest_release(config)
-    if nightly_number(version) <= nightly_number(bundle_version(app)):
-        return False
-    if app_running(app):
-        say(f'T3 Code {version} is out; quit {app.stem} to let {NAME} install it.')
-        return False
-    work = CACHE / 'download'
-    shutil.rmtree(work, ignore_errors=True)
-    work.mkdir(parents=True)
-    archive = downloaded_by_t3(config, digest)
-    if archive:
-        step(f'Installing T3 Code {version}, already downloaded by T3 Code...')
-    else:
-        step(f'Downloading T3 Code {version}...')
-        archive = work / 'update.zip'
-        request = urllib.request.Request(url, headers={'User-Agent': NAME})
-        with urllib.request.urlopen(request, timeout=600) as response, archive.open('wb') as target:
-            shutil.copyfileobj(response, target)
-        if sha512_base64(archive) != digest:
-            raise Stop('The T3 Code download did not match its published checksum.')
-    run(['ditto', '-x', '-k', str(archive), str(work / 'app')], log=log)
-    found = list((work / 'app').glob('*.app'))
-    if len(found) != 1:
-        raise Stop('The T3 Code download did not contain one app.')
-    new = found[0]
-    # Squirrel's check: the update must satisfy the installed app's designated requirement.
-    details = subprocess.run(['codesign', '-d', '-r-', str(app)], capture_output=True, text=True)
-    requirement = re.search(r'designated => (.+)', details.stdout + details.stderr)
-    if not requirement or run(['codesign', '--verify', '--deep', '--strict', '-R=' + requirement.group(1), str(new)],
-                              log=log, check=False).returncode:
-        raise Stop('The T3 Code download is not signed like your installed T3 Code.')
-    replace_app(new, app)
-    shutil.rmtree(work, ignore_errors=True)
-    step(f'Installed T3 Code {version}.')
-    return True
-
-
 def cmd_update(args):
-    """Bring stock Nightly and the customized build up to date (macOS); a plain build elsewhere."""
-    if not MAC:
-        return cmd_build(args)
+    """Rebuild for the T3 Code installed now. On macOS T3's own updater installs new
+    releases into the untouched app; this brings the customization back afterwards."""
     try:
-        if install_pending():
-            notify('Installed the new build. Open it to use the latest Nightly.')
-        app = find_appimage(args.appimage)
-        if args.background and app_running(MAC_APP) and PENDING.exists():
-            return
-        logs = CACHE / 'logs'
-        logs.mkdir(parents=True, exist_ok=True)
-        with (logs / 'update.log').open('a') as log:
-            update_stock(app, log)
         if cmd_build(args) and args.background:
-            notify('A new build is ready; it installs when you quit T3 Code.' if PENDING.exists()
-                   else 'Updated to ' + load(STATE, {}).get('version', 'the latest Nightly') + '.')
-    except Stop as stop:
+            notify(LAUNCHER_NAME, 'Rebuilt for ' + load(STATE, {}).get('version', 'the latest Nightly')
+                   + f'. Quit T3 Code and open "{LAUNCHER_NAME}" to use it.')
+    except (Stop, PlatformError) as stop:
         if args.background:
             first = str(stop).strip().splitlines()[0]
-            notify(f'Update failed: {first} Run {NAME} in a terminal.')
+            notify(LAUNCHER_NAME, f'Update failed: {first} Run {NAME} in a terminal.')
         raise
-
-
-def start_install_waiter():
-    """Swap the pending build in as soon as the open app quits, from a launchd job so it
-    outlives this terminal."""
-    label = AUTOUPDATE_LABEL.rsplit('.', 1)[0] + '.install-pending'
-    plist = CACHE / (label + '.plist')
-    plist.write_bytes(plistlib.dumps({
-        'Label': label, 'ProgramArguments': [sys.executable, str(REPO / NAME), 'install-pending'],
-        'EnvironmentVariables': {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(HOME)},
-        'RunAtLoad': True, 'ProcessType': 'Background',
-        'StandardOutPath': str(CACHE / 'logs/install-pending.log'),
-        'StandardErrorPath': str(CACHE / 'logs/install-pending.log'),
-    }))
-    domain = f'gui/{os.getuid()}'
-    subprocess.run(['launchctl', 'bootout', f'{domain}/{label}'], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(['launchctl', 'bootstrap', domain, str(plist)], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-
-def cmd_install_pending(args):
-    """Wait for the customized app to quit, then install the pending build (started by a build)."""
-    deadline = time.time() + 24 * 3600
-    while PENDING.exists() and app_running(MAC_APP) and time.time() < deadline:
-        time.sleep(3)
-    CACHE.mkdir(parents=True, exist_ok=True)
-    with (CACHE / 'lock').open('w') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return  # A running build or update installs it itself.
-        if install_pending():
-            notify('The new build is installed. Open it again to use it.')
 
 
 def cmd_autoupdate(args):
@@ -1530,8 +1405,8 @@ def cmd_autoupdate(args):
         'StandardOutPath': str(CACHE / 'logs/autoupdate.log'), 'StandardErrorPath': str(CACHE / 'logs/autoupdate.log'),
     }))
     run(['launchctl', 'bootstrap', domain, str(AUTOUPDATE_PLIST)])
-    say(f'Background updates on: every {args.every} minutes it installs a newer Nightly, rebuilds,'
-        f' and swaps the build in when "{LAUNCHER_NAME}" is closed.' + (f' Broken patches are ported by {AGENT_NAMES[args.fix]}.' if args.fix else ''))
+    say(f'Background updates on: every {args.every} minutes it rebuilds once T3 Code has updated itself'
+        ' or the patches changed.' + (f' Broken patches are ported by {AGENT_NAMES[args.fix]}.' if args.fix else ''))
     say(f'Log: {CACHE / "logs/autoupdate.log"}')
 
 
@@ -1545,63 +1420,51 @@ def cmd_status(args):
             + (f'; patches changed since, run {NAME} server' if mark and mark.get('recipe') != recipe_hash() else ''))
         say('Background updates: ' + ('on' if SERVER_UNITS['.path'].exists() else f'off ({NAME} autoupdate on)'))
         try:
-            find_appimage()
-        except Stop:
+            installed_app()
+        except PlatformError:
             return  # A headless server without a desktop app.
         say()
-    appimage = find_appimage()
+    app = installed_app()
     state = load(STATE, {})
     target, notice = launch_target()
-    say('Installed T3 Code:  ' + str(appimage) + (f' ({bundle_version(appimage)})' if MAC else ''))
+    say('Installed T3 Code:  ' + str(app.path) + (f' ({bundle_version(app.path)})' if MAC else ''))
     say('Customized build:   ' + (f"{state['version']} (built {state['builtAt']})" if state else 'none yet'))
+    say('Switched:           ' + ('off' if DISABLED.exists() else 'on'))
+    say('Next launch opens:  ' + ('customized build' if target != stock_target(app) else 'stock T3 Code'))
+    if notice:
+        say(notice)
     if MAC:
-        say('Customized app:     ' + (str(MAC_APP) if MAC_APP.exists() else 'not installed'))
-        if PENDING.exists():
-            say('Waiting to install: a newer build, once the customized app is closed')
+        say('Launcher:           ' + (str(MAC_LAUNCHER) if MAC_LAUNCHER.exists() else 'not installed'))
         say('Background updates: ' + ('on' if AUTOUPDATE_PLIST.exists() else f'off ({NAME} autoupdate on)'))
-        if notice:
-            say(f'Your T3 Code is newer than the customized build. Run {NAME} to rebuild.')
         ios_state = load(IOS_STATE)
         if ios_state:
             behind = (ios_state.get('recipe') != ios_recipe_hash()
-                      or ios_state.get('version') != bundle_version(appimage))
+                      or ios_state.get('version') != bundle_version(app.path))
             say(f"iOS app:            build {ios_state['buildNumber']} for {ios_state['version']}"
                 + (f' (behind; run {NAME} ios)' if behind else ''))
-        return
-    say('Switched:           ' + ('off' if DISABLED.exists() else 'on'))
-    say('Next launch opens:  ' + ('customized build' if target != appimage else 'stock T3 Code'))
-    if notice:
-        say(notice)
 
 
 def cmd_on(args):
-    if MAC:
-        return say(f'On macOS, open "{LAUNCHER_NAME}" for the customized build or your T3 Code for stock.')
     DISABLED.unlink(missing_ok=True)
     say('Customization on. Quit T3 Code fully and reopen it.')
 
 
 def cmd_off(args):
-    if MAC:
-        return cmd_on(args)
     DATA.mkdir(parents=True, exist_ok=True)
     DISABLED.touch()
     say('Stock T3 Code on the next launch. Quit it fully and reopen it.')
 
 
 def cmd_uninstall(args):
-    if BIN.is_symlink() and BIN.resolve() == (REPO / NAME).resolve():
-        BIN.unlink()
+    BIN.unlink(missing_ok=True)
     DESKTOP.unlink(missing_ok=True)
     if MAC:
         args.state = 'off'
         cmd_autoupdate(args)
-        if app_running(MAC_APP):
-            raise Stop(f'Quit "{LAUNCHER_NAME}" first.')
-        shutil.rmtree(MAC_APP, ignore_errors=True)
-        subprocess.run(['security', 'delete-keychain', str(SIGNING_KEYCHAIN)], capture_output=True)
+        shutil.rmtree(MAC_LAUNCHER, ignore_errors=True)
     for folder in (DATA, CACHE, CONFIG):
-        shutil.rmtree(folder, ignore_errors=True)
+        if folder.exists():
+            shutil.rmtree(folder)
     tail = '' if DATA in REPO.parents else f' You can delete {REPO} too.'
     say('Removed t3code-customize, its launcher, builds and caches. Your T3 Code and its data are untouched.' + tail)
 
@@ -1902,7 +1765,7 @@ def cmd_ios(args):
     config = ios_config()
     if not args.no_pull and not args.resume:
         pull_latest()
-    app = find_mac_app(args.appimage)
+    app = installed_app(args.app).path
     archive = Archive(app / 'Contents/Resources/app.asar')
     try:
         metadata = json.loads(archive.read('package.json'))
@@ -1959,12 +1822,12 @@ def cmd_ios(args):
 
 def main():
     parser = argparse.ArgumentParser(prog=NAME, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
-                                     epilog='With no command, it updates the patches and builds for your installed T3 Code'
-                                            ' (on macOS it first installs a newer Nightly).')
+                                     epilog='With no command, it updates the patches and builds for your installed T3 Code.')
     sub = parser.add_subparsers(dest='command', metavar='command')
 
     def build_options(p):
-        p.add_argument('--appimage', '--app', dest='appimage', help='path to your T3 Code AppImage or .app (remembered)')
+        p.add_argument('--app', '--appimage', dest='app',
+                       help='installed AppImage, macOS T3 Code (Nightly).app or Windows executable (remembered)')
         p.add_argument('--fix', choices=sorted(AGENTS), help='if a nightly breaks the patches, let this agent port them without asking')
         p.add_argument('--resume', action='store_true', help='continue from the source checkout as you or your agent left it')
         p.add_argument('--skip-checks', action='store_true', help='skip the patch tests, typechecks and lint')
@@ -1972,7 +1835,7 @@ def main():
         p.add_argument('--no-pull', action='store_true', help='do not fetch newer patches first')
 
     build_options(sub.add_parser('build', help='update the patches and build for the T3 Code you have'))
-    update = sub.add_parser('update', help='macOS: install a newer Nightly, then build (the default on macOS)')
+    update = sub.add_parser('update', help='build, and on failure notify (what autoupdate runs; the default on macOS)')
     build_options(update)
     update.add_argument('--background', action='store_true', help=argparse.SUPPRESS)
     auto = sub.add_parser('autoupdate', help='macOS: keep everything up to date in the background')
@@ -1999,16 +1862,22 @@ def main():
     fleet.add_argument('--no-pull', action='store_true', help='do not fetch newer patches first')
     ios = sub.add_parser('ios', help='macOS: build the patched iOS app and upload it to TestFlight (see ios.json)')
     build_options(ios)
-    sub.add_parser('install-pending')
     sub.add_parser('identity')
     argv = sys.argv[1:]
     if not argv or argv[0].startswith('-') and argv[0] not in ('-h', '--help'):
         argv = ['update' if MAC else 'build', *argv]
     args = parser.parse_args(argv)
+    if not args.command:
+        parser.print_help()
+        return
     handler = globals()['cmd_' + args.command.replace('-', '_')]
-    if args.command in ('launch', 'status', 'on', 'off', 'autoupdate', 'install-pending', 'fleet', 'identity'):
+    if args.command in ('launch', 'status', 'on', 'off', 'autoupdate', 'fleet', 'identity'):
         return handler(args)
     CACHE.mkdir(parents=True, exist_ok=True)
+    if SYSTEM == 'win32':
+        with build_lock(LOCK):
+            return handler(args)
+    import fcntl
     # The lock file names its holder, so a second run (or an agent) can see who uses the checkout.
     with (CACHE / 'lock').open('a+') as lock:
         # A few seconds of grace for a run that is just handing over (server relaunching itself).
@@ -2034,7 +1903,7 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except Stop as stop:
+    except (Stop, PlatformError, OSError) as stop:
         print(f'\n{stop}', file=sys.stderr)
         sys.exit(3 if isinstance(stop, NeedsFix) else 1)
     except KeyboardInterrupt:
