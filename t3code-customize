@@ -1521,6 +1521,54 @@ def cmd_status(args):
                 + (f' (behind; run {NAME} ios)' if behind else ''))
 
 
+# --- Ported upstream PRs ------------------------------------------------------------
+
+PORTED_PRS = REPO / 'ported-prs.json'
+
+
+def report_ported_prs():
+    """Say, for each upstream PR an own patch ports (ported-prs.json), whether upstream
+    merged, moved or closed it, so an update never misses that a patch can go."""
+    listed = load(PORTED_PRS, {})
+    prs = listed.get('prs', [])
+    if not prs:
+        return
+    say()
+    if not shutil.which('gh'):
+        say('Ported upstream PRs: skipped, gh is not installed.')
+        return
+    say(f"Ported upstream PRs ({listed['repo']}):")
+    nightly = load(STATE, {}).get('commit')
+    for entry in prs:
+        label = f"    #{entry['pr']} ({Path(entry['patch']).name[:4]})"
+        try:
+            result = subprocess.run(['gh', 'pr', 'view', str(entry['pr']), '--repo', listed['repo'],
+                                     '--json', 'state,headRefOid,mergeCommit'],
+                                    capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+        if result is None or result.returncode:
+            say('Ported upstream PRs: skipped, gh could not reach GitHub (offline or not signed in).')
+            return
+        info = json.loads(result.stdout)
+        state, head = info['state'], info['headRefOid']
+        if state == 'MERGED':
+            merge = (info.get('mergeCommit') or {}).get('oid')
+            in_nightly = bool(nightly and merge and SOURCE.exists() and subprocess.run(
+                ['git', '-C', str(SOURCE), 'merge-base', '--is-ancestor', merge, nightly],
+                capture_output=True).returncode == 0)
+            hint = ('merged and in your nightly: drop the patch once every machine has this nightly'
+                    if in_nightly else 'merged: drop the patch once the installed nightly has it')
+        elif state == 'CLOSED':
+            hint = 'closed without merging: ask Tim whether to keep the patch'
+        elif not head.startswith(entry['head']):
+            hint = f"head moved {entry['head']} -> {head[:12]}: port the new commits"
+        else:
+            hint = 'open, ported head is current: keep the patch'
+        say(f'{label}: {hint}')
+    say('    See "Checking that an update did not break a fork change" in AGENTS.md.')
+
+
 def cmd_on(args):
     DISABLED.unlink(missing_ok=True)
     say('Customization on. Quit T3 Code fully and reopen it.')
@@ -1957,7 +2005,12 @@ def main():
         parser.print_help()
         return
     handler = globals()['cmd_' + args.command.replace('-', '_')]
-    if args.command in ('launch', 'status', 'on', 'off', 'autoupdate', 'fleet', 'identity'):
+    if args.command == 'status':
+        try:
+            return handler(args)
+        finally:
+            report_ported_prs()
+    if args.command in ('launch', 'on', 'off', 'autoupdate', 'fleet', 'identity'):
         return handler(args)
     CACHE.mkdir(parents=True, exist_ok=True)
     if SYSTEM == 'win32':
@@ -1983,7 +2036,13 @@ def main():
         lock.truncate(0)
         lock.write(f'pid {os.getpid()}, {NAME} {" ".join(argv)}, since {time.strftime("%H:%M:%S")}\n')
         lock.flush()
-        handler(args)
+        if args.command not in ('build', 'update', 'server'):
+            return handler(args)
+        try:
+            return handler(args)
+        finally:
+            # Also after a conflict: upstream may have merged the very change that conflicts.
+            report_ported_prs()
 
 
 if __name__ == '__main__':
