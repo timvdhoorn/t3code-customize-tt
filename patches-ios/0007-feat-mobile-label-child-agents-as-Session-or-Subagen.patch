@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t3code-customize <t3code-customize@localhost>
+Date: Fri, 16 Oct 2026 22:07:48 +0200
+Subject: [PATCH] feat(mobile): label child agents as Session or Subagent
+
+---
+ .../src/features/threads/SubagentRow.tsx      | 15 +++++----
+ .../threadAgentsPresentation.kind.test.ts     | 33 +++++++++++++++++++
+ .../threads/threadAgentsPresentation.ts       |  6 +++-
+ 3 files changed, 46 insertions(+), 8 deletions(-)
+ create mode 100644 apps/mobile/src/features/threads/threadAgentsPresentation.kind.test.ts
+
+diff --git a/apps/mobile/src/features/threads/SubagentRow.tsx b/apps/mobile/src/features/threads/SubagentRow.tsx
+index ea66da928..1ae47f755 100644
+--- a/apps/mobile/src/features/threads/SubagentRow.tsx
++++ b/apps/mobile/src/features/threads/SubagentRow.tsx
+@@ -18,6 +18,7 @@ type SubagentRowSubagent = Pick<
+   OrchestrationV2Subagent,
+   | "threadId"
+   | "childThreadId"
++  | "origin"
+   | "model"
+   | "driver"
+   | "providerInstanceId"
+@@ -56,13 +57,13 @@ export function SubagentRow(props: {
+             >
+               ·
+             </Text>
+-            <Text
+-              className={cn(
+-                "shrink-0 text-xs font-t3-medium",
+-                SUBAGENT_TONE_TEXT_CLASS[presentation.tone],
+-              )}
+-            >
+-              {presentation.statusLabel}
++            <Text className="shrink-0 text-xs text-foreground-muted">
++              {presentation.kindLabel ? `${presentation.kindLabel} · ` : null}
++              <Text
++                className={cn("text-xs font-t3-medium", SUBAGENT_TONE_TEXT_CLASS[presentation.tone])}
++              >
++                {presentation.statusLabel}
++              </Text>
+             </Text>
+           </View>
+           {props.elapsed}
+diff --git a/apps/mobile/src/features/threads/threadAgentsPresentation.kind.test.ts b/apps/mobile/src/features/threads/threadAgentsPresentation.kind.test.ts
+new file mode 100644
+index 000000000..180bc9459
+--- /dev/null
++++ b/apps/mobile/src/features/threads/threadAgentsPresentation.kind.test.ts
+@@ -0,0 +1,33 @@
++import { describe, expect, it } from "vite-plus/test";
++
++import { resolveSubagentRowPresentation } from "./threadAgentsPresentation";
++
++const base = {
++  title: "Port the patches",
++  prompt: "Port the patches",
++  status: "running" as const,
++  progress: undefined,
++  result: null,
++  childThreadId: "thread-child" as never,
++};
++
++describe("resolveSubagentRowPresentation kind", () => {
++  it("names a delegate_task worker a session", () => {
++    const row = resolveSubagentRowPresentation({ ...base, origin: "app_owned" });
++    expect(row.kindLabel).toBe("Session");
++    expect(row.statusLabel).toBe("Working");
++  });
++
++  it("names a provider-native child a subagent", () => {
++    const row = resolveSubagentRowPresentation({
++      ...base,
++      origin: "provider_native",
++      childThreadId: null,
++    });
++    expect(row.kindLabel).toBe("Subagent");
++  });
++
++  it("names nothing without an origin", () => {
++    expect(resolveSubagentRowPresentation(base).kindLabel).toBeNull();
++  });
++});
+diff --git a/apps/mobile/src/features/threads/threadAgentsPresentation.ts b/apps/mobile/src/features/threads/threadAgentsPresentation.ts
+index 96981ab3a..e5bb186f7 100644
+--- a/apps/mobile/src/features/threads/threadAgentsPresentation.ts
++++ b/apps/mobile/src/features/threads/threadAgentsPresentation.ts
+@@ -1,6 +1,7 @@
+ import {
+   formatSubagentDisplayTitle,
+   subagentDetailPreview,
++  subagentKindLabel,
+ } from "@t3tools/client-runtime/state/subagent-display";
+ import { isActiveSubagentStatus } from "@t3tools/client-runtime/state/subagentRuntime";
+ import type { OrchestrationV2Subagent } from "@t3tools/contracts";
+@@ -13,6 +14,8 @@ export interface SubagentRowPresentation {
+   readonly title: string;
+   readonly detail: string | null;
+   readonly statusLabel: string;
++  /** "Session" for a T3 delegate_task worker, "Subagent" for a provider-native one. */
++  readonly kindLabel: "Session" | "Subagent" | null;
+   readonly tone: SubagentRowTone;
+   readonly live: boolean;
+   readonly canOpenThread: boolean;
+@@ -59,13 +62,14 @@ export function resolveSubagentRowPresentation(
+   subagent: Pick<
+     OrchestrationV2Subagent,
+     "title" | "prompt" | "status" | "progress" | "result" | "childThreadId"
+-  >,
++  > & { readonly origin?: OrchestrationV2Subagent["origin"] },
+ ): SubagentRowPresentation {
+   const live = isActiveSubagentStatus(subagent.status);
+   return {
+     title: rowTitle(subagent),
+     detail: subagentDetailPreview(subagent),
+     statusLabel: rowStatusLabel(subagent.status),
++    kindLabel: subagentKindLabel(subagent.origin),
+     tone: rowTone(subagent.status),
+     live,
+     canOpenThread: subagent.childThreadId !== null,
