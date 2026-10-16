@@ -13,6 +13,7 @@ customize = importlib.util.module_from_spec(spec)
 loader.exec_module(customize)
 
 ROUTE_TREE = 'apps/web/src/routeTree.gen.ts'
+UNIWIND = 'apps/mobile/uniwind-types.d.ts'
 
 
 class RestoreGeneratedTest(unittest.TestCase):
@@ -23,6 +24,8 @@ class RestoreGeneratedTest(unittest.TestCase):
         run('init', '-q')
         (self.source / 'apps/web/src').mkdir(parents=True)
         (self.source / ROUTE_TREE).write_text('routes\n')
+        (self.source / 'apps/mobile').mkdir(parents=True)
+        (self.source / UNIWIND).write_text('types\n')
         (self.source / 'other.ts').write_text('code\n')
         run('add', '.')
         run('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'base')
@@ -42,6 +45,29 @@ class RestoreGeneratedTest(unittest.TestCase):
         customize.restore_generated()
         self.assertEqual((self.source / ROUTE_TREE).read_text(), '// generated header\nroutes\n')
         self.assertEqual((self.source / 'other.ts').read_text(), 'a port in progress\n')
+
+    def test_ios_rewrite_of_uniwind_types_is_undone(self):
+        (self.source / ROUTE_TREE).write_text('// generated header\nroutes\n')
+        (self.source / UNIWIND).write_text('regenerated types\n')
+        customize.restore_generated()
+        self.assertEqual((self.source / UNIWIND).read_text(), 'types\n')
+        self.assertEqual((self.source / ROUTE_TREE).read_text(), 'routes\n')
+
+    def test_a_build_undoes_every_tracked_file_it_rewrote(self):
+        (self.source / 'untracked.log').write_text('output\n')
+        with customize.build_rewrites_discarded():
+            (self.source / 'other.ts').write_text('rewritten by the build\n')
+            (self.source / UNIWIND).write_text('regenerated types\n')
+        self.assertEqual((self.source / 'other.ts').read_text(), 'code\n')
+        self.assertEqual((self.source / UNIWIND).read_text(), 'types\n')
+        self.assertTrue((self.source / 'untracked.log').exists())
+
+    def test_a_failed_build_step_still_undoes_its_rewrites(self):
+        with self.assertRaises(customize.Stop):
+            with customize.build_rewrites_discarded():
+                (self.source / 'other.ts').write_text('half written\n')
+                raise customize.Stop('build failed')
+        self.assertEqual((self.source / 'other.ts').read_text(), 'code\n')
 
 
 if __name__ == '__main__':
