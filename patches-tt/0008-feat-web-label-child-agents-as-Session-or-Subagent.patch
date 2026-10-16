@@ -1,0 +1,383 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t3code-customize <t3code-customize@localhost>
+Date: Fri, 16 Oct 2026 22:01:23 +0200
+Subject: [PATCH] feat(web): label child agents as Session or Subagent
+
+---
+ .../chat/SubagentTooltipContent.tsx           |  5 +
+ .../ThreadRelationshipsControl.kind.test.tsx  | 91 +++++++++++++++++++
+ .../chat/ThreadRelationshipsControl.tsx       | 15 ++-
+ .../chat/V2LifecycleRow.kind.test.tsx         | 74 +++++++++++++++
+ .../src/components/chat/V2LifecycleRow.tsx    | 21 ++++-
+ .../src/state/subagentDisplay.kind.test.ts    | 13 +++
+ .../src/state/subagentDisplay.ts              | 13 +++
+ 7 files changed, 224 insertions(+), 8 deletions(-)
+ create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.kind.test.tsx
+ create mode 100644 apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx
+ create mode 100644 packages/client-runtime/src/state/subagentDisplay.kind.test.ts
+
+diff --git a/apps/web/src/components/chat/SubagentTooltipContent.tsx b/apps/web/src/components/chat/SubagentTooltipContent.tsx
+index 65b373167..544d9b604 100644
+--- a/apps/web/src/components/chat/SubagentTooltipContent.tsx
++++ b/apps/web/src/components/chat/SubagentTooltipContent.tsx
+@@ -10,6 +10,7 @@ import type {
+ import {
+   resolveSubagentMetadata,
+   subagentDetailPreview,
++  subagentKindLabel,
+ } from "@t3tools/client-runtime/state/subagent-display";
+ import { getModelSelectionStringOptionValue, resolveSelectableModel } from "@t3tools/shared/model";
+ import { getTraitsSpeedDisplay, TraitsSpeedIcon } from "./TraitsSpeed";
+@@ -52,6 +53,7 @@ export function SubagentTooltipContent(props: {
+ }) {
+   const { modelLabel, workspace: metadata } = resolveSubagentMetadata(props);
+   const preview = subagentDetailPreview(props);
++  const kindLabel = subagentKindLabel(props.origin);
+   const model = props.model?.trim();
+   const modelSlug = props.provider
+     ? resolveSelectableModel(props.provider.driver, model, props.provider.models)
+@@ -165,6 +167,9 @@ export function SubagentTooltipContent(props: {
+         >
+           <StatusIcon aria-hidden className="size-3 shrink-0" />
+           {props.status.replaceAll("_", " ")}
++          {kindLabel ? (
++            <span className="font-normal normal-case text-muted-foreground">· {kindLabel}</span>
++          ) : null}
+         </span>
+         {props.elapsed}
+       </div>
+diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.kind.test.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.kind.test.tsx
+new file mode 100644
+index 000000000..44cb58058
+--- /dev/null
++++ b/apps/web/src/components/chat/ThreadRelationshipsControl.kind.test.tsx
+@@ -0,0 +1,91 @@
++import { act, cloneElement, type ReactElement, type ReactNode } from "react";
++import { create, type ReactTestRenderer } from "react-test-renderer";
++import { EnvironmentId, ThreadId } from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++import { afterEach, expect, it, vi } from "vite-plus/test";
++
++const state = vi.hoisted(() => ({ projection: null as unknown, showTooltips: false }));
++
++vi.mock("@tanstack/react-router", () => ({ useNavigate: () => vi.fn() }));
++vi.mock("../../state/entities", () => ({
++  useThreadProjection: () => ({ projection: state.projection }),
++  useThreadShells: () => [],
++  useProjects: () => [],
++  useServerConfigs: () => new Map(),
++}));
++vi.mock("../../lib/archivedThreadsState", () => ({
++  useArchivedThreadSnapshots: () => ({ snapshots: [] }),
++}));
++vi.mock("../../state/use-atom-command", () => ({ useAtomCommand: () => vi.fn() }));
++vi.mock("../ui/toast", () => ({ toastManager: { add: vi.fn() } }));
++vi.mock("../ui/tooltip", () => ({
++  Tooltip: ({ children }: { children: ReactNode }) => children,
++  TooltipTrigger: ({ render, children }: { render: ReactElement; children: ReactNode }) =>
++    cloneElement(render, {}, children),
++  TooltipPopup: ({ children }: { children: ReactNode }) => (state.showTooltips ? children : null),
++}));
++
++import { ThreadRelationshipsPanel } from "./ThreadRelationshipsControl";
++
++let renderer: ReactTestRenderer;
++
++afterEach(async () => {
++  await act(async () => renderer?.unmount());
++  vi.unstubAllGlobals();
++  state.projection = null;
++  state.showTooltips = false;
++});
++
++const agent = (input: { id: string; title: string; origin: "app_owned" | "provider_native" }) => ({
++  id: input.id,
++  origin: input.origin,
++  driver: "claudeAgent",
++  providerInstanceId: "claudeAgent",
++  childThreadId: `${input.id}-thread`,
++  title: input.title,
++  prompt: "Work",
++  model: null,
++  status: "running",
++  result: null,
++  startedAt: DateTime.makeUnsafe("2026-10-16T12:00:00Z"),
++  completedAt: null,
++  updatedAt: DateTime.makeUnsafe("2026-10-16T12:00:00Z"),
++});
++
++const text = () =>
++  renderer.root
++    .findAll((node) => typeof node.type === "string")
++    .flatMap((node) => node.children.filter((child) => typeof child === "string"))
++    .join(" ")
++    .replace(/\s+/g, " ");
++
++it("names a delegate_task worker a session and a provider-native child a subagent", async () => {
++  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
++  state.projection = {
++    thread: { id: "parent", lineage: { relationshipToParent: null }, activeProviderThreadId: null },
++    runs: [],
++    providerThreads: [],
++    providerSessions: [],
++    contextTransfers: [],
++    subagents: [
++      agent({ id: "worker", title: "Port the patches", origin: "app_owned" }),
++      agent({ id: "native", title: "Explore the sidebar", origin: "provider_native" }),
++    ],
++  };
++  const panel = (
++    <ThreadRelationshipsPanel
++      environmentId={EnvironmentId.make("test")}
++      threadId={ThreadId.make("parent")}
++    />
++  );
++  await act(async () => {
++    renderer = create(panel);
++  });
++  expect(text()).toContain("Port the patches Session");
++  expect(text()).toContain("Explore the sidebar Subagent");
++
++  state.showTooltips = true;
++  await act(async () => renderer.update(cloneElement(panel)));
++  expect(text()).toMatch(/running · Session/);
++  expect(text()).toMatch(/running · Subagent/);
++});
+diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
+index 536fd7981..24d5b8954 100644
+--- a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
++++ b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
+@@ -11,7 +11,10 @@ import {
+   projectedSubagentsToRuntime,
+   type RuntimeSubagent,
+ } from "@t3tools/client-runtime/state/subagentRuntime";
+-import { formatSubagentDisplayTitle } from "@t3tools/client-runtime/state/subagent-display";
++import {
++  formatSubagentDisplayTitle,
++  subagentKindLabel,
++} from "@t3tools/client-runtime/state/subagent-display";
+ import {
+   deriveThreadRelationshipGraph,
+   immediateThreadRelationships,
+@@ -444,6 +447,7 @@ export function ThreadRelationshipsPanel(props: {
+               const agent = workflowGroup
+                 ? projectedAgent
+                 : currentSubagent(projectedAgent, node?.thread);
++              const kindLabel = subagentKindLabel(agent?.origin);
+               const failed = rowStatus === "failed" || rowStatus === "error";
+               const canStop =
+                 agent &&
+@@ -513,10 +517,15 @@ export function ThreadRelationshipsPanel(props: {
+                     fallbackIcon={RelationshipIcon}
+                     status={rowStatus}
+                   />
+-                  <span className="min-w-0 flex-1">
+-                    <span className="block truncate text-left text-sm font-medium leading-4 text-foreground/85">
++                  <span className="flex min-w-0 flex-1 items-baseline gap-1.5">
++                    <span className="min-w-0 truncate text-left text-sm font-medium leading-4 text-foreground/85">
+                       {threadTitle}
+                     </span>
++                    {kindLabel ? (
++                      <span className="shrink-0 text-2xs font-normal text-muted-foreground">
++                        {kindLabel}
++                      </span>
++                    ) : null}
+                   </span>
+                   {agent ? null : (
+                     <ArrowRightIcon className="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
+diff --git a/apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx b/apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx
+new file mode 100644
+index 000000000..540fa7278
+--- /dev/null
++++ b/apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx
+@@ -0,0 +1,74 @@
++import { type ReactNode } from "react";
++import { renderToStaticMarkup } from "react-dom/server";
++import { EnvironmentId, type OrchestrationV2TurnItem } from "@t3tools/contracts";
++import { describe, expect, it, vi } from "vite-plus/test";
++
++vi.mock("@effect/atom-react", () => ({
++  useAtomValue: (_atom: unknown, select?: (value: undefined) => unknown) =>
++    select ? select(undefined) : undefined,
++}));
++vi.mock("../../state/threads", () => ({
++  environmentThreadDetails: { threadAtom: () => null },
++}));
++vi.mock("../../state/entities", () => ({
++  useThreadShell: () => undefined,
++  useProject: () => undefined,
++}));
++vi.mock("../ui/tooltip", () => ({
++  Tooltip: ({ children }: { children: ReactNode }) => children,
++  TooltipTrigger: ({ render }: { render: ReactNode }) => render,
++  TooltipPopup: () => null,
++}));
++
++import { V2LifecycleRow } from "./V2LifecycleRow";
++
++const subagentItem = (
++  origin: "app_owned" | "provider_native",
++  overrides: Record<string, unknown> = {},
++) =>
++  ({
++    type: "subagent",
++    id: `item-${origin}`,
++    threadId: "parent",
++    subagentId: `agent-${origin}`,
++    origin,
++    driver: "claudeAgent",
++    providerInstanceId: "claudeAgent",
++    childThreadId: `child-${origin}`,
++    title: "Onbeheerde updates",
++    status: "running",
++    result: null,
++    startedAt: null,
++    completedAt: null,
++    ...overrides,
++  }) as unknown as OrchestrationV2TurnItem;
++
++const render = (item: OrchestrationV2TurnItem) =>
++  renderToStaticMarkup(
++    <V2LifecycleRow
++      item={item}
++      environmentId={EnvironmentId.make("test")}
++      createdAt="2026-10-16T12:00:00Z"
++      timestampFormat="locale"
++      providerStatuses={[]}
++      runs={[]}
++      onOpenThread={() => {}}
++    />,
++  ).replace(/<[^>]+>/g, " ");
++
++describe("subagent timeline card", () => {
++  it("prefixes the status with Session for a delegate_task worker", () => {
++    expect(render(subagentItem("app_owned"))).toContain("Session · Running");
++  });
++
++  it("prefixes the status with Subagent for a provider-native child", () => {
++    expect(render(subagentItem("provider_native"))).toContain("Subagent · Running");
++  });
++
++  it("keeps the kind beside the title when a completed card shows its result", () => {
++    const html = render(subagentItem("app_owned", { status: "completed", result: "All done" }));
++    expect(html).toContain("Session");
++    expect(html).toContain("All done");
++    expect(html).not.toContain("Completed");
++  });
++});
+diff --git a/apps/web/src/components/chat/V2LifecycleRow.tsx b/apps/web/src/components/chat/V2LifecycleRow.tsx
+index e9a4cc1a4..648b743e6 100644
+--- a/apps/web/src/components/chat/V2LifecycleRow.tsx
++++ b/apps/web/src/components/chat/V2LifecycleRow.tsx
+@@ -15,7 +15,10 @@ import {
+   type HandoffEndpoints,
+   type HandoffTimelineRun,
+ } from "@t3tools/client-runtime/handoff";
+-import { formatSubagentDisplayTitle } from "@t3tools/client-runtime/state/subagent-display";
++import {
++  formatSubagentDisplayTitle,
++  subagentKindLabel,
++} from "@t3tools/client-runtime/state/subagent-display";
+ import {
+   ProviderDriverKind,
+   type OrchestrationV2Notification,
+@@ -391,6 +394,8 @@ function SubagentTimelineLink(props: {
+   const liveStatus = agent?.status ?? props.status;
+   const status = props.event ? props.event.status : liveStatus;
+   const statusLabel = props.event?.label ?? subagentStatusVisual(liveStatus).label;
++  const kindLabel = subagentKindLabel(props.origin);
++  const kindStatusLabel = kindLabel ? `${kindLabel} · ${statusLabel}` : statusLabel;
+   const result = (agent?.result ?? props.result)?.trim();
+   const progress = (agent?.progress ?? props.progress)?.trim();
+   const settled = SETTLED_SUBAGENT_STATUSES.has(status ?? liveStatus);
+@@ -422,8 +427,10 @@ function SubagentTimelineLink(props: {
+                 failed ? "text-destructive" : "text-muted-foreground",
+               )}
+             >
+-              {statusLabel}
++              {kindStatusLabel}
+             </span>
++          ) : detail !== null && kindLabel ? (
++            <span className="shrink-0 text-3xs text-muted-foreground">{kindLabel}</span>
+           ) : null}
+         </span>
+         <span
+@@ -433,7 +440,7 @@ function SubagentTimelineLink(props: {
+           )}
+         >
+           {detail === null ? (
+-            statusLabel
++            kindStatusLabel
+           ) : detail.includes("/") && !detail.includes(" ") ? (
+             <MiddleTruncate value={detail} showTitle={false} className="flex" />
+           ) : (
+@@ -460,7 +467,11 @@ function SubagentTimelineLink(props: {
+         delay={200}
+         render={
+           threadId === null ? (
+-            <div data-v2-item-type="subagent" aria-description={statusLabel} className={className}>
++            <div
++              data-v2-item-type="subagent"
++              aria-description={kindStatusLabel}
++              className={className}
++            >
+               {content}
+             </div>
+           ) : (
+@@ -468,7 +479,7 @@ function SubagentTimelineLink(props: {
+               type="button"
+               data-v2-item-type="subagent"
+               aria-label={`Open ${props.title}`}
+-              aria-description={statusLabel}
++              aria-description={kindStatusLabel}
+               onClick={() => props.onOpenThread(threadId)}
+               className={cn(
+                 className,
+diff --git a/packages/client-runtime/src/state/subagentDisplay.kind.test.ts b/packages/client-runtime/src/state/subagentDisplay.kind.test.ts
+new file mode 100644
+index 000000000..674c6f5b7
+--- /dev/null
++++ b/packages/client-runtime/src/state/subagentDisplay.kind.test.ts
+@@ -0,0 +1,13 @@
++import { describe, expect, it } from "vite-plus/test";
++import { subagentKindLabel } from "./subagentDisplay.js";
++
++describe("subagentKindLabel", () => {
++  it("names a delegate_task worker a session and a provider-native child a subagent", () => {
++    expect(subagentKindLabel("app_owned")).toBe("Session");
++    expect(subagentKindLabel("provider_native")).toBe("Subagent");
++  });
++
++  it("names nothing when the origin is unknown", () => {
++    expect(subagentKindLabel(undefined)).toBeNull();
++  });
++});
+diff --git a/packages/client-runtime/src/state/subagentDisplay.ts b/packages/client-runtime/src/state/subagentDisplay.ts
+index d4d0db34e..2282c076d 100644
+--- a/packages/client-runtime/src/state/subagentDisplay.ts
++++ b/packages/client-runtime/src/state/subagentDisplay.ts
+@@ -1,4 +1,5 @@
+ import type {
++  OrchestrationV2Subagent,
+   OrchestrationV2TurnItemStatus,
+   OrchestrationV2ThreadShell,
+   OrchestrationProjectShell,
+@@ -21,6 +22,18 @@ export function subagentGroupSummary(
+   };
+ }
+ 
++/**
++ * A T3 `delegate_task` worker (`app_owned`) runs its own provider session in its own thread;
++ * a provider-native subagent runs inside the parent's provider process.
++ */
++export function subagentKindLabel(
++  origin: OrchestrationV2Subagent["origin"] | undefined,
++): "Session" | "Subagent" | null {
++  if (origin === "app_owned") return "Session";
++  if (origin === "provider_native") return "Subagent";
++  return null;
++}
++
+ export function summarizeSubagentStatuses(
+   statuses: ReadonlyArray<OrchestrationV2TurnItemStatus>,
+ ): string {
