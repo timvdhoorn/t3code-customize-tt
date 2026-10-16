@@ -566,7 +566,10 @@ def modified_files():
 
 
 def restore_generated():
-    """Undo the build's own rewrites of GENERATED when nothing else in SOURCE changed."""
+    """Undo the build's own rewrites of GENERATED when nothing else in SOURCE changed.
+
+    A hand edit to only these files goes too: they are generated, so a port changes their
+    generator (or a patch commit) instead, and an edit next to any other change is kept."""
     if rebase_in_progress():
         return
     changed = modified_files()
@@ -789,25 +792,51 @@ def stuck_message(problem, target):
 # same code lines as before, so only context, comments and line numbers moved. Anything else
 # waits in a PR for him.
 
-PORT_FILES = ('patches-port', 'patches-tt', 'patches-ios', 'checks-tt.json', 'checks-ios.json')
-COMMENT_PREFIXES = ('//', '/*', '*', '#', '<!--')
+PATCH_FOLDERS = ('patches-port', 'patches-tt', 'patches-ios')
+# Minutes the fleet a merged port starts waits for this run: up to an hour of iOS upload and its build.
+PORT_FLEET_WAIT = 180
+CHECK_FILES = ('checks-tt.json', 'checks-ios.json')
+# Header lines that leave no line to compare: the code they change is not in the patch text.
+UNCOMPARABLE = ('old mode', 'new mode', 'GIT binary patch', 'Binary files')
+# Header lines that are part of what a patch does to its file.
+STRUCTURE = ('new file mode', 'deleted file mode', 'rename from', 'rename to', 'copy from', 'copy to')
+
+
+def is_comment(body):
+    """A line that holds only a comment: //, a /* or <!-- line that ends its comment or runs on,
+    or a * continuation. # is not one (private fields, shell, CSS colors are code)."""
+    if body.startswith('//'):
+        return True
+    for opener, closer in (('/*', '*/'), ('<!--', '-->')):
+        if body.startswith(opener):
+            return closer not in body or body.endswith(closer)
+    return body == '*' or body.startswith(('* ', '*/'))
 
 
 def code_lines(patch_text):
-    """The added and removed code lines of a patch, sorted: no headers, context, blank or comment lines."""
-    lines, in_diff = [], False
+    """Per changed file, in patch order: (diff --git path, its added and removed code lines in order),
+    leaving out context, hunk positions, blank lines and comment-only lines. None when the patch
+    changes a binary file or a file mode, which no line comparison covers."""
+    files, lines, header = [], None, False
     for line in patch_text.splitlines():
         if line.startswith('diff --git '):
-            in_diff = True
+            lines, header = [], True
+            files.append((line[len('diff --git '):], lines))
+        elif lines is None:
             continue
-        if not in_diff or line.startswith(('+++', '---', '@@', 'index ', 'new file', 'deleted file',
-                                            'similarity', 'rename ', 'old mode', 'new mode')):
-            continue
-        if line[:1] in ('+', '-'):
+        elif header:
+            # Everything up to a file's first hunk is header, so a code line starting with ++ or -- is
+            # never mistaken for a +++ or --- file line.
+            if line.startswith(UNCOMPARABLE):
+                return None
+            if line.startswith(STRUCTURE):
+                lines.append(line)
+            header = not line.startswith('@@')
+        elif line[:1] in ('+', '-'):
             body = line[1:].strip()
-            if body and not body.startswith(COMMENT_PREFIXES):
+            if body and not is_comment(body):
                 lines.append(line[0] + body)
-    return sorted(lines)
+    return files
 
 
 def patch_sets(read):
@@ -824,8 +853,14 @@ def patch_sets(read):
 
 
 def code_unchanged(before, after):
-    """True when after has the same patches as before and each keeps the same code lines."""
-    return before.keys() == after.keys() and all(code_lines(before[k]) == code_lines(after[k]) for k in before)
+    """True when after has the same patches as before and each changes the same files with the same code lines."""
+    if before.keys() != after.keys():
+        return False
+    for key in before:
+        lines = code_lines(before[key])
+        if lines is None or lines != code_lines(after[key]):
+            return False
+    return True
 
 
 def repo_run(*args, check=True):
@@ -844,6 +879,43 @@ def working_folder(folder):
     return {p.name: p.read_text() for p in sorted((REPO / folder).glob('*.patch'))}
 
 
+def is_port_file(path):
+    """A file export_patches writes: a patch or base.txt directly in a patch folder."""
+    parts = Path(path).parts
+    return len(parts) == 2 and parts[0] in PATCH_FOLDERS and (parts[1].endswith('.patch') or parts[1] == 'base.txt')
+
+
+def port_changes():
+    """(port files changed, other changed files) in REPO's working tree against HEAD, by path.
+    Syncthing's temporary files are not changes."""
+    out = subprocess.run(['git', 'status', '--porcelain', '-z', '--untracked-files=all'], cwd=REPO,
+                         capture_output=True, text=True, check=True).stdout
+    entries = iter(out.split('\0'))
+    port, other = [], []
+    for entry in entries:
+        if not entry:
+            continue
+        path = entry[3:]
+        if entry[0] in 'RC':
+            other.append(next(entries, ''))  # where a rename came from changed too
+        if '.syncthing.' not in Path(path).name:
+            (port if is_port_file(path) else other).append(path)
+    return sorted(port), sorted(p for p in other if p)
+
+
+def port_branch(version, title):
+    """port/nightly-<version>, or a fresh -2, -3 when that branch has commits this tool did not make."""
+    for suffix in [''] + [f'-{n}' for n in range(2, 10)]:
+        branch = f'port/nightly-{version}{suffix}'
+        if not repo_run('git', 'ls-remote', '--heads', 'origin', branch, check=False):
+            return branch
+        repo_run('git', 'fetch', '--quiet', 'origin', branch, check=False)
+        subjects = repo_run('git', 'log', '--format=%s', 'HEAD..FETCH_HEAD', check=False).splitlines()
+        if all(subject == title for subject in subjects):
+            return branch
+    raise Stop(f'port/nightly-{version} and its suffixes all hold commits from someone else')
+
+
 def publish_port(args, version):
     """Commit a port to a branch and open a PR; merge it and run fleet when the standing grant covers it."""
     if not getattr(args, 'agent_ported', False):
@@ -851,7 +923,7 @@ def publish_port(args, version):
         return
     try:
         url, merged = _publish_port(version, checked=not args.skip_checks)
-    except (Stop, OSError) as error:
+    except (Stop, OSError, subprocess.CalledProcessError) as error:
         notify(LAUNCHER_NAME, f'An agent ported the patches, but opening the PR failed: {error}'
                f' The port is in {REPO}; commit it by hand.')
         return
@@ -859,31 +931,35 @@ def publish_port(args, version):
         notify(LAUNCHER_NAME, f'An agent ported the patches to {version}; only context moved, so {url} is merged'
                ' and fleet is updating every machine.')
     else:
-        notify(LAUNCHER_NAME, f'An agent ported the patches to {version} and changed code: review {url}.'
+        notify(LAUNCHER_NAME, f'An agent ported the patches to {version} and changed more than context: review {url}.'
                ' This machine already runs the port.')
 
 
 def _publish_port(version, checked):
     if not (REPO / '.git').exists() or not shutil.which('gh'):
         raise Stop('this copy of the repo has no git or gh')
+    port, other = port_changes()
+    if not port:
+        raise Stop('the port left no patch changes to commit')
+    repo_run('git', 'fetch', '--quiet', 'origin', 'main')
+    on_main = repo_run('git', 'rev-parse', 'HEAD') == repo_run('git', 'rev-parse', 'FETCH_HEAD')
     before, after = patch_sets(committed_folder), patch_sets(working_folder)
-    safe = checked and code_unchanged(before, after)
-    branch = 'port/nightly-' + version
+    # The grant covers patches alone: checks, the script and every other file stay as on main.
+    safe = checked and on_main and not other and code_unchanged(before, after)
     title = f'chore: port patches to nightly {version}'
+    branch = port_branch(version, title)
     worktree = Path(tempfile.mkdtemp(prefix='port-', dir=CACHE))
     try:
         repo_run('git', 'worktree', 'add', '--quiet', '-B', branch, str(worktree), 'HEAD')
-        for name in PORT_FILES:
-            target, source = worktree / name, REPO / name
-            if target.is_dir():
-                shutil.rmtree(target)
-            elif target.exists():
-                target.unlink()
-            if source.is_dir():
-                shutil.copytree(source, target)
-            elif source.exists():
+        # Only the patch files the port wrote; a changed check list or script goes along for review.
+        for path in port + [p for p in other if p in CHECK_FILES]:
+            source, target = REPO / path, worktree / path
+            if source.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
-        subprocess.run(['git', 'add', '-A', '--', *PORT_FILES], cwd=worktree, check=True)
+                subprocess.run(['git', 'add', '--', path], cwd=worktree, check=True)
+            else:
+                subprocess.run(['git', 'rm', '--quiet', '--', path], cwd=worktree, check=True)
         subprocess.run(['git', 'commit', '--quiet', '-m', title], cwd=worktree, check=True,
                        capture_output=True, text=True)
         subprocess.run(['git', 'push', '--quiet', '--force', 'origin', branch], cwd=worktree, check=True,
@@ -891,9 +967,14 @@ def _publish_port(version, checked):
     finally:
         repo_run('git', 'worktree', 'remove', '--force', str(worktree), check=False)
         shutil.rmtree(worktree, ignore_errors=True)
-    verdict = ('Checks passed and every patch keeps the same code lines (only context, comments and line'
-               ' numbers moved), so it merges under the standing grant in AGENTS.md.' if safe else
-               'Code lines changed' + ('' if checked else ' or checks were skipped') + ': this waits for review.')
+    if safe:
+        verdict = ('Checks passed and every patch keeps the same code lines (only context, comments and line'
+                   ' numbers moved), so it merges under the standing grant in AGENTS.md.')
+    else:
+        reasons = ([] if checked else ['checks were skipped']) + ([] if on_main else ['this copy is not on main'])
+        reasons += ['also changed: ' + ', '.join(other)] if other else []
+        reasons += [] if code_unchanged(before, after) else ['code lines changed']
+        verdict = 'Waits for review: ' + '; '.join(reasons) + '.'
     url = repo_run('gh', 'pr', 'view', branch, '--json', 'url', '--jq', '.url', check=False)
     if not url:
         url = repo_run('gh', 'pr', 'create', '--base', 'main', '--head', branch, '--title', title,
@@ -902,12 +983,16 @@ def _publish_port(version, checked):
         return url, False
     repo_run('gh', 'pr', 'merge', branch, '--squash', '--delete-branch')
     # The working tree already holds the merged files; put them back as committed and fast-forward.
-    for name in PORT_FILES:
-        repo_run('git', 'checkout', '--quiet', 'HEAD', '--', name, check=False)
-    repo_run('git', 'clean', '--quiet', '-fd', '--', *PORT_FILES, check=False)
+    for path in port:
+        if repo_run('git', 'ls-files', '--', path, check=False):
+            repo_run('git', 'checkout', '--quiet', 'HEAD', '--', path, check=False)
+        else:
+            (REPO / path).unlink(missing_ok=True)
     repo_run('git', 'pull', '--quiet', '--ff-only')
-    # fleet waits for this run's lock, then updates every machine, this one included.
-    spawn_detached([sys.executable, str(REPO / NAME), 'fleet', '--no-pull'], 'fleet')
+    # fleet waits for this run's lock, then updates every machine, this one included. This run may
+    # still build the iOS app after it (update --ios), so fleet waits longer than a normal run.
+    spawn_detached([sys.executable, str(REPO / NAME), 'fleet', '--no-pull', '--wait-lock', str(PORT_FLEET_WAIT)],
+                   'fleet')
     return url, True
 
 
@@ -1159,6 +1244,7 @@ def cmd_build(args):
             raise Stop('The installed T3 Code changed during the build. Run again for its new version.')
         if ported:
             export_patches(target)
+            publish_port(args, version)
         build_dir = DATA / 'builds' / f'{version}-{recipe_hash()}-{job.name}'
         build_dir.mkdir(parents=True)
         destination = build_dir / assembled.name
@@ -1176,8 +1262,6 @@ def cmd_build(args):
     install_launcher(app)
     minutes = max(1, round((time.time() - started) / 60))
     say(f'\nDone in {minutes} min: T3 Code {version} with the stats bar.')
-    if ported:
-        publish_port(args, version)
     if DISABLED.exists():
         say(f'Customization is switched off. Run {NAME} on to use it.')
     else:
@@ -1357,33 +1441,50 @@ def inside_t3_service():
 
 # --- Never interrupting a running thread ---------------------------------------------
 # A restart of the T3 server ends every run on it, so nothing here restarts it while a thread
-# works. The server's projection in statev2.sqlite says which runs are live: these statuses
-# are the ones it recovers after a restart (orchestration_v2_projection_runs_recovery_idx),
-# which covers a turn in progress, a queued send and a run waiting on approval or input.
-ACTIVE_RUN_STATUSES = ('preparing', 'queued', 'starting', 'running', 'waiting')
+# works. "Working" is what the server itself treats as live work when it starts up
+# (ProjectionStore's runtime recovery query in statev2.sqlite): a run that is preparing,
+# starting, running or waiting (on approval or input), a queued send that is not held, and a
+# provider thread with background tasks still pending. A held queue can wait forever, so it
+# does not count.
+LIVE_RUN_STATUSES = ('preparing', 'starting', 'running', 'waiting')
 STATE_DB = T3_HOME / 'userdata/statev2.sqlite'
 IDLE_WAIT = int(os.environ.get('T3CODE_CUSTOMIZE_IDLE_WAIT_MINUTES', '240')) * 60
 IDLE_POLL = 60
+BUSY_QUERY = f"""
+    WITH busy(thread_id) AS (
+      SELECT thread_id FROM orchestration_v2_projection_runs
+      WHERE status IN ({','.join(repr(s) for s in LIVE_RUN_STATUSES)})
+      UNION
+      SELECT thread_id FROM orchestration_v2_projection_runs
+      WHERE status = 'queued'
+        AND CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.queueHeld') IS NOT 1 ELSE 1 END
+      UNION
+      SELECT thread_id FROM orchestration_v2_projection_provider_threads
+      WHERE CASE WHEN json_valid(payload_json)
+        THEN json_array_length(payload_json, '$.pendingBackgroundTasks') > 0 ELSE 0 END
+    )
+    SELECT DISTINCT COALESCE(t.title, busy.thread_id, '(unknown thread)') FROM busy
+    LEFT JOIN orchestration_v2_projection_threads t ON t.thread_id = busy.thread_id
+    WHERE t.deleted_at IS NULL
+"""
 
 
 class Deferred(Stop):
     """Threads kept working for the whole wait, so nothing was restarted."""
 
 
-def busy_threads(db=None):
-    """Titles of the threads with a live run on this machine's T3 server; empty when idle."""
+def busy_threads(db=None, server=None):
+    """Titles of the threads working on this machine's T3 server; empty only when it is idle."""
     db = Path(db or STATE_DB)
     if not db.exists():
-        return []
+        # No projection to ask: only a machine without a T3 server is idle.
+        present = server_runtime() is not None if server is None else server
+        return [f'(no {db.name} to check)'] if present else []
     import sqlite3
-    marks = ','.join('?' * len(ACTIVE_RUN_STATUSES))
     try:
         connection = sqlite3.connect(db.resolve().as_uri() + '?mode=ro', uri=True, timeout=10)
         try:
-            rows = connection.execute(
-                'SELECT DISTINCT COALESCE(t.title, r.thread_id) FROM orchestration_v2_projection_runs r'
-                ' LEFT JOIN orchestration_v2_projection_threads t ON t.thread_id = r.thread_id'
-                f' WHERE r.status IN ({marks}) AND t.deleted_at IS NULL', ACTIVE_RUN_STATUSES).fetchall()
+            rows = connection.execute(BUSY_QUERY).fetchall()
         finally:
             connection.close()
     except sqlite3.Error as error:
@@ -1393,7 +1494,7 @@ def busy_threads(db=None):
 
 
 def wait_until_idle(action, timeout=None, poll=IDLE_POLL, busy=busy_threads, sleep=time.sleep, clock=time.time):
-    """Return once no thread runs on this T3 server; raise Deferred after timeout seconds."""
+    """Return once no thread works on this T3 server; raise Deferred after timeout seconds."""
     timeout = IDLE_WAIT if timeout is None else timeout
     deadline = clock() + timeout
     shown = None
@@ -1410,40 +1511,38 @@ def wait_until_idle(action, timeout=None, poll=IDLE_POLL, busy=busy_threads, sle
         sleep(poll)
 
 
-def latest_server_version():
-    """The newest t3 nightly on npm, or None when npm cannot say."""
-    try:
-        result = subprocess.run(['npm', 'view', 't3@nightly', 'version'], capture_output=True, text=True,
-                                timeout=60, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return (result.stdout.strip() or None) if result.returncode == 0 else None
+def restart_service(action, busy=busy_threads):
+    """systemctl restart, but only when a last look right before it still finds no thread working."""
+    threads = busy()
+    if threads:
+        raise Deferred(f'deferred: threads busy. Did not {action}: {", ".join(threads[:5])} started working'
+                       ' just before the restart. Nothing was restarted; the next run tries again.')
+    return systemctl('restart', SERVICE_UNIT)
 
 
-def update_t3_server(settle=600):
-    """Move the T3 server to the newest nightly with `t3 update --yes`, which restarts the service;
-    so only while no thread works. True when it switched versions."""
+def stage_t3_update():
+    """Download the newest t3 nightly and point the service at it without restarting it.
+
+    Without --yes and without a terminal, `t3 update` downloads and verifies the release, writes
+    activeVersion to service-state.json, rewrites the unit and leaves a restart-pending marker;
+    the service keeps running its version until the next restart, which the launcher then
+    starts on the new one. So nothing here interrupts a thread: the one restart comes later,
+    gated, from cmd_server. True when the service now names another version."""
     runtime = server_runtime()
     if not runtime:
         return False
     version, folder = runtime
-    latest = latest_server_version()
-    if latest == version:
-        say(f'T3 server: {version} is the newest nightly.')
-        return False
-    wait_until_idle('update the T3 server to ' + (latest or 'the newest nightly'))
-    step(f'Updating T3 to {latest or "the newest nightly"} (t3 update --yes; open sessions reconnect)...')
-    result = subprocess.run([str(folder / 't3'), 'update', '--yes'], cwd=HOME, capture_output=True, text=True,
+    step('Checking for a newer T3 nightly (t3 update, without restarting the service)...')
+    result = subprocess.run([str(folder / 't3'), 'update'], cwd=HOME, capture_output=True, text=True,
                             stdin=subprocess.DEVNULL, timeout=1800)
     if result.returncode:
         raise Stop('t3 update failed: ' + (result.stderr or result.stdout).strip()[-300:])
-    deadline = time.time() + settle
-    while time.time() < deadline:
-        runtime = server_runtime()
-        if runtime and not server_installing(*runtime):
-            break
-        time.sleep(10)
-    return bool(runtime) and runtime[0] != version
+    runtime = server_runtime()
+    if runtime and runtime[0] != version:
+        say(f'    Staged T3 {runtime[0]}; the service still runs {version} until the restart below.')
+        return True
+    say(f'    T3 {version} is the newest nightly.')
+    return False
 
 
 def contains(folder, marker):
@@ -1472,9 +1571,9 @@ def build_server(env, version, config, log):
             raise Stop(f'The build in {folder} is missing the patches (no {marker.decode()}).')
 
 
-def install_server_build(folder, version, commit, recipe):
-    """Swap the customized binary and web client into the runtime folder; the originals stay as *.stock."""
-    binary, client = folder / 't3', folder / 'client'
+def stage_server_build(folder, version):
+    """Copy the customized binary and web client next to the runtime's as *.customize-new and check
+    that the binary runs. Slow, so it happens before waiting for the server to be idle."""
     new_binary, new_client = folder / 't3.customize-new', folder / 'client.customize-new'
     shutil.rmtree(new_client, ignore_errors=True)
     shutil.copy2(SOURCE / 'apps/server/dist-exe/t3', new_binary)
@@ -1484,6 +1583,12 @@ def install_server_build(folder, version, commit, recipe):
         new_binary.unlink(missing_ok=True)
         shutil.rmtree(new_client, ignore_errors=True)
         raise Stop(f'The customized server does not run: {(probe.stdout + probe.stderr).strip()[:300]}')
+
+
+def install_server_build(folder, version, commit, recipe):
+    """Swap the staged customized binary and web client in (renames only); the originals stay as *.stock."""
+    binary, client = folder / 't3', folder / 'client'
+    new_binary, new_client = folder / 't3.customize-new', folder / 'client.customize-new'
     if not (folder / 't3.stock').exists():
         shutil.copy2(binary, folder / 't3.stock')
     os.replace(new_binary, binary)
@@ -1529,17 +1634,23 @@ def server_healthy(timeout=120):
     return False
 
 
-def restart_server(folder):
-    """Restart the service on the customized build; back to stock if it does not come up."""
+def restart_server(folder, action='restart the T3 server'):
+    """Restart the service (only if still idle); back to stock if it does not come up."""
     step('Restarting the T3 server (open sessions on it reconnect)...')
-    systemctl('restart', SERVICE_UNIT)
+    restart_service(action)
     if server_healthy():
         return
     say('The customized server did not come up; going back to stock T3.')
     restore_server_stock(folder)
-    systemctl('restart', SERVICE_UNIT)
-    raise Stop('The customized server failed its health check and was rolled back to stock T3.'
-               f' See journalctl --user -u {SERVICE_UNIT} and ~/.t3/userdata/logs/boot-service.log.')
+    # A server that does not answer runs no turns, unless it came up late after all: then the
+    # rollback waits for idle like any restart, and otherwise takes effect on the next restart.
+    if systemctl('is-active', '--quiet', SERVICE_UNIT).returncode or not busy_threads():
+        systemctl('restart', SERVICE_UNIT)
+        raise Stop('The customized server failed its health check and was rolled back to stock T3.'
+                   f' See journalctl --user -u {SERVICE_UNIT} and ~/.t3/userdata/logs/boot-service.log.')
+    raise Stop('The customized server was slow to answer and threads work on it now, so it was not'
+               ' restarted; stock T3 is back on disk and starts with the next restart.'
+               f' See journalctl --user -u {SERVICE_UNIT}.')
 
 
 def cmd_server(args):
@@ -1551,13 +1662,16 @@ def cmd_server(args):
         argv = [sys.executable, str(REPO / NAME), *sys.argv[1:]]
         run(['systemd-run', '--user', '--collect', '--unit', NAME + '-server-run',
              '--setenv=PATH=' + os.environ.get('PATH', ''), *argv], capture=True)
-        say(f'Running outside the T3 server, since it restarts it. Follow it with:\n'
-            f'  journalctl --user -fu {NAME}-server-run')
+        # Not followed here: an agent turn that waits on this unit keeps its own run live, and the
+        # unit waits for that run to end (wait_until_idle), so it would defer itself.
+        say(f'Running outside the T3 server, since it restarts it, once no thread works (including this'
+            f' one). Do not wait on it in this turn; check later with:\n'
+            f'  journalctl --user -u {NAME}-server-run')
         return False
     if not args.no_pull and not args.resume:
         pull_latest()
     if args.t3_update and not args.resume:
-        update_t3_server()
+        stage_t3_update()
     runtime = server_runtime()
     if not runtime:
         raise Stop(f'No T3 server here: {T3_HOME}/runtime/service-state.json names no installed version.\n'
@@ -1596,18 +1710,19 @@ def cmd_server(args):
             raise Stop('The source checkout changed during the build.')
         if ported:
             export_patches(target)
+            # Before the idle wait, so a deferred or failed restart never loses the port.
+            publish_port(args, version)
+        stage_server_build(folder, version)
         if not args.no_restart:
-            # Installing and restarting follow each other within seconds, once nobody works.
+            # Only renames and the restart follow, once nobody works; restart_service looks once more.
             wait_until_idle('restart the T3 server on the customized build')
         step('Installing the customized server...')
         install_server_build(folder, version, target, recipe_hash() if ported else recipe)
     if args.no_restart:
         say(f'\nInstalled; it starts with the next restart (systemctl --user restart {SERVICE_UNIT}).')
     else:
-        restart_server(folder)
+        restart_server(folder, 'restart the T3 server on the customized build')
         say(f'\nDone in {max(1, round((time.time() - started) / 60))} min: the T3 server runs {version} with the patches.')
-    if ported:
-        publish_port(args, version)
     return True
 
 
@@ -1621,7 +1736,7 @@ def cmd_server_off(args):
         wait_until_idle('restart the T3 server on stock T3')
     restore_server_stock(folder)
     if not args.no_restart:
-        restart_server(folder)
+        restart_server(folder, 'restart the T3 server on stock T3')
     say('The T3 server runs stock T3 again. ' + NAME + ' server switches it back.')
 
 
@@ -1634,7 +1749,7 @@ def server_autoupdate(args):
             unit.unlink(missing_ok=True)
         systemctl('daemon-reload')
         return say('Background updates off.')
-    # `t3 update --yes` first (it waits until no thread works), then the rebuild for that version.
+    # `t3 update` stages the newest nightly first, then the rebuild for it and one restart once idle.
     command = ([sys.executable, str(REPO / NAME), 'server', '--background', '--t3-update', '--wait-lock', '30']
                + (['--fix', args.fix] if args.fix else []))
     SYSTEMD_USER.mkdir(parents=True, exist_ok=True)
@@ -1744,13 +1859,13 @@ def update_ios(args):
     """After a background update: build the iOS app for the new nightly, in this run (it holds the lock)."""
     if not ios_behind_nightly():
         return
-    # One try per nightly: a failing iOS build notifies once, not every hour.
+    # One upload per nightly: cmd_ios records the attempt once its build worked, so an upload
+    # that fails notifies once, not every hour; a build that fails before that tries again.
     version = load(STATE, {}).get('version')
     if load(IOS_ATTEMPT, {}).get('version') == version:
         return
-    save(IOS_ATTEMPT, {'version': version, 'at': time.strftime('%Y-%m-%dT%H:%M:%S')})
     ios_args = argparse.Namespace(app=args.app, fix=args.fix, resume=False, skip_checks=False, force=False,
-                                  no_pull=True)
+                                  no_pull=True, attempt=IOS_ATTEMPT)
     try:
         if cmd_ios(ios_args):
             notify(LAUNCHER_NAME, f"The iOS app for {load(IOS_STATE, {}).get('version')} is on TestFlight.")
@@ -1996,7 +2111,8 @@ FLEET_STATUS = {0: 'ok', 3: 'needs a port (see AGENTS.md)', 4: 'deferred: thread
 def fleet_command(machine, args):
     """What fleet runs on machine: a Mac rebuilds for its app, a server first moves T3 to the newest
     nightly; both wait for a run already holding the checkout and never restart a working thread."""
-    command = ['update' if machine['kind'] == 'mac' else 'server', '--no-pull', '--wait-lock', '30']
+    command = ['update' if machine['kind'] == 'mac' else 'server', '--no-pull', '--wait-lock',
+               str(getattr(args, 'wait_lock', 30))]
     command += [] if machine['kind'] == 'mac' else ['--t3-update']
     command += ['--fix', args.fix] if args.fix else []
     command += ['--force'] if args.force else []
@@ -2285,6 +2401,10 @@ def cmd_ios(args):
             raise Stop('The source checkout changed during the build.')
         if ported:
             export_patches(target)
+            publish_port(args, version)
+        if getattr(args, 'attempt', None):
+            # The build worked; an upload that fails from here is not retried every hour.
+            save(args.attempt, {'version': version, 'at': time.strftime('%Y-%m-%dT%H:%M:%S')})
         step(f'Uploading build {build_number} to TestFlight and waiting for processing...')
         asc(config, 'builds', 'upload', '--app-id', app_id, '--file', str(ipa), '--version', marketing,
             '--build-number', build_number, '--wait', '--timeout', '60m', log=log)
@@ -2296,8 +2416,6 @@ def cmd_ios(args):
     minutes = max(1, round((time.time() - started) / 60))
     say(f'\nDone in {minutes} min: {config["appName"]} {marketing} ({build_number}) for nightly {version}'
         f' is on TestFlight in "{group.get("name")}". Update it from the TestFlight app on your iPhone.')
-    if ported:
-        publish_port(args, version)
     return True
 
 
@@ -2362,7 +2480,7 @@ def main():
     build_options(server)
     server.add_argument('--no-restart', action='store_true', help='install without restarting the service')
     server.add_argument('--t3-update', action='store_true',
-                        help='first move T3 to the newest nightly (t3 update --yes, once no thread works)')
+                        help='first stage the newest T3 nightly (t3 update, restarted once below when no thread works)')
     server.add_argument('--background', action='store_true', help=argparse.SUPPRESS)
     server_off = sub.add_parser('server-off', help='Linux T3 server: put the stock server back')
     server_off.add_argument('--no-restart', action='store_true', help='do not restart the service')
@@ -2371,6 +2489,8 @@ def main():
     fleet.add_argument('--fix', choices=sorted(AGENTS), help='let this agent port broken patches on each machine')
     fleet.add_argument('--force', action='store_true', help='rebuild even if nothing changed')
     fleet.add_argument('--no-pull', action='store_true', help='do not fetch newer patches first')
+    fleet.add_argument('--wait-lock', type=int, default=30, metavar='MINUTES',
+                       help='how long each machine waits for a run that holds its checkout (default 30)')
     ios = sub.add_parser('ios', help='macOS: build the patched iOS app and upload it to TestFlight (see ios.json)')
     build_options(ios)
     sub.add_parser('identity')
