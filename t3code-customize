@@ -555,10 +555,25 @@ def ensure_commit(commit, version, log):
     return git('rev-parse', commit + '^{commit}').strip()
 
 
+# Tracked files the build itself rewrites (TanStack Router regenerates the route tree with a header
+# upstream strips), so a finished build leaves them modified without anyone editing them.
+GENERATED = ('apps/web/src/routeTree.gen.ts',)
+
+
+def restore_generated():
+    """Undo the build's own rewrites of GENERATED when nothing else in SOURCE changed."""
+    if rebase_in_progress():
+        return
+    changed = [line[3:] for line in git('status', '--porcelain', '--untracked-files=no').splitlines()]
+    if changed and set(changed) <= set(GENERATED):
+        git('checkout', '--quiet', '--', *changed)
+
+
 def prepare(target, log, resume=False):
     """Leave SOURCE with the patches as commits on top of target."""
     base = shared_base()
     if not resume:
+        restore_generated()
         # A fresh build starts over from the repo's patches, which throws away a stopped rebase or
         # git am and uncommitted edits. Those may be a port someone is still working on: stop.
         if rebase_in_progress() or git('status', '--porcelain', '--untracked-files=no').strip():
