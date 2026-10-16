@@ -55,6 +55,11 @@ This repo is Tim's fork of [btsouth/t3code-customize](https://github.com/btsouth
 Every update must carry the fork's own changes forward, and an agent must confirm that
 upstream did not break or duplicate them. This section says how.
 
+**This repo is public.** Never commit secrets or private data: no keys, tokens, passwords,
+`.p8` or `.bin` contents, pairing URLs, Tailscale IPs, customer names or log excerpts with
+personal data. Name where a secret lives (a 1Password item, a path under
+`~/.t3/userdata/secrets/`) instead of its value, and check the staged diff before every commit.
+
 ### Ownership
 
 | Upstream owns (never commit changes) | The fork owns (commit changes) |
