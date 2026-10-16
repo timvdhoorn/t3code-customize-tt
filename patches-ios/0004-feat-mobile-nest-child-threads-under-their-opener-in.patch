@@ -9,7 +9,7 @@ Subject: [PATCH 4/6] feat(mobile): nest child threads under their opener in
  apps/mobile/src/features/home/HomeScreen.tsx  |  31 +
  .../features/home/thread-swipe-actions.tsx    |  30 +-
  .../threads/ThreadNavigationSidebar.tsx       |  35 +-
- .../features/threads/thread-list-v2-items.tsx | 266 ++++++++-
+ .../features/threads/thread-list-v2-items.tsx | 299 +++++++++-
  .../src/features/threads/threadListV2.test.ts | 245 ++++++++
  .../src/features/threads/threadListV2.ts      | 545 +++++++++++++-----
  .../use-thread-list-v2-shelf-preferences.ts   |  56 +-
@@ -23,7 +23,7 @@ Subject: [PATCH 4/6] feat(mobile): nest child threads under their opener in
  .../src/state/threadFamilies.ts               | 314 ++++++++++
  .../src/state/threadShell.test.ts             |  37 ++
  .../client-runtime/src/state/threadShell.ts   |  24 +
- 18 files changed, 1816 insertions(+), 455 deletions(-)
+ 18 files changed, 1848 insertions(+), 456 deletions(-)
  create mode 100644 packages/client-runtime/src/state/threadFamilies.test.ts
  create mode 100644 packages/client-runtime/src/state/threadFamilies.ts
 
@@ -303,7 +303,7 @@ index 52408e292..042cc6162 100644
        toggleSnoozedShelf,
        toggleWorkingShelf,
 diff --git a/apps/mobile/src/features/threads/thread-list-v2-items.tsx b/apps/mobile/src/features/threads/thread-list-v2-items.tsx
-index 4b9e2d327..5828a8937 100644
+index 4b9e2d327..491beea6e 100644
 --- a/apps/mobile/src/features/threads/thread-list-v2-items.tsx
 +++ b/apps/mobile/src/features/threads/thread-list-v2-items.tsx
 @@ -18,6 +18,7 @@ import type {
@@ -322,7 +322,7 @@ index 4b9e2d327..5828a8937 100644
    type ThreadListV2Status,
  } from "./threadListV2";
  import { QueuedMessageIcon } from "./queued-message-icon";
-@@ -276,6 +278,120 @@ export const ThreadListV2SettledShelfHeader = memo(function ThreadListV2SettledS
+@@ -276,6 +278,134 @@ export const ThreadListV2SettledShelfHeader = memo(function ThreadListV2SettledS
    return <ThreadListV2ShelfHeader {...props} kind="settled" />;
  });
  
@@ -331,6 +331,16 @@ index 4b9e2d327..5828a8937 100644
 +const FAMILY_GUIDE_LEFT = { screen: 27, sidebar: 19 } as const;
 +const FAMILY_CORNER_RADIUS = 6;
 +const FAMILY_GUIDE_WIDTH = 1;
++const FAMILY_CORNER_WIDTH = 10;
++// A child row starts right of the guide's corner, so a swiped row slides
++// under its own edge instead of across the guide line.
++const FAMILY_ROW_LEFT = {
++  screen: FAMILY_GUIDE_LEFT.screen + FAMILY_CORNER_WIDTH,
++  sidebar: FAMILY_GUIDE_LEFT.sidebar + FAMILY_CORNER_WIDTH,
++} as const;
++// Where a child's title starts: pl-12 and pl-9 at the app's 14pt rem, in line
++// with the disclosure row's chevron.
++const FAMILY_TITLE_LEFT = { screen: 42, sidebar: 31.5 } as const;
 +
 +/** Hairline that ties a family's rows to the head; the last row ends in a
 +    rounded corner that points at its title. The corner half is a flex child,
@@ -355,7 +365,11 @@ index 4b9e2d327..5828a8937 100644
 +      style={{ left, borderLeftWidth: FAMILY_GUIDE_WIDTH }}
 +    />
 +  ) : (
-+    <View pointerEvents="none" className="absolute bottom-0 top-0" style={{ left, width: 10 }}>
++    <View
++      pointerEvents="none"
++      className="absolute bottom-0 top-0"
++      style={{ left, width: FAMILY_CORNER_WIDTH }}
++    >
 +      <View
 +        className={colorClassName}
 +        style={{
@@ -443,7 +457,7 @@ index 4b9e2d327..5828a8937 100644
  export const ThreadListV2ShowMoreRow = memo(function ThreadListV2ShowMoreRow(props: {
    readonly pane?: "screen" | "sidebar";
    readonly hiddenCount: number;
-@@ -576,6 +692,15 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -576,6 +706,15 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
        would fall off the end of the list. */
    readonly canMoveUp?: boolean;
    readonly canMoveDown?: boolean;
@@ -459,7 +473,7 @@ index 4b9e2d327..5828a8937 100644
    readonly onSwipeableWillOpen: (methods: SwipeableMethods) => void;
    readonly onSwipeableClose: (methods: SwipeableMethods) => void;
    /** List key checked against the Home swipe row activation. */
-@@ -721,7 +846,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -721,7 +860,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
    // hides the card until wake with the pin intact.)
    const arrangementMenuItems = useMemo<MenuAction[]>(
      () => [
@@ -468,7 +482,7 @@ index 4b9e2d327..5828a8937 100644
          ? [
              { id: "arrange", title: "Arrange threads…", image: "line.3.horizontal" },
              {
-@@ -750,6 +875,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -750,6 +889,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
        props.canMoveDown,
        props.canMoveUp,
        props.reorderSupported,
@@ -476,7 +490,7 @@ index 4b9e2d327..5828a8937 100644
        props.pinningSupported,
        thread.pinnedAt,
        variant,
-@@ -850,9 +976,25 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -850,9 +990,25 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
      ],
      [arrangementMenuItems, titleMenuItems],
    );
@@ -502,7 +516,7 @@ index 4b9e2d327..5828a8937 100644
        if (nativeEvent.event === "settle") handleSettle();
        if (nativeEvent.event === "unsettle") handleUnsettle();
        if (nativeEvent.event === "unsnooze") handleUnsnooze();
-@@ -890,6 +1032,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -890,6 +1046,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
      },
      [
        onNewThreadOnBranch,
@@ -511,7 +525,7 @@ index 4b9e2d327..5828a8937 100644
        thread,
        handleArchive,
        handleDelete,
-@@ -1193,8 +1337,96 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1193,8 +1351,101 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
      cardContent
    );
  
@@ -543,8 +557,13 @@ index 4b9e2d327..5828a8937 100644
 +        <View
 +          className={cn(
 +            "min-h-[40px] flex-row items-center gap-2 py-1.5",
-+            sidebarPane ? "pl-9 pr-3" : "pl-12 pr-5",
++            sidebarPane ? "pr-3" : "pr-5",
 +          )}
++          style={{
++            paddingLeft:
++              FAMILY_TITLE_LEFT[sidebarPane ? "sidebar" : "screen"] -
++              FAMILY_ROW_LEFT[sidebarPane ? "sidebar" : "screen"],
++          }}
 +        >
 +          <View className="min-w-0 flex-1">
 +            <Text
@@ -609,30 +628,42 @@ index 4b9e2d327..5828a8937 100644
        <RowPressable
          key={`${thread.environmentId}:${thread.id}`}
          interactionClassName={rowAppearance.interactionClassName}
-@@ -1305,7 +1537,29 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1305,7 +1556,41 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
        </RowPressable>
      );
  
 -  if (!canOperateThread) return rowContent(() => {});
 +  // The guide line sits outside the swipeable, so it stays put while a child
 +  // row slides to reveal its actions on the far side.
++  const familyInset =
++    typeof rowAppearance.swipeContainerStyle?.marginHorizontal === "number"
++      ? rowAppearance.swipeContainerStyle.marginHorizontal
++      : 0;
 +  const familyGuide =
 +    props.nested === true ? (
 +      <ThreadListV2FamilyGuide
 +        pane={props.pane}
 +        edge={props.familyEdge === "last" ? "last" : "middle"}
-+        inset={
-+          typeof rowAppearance.swipeContainerStyle?.marginHorizontal === "number"
-+            ? rowAppearance.swipeContainerStyle.marginHorizontal
-+            : 0
-+        }
++        inset={familyInset}
 +      />
 +    ) : null;
++  const swipeContainerStyle =
++    props.nested === true
++      ? [
++          rowAppearance.swipeContainerStyle,
++          {
++            marginLeft:
++              familyInset + FAMILY_ROW_LEFT[props.pane === "sidebar" ? "sidebar" : "screen"],
++          },
++        ]
++      : rowAppearance.swipeContainerStyle;
 +
 +  if (!canOperateThread) {
 +    return (
 +      <View collapsable={false}>
-+        {rowContent(() => {})}
++        <View style={props.nested === true ? swipeContainerStyle : undefined}>
++          {rowContent(() => {})}
++        </View>
 +        {familyGuide}
 +      </View>
 +    );
@@ -640,18 +671,20 @@ index 4b9e2d327..5828a8937 100644
  
    return (
      <View collapsable={false}>
-@@ -1316,7 +1570,9 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1316,8 +1601,10 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
          dormant={dormant}
          threadKey={`${thread.environmentId}:${thread.id}`}
          backgroundColor={rowAppearance.swipeBackgroundColor}
 -        compactActions={variant === "slim"}
+-        containerStyle={rowAppearance.swipeContainerStyle}
 +        compactActions={variant === "slim" || props.nested === true}
 +        // A child row is too short for labelled circles.
 +        iconOnlyActions={props.nested === true}
-         containerStyle={rowAppearance.swipeContainerStyle}
++        containerStyle={swipeContainerStyle}
          enableTrackpadSwipe
          // Full swipe commits the advertised lifecycle action (Settle /
-@@ -1345,6 +1601,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+         // Un-settle), never the secondary snooze action.
+@@ -1345,6 +1632,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
                    ]
                  : []),
                { id: "copy-thread-id", title: "Copy thread ID", image: "doc.on.doc" },
@@ -659,7 +692,7 @@ index 4b9e2d327..5828a8937 100644
                ...(snoozedRow
                  ? snoozedMenuActions
                  : !props.settlementSupported
-@@ -1362,6 +1619,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1362,6 +1650,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
            </Menu>
          )}
        </ThreadSwipeable>
