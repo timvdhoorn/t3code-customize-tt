@@ -5,7 +5,7 @@ Subject: [PATCH 3/6] feat(mobile): show stats for nerds in the composer
 
 ---
  .../settings/SettingsThreadsRouteScreen.tsx   |  26 +
- .../src/features/threads/ComposerStats.tsx    | 565 ++++++++++++++++
+ .../src/features/threads/ComposerStats.tsx    | 565 +++++++++++++++
  .../src/features/threads/ThreadComposer.tsx   |   3 +
  .../features/threads/ThreadDetailScreen.tsx   |  40 +-
  .../features/threads/ThreadRouteScreen.tsx    |   1 +
@@ -16,16 +16,16 @@ Subject: [PATCH 3/6] feat(mobile): show stats for nerds in the composer
  apps/web/src/components/ChatView.tsx          |  64 +-
  apps/web/src/components/chat/ChatComposer.tsx |   2 +-
  .../chat/ComposerPrimaryActions.tsx           |   2 +-
- .../components/chat/ComposerStats.logic.ts    | 303 +--------
+ .../components/chat/ComposerStats.logic.ts    | 303 +-------
  .../web/src/components/chat/ComposerStats.tsx |  57 +-
  .../components/chat/ContextWindowMeter.tsx    |   5 +-
- apps/web/src/lib/contextWindow.ts             | 180 +-----
+ apps/web/src/lib/contextWindow.ts             | 180 +----
  packages/client-runtime/package.json          |   8 +
- .../src/state/composerStats.test.ts           | 608 ++++++++++++++++++
- .../client-runtime/src/state/composerStats.ts | 424 ++++++++++++
+ .../src/state/composerStats.test.ts           | 668 ++++++++++++++++++
+ .../client-runtime/src/state/composerStats.ts | 427 +++++++++++
  .../src/state/contextWindow.test.ts           | 158 +++++
- .../client-runtime/src/state/contextWindow.ts | 179 ++++++
- 21 files changed, 2145 insertions(+), 578 deletions(-)
+ .../client-runtime/src/state/contextWindow.ts | 179 +++++
+ 21 files changed, 2208 insertions(+), 578 deletions(-)
  create mode 100644 apps/mobile/src/features/threads/ComposerStats.tsx
  create mode 100644 apps/mobile/src/state/use-composer-stats.ts
  create mode 100644 packages/client-runtime/src/state/composerStats.test.ts
@@ -1661,10 +1661,10 @@ index 703d418ac..e7c70a789 100644
        "default": "./src/state/auth.ts"
 diff --git a/packages/client-runtime/src/state/composerStats.test.ts b/packages/client-runtime/src/state/composerStats.test.ts
 new file mode 100644
-index 000000000..dadcac452
+index 000000000..81ebba342
 --- /dev/null
 +++ b/packages/client-runtime/src/state/composerStats.test.ts
-@@ -0,0 +1,608 @@
+@@ -0,0 +1,668 @@
 +import {
 +  NodeId,
 +  ProviderDriverKind,
@@ -1676,7 +1676,7 @@ index 000000000..dadcac452
 +  type OrchestrationV2ProviderTurn,
 +} from "@t3tools/contracts";
 +import * as DateTime from "effect/DateTime";
-+import { describe, expect, it } from "vite-plus/test";
++import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
 +
 +import {
 +  composerLimitDisplay,
@@ -2273,12 +2273,72 @@ index 000000000..dadcac452
 +    expect(composerCompactDisabledReason({ ...base, isWorking: false, fallback: "x" })).toBe("x");
 +  });
 +});
++
++// The mobile app runs these on Hermes, which has no ES2023 Array.prototype.toSorted.
++describe("without ES2023 change-by-copy array methods", () => {
++  const toSorted = Object.getOwnPropertyDescriptor(Array.prototype, "toSorted");
++  beforeAll(() => {
++    delete (Array.prototype as { toSorted?: unknown }).toSorted;
++  });
++  afterAll(() => {
++    if (toSorted) Object.defineProperty(Array.prototype, "toSorted", toSorted);
++  });
++
++  it("orders turns, compactions and limit readings", () => {
++    const providerTurns = [turn(2), turn(1)];
++    expect(
++      selectComposerStatsTurns({
++        thread: { activeProviderThreadId: ProviderThreadId.make("active") },
++        nodes: [{ id: NodeId.make("main"), kind: "root_turn", parentNodeId: null }],
++        providerTurns,
++      }),
++    ).toEqual([turn(1), turn(2)]);
++    expect(providerTurns).toEqual([turn(2), turn(1)]);
++
++    const compaction = (id: string, updatedAt: DateTime.Utc) =>
++      ({
++        id: TurnItemId.make(id),
++        threadId: ThreadId.make("thread"),
++        runId: null,
++        nodeId: NodeId.make("main"),
++        providerThreadId: ProviderThreadId.make("active"),
++        providerTurnId: null,
++        nativeItemRef: null,
++        parentItemId: null,
++        ordinal: 0,
++        status: "completed",
++        title: null,
++        startedAt: start,
++        completedAt: updatedAt,
++        updatedAt,
++        type: "compaction",
++        driver: null,
++        beforeTokenCount: 100000,
++        afterTokenCount: 20000,
++      }) satisfies Extract<OrchestrationV2TurnItem, { type: "compaction" }>;
++    const older = compaction("older", start);
++    const newer = compaction("newer", end);
++    expect(selectRecordedCompactions([newer, older], [turn(1)])).toEqual([older, newer]);
++
++    expect(
++      composerLimitsFreshness(["2026-10-03T09:58:00.000Z", "2026-10-03T09:59:30.000Z"], nowMs)
++        .checkedAt,
++    ).toBe("2026-10-03T09:59:30.000Z");
++    expect(
++      composerLimitDisplay(
++        { id: "five_hour", kind: "session", label: "5h", usedPercent: 40 },
++        "2026-10-03T10:00:00.000Z",
++        nowMs,
++      ).percentText,
++    ).toBe("40%");
++  });
++});
 diff --git a/packages/client-runtime/src/state/composerStats.ts b/packages/client-runtime/src/state/composerStats.ts
 new file mode 100644
-index 000000000..0cdfd8e23
+index 000000000..836da770e
 --- /dev/null
 +++ b/packages/client-runtime/src/state/composerStats.ts
-@@ -0,0 +1,424 @@
+@@ -0,0 +1,427 @@
 +import type {
 +  OrchestrationV2ProviderTurn,
 +  OrchestrationV2ThreadProjection,
@@ -2289,6 +2349,9 @@ index 000000000..0cdfd8e23
 +} from "@t3tools/contracts";
 +import * as DateTime from "effect/DateTime";
 +import { deriveLatestContextWindowSnapshot, type ContextWindowSnapshot } from "./contextWindow.ts";
++
++// These run on Hermes in the mobile app, which has no ES2023 `toSorted`: sort the
++// copies `filter` and `flatMap` already return instead.
 +
 +/** Provider turn ordinals are scoped to a provider thread; children have their own nodes. */
 +export function selectComposerStatsTurns(projection: {
@@ -2309,7 +2372,7 @@ index 000000000..0cdfd8e23
 +        turn.providerThreadId === projection.thread.activeProviderThreadId &&
 +        mainNodes.has(turn.nodeId),
 +    )
-+    .toSorted((a, b) => a.ordinal - b.ordinal);
++    .sort((a, b) => a.ordinal - b.ordinal);
 +}
 +
 +/** Cache reads are a subset of normalized input (which includes cache writes). */
@@ -2394,7 +2457,7 @@ index 000000000..0cdfd8e23
 +      seen.add(item.id);
 +      return true;
 +    })
-+    .toSorted((a, b) => DateTime.toEpochMillis(a.updatedAt) - DateTime.toEpochMillis(b.updatedAt));
++    .sort((a, b) => DateTime.toEpochMillis(a.updatedAt) - DateTime.toEpochMillis(b.updatedAt));
 +}
 +
 +/** Persisted provider telemetry is independent of whole-turn wall time. */
@@ -2463,7 +2526,7 @@ index 000000000..0cdfd8e23
 +      ? [{ time, checkedAt }]
 +      : [];
 +  });
-+  const newest = times.toSorted((a, b) => b.time - a.time)[0];
++  const newest = times.sort((a, b) => b.time - a.time)[0];
 +  if (!newest) return { status: "expired", ageMins: null, checkedAt: undefined };
 +  const ageMs = Math.max(0, nowMs - newest.time);
 +  return {

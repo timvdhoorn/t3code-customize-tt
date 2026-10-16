@@ -567,7 +567,7 @@ def install_dependencies(env, log):
     run([*pnpm(env), 'install', *PNPM_INSTALL], cwd=SOURCE, env=env, log=log)
 
 
-def checks(env, log):
+def checks(env, log, target):
     spec = json.loads((REPO / 'checks.json').read_text())
     for path in own_checks():
         own = load(path, {})
@@ -578,6 +578,12 @@ def checks(env, log):
     step('Testing the patches...')
     steps = [(['vp', 'test', 'run', *spec['tests']], 'The patch tests failed.')]
     steps += [(['tsc', '--noEmit', '-p', p + '/tsconfig.json'], f'Typecheck failed in {p}.') for p in spec['typecheck']]
+    # Upstream's lint holds rules tests and typechecks miss, such as no-hermes-unsupported-apis
+    # (Array#toSorted crashes the iOS app at render). Lint what the patches add or change.
+    changed = [f for f in git('diff', '--name-only', '--diff-filter=AM', target + '..HEAD').split()
+               if f.endswith(('.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs'))]
+    if changed:
+        steps.append((['vp', 'lint', *changed], 'Lint failed on files the patches change.'))
     # Run against an empty home, as upstream's CI does: the server tests read the user's
     # real ~/.claude/skills, and a large set of skills races their TestClock steps.
     with tempfile.TemporaryDirectory(prefix='t3code-checks-home-') as home:
@@ -901,7 +907,7 @@ def apply_patches(args, target, version, env, log):
             prepare(target, log, resume=resume)
             install_dependencies(env, log)
             if not args.skip_checks:
-                checks(env, log)
+                checks(env, log, target)
             return ported
         except NeedsFix as problem:
             if older_than_patches(target):
@@ -1075,7 +1081,7 @@ def cmd_verify(args):
         target = ensure_commit(base, None, log)
         prepare(target, log)
         install_dependencies(env, log)
-        checks(env, log)
+        checks(env, log, target)
     say('Patches apply and pass their checks on ' + base[:12] + '.')
 
 
@@ -1954,7 +1960,7 @@ def main():
         p.add_argument('--appimage', '--app', dest='appimage', help='path to your T3 Code AppImage or .app (remembered)')
         p.add_argument('--fix', choices=sorted(AGENTS), help='if a nightly breaks the patches, let this agent port them without asking')
         p.add_argument('--resume', action='store_true', help='continue from the source checkout as you or your agent left it')
-        p.add_argument('--skip-checks', action='store_true', help='skip the patch tests and typechecks')
+        p.add_argument('--skip-checks', action='store_true', help='skip the patch tests, typechecks and lint')
         p.add_argument('--force', action='store_true', help='rebuild even if nothing changed')
         p.add_argument('--no-pull', action='store_true', help='do not fetch newer patches first')
 
