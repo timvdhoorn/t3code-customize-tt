@@ -1,0 +1,2517 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler South <tsouth2@gmail.com>
+Date: Thu, 8 Oct 2026 22:05:20 -0400
+Subject: [PATCH 2/5] Usage limits: background polling, reset-aware merging and
+ fetch-time ordering
+
+---
+ .../provider/ClaudeCapabilitiesProbe.test.ts  |   2 +
+ apps/server/src/provider/ClaudeProvider.ts    |  22 +-
+ apps/server/src/provider/CodexProvider.ts     |  18 +-
+ .../src/provider/Drivers/ClaudeDriver.ts      |  13 +-
+ .../src/provider/Drivers/CodexDriver.ts       |  27 +-
+ .../src/provider/claudeResetCredits.test.ts   | 531 ++++++++++++++++++
+ .../server/src/provider/claudeResetCredits.ts | 152 +++++
+ .../src/provider/claudeUsageLimits.test.ts    | 164 +++++-
+ apps/server/src/provider/claudeUsageLimits.ts | 141 ++++-
+ .../src/provider/codexUsageLimits.test.ts     |  14 +-
+ apps/server/src/provider/codexUsageLimits.ts  |  16 +-
+ apps/server/src/usage/cliproxyApi.ts          |   1 +
+ packages/contracts/src/providerUsageLimits.ts |  10 +
+ .../src/server/managedProvider.test.ts        | 200 ++++++-
+ .../src/server/managedProvider.ts             |  70 ++-
+ .../src/server/usageLimits.test.ts            | 212 ++++++-
+ .../provider-core/src/server/usageLimits.ts   | 219 +++++++-
+ .../provider-cursor/src/server/usageLimits.ts |   1 +
+ .../provider-grok/src/server/usageLimits.ts   |   1 +
+ .../src/server/usageLimits.ts                 |   3 +
+ 20 files changed, 1736 insertions(+), 81 deletions(-)
+
+diff --git a/apps/server/src/provider/ClaudeCapabilitiesProbe.test.ts b/apps/server/src/provider/ClaudeCapabilitiesProbe.test.ts
+index 54616bb3e..dbae8ca64 100644
+--- a/apps/server/src/provider/ClaudeCapabilitiesProbe.test.ts
++++ b/apps/server/src/provider/ClaudeCapabilitiesProbe.test.ts
+@@ -2,6 +2,7 @@
+ import * as ClaudeSdk from "@anthropic-ai/claude-agent-sdk";
+ import { vi } from "vite-plus/test";
+ import * as Deferred from "effect/Deferred";
++import * as DateTime from "effect/DateTime";
+ import * as Fiber from "effect/Fiber";
+ import * as TestClock from "effect/testing/TestClock";
+ import {
+@@ -302,6 +303,7 @@ it.layer(NodeServices.layer)("Claude capability probe SDK boundary", (it) => {
+             input: { hint: "[path]" },
+           },
+         ],
++        usageCheckedAt: DateTime.formatIso(yield* DateTime.now),
+         usage: {
+           rate_limits_available: true,
+           rate_limits: { five_hour: { utilization: 12, resets_at: "2026-07-18T14:39:00Z" } },
+diff --git a/apps/server/src/provider/ClaudeProvider.ts b/apps/server/src/provider/ClaudeProvider.ts
+index 6b7907dd5..23d6f2312 100644
+--- a/apps/server/src/provider/ClaudeProvider.ts
++++ b/apps/server/src/provider/ClaudeProvider.ts
+@@ -262,6 +262,7 @@ type ClaudeCapabilitiesProbe = {
+    * otherwise successful response mean the account has none (API key).
+    */
+   readonly usage?: Pick<SDKControlGetUsageResponse, "rate_limits_available" | "rate_limits">;
++  readonly usageCheckedAt?: string;
+ };
+ 
+ function parseClaudeInitializationCommands(
+@@ -410,7 +411,7 @@ const probeClaudeCapabilities = (
+           apiKeySource: account?.apiKeySource,
+           apiProvider: account?.apiProvider,
+           slashCommands: parseClaudeInitializationCommands(init.commands),
+-          ...(usage ? { usage } : {}),
++          ...(usage ? { usage, usageCheckedAt: DateTime.formatIso(yield* DateTime.now) } : {}),
+         } satisfies ClaudeCapabilitiesProbe;
+       }),
+     ),
+@@ -628,14 +629,17 @@ export const checkClaudeProviderStatus = Effect.fn("checkClaudeProviderStatus")(
+       subscriptionType: capabilities.subscriptionType,
+       authMethod: capabilities.tokenSource,
+     }) ?? apiProviderAuthMetadata(capabilities.apiProvider);
+-  const usageLimits = !capabilities.usage
+-    ? makeUnavailableUsageLimits({ checkedAt, reason: "probeFailed" })
+-    : scopedLimitNames
+-      ? yield* recordClaudeUsageResponse(scopedLimitNames, {
+-          response: capabilities.usage,
+-          checkedAt,
+-        })
+-      : claudeUsageResponseToLimits({ response: capabilities.usage, checkedAt }).limits;
++  const usageCheckedAt = capabilities.usageCheckedAt;
++  const usageLimits =
++    !capabilities.usage || !usageCheckedAt
++      ? makeUnavailableUsageLimits({ checkedAt, reason: "probeFailed" })
++      : scopedLimitNames
++        ? yield* recordClaudeUsageResponse(scopedLimitNames, {
++            response: capabilities.usage,
++            checkedAt: usageCheckedAt,
++          })
++        : claudeUsageResponseToLimits({ response: capabilities.usage, checkedAt: usageCheckedAt })
++            .limits;
+   const resetCredits =
+     resolveResetCredits &&
+     capabilities.subscriptionType &&
+diff --git a/apps/server/src/provider/CodexProvider.ts b/apps/server/src/provider/CodexProvider.ts
+index f4f123dc1..bf9679675 100644
+--- a/apps/server/src/provider/CodexProvider.ts
++++ b/apps/server/src/provider/CodexProvider.ts
+@@ -56,6 +56,7 @@ const RATE_LIMITS_PROBE_TIMEOUT_MS = 3_000;
+ 
+ type CodexRateLimitsProbe =
+   | {
++      readonly checkedAt: string;
+       readonly snapshot: CodexRateLimitSnapshot;
+       readonly rateLimitsByLimitId?:
+         | Readonly<Record<string, CodexRateLimitSnapshot>>
+@@ -491,12 +492,15 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
+       input.skipNativeUsage
+         ? Effect.succeed(undefined)
+         : client.request("account/rateLimits/read", null).pipe(
+-            Effect.map((response): CodexRateLimitsProbe => ({
+-              snapshot: response.rateLimits,
+-              rateLimitsByLimitId: response.rateLimitsByLimitId,
+-              resetCredits: response.rateLimitResetCredits,
+-              accountId: response.accountId,
+-            })),
++            Effect.flatMap((response) =>
++              Effect.map(DateTime.now, (now): CodexRateLimitsProbe => ({
++                checkedAt: DateTime.formatIso(now),
++                snapshot: response.rateLimits,
++                rateLimitsByLimitId: response.rateLimitsByLimitId,
++                resetCredits: response.rateLimitResetCredits,
++                accountId: response.accountId,
++              })),
++            ),
+             Effect.timeoutOption(Duration.millis(RATE_LIMITS_PROBE_TIMEOUT_MS)),
+             Effect.map(
+               Option.getOrElse((): CodexRateLimitsProbe => ({
+@@ -726,7 +730,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
+             snapshot: snapshot.rateLimits.snapshot,
+             rateLimitsByLimitId: snapshot.rateLimits.rateLimitsByLimitId,
+             resetCredits: snapshot.rateLimits.resetCredits,
+-            checkedAt,
++            checkedAt: snapshot.rateLimits.checkedAt,
+           });
+ 
+   return buildServerProvider({
+diff --git a/apps/server/src/provider/Drivers/ClaudeDriver.ts b/apps/server/src/provider/Drivers/ClaudeDriver.ts
+index 67a217294..ce49abce7 100644
+--- a/apps/server/src/provider/Drivers/ClaudeDriver.ts
++++ b/apps/server/src/provider/Drivers/ClaudeDriver.ts
+@@ -158,6 +158,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
+       });
+ 
+       const scopedLimitNames = yield* makeClaudeScopedLimitNames;
++      const readUsageLimits = yield* ClaudeResetCredits.makeClaudeUsageLimitsReader(
++        configDir,
++        scopedLimitNames,
++        yield* ClaudeResetCredits.claudeUsageShareDirectory(),
++      );
+       const orchestrationAdapter = yield* createClaudeAdapterV2(
+         {
+           instanceId,
+@@ -220,11 +225,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
+                 catalog,
+                 scopedLimitNames,
+                 (version) =>
+-                  ClaudeResetCredits.readClaudeResetCredits(configDir, version).pipe(
+-                    Effect.provideService(HttpClient.HttpClient, httpClient),
+-                    Effect.provideService(FileSystem.FileSystem, fileSystem),
+-                    Effect.provideService(Path.Path, path),
+-                  ),
++                  readUsageLimits(version).pipe(Effect.map((limits) => limits?.resetCredits)),
+               ),
+             ),
+             Effect.map(stampIdentity),
+@@ -247,6 +248,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
+             Effect.map(stampIdentity),
+           ),
+         checkProvider,
++        checkUsageLimits: (snapshot) =>
++          snapshot.version ? readUsageLimits(snapshot.version) : Effect.succeed(undefined),
+         enrichSnapshot: ({ settings, snapshot, publishSnapshot }) =>
+           resolveMaintenance().pipe(
+             Effect.flatMap((maintenanceCapabilities) =>
+diff --git a/apps/server/src/provider/Drivers/CodexDriver.ts b/apps/server/src/provider/Drivers/CodexDriver.ts
+index 2388213ee..d7d7215b2 100644
+--- a/apps/server/src/provider/Drivers/CodexDriver.ts
++++ b/apps/server/src/provider/Drivers/CodexDriver.ts
+@@ -1,4 +1,8 @@
+-import { CodexSettings, ProviderDriverKind } from "@t3tools/contracts";
++import {
++  CodexSettings,
++  ProviderDriverKind,
++  type ServerProviderUsageLimits,
++} from "@t3tools/contracts";
+ import * as Crypto from "effect/Crypto";
+ import * as Effect from "effect/Effect";
+ import * as FileSystem from "effect/FileSystem";
+@@ -166,6 +170,7 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv, Path.Pat
+         ),
+       );
+ 
++      const usageLimitsReaders = new Set<Effect.Effect<ServerProviderUsageLimits | undefined>>();
+       const orchestrationAdapter = yield* createCodexAdapterV2(
+         {
+           instanceId,
+@@ -175,7 +180,17 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv, Path.Pat
+           enabled,
+           config,
+         },
+-        { onUsageLimits: (update) => snapshot.applyUsageLimits(update) },
++        {
++          onUsageLimits: (update) => snapshot.applyUsageLimits(update),
++          registerUsageLimitsReader: (reader) =>
++            Effect.acquireRelease(
++              Effect.sync(() => usageLimitsReaders.add(reader)),
++              () =>
++                Effect.sync(() => {
++                  usageLimitsReaders.delete(reader);
++                }),
++            ).pipe(Effect.asVoid),
++        },
+       ).pipe(
+         Effect.mapError(
+           (cause) =>
+@@ -216,6 +231,14 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv, Path.Pat
+             (draft, catalog) => stampIdentity(applyCodexModelCatalog(draft, catalog)),
+           ),
+         checkProvider,
++        checkUsageLimits: () =>
++          Effect.gen(function* () {
++            for (const reader of usageLimitsReaders) {
++              const limits = yield* reader;
++              if (limits) return limits;
++            }
++            return undefined;
++          }),
+         enrichSnapshot: ({ settings, snapshot, publishSnapshot }) =>
+           resolveMaintenance().pipe(
+             Effect.flatMap((maintenanceCapabilities) =>
+diff --git a/apps/server/src/provider/claudeResetCredits.test.ts b/apps/server/src/provider/claudeResetCredits.test.ts
+index c946afb66..6eb3b8561 100644
+--- a/apps/server/src/provider/claudeResetCredits.test.ts
++++ b/apps/server/src/provider/claudeResetCredits.test.ts
+@@ -1,17 +1,34 @@
+ import * as NodeServices from "@effect/platform-node/NodeServices";
+ import { it as effectIt } from "@effect/vitest";
++import {
++  DEFAULT_SERVER_SETTINGS,
++  ProviderDriverKind,
++  ProviderInstanceId,
++  type ServerProvider,
++} from "@t3tools/contracts";
+ import * as HostProcess from "@t3tools/shared/HostProcess";
+ import * as Deferred from "effect/Deferred";
++import * as DateTime from "effect/DateTime";
+ import * as Effect from "effect/Effect";
+ import * as FileSystem from "effect/FileSystem";
+ import * as Fiber from "effect/Fiber";
++import * as Layer from "effect/Layer";
+ import * as Path from "effect/Path";
++import * as Ref from "effect/Ref";
++import * as Queue from "effect/Queue";
+ import * as Schema from "effect/Schema";
++import * as Stream from "effect/Stream";
+ import * as TestClock from "effect/testing/TestClock";
+ import { HttpClient, HttpClientResponse, UrlParams } from "effect/http";
+ import { describe, expect, it } from "vite-plus/test";
+ 
+ import * as ClaudeResetCredits from "./claudeResetCredits.ts";
++import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
++import { ProviderHost } from "@t3tools/provider-core/server/ProviderHost";
++
++const decodeJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
++
++const httpDate = (ms: number) => DateTime.toDateUtc(DateTime.makeUnsafe(ms)).toUTCString();
+ 
+ const NOW = Date.parse("2026-09-22T12:00:00.000Z");
+ const grant = (overrides: Record<string, unknown>) => ({
+@@ -255,3 +272,517 @@ effectIt.layer(NodeServices.layer)("consumeClaudeResetCredit", (it) => {
+     }),
+   );
+ });
++
++effectIt.layer(NodeServices.layer)("Claude limits-only OAuth reader", (it) => {
++  it.effect("shares usage under the host cache directory or host home", () =>
++    Effect.gen(function* () {
++      for (const [env, expected] of [
++        [{ XDG_CACHE_HOME: "/host/cache" }, "/host/cache/claude-usage"],
++        [{ XDG_CACHE_HOME: "relative/cache" }, "/host/home/.cache/claude-usage"],
++        [{}, "/host/home/.cache/claude-usage"],
++      ] as const) {
++        const directory = yield* ClaudeResetCredits.claudeUsageShareDirectory().pipe(
++          Effect.provideService(HostProcess.Environment, env),
++          Effect.provideService(HostProcess.HomeDirectory, "/host/home"),
++        );
++        expect(directory).toBe(expected);
++      }
++    }),
++  );
++
++  it.effect("keeps polling after a startup 429 without foreground demand and after success", () =>
++    Effect.gen(function* () {
++      const fs = yield* FileSystem.FileSystem;
++      const path = yield* Path.Path;
++      const { configDir } = yield* writeLogin;
++      const shareDirectory = yield* fs.makeTempDirectoryScoped();
++      const name = path
++        .resolve(configDir)
++        .replace(/^\/+/, "")
++        .replace(/[^A-Za-z0-9._-]+/g, "-");
++      const poll = path.join(shareDirectory, `${name}.poll.json`);
++      const reading = path.join(shareDirectory, `${name}.json`);
++      const names = yield* Ref.make({ overageIncluded: undefined as string | undefined });
++      const ticks = yield* Queue.unbounded<void>();
++      const startupDone = yield* Deferred.make<void>();
++      let loopCalls = 0;
++      const attempts: number[] = [];
++      const client = HttpClient.make((request) =>
++        Effect.gen(function* () {
++          attempts.push(DateTime.toEpochMillis(yield* DateTime.now));
++          return HttpClientResponse.fromWeb(
++            request,
++            attempts.length === 1
++              ? Response.json({}, { status: 429 })
++              : Response.json({ five_hour: { utilization: attempts.length, resets_at: null } }),
++          );
++        }),
++      );
++      const reader = yield* ClaudeResetCredits.makeClaudeUsageLimitsReader(
++        configDir,
++        names,
++        shareDirectory,
++      ).pipe(
++        Effect.provideService(HostProcess.Platform, "linux"),
++        Effect.provideService(HttpClient.HttpClient, client),
++      );
++      const snapshot: ServerProvider = {
++        instanceId: ProviderInstanceId.make("claude"),
++        driver: ProviderDriverKind.make("claudeAgent"),
++        enabled: true,
++        installed: true,
++        version: "2.1.0",
++        status: "ready",
++        auth: { status: "authenticated" },
++        checkedAt: "1970-01-01T00:00:00.000Z",
++        models: [],
++        slashCommands: [],
++        skills: [],
++      };
++      const epoch = DateTime.toEpochMillis(yield* DateTime.now);
++      const provider = yield* makeManagedServerProvider({
++        resolveMaintenance: () => Effect.die("maintenance is not part of usage polling"),
++        getSettings: Effect.succeed({ enabled: true }),
++        streamSettings: Stream.empty,
++        haveSettingsChanged: () => false,
++        initialSnapshot: () => Effect.succeed(snapshot),
++        checkProvider: reader("2.1.0").pipe(
++          Effect.andThen(Deferred.succeed(startupDone, undefined)),
++          Effect.as(snapshot),
++        ),
++        checkUsageLimits: () =>
++          Effect.gen(function* () {
++            loopCalls++;
++            const limits = yield* reader("2.1.0");
++            yield* Queue.offer(ticks, undefined);
++            return limits;
++          }),
++        refreshInterval: "1 hour",
++      }).pipe(
++        Effect.provide(
++          Layer.succeed(
++            ProviderHost,
++            ProviderHost.of({
++              paths: {
++                cwd: process.cwd(),
++                baseDir: "/t3",
++                stateDir: "/t3/userdata",
++                providerStatusCacheDir: "/t3/caches",
++                attachmentsDir: "/t3/userdata/attachments",
++              },
++              settings: {
++                get: Effect.succeed(DEFAULT_SERVER_SETTINGS),
++                withSnapshot: (use) => use(DEFAULT_SERVER_SETTINGS),
++                changes: Stream.empty,
++                subscribe: Effect.succeed(Stream.empty),
++              },
++              shouldRunBackgroundWork: () => Effect.succeed(false),
++              resolveAttachmentPath: () => null,
++              credentials: () => Effect.die("usage polling must not access credential storage"),
++            }),
++          ),
++        ),
++      );
++      yield* Deferred.await(startupDone);
++      yield* TestClock.adjust("59 seconds");
++      expect(loopCalls).toBe(1);
++      yield* Queue.take(ticks);
++      const firstPoll = yield* fs.readFileString(poll);
++      expect(yield* decodeJson(firstPoll)).toMatchObject({
++        attemptedAtMs: epoch,
++        status: "rate_limited",
++        nextAttemptAtMs: epoch + 120_000,
++      });
++      yield* TestClock.adjust("1 second");
++      yield* Queue.take(ticks);
++      expect(loopCalls).toBe(2);
++      expect(attempts).toEqual([epoch]);
++      expect(yield* fs.readFileString(poll)).toBe(firstPoll);
++      expect(yield* fs.exists(reading)).toBe(false);
++      for (const seconds of [120, 180, 240]) {
++        yield* TestClock.adjust("1 minute");
++        yield* Queue.take(ticks);
++        expect(yield* decodeJson(yield* fs.readFileString(poll))).toMatchObject({
++          attemptedAtMs: epoch + seconds * 1000,
++          status: "ok",
++          nextAttemptAtMs: epoch + seconds * 1000 + 55_000,
++        });
++        expect(yield* decodeJson(yield* fs.readFileString(reading))).toMatchObject({
++          fetchedAtMs: epoch + seconds * 1000,
++        });
++      }
++      expect(loopCalls).toBe(5);
++      expect(attempts).toEqual([epoch, epoch + 120_000, epoch + 180_000, epoch + 240_000]);
++      expect((yield* provider.getSnapshot).usageLimits?.windows[0]?.usedPercent).toBe(4);
++    }),
++  );
++
++  it.effect("reads each instance's credentials and preserves the percentage scale", () =>
++    Effect.gen(function* () {
++      const { configDir } = yield* writeLogin;
++      const names = yield* Ref.make({ overageIncluded: undefined as string | undefined });
++      let calls = 0;
++      const client = HttpClient.make((request) => {
++        calls++;
++        expect(request.headers.authorization).toBe("Bearer oauth-token");
++        expect(UrlParams.toString(request.urlParams)).toBe("cedar_ember=1&skip_spend=1");
++        return Effect.succeed(
++          HttpClientResponse.fromWeb(
++            request,
++            Response.json({
++              five_hour: { utilization: 60, resets_at: null },
++              seven_day: { utilization: 12, resets_at: null },
++              cedar_ember: { eligible: true, next_grant_id: "grant_a", grants: [grant({})] },
++            }),
++          ),
++        );
++      });
++      const reader = yield* ClaudeResetCredits.makeClaudeUsageLimitsReader(configDir, names).pipe(
++        Effect.provideService(HostProcess.Platform, "linux"),
++        Effect.provideService(HttpClient.HttpClient, client),
++      );
++      const limits = yield* reader("2.1.0");
++      expect(calls).toBe(1);
++      expect(limits?.windows.map((window) => window.usedPercent)).toEqual([60, 12]);
++      expect(limits?.windows[0]?.checkedAt).toBe(limits?.checkedAt);
++      expect(limits?.resetCredits?.availableCount).toBe(1);
++    }),
++  );
++
++  it.effect("keeps distinct config directories on their own accounts", () =>
++    Effect.gen(function* () {
++      const first = yield* writeLogin;
++      const second = yield* writeLogin;
++      const fs = yield* FileSystem.FileSystem;
++      const path = yield* Path.Path;
++      yield* fs.writeFileString(
++        path.join(second.configDir, ".credentials.json"),
++        '{"claudeAiOauth":{"accessToken":"second-token"}}',
++      );
++      const names = yield* Ref.make({ overageIncluded: undefined as string | undefined });
++      const tokens: string[] = [];
++      const client = HttpClient.make((request) => {
++        tokens.push(request.headers.authorization!);
++        return Effect.succeed(
++          HttpClientResponse.fromWeb(
++            request,
++            Response.json({
++              five_hour: { utilization: tokens.length * 10, resets_at: null },
++            }),
++          ),
++        );
++      });
++      const reads = [];
++      for (const { configDir } of [first, second]) {
++        const reader = yield* ClaudeResetCredits.makeClaudeUsageLimitsReader(configDir, names).pipe(
++          Effect.provideService(HostProcess.Platform, "linux"),
++          Effect.provideService(HttpClient.HttpClient, client),
++        );
++        reads.push(yield* reader("2.1.0"));
++      }
++      expect(tokens).toEqual(["Bearer oauth-token", "Bearer second-token"]);
++      expect(reads.map((limits) => limits?.windows[0]?.usedPercent)).toEqual([10, 20]);
++    }),
++  );
++
++  it.effect("reuses concurrent and recent readings until 55 seconds", () =>
++    Effect.gen(function* () {
++      const { configDir } = yield* writeLogin;
++      const names = yield* Ref.make({ overageIncluded: undefined as string | undefined });
++      let calls = 0;
++      const client = HttpClient.make((request) => {
++        calls++;
++        return Effect.succeed(
++          HttpClientResponse.fromWeb(
++            request,
++            Response.json({
++              five_hour: { utilization: calls, resets_at: null },
++            }),
++          ),
++        );
++      });
++      const reader = yield* ClaudeResetCredits.makeClaudeUsageLimitsReader(configDir, names).pipe(
++        Effect.provideService(HostProcess.Platform, "linux"),
++        Effect.provideService(HttpClient.HttpClient, client),
++      );
++      const [first, second] = yield* Effect.all([reader("2.1.0"), reader("2.1.0")], {
++        concurrency: "unbounded",
++      });
++      expect(first).toBeDefined();
++      expect(second).toBe(first);
++      yield* TestClock.adjust("54 seconds");
++      expect(yield* reader("2.1.0")).toBe(first);
++      expect(calls).toBe(1);
++      yield* TestClock.adjust("1 second");
++      expect((yield* reader("2.1.0"))?.windows[0]?.usedPercent).toBe(2);
++      expect(calls).toBe(2);
++    }),
++  );
++
++  it.effect("backs off zero Retry-After for 2 then 4 minutes and resets after success", () =>
++    Effect.gen(function* () {
++      const fs = yield* FileSystem.FileSystem;
++      const path = yield* Path.Path;
++      const { configDir } = yield* writeLogin;
++      const shareDirectory = yield* fs.makeTempDirectoryScoped();
++      const name = path
++        .resolve(configDir)
++        .replace(/^\/+/, "")
++        .replace(/[^A-Za-z0-9._-]+/g, "-");
++      const reading = path.join(shareDirectory, `${name}.json`);
++      const poll = path.join(shareDirectory, `${name}.poll.json`);
++      const names = yield* Ref.make({ overageIncluded: undefined as string | undefined });
++      let calls = 0;
++      const client = HttpClient.make((request) => {
++        calls++;
++        return Effect.succeed(
++          HttpClientResponse.fromWeb(
++            request,
++            calls === 3
++              ? Response.json({ five_hour: { utilization: 14, resets_at: null } })
++              : Response.json({}, { status: 429, headers: { "retry-after": "0" } }),
++          ),
++        );
++      });
++      const reader = yield* ClaudeResetCredits.makeClaudeUsageLimitsReader(
++        configDir,
++        names,
++        shareDirectory,
++      ).pipe(
++        Effect.provideService(HostProcess.Platform, "linux"),
++        Effect.provideService(HttpClient.HttpClient, client),
++      );
++      for (const [expectedCalls, delay] of [
++        [1, 120_000],
++        [2, 240_000],
++      ] as const) {
++        const attemptedAtMs = DateTime.toEpochMillis(yield* DateTime.now);
++        expect(yield* reader("2.1.0")).toBeUndefined();
++        expect(yield* decodeJson(yield* fs.readFileString(poll))).toEqual({
++          configDir,
++          attemptedAtMs,
++          status: "rate_limited",
++          nextAttemptAtMs: attemptedAtMs + delay,
++        });
++        expect((yield* fs.stat(poll)).mode & 0o777).toBe(0o600);
++        expect(yield* fs.exists(reading)).toBe(false);
++        yield* TestClock.adjust(delay - 1);
++        expect(yield* reader("2.1.0")).toBeUndefined();
++        expect(calls).toBe(expectedCalls);
++        yield* TestClock.adjust(1);
++      }
++      expect(yield* reader("2.1.0")).toBeDefined();
++      const goodReading = yield* fs.readFileString(reading);
++      yield* TestClock.adjust("55 seconds");
++      const attemptedAtMs = DateTime.toEpochMillis(yield* DateTime.now);
++      expect(yield* reader("2.1.0")).toBeUndefined();
++      expect(yield* decodeJson(yield* fs.readFileString(poll))).toEqual({
++        configDir,
++        attemptedAtMs,
++        status: "rate_limited",
++        nextAttemptAtMs: attemptedAtMs + 120_000,
++      });
++      expect(yield* fs.readFileString(reading)).toBe(goodReading);
++      yield* TestClock.adjust(119_999);
++      expect(yield* reader("2.1.0")).toBeUndefined();
++      expect(calls).toBe(4);
++      yield* TestClock.adjust(1);
++      yield* reader("2.1.0");
++      expect(calls).toBe(5);
++    }),
++  );
++
++  it.effect("honors positive numeric and date Retry-After and backs off invalid delays", () =>
++    Effect.gen(function* () {
++      const { configDir } = yield* writeLogin;
++      const names = yield* Ref.make({ overageIncluded: undefined as string | undefined });
++      for (const header of ["30", "120", "date", "invalid", "0", undefined]) {
++        let calls = 0;
++        const now = DateTime.toEpochMillis(yield* DateTime.now);
++        const value = header === "date" ? httpDate(now + 120_000) : header;
++        const client = HttpClient.make((request) => {
++          calls++;
++          return Effect.succeed(
++            HttpClientResponse.fromWeb(
++              request,
++              Response.json(
++                {},
++                {
++                  status: 429,
++                  headers: value ? { "retry-after": value } : {},
++                },
++              ),
++            ),
++          );
++        });
++        const reader = yield* ClaudeResetCredits.makeClaudeUsageLimitsReader(configDir, names).pipe(
++          Effect.provideService(HostProcess.Platform, "linux"),
++          Effect.provideService(HttpClient.HttpClient, client),
++        );
++        expect(yield* reader("2.1.0")).toBeUndefined();
++        yield* TestClock.adjust(header === "30" ? 54_999 : 119_999);
++        expect(yield* reader("2.1.0")).toBeUndefined();
++        expect(calls).toBe(1);
++        yield* TestClock.adjust(1);
++        yield* reader("2.1.0");
++        expect(calls).toBe(2);
++      }
++    }),
++  );
++
++  it.effect("spaces failed HTTP requests and shares their error status", () =>
++    Effect.gen(function* () {
++      const fs = yield* FileSystem.FileSystem;
++      const path = yield* Path.Path;
++      const { configDir } = yield* writeLogin;
++      const shareDirectory = yield* fs.makeTempDirectoryScoped();
++      const names = yield* Ref.make({ overageIncluded: undefined as string | undefined });
++      let calls = 0;
++      const client = HttpClient.make((request) => {
++        calls++;
++        return Effect.succeed(
++          HttpClientResponse.fromWeb(request, Response.json({}, { status: 500 })),
++        );
++      });
++      const reader = yield* ClaudeResetCredits.makeClaudeUsageLimitsReader(
++        configDir,
++        names,
++        shareDirectory,
++      ).pipe(
++        Effect.provideService(HostProcess.Platform, "linux"),
++        Effect.provideService(HttpClient.HttpClient, client),
++      );
++      const attemptedAtMs = DateTime.toEpochMillis(yield* DateTime.now);
++      expect(yield* reader("2.1.0")).toBeUndefined();
++      const files = yield* fs.readDirectory(shareDirectory);
++      expect(files).toHaveLength(1);
++      expect(files[0]).toMatch(/\.poll\.json$/);
++      expect(
++        yield* decodeJson(yield* fs.readFileString(path.join(shareDirectory, files[0]!))),
++      ).toEqual({
++        configDir,
++        attemptedAtMs,
++        status: "error",
++        nextAttemptAtMs: attemptedAtMs + 55_000,
++      });
++      yield* TestClock.adjust(54_999);
++      expect(yield* reader("2.1.0")).toBeUndefined();
++      expect(calls).toBe(1);
++      yield* TestClock.adjust(1);
++      yield* reader("2.1.0");
++      expect(calls).toBe(2);
++    }),
++  );
++
++  it.effect("spaces timed-out attempts and writes their poll status", () =>
++    Effect.gen(function* () {
++      const fs = yield* FileSystem.FileSystem;
++      const path = yield* Path.Path;
++      const { configDir } = yield* writeLogin;
++      const shareDirectory = yield* fs.makeTempDirectoryScoped();
++      const names = yield* Ref.make({ overageIncluded: undefined as string | undefined });
++      const sent = yield* Deferred.make<void>();
++      let calls = 0;
++      const client = HttpClient.make(() => {
++        calls++;
++        return Deferred.succeed(sent, undefined).pipe(Effect.andThen(Effect.never));
++      });
++      const reader = yield* ClaudeResetCredits.makeClaudeUsageLimitsReader(
++        configDir,
++        names,
++        shareDirectory,
++      ).pipe(
++        Effect.provideService(HostProcess.Platform, "linux"),
++        Effect.provideService(HttpClient.HttpClient, client),
++      );
++      const attemptedAtMs = DateTime.toEpochMillis(yield* DateTime.now);
++      const pending = yield* reader("2.1.0").pipe(Effect.forkChild);
++      yield* Deferred.await(sent);
++      yield* TestClock.adjust("10 seconds");
++      expect(yield* Fiber.join(pending)).toBeUndefined();
++      const files = yield* fs.readDirectory(shareDirectory);
++      expect(files).toHaveLength(1);
++      expect(
++        yield* decodeJson(yield* fs.readFileString(path.join(shareDirectory, files[0]!))),
++      ).toEqual({
++        configDir,
++        attemptedAtMs,
++        status: "error",
++        nextAttemptAtMs: attemptedAtMs + 55_000,
++      });
++      yield* TestClock.adjust("44 seconds");
++      expect(yield* reader("2.1.0")).toBeUndefined();
++      expect(calls).toBe(1);
++    }),
++  );
++
++  it.effect("shares each good reading for other local readers of the login", () =>
++    Effect.gen(function* () {
++      const fs = yield* FileSystem.FileSystem;
++      const path = yield* Path.Path;
++      const { configDir } = yield* writeLogin;
++      const shareDirectory = path.join(yield* fs.makeTempDirectoryScoped(), "claude-usage");
++      const names = yield* Ref.make({ overageIncluded: undefined as string | undefined });
++      const shared = path.join(
++        shareDirectory,
++        `${configDir.replace(/^\/+/, "").replace(/[^A-Za-z0-9._-]+/g, "-")}.json`,
++      );
++      const failing = yield* ClaudeResetCredits.makeClaudeUsageLimitsReader(
++        configDir,
++        names,
++        shareDirectory,
++      ).pipe(
++        Effect.provideService(HostProcess.Platform, "linux"),
++        Effect.provideService(HttpClient.HttpClient, respond(500, {})),
++      );
++      yield* failing("2.1.0");
++      expect(yield* fs.exists(shared)).toBe(false);
++
++      const usage = { five_hour: { utilization: 14, resets_at: null } };
++      const reader = yield* ClaudeResetCredits.makeClaudeUsageLimitsReader(
++        configDir,
++        names,
++        shareDirectory,
++      ).pipe(
++        Effect.provideService(HostProcess.Platform, "linux"),
++        Effect.provideService(HttpClient.HttpClient, respond(200, usage)),
++      );
++      const limits = yield* reader("2.1.0");
++      const reading = yield* decodeJson(yield* fs.readFileString(shared));
++      expect(reading).toEqual({
++        configDir,
++        fetchedAtMs: Date.parse(limits!.checkedAt),
++        usage,
++      });
++      expect((yield* fs.stat(shared)).mode & 0o777).toBe(0o600);
++      const poll = shared.replace(/\.json$/, ".poll.json");
++      expect(yield* decodeJson(yield* fs.readFileString(poll))).toEqual({
++        configDir,
++        attemptedAtMs: Date.parse(limits!.checkedAt),
++        status: "ok",
++        nextAttemptAtMs: Date.parse(limits!.checkedAt) + 55_000,
++      });
++      expect((yield* fs.stat(poll)).mode & 0o777).toBe(0o600);
++      expect((yield* fs.readDirectory(shareDirectory)).sort()).toEqual(
++        [path.basename(shared), path.basename(poll)].sort(),
++      );
++    }),
++  );
++
++  it.effect("returns no new timestamp on HTTP or malformed-response failures", () =>
++    Effect.gen(function* () {
++      const { configDir } = yield* writeLogin;
++      const names = yield* Ref.make({ overageIncluded: undefined as string | undefined });
++      for (const client of [
++        respond(500, {}),
++        respond(200, { five_hour: { utilization: "wrong", resets_at: null } }),
++      ]) {
++        const reader = yield* ClaudeResetCredits.makeClaudeUsageLimitsReader(configDir, names).pipe(
++          Effect.provideService(HostProcess.Platform, "linux"),
++          Effect.provideService(HttpClient.HttpClient, client),
++        );
++        expect(yield* reader("2.1.0")).toBeUndefined();
++      }
++    }),
++  );
++});
+diff --git a/apps/server/src/provider/claudeResetCredits.ts b/apps/server/src/provider/claudeResetCredits.ts
+index 4736fbe49..37cb45ab0 100644
+--- a/apps/server/src/provider/claudeResetCredits.ts
++++ b/apps/server/src/provider/claudeResetCredits.ts
+@@ -1,6 +1,7 @@
+ import type {
+   ProviderConsumeResetCreditOutcome,
+   ServerProviderResetCredits,
++  ServerProviderUsageLimits,
+ } from "@t3tools/contracts";
+ import * as HostProcess from "@t3tools/shared/HostProcess";
+ import * as DateTime from "effect/DateTime";
+@@ -9,6 +10,9 @@ import * as FileSystem from "effect/FileSystem";
+ import * as Option from "effect/Option";
+ import * as Path from "effect/Path";
+ import * as Schema from "effect/Schema";
++import * as Ref from "effect/Ref";
++import * as Semaphore from "effect/Semaphore";
++import { claudeOAuthUsageToLimits, type ClaudeScopedLimitNames } from "./claudeUsageLimits.ts";
+ import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
+ 
+ const API_BASE = "https://api.anthropic.com";
+@@ -171,6 +175,154 @@ export const readClaudeResetCredits = Effect.fn("readClaudeResetCredits")(
+   Effect.orElseSucceed(() => undefined),
+ );
+ 
++/**
++ * The endpoint allows each login about one request a minute, so other local
++ * readers of the same login (the desktop usage panel) would otherwise lose to
++ * this poller. Each good reading is kept here, one file per config directory,
++ * for them to use instead of asking again.
++ */
++export const claudeUsageShareDirectory = Effect.fn("claudeUsageShareDirectory")(function* () {
++  const env = yield* HostProcess.Environment;
++  return env.XDG_CACHE_HOME?.startsWith("/")
++    ? `${env.XDG_CACHE_HOME}/claude-usage`
++    : `${yield* HostProcess.HomeDirectory}/.cache/claude-usage`;
++});
++
++const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
++
++const shareUsageJson = (directory: string, configDir: string, suffix: string, value: unknown) =>
++  Effect.scoped(
++    Effect.gen(function* () {
++      const fs = yield* FileSystem.FileSystem;
++      const path = yield* Path.Path;
++      const name = path
++        .resolve(configDir)
++        .replace(/^\/+/, "")
++        .replace(/[^A-Za-z0-9._-]+/g, "-");
++      yield* fs.makeDirectory(directory, { recursive: true });
++      const tempPath = yield* fs.makeTempFileScoped({ directory, prefix: ".usage-" });
++      yield* fs.chmod(tempPath, 0o600);
++      yield* fs.writeFileString(tempPath, yield* encodeJson(value));
++      yield* fs.rename(tempPath, path.join(directory, `${name}${suffix}.json`));
++    }),
++  );
++
++const shareUsageReading = (
++  directory: string,
++  configDir: string,
++  fetchedAtMs: number,
++  usage: unknown,
++) => shareUsageJson(directory, configDir, "", { configDir, fetchedAtMs, usage });
++
++/** A limits-only reader for one config directory; failures never manufacture a fetch time. */
++export const makeClaudeUsageLimitsReader = Effect.fn("makeClaudeUsageLimitsReader")(function* (
++  configDir: string,
++  names: Ref.Ref<ClaudeScopedLimitNames>,
++  shareDirectory?: string,
++) {
++  const client = yield* HttpClient.HttpClient;
++  const fs = yield* FileSystem.FileSystem;
++  const path = yield* Path.Path;
++  const platform = yield* HostProcess.Platform;
++  const semaphore = yield* Semaphore.make(1);
++  let retryAt = 0;
++  let consecutive429s = 0;
++  let lastAttemptAt: number | undefined;
++  let lastResult: ServerProviderUsageLimits | undefined;
++  return (version: string) =>
++    semaphore.withPermits(1)(
++      Effect.gen(function* () {
++        const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
++        if (lastAttemptAt !== undefined && nowMs < lastAttemptAt + 55_000) return lastResult;
++        if (nowMs < retryAt) return undefined;
++        let attemptedAtMs: number | undefined;
++        let status: "ok" | "rate_limited" | "error" = "error";
++        const result = yield* Effect.gen(function* () {
++          const token = yield* readAccessToken(configDir).pipe(
++            Effect.provideService(FileSystem.FileSystem, fs),
++            Effect.provideService(Path.Path, path),
++            Effect.provideService(HostProcess.Platform, platform),
++          );
++          if (!token) return undefined;
++          attemptedAtMs = DateTime.toEpochMillis(yield* DateTime.now);
++          lastAttemptAt = attemptedAtMs;
++          lastResult = undefined;
++          const response = yield* client.execute(
++            HttpClientRequest.get(`${API_BASE}/api/oauth/usage`, {
++              urlParams: { cedar_ember: "1", skip_spend: "1" },
++            }).pipe(withClaudeHeaders(token, version)),
++          );
++          if (response.status === 429) {
++            const receivedAt = DateTime.toEpochMillis(yield* DateTime.now);
++            const value = response.headers["retry-after"];
++            const seconds = value?.trim() ? Number(value) : NaN;
++            const delay =
++              Number.isFinite(seconds) && seconds >= 0
++                ? seconds * 1000
++                : Date.parse(value ?? "") - receivedAt;
++            consecutive429s++;
++            retryAt =
++              receivedAt +
++              (Number.isFinite(delay) && delay > 0
++                ? delay
++                : Math.min(60_000 * 2 ** consecutive429s, 600_000));
++            status = "rate_limited";
++            return undefined;
++          }
++          const body = yield* HttpClientResponse.schemaBodyJson(Schema.Unknown)(
++            yield* HttpClientResponse.filterStatusOk(response),
++          );
++          const fetchedAt = yield* DateTime.now;
++          const limits = claudeOAuthUsageToLimits({
++            response: body,
++            checkedAt: DateTime.formatIso(fetchedAt),
++            names: yield* Ref.get(names),
++          });
++          if (!limits) return undefined;
++          consecutive429s = 0;
++          retryAt = 0;
++          status = "ok";
++          if (shareDirectory) {
++            yield* shareUsageReading(
++              shareDirectory,
++              configDir,
++              DateTime.toEpochMillis(fetchedAt),
++              body,
++            ).pipe(
++              Effect.provideService(FileSystem.FileSystem, fs),
++              Effect.provideService(Path.Path, path),
++              Effect.orElseSucceed(() => undefined),
++            );
++          }
++          const resetCredits = claudeResetCreditsToContract(
++            (body as Record<string, unknown>).cedar_ember,
++            DateTime.toEpochMillis(fetchedAt),
++          );
++          return { ...limits, ...(resetCredits ? { resetCredits } : {}) };
++        }).pipe(
++          Effect.timeout("10 seconds"),
++          Effect.orElseSucceed(() => undefined),
++        );
++        if (attemptedAtMs !== undefined) {
++          lastResult = result;
++          if (shareDirectory) {
++            yield* shareUsageJson(shareDirectory, configDir, ".poll", {
++              configDir,
++              attemptedAtMs,
++              status,
++              nextAttemptAtMs: Math.max(attemptedAtMs + 55_000, retryAt),
++            }).pipe(
++              Effect.provideService(FileSystem.FileSystem, fs),
++              Effect.provideService(Path.Path, path),
++              Effect.orElseSucceed(() => undefined),
++            );
++          }
++        }
++        return result;
++      }).pipe(Effect.orElseSucceed(() => undefined)),
++    );
++});
++
+ export const readClaudeOrganizationId = (accountConfigPath: string) =>
+   readJson(Config, accountConfigPath).pipe(
+     Effect.map((config) => config.oauthAccount?.organizationUuid?.trim() || undefined),
+diff --git a/apps/server/src/provider/claudeUsageLimits.test.ts b/apps/server/src/provider/claudeUsageLimits.test.ts
+index a2da39b00..c7bdc7e08 100644
+--- a/apps/server/src/provider/claudeUsageLimits.test.ts
++++ b/apps/server/src/provider/claudeUsageLimits.test.ts
+@@ -1,6 +1,10 @@
+ import { describe, expect, it } from "vite-plus/test";
+ 
+-import { claudeRateLimitEventToUpdate, claudeUsageResponseToLimits } from "./claudeUsageLimits.ts";
++import {
++  claudeOAuthUsageToLimits,
++  claudeRateLimitEventToUpdate,
++  claudeUsageResponseToLimits,
++} from "./claudeUsageLimits.ts";
+ 
+ const checkedAt = "2026-07-18T10:00:00.000Z";
+ const noNames = { overageIncluded: undefined } as const;
+@@ -42,6 +46,7 @@ describe("claudeUsageResponseToLimits", () => {
+             id: "five_hour",
+             kind: "session",
+             label: "Session",
++            source: "probe",
+             usedPercent: 54,
+             windowDurationMins: 300,
+             resetsAt: "2026-07-18T14:39:00.000Z",
+@@ -50,6 +55,7 @@ describe("claudeUsageResponseToLimits", () => {
+             id: "seven_day",
+             kind: "weekly",
+             label: "Weekly",
++            source: "probe",
+             usedPercent: 18.4,
+             windowDurationMins: 10080,
+             resetsAt: "2026-07-24T08:59:00.000Z",
+@@ -58,6 +64,7 @@ describe("claudeUsageResponseToLimits", () => {
+             id: "seven_day_fable",
+             kind: "weekly",
+             label: "Weekly · Fable",
++            source: "probe",
+             usedPercent: 73,
+             windowDurationMins: 10080,
+             resetsAt: "2026-07-24T08:59:00.000Z",
+@@ -112,6 +119,7 @@ describe("claudeUsageResponseToLimits", () => {
+         id: "seven_day",
+         kind: "weekly",
+         label: "Weekly",
++        source: "probe",
+         usedPercent: 100,
+         windowDurationMins: 10080,
+       },
+@@ -137,6 +145,7 @@ describe("claudeRateLimitEventToUpdate", () => {
+           id: "seven_day",
+           kind: "weekly",
+           label: "Weekly",
++          source: "turn",
+           usedPercent: 85,
+           windowDurationMins: 10080,
+           resetsAt: "2026-07-14T03:33:20.000Z",
+@@ -158,6 +167,7 @@ describe("claudeRateLimitEventToUpdate", () => {
+           id: "seven_day_fable",
+           kind: "weekly",
+           label: "Weekly · Fable",
++          source: "turn",
+           usedPercent: 40,
+           windowDurationMins: 10080,
+         },
+@@ -176,4 +186,156 @@ describe("claudeRateLimitEventToUpdate", () => {
+       claudeRateLimitEventToUpdate({ status: "rejected", rateLimitType: "five_hour" }, noNames),
+     ).toBeUndefined();
+   });
++
++  it("reads every recognized window from unifiedWindows without a top-level utilization", () => {
++    const update = claudeRateLimitEventToUpdate(
++      {
++        status: "allowed",
++        rateLimitType: "five_hour",
++        resetsAt: 1_784_000_000,
++        unifiedWindows: {
++          five_hour: { utilization: 0.02, resetsAt: 1_784_000_000 },
++          seven_day: { utilization: 0.11, resetsAt: 1_784_600_000 },
++          seven_day_overage_included: { utilization: 0.4, resetsAt: 1_784_500_000 },
++        },
++      } as never,
++      { overageIncluded: "Fable" },
++    );
++
++    expect(update).toEqual({
++      windows: [
++        {
++          id: "five_hour",
++          kind: "session",
++          label: "Session",
++          source: "turn",
++          usedPercent: 2,
++          windowDurationMins: 300,
++          resetsAt: "2026-07-14T03:33:20.000Z",
++        },
++        {
++          id: "seven_day",
++          kind: "weekly",
++          label: "Weekly",
++          source: "turn",
++          usedPercent: 11,
++          windowDurationMins: 10080,
++          resetsAt: "2026-07-21T02:13:20.000Z",
++        },
++        {
++          id: "seven_day_fable",
++          kind: "weekly",
++          label: "Weekly · Fable",
++          source: "turn",
++          usedPercent: 40,
++          windowDurationMins: 10080,
++          resetsAt: "2026-07-19T22:26:40.000Z",
++        },
++      ],
++    });
++  });
++});
++
++describe("claudeOAuthUsageToLimits", () => {
++  it("maps OAuth percentages and model windows onto the SDK identities", () => {
++    const limits = claudeOAuthUsageToLimits({
++      checkedAt,
++      names: { overageIncluded: "Fable" },
++      response: {
++        five_hour: { utilization: 60, resets_at: "2026-07-18T14:39:00Z" },
++        seven_day: { utilization: 0.5, resets_at: null },
++        seven_day_opus: { utilization: 7, resets_at: null },
++        seven_day_sonnet: null,
++        seven_day_overage_included: { utilization: 42, resets_at: null },
++        cedar_ember: { eligible: false },
++      },
++    });
++    expect(
++      limits?.windows.map(
++        ({ id, label, kind, source, usedPercent, windowDurationMins, checkedAt }) => ({
++          id,
++          label,
++          kind,
++          source,
++          usedPercent,
++          windowDurationMins,
++          checkedAt,
++        }),
++      ),
++    ).toEqual([
++      {
++        id: "five_hour",
++        label: "Session",
++        kind: "session",
++        source: "account",
++        usedPercent: 60,
++        windowDurationMins: 300,
++        checkedAt,
++      },
++      {
++        id: "seven_day",
++        label: "Weekly",
++        kind: "weekly",
++        source: "account",
++        usedPercent: 0.5,
++        windowDurationMins: 10080,
++        checkedAt,
++      },
++      {
++        id: "seven_day_fable",
++        label: "Weekly · Fable",
++        kind: "weekly",
++        source: "account",
++        usedPercent: 42,
++        windowDurationMins: 10080,
++        checkedAt,
++      },
++      {
++        id: "seven_day_opus",
++        label: "Weekly · Opus",
++        kind: "weekly",
++        source: "account",
++        usedPercent: 7,
++        windowDurationMins: 10080,
++        checkedAt,
++      },
++    ]);
++    expect(limits?.windows[0]?.resetsAt).toBe("2026-07-18T14:39:00.000Z");
++  });
++
++  it("ignores null, malformed, and out-of-range numbers instead of reporting zero", () => {
++    for (const utilization of [null, "60", NaN, Infinity, -1, 101]) {
++      expect(
++        claudeOAuthUsageToLimits({
++          checkedAt,
++          names: noNames,
++          response: { five_hour: { utilization, resets_at: null } },
++        }),
++      ).toBeUndefined();
++    }
++    expect(claudeOAuthUsageToLimits({ checkedAt, names: noNames, response: null })).toBeUndefined();
++  });
++
++  it("uses the SDK's model_scoped display names and skips unsupported fields", () => {
++    expect(
++      claudeOAuthUsageToLimits({
++        checkedAt,
++        names: noNames,
++        response: {
++          model_scoped: [{ display_name: "Fable", utilization: 10, resets_at: null }],
++          seven_day_oauth_apps: { utilization: 80, resets_at: null },
++        },
++      })?.windows,
++    ).toEqual([
++      {
++        id: "seven_day_fable",
++        kind: "weekly",
++        label: "Weekly · Fable",
++        source: "account",
++        usedPercent: 10,
++        windowDurationMins: 10080,
++        checkedAt,
++      },
++    ]);
++  });
+ });
+diff --git a/apps/server/src/provider/claudeUsageLimits.ts b/apps/server/src/provider/claudeUsageLimits.ts
+index a4dd6d015..6e75cc398 100644
+--- a/apps/server/src/provider/claudeUsageLimits.ts
++++ b/apps/server/src/provider/claudeUsageLimits.ts
+@@ -8,6 +8,7 @@ import * as DateTime from "effect/DateTime";
+ import * as Effect from "effect/Effect";
+ import * as Option from "effect/Option";
+ import * as Ref from "effect/Ref";
++import * as Schema from "effect/Schema";
+ 
+ import {
+   clampPercent,
+@@ -17,6 +18,7 @@ import {
+ 
+ const SESSION_MINS = 5 * 60;
+ const WEEK_MINS = 7 * 24 * 60;
++type UsageSource = NonNullable<ServerProviderUsageWindow["source"]>;
+ 
+ const WINDOWS: Readonly<
+   Record<string, Pick<ServerProviderUsageWindow, "kind" | "label" | "windowDurationMins">>
+@@ -50,11 +52,13 @@ function scopedWindow(
+   displayName: string,
+   usedPercent: number,
+   resetsAt: string | undefined,
++  source: UsageSource,
+ ): ServerProviderUsageWindow {
+   return {
+     id: scopedWindowId(displayName),
+     kind: "weekly",
+     label: `Weekly · ${displayName}`,
++    source,
+     windowDurationMins: WEEK_MINS,
+     usedPercent: clampPercent(usedPercent),
+     ...(resetsAt ? { resetsAt } : {}),
+@@ -98,16 +102,54 @@ function makeWindow(
+   id: keyof typeof WINDOWS & string,
+   usedPercent: number,
+   resetsAt: string | undefined,
++  source: UsageSource,
+ ): ServerProviderUsageWindow {
+   const window = WINDOWS[id]!;
+   return {
+     id,
+     ...window,
++    source,
+     usedPercent: clampPercent(usedPercent),
+     ...(resetsAt ? { resetsAt } : {}),
+   };
+ }
+ 
++interface UnifiedRateLimitWindow {
++  readonly utilization?: unknown;
++  readonly resetsAt?: unknown;
++}
++
++function readUnifiedWindows(info: SDKRateLimitInfo): Readonly<Record<string, unknown>> {
++  const unified = (info as SDKRateLimitInfo & { readonly unifiedWindows?: unknown }).unifiedWindows;
++  return typeof unified === "object" && unified !== null && !Array.isArray(unified)
++    ? (unified as Readonly<Record<string, unknown>>)
++    : {};
++}
++
++function readEventReading(
++  info: SDKRateLimitInfo,
++  unifiedWindows: Readonly<Record<string, unknown>>,
++  type: string,
++): { readonly usedPercent: number; readonly resetsAt: string | undefined } | undefined {
++  const unified = unifiedWindows[type];
++  if (typeof unified === "object" && unified !== null) {
++    const { utilization, resetsAt } = unified as UnifiedRateLimitWindow;
++    if (typeof utilization === "number" && Number.isFinite(utilization)) {
++      return {
++        usedPercent: utilization * 100,
++        resetsAt: isoFromEpochSeconds(
++          typeof resetsAt === "number" && Number.isFinite(resetsAt) ? resetsAt : undefined,
++        ),
++      };
++    }
++  }
++  if (info.rateLimitType !== type || typeof info.utilization !== "number") return undefined;
++  return {
++    usedPercent: info.utilization * 100,
++    resetsAt: isoFromEpochSeconds(info.resetsAt),
++  };
++}
++
+ /**
+  * Utilization is a 0–1 fraction on the streamed event. An overage-included
+  * event before any probe has named the bucket is dropped: guessing a name
+@@ -117,19 +159,21 @@ export function claudeRateLimitEventToUpdate(
+   info: SDKRateLimitInfo,
+   names: ClaudeScopedLimitNames,
+ ): ProviderUsageLimitsUpdate | undefined {
+-  const type: string | undefined = info.rateLimitType;
+-  if (!type || typeof info.utilization !== "number") {
+-    return undefined;
+-  }
+-  const usedPercent = info.utilization * 100;
+-  const resetsAt = isoFromEpochSeconds(info.resetsAt);
+-  if (type in WINDOWS) {
+-    return { windows: [makeWindow(type, usedPercent, resetsAt)] };
++  const unifiedWindows = readUnifiedWindows(info);
++  const windows: ServerProviderUsageWindow[] = [];
++  for (const type of Object.keys(WINDOWS)) {
++    const reading = readEventReading(info, unifiedWindows, type);
++    if (reading) {
++      windows.push(makeWindow(type, reading.usedPercent, reading.resetsAt, "turn"));
++    }
+   }
+-  if (type === OVERAGE_INCLUDED_EVENT_TYPE && names.overageIncluded) {
+-    return { windows: [scopedWindow(names.overageIncluded, usedPercent, resetsAt)] };
++  const overage = readEventReading(info, unifiedWindows, OVERAGE_INCLUDED_EVENT_TYPE);
++  if (overage && names.overageIncluded) {
++    windows.push(
++      scopedWindow(names.overageIncluded, overage.usedPercent, overage.resetsAt, "turn"),
++    );
+   }
+-  return undefined;
++  return windows.length > 0 ? { windows } : undefined;
+ }
+ 
+ /**
+@@ -138,8 +182,10 @@ export function claudeRateLimitEventToUpdate(
+ export function claudeUsageResponseToLimits(input: {
+   readonly response: Pick<SDKControlGetUsageResponse, "rate_limits_available" | "rate_limits">;
+   readonly checkedAt: string;
++  readonly source?: UsageSource;
+ }): { readonly limits: ServerProviderUsageLimits; readonly names: ClaudeScopedLimitNames } {
+   const { response, checkedAt } = input;
++  const source = input.source ?? "probe";
+   if (!response.rate_limits_available || !response.rate_limits) {
+     return {
+       limits: makeUnavailableUsageLimits({ checkedAt, reason: "unsupported" }),
+@@ -150,7 +196,7 @@ export function claudeUsageResponseToLimits(input: {
+   for (const id of Object.keys(WINDOWS)) {
+     const window = response.rate_limits[id as "five_hour" | "seven_day"];
+     if (!window || typeof window.utilization !== "number") continue;
+-    windows.push(makeWindow(id, window.utilization, isoFromString(window.resets_at)));
++    windows.push(makeWindow(id, window.utilization, isoFromString(window.resets_at), source));
+   }
+   // The CLI filters `model_scoped` to the overage-included allowlist, which
+   // today holds one model; the first entry is the one the event refers to.
+@@ -158,7 +204,7 @@ export function claudeUsageResponseToLimits(input: {
+   for (const entry of readModelScoped(response.rate_limits)) {
+     if (typeof entry.utilization !== "number") continue;
+     windows.push(
+-      scopedWindow(entry.display_name, entry.utilization, isoFromString(entry.resets_at)),
++      scopedWindow(entry.display_name, entry.utilization, isoFromString(entry.resets_at), source),
+     );
+     overageIncluded ??= entry.display_name;
+   }
+@@ -175,3 +221,72 @@ export const recordClaudeUsageResponse = (
+   const { limits, names } = claudeUsageResponseToLimits(input);
+   return Ref.set(namesRef, names).pipe(Effect.as(limits));
+ };
++
++const OAuthWindow = Schema.Struct({
++  utilization: Schema.Number.check(Schema.isBetween({ minimum: 0, maximum: 100 })),
++  resets_at: Schema.NullOr(Schema.String),
++});
++const decodeOAuthWindow = Schema.decodeUnknownOption(OAuthWindow);
++
++/** The OAuth endpoint, like get_usage, reports percentages rather than fractions. */
++export function claudeOAuthUsageToLimits(input: {
++  readonly response: unknown;
++  readonly checkedAt: string;
++  readonly names: ClaudeScopedLimitNames;
++}): ServerProviderUsageLimits | undefined {
++  if (typeof input.response !== "object" || input.response === null) return undefined;
++  const response = input.response as Record<string, unknown>;
++  const windows: ServerProviderUsageWindow[] = [];
++  for (const id of Object.keys(WINDOWS)) {
++    const parsed = decodeOAuthWindow(response[id]);
++    if (Option.isSome(parsed)) {
++      windows.push(
++        makeWindow(id, parsed.value.utilization, isoFromString(parsed.value.resets_at), "account"),
++      );
++    }
++  }
++  // Use the same normalized ids and display labels as the SDK's model_scoped rows.
++  const names = new Set([
++    "Opus",
++    "Sonnet",
++    ...(input.names.overageIncluded ? [input.names.overageIncluded] : []),
++  ]);
++  for (const name of names) {
++    const raw =
++      response[scopedWindowId(name)] ??
++      (name === input.names.overageIncluded ? response.seven_day_overage_included : undefined);
++    const parsed = decodeOAuthWindow(raw);
++    if (Option.isSome(parsed)) {
++      windows.push(
++        scopedWindow(
++          name,
++          parsed.value.utilization,
++          isoFromString(parsed.value.resets_at),
++          "account",
++        ),
++      );
++    }
++  }
++  for (const entry of readModelScoped(response)) {
++    const parsed = decodeOAuthWindow(entry);
++    if (
++      Option.isSome(parsed) &&
++      !windows.some((window) => window.id === scopedWindowId(entry.display_name))
++    ) {
++      windows.push(
++        scopedWindow(
++          entry.display_name,
++          parsed.value.utilization,
++          isoFromString(parsed.value.resets_at),
++          "account",
++        ),
++      );
++    }
++  }
++  return windows.length > 0
++    ? makeUsageLimits({
++        checkedAt: input.checkedAt,
++        windows: windows.map((window) => ({ ...window, checkedAt: input.checkedAt })),
++      })
++    : undefined;
++}
+diff --git a/apps/server/src/provider/codexUsageLimits.test.ts b/apps/server/src/provider/codexUsageLimits.test.ts
+index 8d310a9ff..8f0fa99cf 100644
+--- a/apps/server/src/provider/codexUsageLimits.test.ts
++++ b/apps/server/src/provider/codexUsageLimits.test.ts
+@@ -19,8 +19,8 @@ describe("codexRateLimitsToLimits", () => {
+         checkedAt,
+         snapshot: {
+           planType: "plus",
+-          primary: { usedPercent: 12, resetsAt: 1_784_000_000, windowDurationMins: 300 },
+-          secondary: { usedPercent: 47, resetsAt: 1_784_500_000, windowDurationMins: 10080 },
++          primary: { usedPercent: 12, resetsAt: 1_784_800_000, windowDurationMins: 300 },
++          secondary: { usedPercent: 47, resetsAt: 1_784_900_000, windowDurationMins: 10080 },
+         },
+       }),
+     ).toEqual({
+@@ -30,17 +30,19 @@ describe("codexRateLimitsToLimits", () => {
+           id: "primary",
+           kind: "session",
+           label: "Session",
++          source: "account",
+           usedPercent: 12,
+           windowDurationMins: 300,
+-          resetsAt: "2026-07-14T03:33:20.000Z",
++          resetsAt: "2026-07-23T09:46:40.000Z",
+         },
+         {
+           id: "secondary",
+           kind: "weekly",
+           label: "Weekly",
++          source: "account",
+           usedPercent: 47,
+           windowDurationMins: 10080,
+-          resetsAt: "2026-07-19T22:26:40.000Z",
++          resetsAt: "2026-07-24T13:33:20.000Z",
+         },
+       ],
+     });
+@@ -57,6 +59,7 @@ describe("codexRateLimitsToLimits", () => {
+         id: "primary",
+         kind: "monthly",
+         label: "Monthly",
++        source: "account",
+         usedPercent: 80,
+         windowDurationMins: 43_200,
+       },
+@@ -83,6 +86,7 @@ describe("codexRateLimitsToLimits", () => {
+         id: "secondary",
+         kind: "weekly",
+         label: "Weekly",
++        source: "account",
+         usedPercent: 42,
+         windowDurationMins: 10080,
+       },
+@@ -124,6 +128,7 @@ describe("codexRateLimitsToUpdate", () => {
+           id: "secondary",
+           kind: "weekly",
+           label: "Weekly",
++          source: "turn",
+           usedPercent: 51,
+           windowDurationMins: 10080,
+         },
+@@ -150,6 +155,7 @@ describe("codexRateLimitsToUpdate", () => {
+         id: "secondary",
+         kind: "weekly",
+         label: "Weekly",
++        source: "turn",
+         usedPercent: 42,
+         windowDurationMins: 10080,
+       },
+diff --git a/apps/server/src/provider/codexUsageLimits.ts b/apps/server/src/provider/codexUsageLimits.ts
+index 31d48535c..55042a253 100644
+--- a/apps/server/src/provider/codexUsageLimits.ts
++++ b/apps/server/src/provider/codexUsageLimits.ts
+@@ -59,6 +59,7 @@ function labelForKind(kind: ServerProviderUsageWindow["kind"]): string {
+  */
+ function codexRateLimitsToWindows(
+   snapshot: CodexRateLimitSnapshot,
++  source: NonNullable<ServerProviderUsageWindow["source"]>,
+ ): ReadonlyArray<ServerProviderUsageWindow> {
+   // Show the main allowance only. Model-specific notifications (such as Spark)
+   // must not replace its primary/secondary rows. Older CLIs omit the limit id.
+@@ -79,6 +80,7 @@ function codexRateLimitsToWindows(
+       id,
+       kind,
+       label: labelForKind(kind),
++      source,
+       usedPercent: clampPercent(window.usedPercent),
+       windowDurationMins,
+       ...(resetsAt ? { resetsAt } : {}),
+@@ -113,7 +115,10 @@ export function codexRateLimitsToLimits(input: {
+   readonly checkedAt: string;
+ }): ServerProviderUsageLimits {
+   const resetCredits = codexResetCreditsToContract(input.resetCredits);
+-  const windows = codexRateLimitsToWindows(input.rateLimitsByLimitId?.codex ?? input.snapshot);
++  const windows = codexRateLimitsToWindows(
++    input.rateLimitsByLimitId?.codex ?? input.snapshot,
++    "account",
++  );
+   return {
+     ...makeUsageLimits({
+       checkedAt: input.checkedAt,
+@@ -126,7 +131,7 @@ export function codexRateLimitsToLimits(input: {
+ export function codexRateLimitsToUpdate(
+   snapshot: CodexRateLimitSnapshot,
+ ): ProviderUsageLimitsUpdate | undefined {
+-  const windows = codexRateLimitsToWindows(snapshot);
++  const windows = codexRateLimitsToWindows(snapshot, "turn");
+   return windows.length > 0 ? { windows } : undefined;
+ }
+ 
+@@ -197,7 +202,8 @@ export function codexUsageLimitMessage(
+   atIso: string,
+ ): string {
+   const atMs = Date.parse(atIso);
+-  const windows = snapshot && Number.isFinite(atMs) ? codexRateLimitsToWindows(snapshot) : [];
++  const windows =
++    snapshot && Number.isFinite(atMs) ? codexRateLimitsToWindows(snapshot, "probe") : [];
+   let reset = "";
+   let latestResetMs = Number.NEGATIVE_INFINITY;
+   for (const window of windows) {
+@@ -215,7 +221,9 @@ export function codexUsageLimitResetAt(
+   snapshot: CodexRateLimitSnapshot | undefined,
+ ): string | null {
+   if (!snapshot) return null;
+-  const windows = codexRateLimitsToWindows(snapshot).filter((window) => window.usedPercent >= 100);
++  const windows = codexRateLimitsToWindows(snapshot, "probe").filter(
++    (window) => window.usedPercent >= 100,
++  );
+   if (windows.length === 0 || windows.some((window) => !window.resetsAt)) return null;
+   return windows.reduce<string | null>(
+     (latest, window) =>
+diff --git a/apps/server/src/usage/cliproxyApi.ts b/apps/server/src/usage/cliproxyApi.ts
+index b6404fce4..4fbda5420 100644
+--- a/apps/server/src/usage/cliproxyApi.ts
++++ b/apps/server/src/usage/cliproxyApi.ts
+@@ -238,6 +238,7 @@ export const makeCliproxyApi = Effect.gen(function* () {
+           plan: "Claude Subscription",
+           usageLimits: claudeUsageResponseToLimits({
+             checkedAt,
++            source: "account",
+             response: {
+               rate_limits_available: true,
+               rate_limits: {
+diff --git a/packages/contracts/src/providerUsageLimits.ts b/packages/contracts/src/providerUsageLimits.ts
+index 894a33a05..fcb79425e 100644
+--- a/packages/contracts/src/providerUsageLimits.ts
++++ b/packages/contracts/src/providerUsageLimits.ts
+@@ -17,8 +17,18 @@ export const ServerProviderUsageWindow = Schema.Struct({
+   id: TrimmedNonEmptyString,
+   kind: Schema.Literals(["session", "weekly", "monthly", "other"]),
+   label: TrimmedNonEmptyString,
++  /**
++   * How this reading was fetched. Account APIs and streamed turn events carry
++   * more authority than a CLI estimate, so the server merge keeps their recent
++   * values from being replaced by an untrusted probe.
++   */
++  source: Schema.optional(Schema.Literals(["account", "turn", "probe"])),
++  /** Time this window was fetched, retained across sparse updates and cached probes. */
++  checkedAt: Schema.optional(IsoDateTime),
+   usedPercent: Schema.Number.check(Schema.isBetween({ minimum: 0, maximum: 100 })),
+   resetsAt: Schema.optional(IsoDateTime),
++  /** The reset has passed and this zero is waiting for the next real reading. */
++  resetPending: Schema.optional(Schema.Boolean),
+   windowDurationMins: Schema.optional(NonNegativeInt),
+ });
+ export type ServerProviderUsageWindow = typeof ServerProviderUsageWindow.Type;
+diff --git a/packages/provider-core/src/server/managedProvider.test.ts b/packages/provider-core/src/server/managedProvider.test.ts
+index 0cbb238cf..7eac6882e 100644
+--- a/packages/provider-core/src/server/managedProvider.test.ts
++++ b/packages/provider-core/src/server/managedProvider.test.ts
+@@ -580,12 +580,19 @@ describe("makeManagedServerProvider", () => {
+         assert.deepStrictEqual(update?.usageLimits, {
+           checkedAt: "2026-04-10T00:05:00.000Z",
+           windows: [
+-            { id: "five_hour", kind: "session", label: "Session", usedPercent: 10 },
++            {
++              id: "five_hour",
++              kind: "session",
++              label: "Session",
++              usedPercent: 10,
++              checkedAt: "2026-04-10T00:00:01.000Z",
++            },
+             {
+               id: "seven_day",
+               kind: "weekly",
+               label: "Weekly",
+               usedPercent: 25,
++              checkedAt: "2026-04-10T00:05:00.000Z",
+               resetsAt: "2026-04-17T00:00:00.000Z",
+             },
+           ],
+@@ -662,11 +669,15 @@ describe("makeManagedServerProvider", () => {
+           Effect.map((chunk) => Array.from(chunk)[0]!),
+         );
+         assert.deepStrictEqual(enriched.models, enrichedSnapshot.models);
+-        assert.deepStrictEqual(enriched.usageLimits?.windows, [liveWindow]);
++        assert.deepStrictEqual(enriched.usageLimits?.windows, [
++          { ...liveWindow, checkedAt: "2026-04-10T00:00:02.000Z" },
++        ]);
+ 
+         const refreshed = yield* provider.refresh;
+         assert.strictEqual(refreshed.message, refreshedSnapshotSecond.message);
+-        assert.deepStrictEqual(refreshed.usageLimits?.windows, [liveWindow]);
++        assert.deepStrictEqual(refreshed.usageLimits?.windows, [
++          { ...liveWindow, checkedAt: "2026-04-10T00:00:02.000Z" },
++        ]);
+         assert.strictEqual(refreshed.auth.workspaceId, "ws-a");
+ 
+         const switched = yield* provider.refresh;
+@@ -676,3 +687,186 @@ describe("makeManagedServerProvider", () => {
+     ).pipe(Effect.provide(layerAlwaysRunTest)),
+   );
+ });
++
++describe("limits-only background refresh", () => {
++  it.effect.each([true, false])(
++    "polls limits every minute regardless of client demand (%s)",
++    (demand) =>
++      Effect.scoped(
++        Effect.gen(function* () {
++          const calls = yield* Ref.make(0);
++          const initialDone = yield* Deferred.make<void>();
++          const provider = yield* makeManagedServerProvider<TestSettings>({
++            resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
++            getSettings: Effect.succeed({ enabled: true }),
++            streamSettings: Stream.empty,
++            haveSettingsChanged: () => false,
++            initialSnapshot: () => Effect.succeed(initialSnapshot),
++            checkProvider: Deferred.succeed(initialDone, undefined).pipe(
++              Effect.as(refreshedSnapshot),
++            ),
++            checkUsageLimits: () =>
++              Ref.update(calls, (count) => count + 1).pipe(Effect.as(undefined)),
++            refreshInterval: "1 hour",
++          });
++          yield* Deferred.await(initialDone);
++          yield* TestClock.adjust("59 seconds");
++          assert.strictEqual(yield* Ref.get(calls), 1);
++          yield* TestClock.adjust("1 second");
++          assert.strictEqual(yield* Ref.get(calls), 2);
++          assert.strictEqual((yield* provider.getSnapshot).version, "1.0.0");
++        }),
++      ).pipe(
++        Effect.provide(
++          Layer.mergeAll(demand ? layerAlwaysRunTest : layerNeverRunTest, TestClock.layer()),
++        ),
++      ),
++  );
++
++  it.effect("keeps its minute cadence after a defect and stops with its scope", () =>
++    Effect.scoped(
++      Effect.gen(function* () {
++        const calls = yield* Ref.make(0);
++        const started = yield* Deferred.make<void>();
++        const run = yield* Effect.scoped(
++          Effect.gen(function* () {
++            yield* makeManagedServerProvider<TestSettings>({
++              resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
++              getSettings: Effect.succeed({ enabled: true }),
++              streamSettings: Stream.empty,
++              haveSettingsChanged: () => false,
++              initialSnapshot: () => Effect.succeed(initialSnapshot),
++              checkProvider: Deferred.succeed(started, undefined).pipe(
++                Effect.as(refreshedSnapshot),
++              ),
++              checkUsageLimits: () =>
++                Effect.gen(function* () {
++                  const count = yield* Ref.updateAndGet(calls, (count) => count + 1);
++                  if (count === 1) return yield* Effect.die("one failed limits read");
++                  return undefined;
++                }),
++              refreshInterval: "1 hour",
++            });
++            return yield* Effect.never;
++          }),
++        ).pipe(Effect.forkChild);
++        yield* Deferred.await(started);
++        yield* TestClock.adjust("59 seconds");
++        assert.strictEqual(yield* Ref.get(calls), 1);
++        yield* TestClock.adjust("1 second");
++        assert.strictEqual(yield* Ref.get(calls), 2);
++        yield* TestClock.adjust("1 minute");
++        assert.strictEqual(yield* Ref.get(calls), 3);
++        yield* Fiber.interrupt(run);
++        yield* TestClock.adjust("2 minutes");
++        assert.strictEqual(yield* Ref.get(calls), 3);
++      }),
++    ).pipe(Effect.provide(Layer.mergeAll(layerAlwaysRunTest, TestClock.layer()))),
++  );
++
++  it.effect("does not overlap reads or fetch limits for disabled instances", () =>
++    Effect.scoped(
++      Effect.gen(function* () {
++        const calls = yield* Ref.make(0);
++        const entered = yield* Deferred.make<void>();
++        const release = yield* Deferred.make<void>();
++        const initialDone = yield* Deferred.make<void>();
++        const common = {
++          resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
++          getSettings: Effect.succeed({ enabled: true }),
++          streamSettings: Stream.empty,
++          haveSettingsChanged: () => false,
++          refreshInterval: "1 hour" as const,
++        };
++        const provider = yield* makeManagedServerProvider<TestSettings>({
++          ...common,
++          initialSnapshot: () => Effect.succeed(initialSnapshot),
++          checkProvider: Deferred.succeed(initialDone, undefined).pipe(
++            Effect.as(refreshedSnapshot),
++          ),
++          checkUsageLimits: () =>
++            Effect.gen(function* () {
++              yield* Ref.update(calls, (count) => count + 1);
++              yield* Deferred.succeed(entered, undefined);
++              yield* Deferred.await(release);
++              return {
++                checkedAt: "2026-04-10T00:01:00.000Z",
++                windows: [
++                  { id: "five_hour", kind: "session" as const, label: "Session", usedPercent: 60 },
++                ],
++              };
++            }),
++        });
++        yield* Deferred.await(entered);
++        yield* Deferred.await(initialDone);
++        yield* TestClock.adjust("2 minutes");
++        assert.strictEqual(yield* Ref.get(calls), 1);
++        const published = yield* Stream.take(provider.streamChanges, 1).pipe(
++          Stream.runCollect,
++          Effect.forkChild,
++        );
++        yield* Effect.yieldNow;
++        yield* Deferred.succeed(release, undefined);
++        const updates = Array.from(yield* Fiber.join(published));
++        assert.strictEqual(updates[0]?.usageLimits?.windows[0]?.usedPercent, 60);
++        yield* makeManagedServerProvider<TestSettings>({
++          ...common,
++          initialSnapshot: () => Effect.succeed({ ...initialSnapshot, enabled: false }),
++          checkProvider: Effect.succeed({ ...refreshedSnapshot, enabled: false }),
++          checkUsageLimits: () => Effect.die("disabled instance must not refresh"),
++        });
++        yield* TestClock.adjust("1 minute");
++      }),
++    ).pipe(Effect.provide(Layer.mergeAll(layerAlwaysRunTest, TestClock.layer()))),
++  );
++});
++
++it.effect("coalesces identical token ticks on the wire without losing ordering", () =>
++  Effect.scoped(
++    Effect.gen(function* () {
++      const limits = {
++        checkedAt: "2026-04-10T00:00:00.000Z",
++        windows: [{ id: "primary", kind: "session" as const, label: "Session", usedPercent: 40 }],
++      };
++      const provider = yield* makeManagedServerProvider<TestSettings>({
++        resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
++        getSettings: Effect.succeed({ enabled: true }),
++        streamSettings: Stream.empty,
++        haveSettingsChanged: () => false,
++        initialSnapshot: () => Effect.succeed(initialSnapshot),
++        checkProvider: Effect.succeed({ ...refreshedSnapshot, usageLimits: limits }),
++        refreshInterval: "1 hour",
++      });
++      yield* Stream.take(provider.streamChanges, 1).pipe(Stream.runDrain);
++      const publication = yield* Deferred.make<void>();
++      yield* provider.streamChanges.pipe(
++        Stream.runForEach(() => Deferred.succeed(publication, undefined)),
++        Effect.forkScoped,
++      );
++      yield* Effect.yieldNow;
++      yield* provider.applyUsageLimits({
++        windows: limits.windows,
++        checkedAt: "2026-04-10T00:00:15.000Z",
++      });
++      assert.strictEqual(
++        (yield* provider.getSnapshot).usageLimits?.windows[0]?.checkedAt,
++        "2026-04-10T00:00:15.000Z",
++      );
++      assert.isFalse(yield* Deferred.isDone(publication));
++      yield* provider.applyUsageLimits({
++        windows: [{ ...limits.windows[0]!, usedPercent: 51 }],
++        checkedAt: "2026-04-10T00:00:10.000Z",
++      });
++      assert.strictEqual((yield* provider.getSnapshot).usageLimits?.windows[0]?.usedPercent, 40);
++      yield* provider.applyUsageLimits({
++        windows: limits.windows,
++        checkedAt: "2026-04-10T00:00:30.000Z",
++      });
++      yield* Deferred.await(publication);
++      assert.strictEqual(
++        (yield* provider.getSnapshot).usageLimits?.windows[0]?.checkedAt,
++        "2026-04-10T00:00:30.000Z",
++      );
++    }),
++  ).pipe(Effect.provide(layerAlwaysRunTest)),
++);
+diff --git a/packages/provider-core/src/server/managedProvider.ts b/packages/provider-core/src/server/managedProvider.ts
+index e90d5eefa..eee25c338 100644
+--- a/packages/provider-core/src/server/managedProvider.ts
++++ b/packages/provider-core/src/server/managedProvider.ts
+@@ -4,7 +4,9 @@ import {
+   ServerSettingsError,
+ } from "@t3tools/contracts";
+ import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
++import * as Cause from "effect/Cause";
+ import * as Duration from "effect/Duration";
++import * as Clock from "effect/Clock";
+ import * as Effect from "effect/Effect";
+ import * as Equal from "effect/Equal";
+ import * as Fiber from "effect/Fiber";
+@@ -16,12 +18,17 @@ import * as Stream from "effect/Stream";
+ import * as Semaphore from "effect/Semaphore";
+ 
+ import * as ProviderHost from "./ProviderHost.ts";
+-import { applyUsageLimitsUpdate, resolveUsageLimitsAfterProbe } from "./usageLimits.ts";
++import {
++  applyUsageLimitsUpdate,
++  resolveUsageLimitsAfterProbe,
++  usageWindowEquals,
++} from "./usageLimits.ts";
+ import type { ManagedServerProvider } from "./snapshot.ts";
+ 
+ interface ProviderSnapshotState {
+   readonly snapshot: ServerProvider;
+   readonly enrichmentGeneration: number;
++  readonly usageLimitsPublishedAt?: string | undefined;
+ }
+ 
+ function withUsageLimits(
+@@ -44,6 +51,9 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
+   readonly haveSettingsChanged: (previous: Settings, next: Settings) => boolean;
+   readonly initialSnapshot: (settings: Settings) => Effect.Effect<ServerProvider>;
+   readonly checkProvider: Effect.Effect<ServerProvider, ServerSettingsError>;
++  readonly checkUsageLimits?: (
++    snapshot: ServerProvider,
++  ) => Effect.Effect<ServerProvider["usageLimits"]>;
+   readonly enrichSnapshot?: (input: {
+     readonly settings: Settings;
+     readonly snapshot: ServerProvider;
+@@ -200,11 +210,33 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
+           update,
+           checkedAt: update.checkedAt,
+         });
++        // Duplicate or older reports leave state and subscribers untouched.
+         if (usageLimits === state.snapshot.usageLimits) {
+           return [null, state] as const;
+         }
+         const snapshot = withUsageLimits(state.snapshot, usageLimits);
+-        return [snapshot, { ...state, snapshot }] as const;
++        const previous = state.snapshot.usageLimits;
++        const onlyFetchTimeChanged =
++          previous &&
++          usageLimits &&
++          previous.windows.length === usageLimits.windows.length &&
++          previous.windows.every((window, index) =>
++            usageWindowEquals(window, usageLimits.windows[index]!),
++          );
++        // Keep every fetch time for ordering, but coalesce identical token ticks
++        // on the wire. The published age is always a real fetch, at most 30s old.
++        const lastPublishedAt = state.usageLimitsPublishedAt ?? previous?.checkedAt;
++        if (
++          onlyFetchTimeChanged &&
++          lastPublishedAt &&
++          Date.parse(usageLimits.checkedAt) - Date.parse(lastPublishedAt) < 30_000
++        ) {
++          return [null, { ...state, snapshot, usageLimitsPublishedAt: lastPublishedAt }] as const;
++        }
++        return [
++          snapshot,
++          { ...state, snapshot, usageLimitsPublishedAt: usageLimits?.checkedAt },
++        ] as const;
+       });
+       if (snapshotToPublish !== null) {
+         yield* PubSub.publish(changesPubSub, snapshotToPublish);
+@@ -226,6 +258,40 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
+     return genericDemand || instanceDemand;
+   });
+ 
++  if (input.checkUsageLimits) {
++    const checkUsageLimits = input.checkUsageLimits;
++    yield* Effect.forever(
++      Effect.gen(function* () {
++        const startedAt = yield* Clock.currentTimeMillis;
++        // Limits keep local usage readings fresh even without a foreground client.
++        // Recover inside the tick so a failed read cannot skip its sleep or stop polling.
++        yield* Effect.gen(function* () {
++          const current = (yield* Ref.get(snapshotStateRef)).snapshot;
++          if (current.enabled) {
++            const limits = yield* checkUsageLimits(current);
++            if (limits) {
++              const next = yield* Ref.modify(snapshotStateRef, (state) => {
++                const usageLimits = resolveUsageLimitsAfterProbe({
++                  published: state.snapshot.usageLimits,
++                  probed: limits,
++                });
++                const snapshot = withUsageLimits(state.snapshot, usageLimits);
++                return [snapshot, { ...state, snapshot }] as const;
++              });
++              yield* PubSub.publish(changesPubSub, next);
++            }
++          }
++        }).pipe(
++          Effect.catchCause((cause) =>
++            Cause.hasInterrupts(cause) ? Effect.failCause(cause) : Effect.logError(cause),
++          ),
++        );
++        const finishedAt = yield* Clock.currentTimeMillis;
++        yield* Effect.sleep(Math.max(0, 60_000 - (finishedAt - startedAt)));
++      }),
++    ).pipe(Effect.forkScoped);
++  }
++
+   const getRefreshInterval =
+     input.refreshInterval !== undefined
+       ? Effect.succeed(input.refreshInterval)
+diff --git a/packages/provider-core/src/server/usageLimits.test.ts b/packages/provider-core/src/server/usageLimits.test.ts
+index 9b305a74b..b46853e37 100644
+--- a/packages/provider-core/src/server/usageLimits.test.ts
++++ b/packages/provider-core/src/server/usageLimits.test.ts
+@@ -7,6 +7,7 @@ const session = {
+   id: "five_hour",
+   kind: "session",
+   label: "Session",
++  checkedAt,
+   usedPercent: 40,
+   windowDurationMins: 300,
+   resetsAt: "2026-09-03T14:00:00.000Z",
+@@ -15,18 +16,19 @@ const weekly = {
+   id: "seven_day",
+   kind: "weekly",
+   label: "Weekly",
++  checkedAt,
+   usedPercent: 20,
+   windowDurationMins: 10_080,
+ } as const;
+ const published = { checkedAt, windows: [session, weekly] };
+ 
+ describe("applyUsageLimitsUpdate", () => {
+-  it("returns the published object itself when no window moved", () => {
++  it("returns the published object itself when no window or fetch time moved", () => {
+     // Codex repeats the same numbers beside every token-usage tick; the
+     // ingestion path relies on identity to skip the publish.
+     const next = applyUsageLimitsUpdate({
+       previous: published,
+-      checkedAt: "2026-09-03T12:00:05.000Z",
++      checkedAt,
+       update: {
+         windows: [
+           { ...weekly },
+@@ -48,7 +50,7 @@ describe("applyUsageLimitsUpdate", () => {
+     expect(next).not.toBe(published);
+     expect(next).toEqual({
+       checkedAt: "2026-09-03T12:00:05.000Z",
+-      windows: [{ ...session, usedPercent: 55 }, weekly],
++      windows: [{ ...session, usedPercent: 55, checkedAt: "2026-09-03T12:00:05.000Z" }, weekly],
+     });
+   });
+ 
+@@ -67,12 +69,12 @@ describe("applyUsageLimitsUpdate", () => {
+     const next = applyUsageLimitsUpdate({
+       previous: { ...published, resetCredits },
+       checkedAt: "2026-09-03T12:00:05.000Z",
+-      update: { windows: [{ ...session, usedPercent: 55 }] },
++      update: { windows: [{ ...session, checkedAt: "2026-09-03T12:00:05.000Z", usedPercent: 55 }] },
+     });
+ 
+     expect(next).toEqual({
+       checkedAt: "2026-09-03T12:00:05.000Z",
+-      windows: [{ ...session, usedPercent: 55 }, weekly],
++      windows: [{ ...session, usedPercent: 55, checkedAt: "2026-09-03T12:00:05.000Z" }, weekly],
+       resetCredits,
+     });
+   });
+@@ -86,4 +88,204 @@ describe("resolveUsageLimitsAfterProbe", () => {
+     expect(resolveUsageLimitsAfterProbe({ published, probed: unsupported })).toBe(unsupported);
+     expect(resolveUsageLimitsAfterProbe({ published: undefined, probed: failed })).toBe(failed);
+   });
++
++  it("rejects a cached probe whose reset already happened before the account reading", () => {
++    const accountCheckedAt = "2026-10-05T21:46:54.000Z";
++    const probeCheckedAt = "2026-10-05T21:48:57.000Z";
++    const merged = resolveUsageLimitsAfterProbe({
++      published: {
++        checkedAt: accountCheckedAt,
++        windows: [
++          {
++            id: "five_hour",
++            kind: "session",
++            label: "Session",
++            source: "account",
++            checkedAt: accountCheckedAt,
++            usedPercent: 1,
++            resetsAt: "2026-10-06T02:40:00.000Z",
++            windowDurationMins: 300,
++          },
++        ],
++      },
++      probed: {
++        checkedAt: probeCheckedAt,
++        windows: [
++          {
++            id: "five_hour",
++            kind: "session",
++            label: "Session",
++            source: "probe",
++            checkedAt: probeCheckedAt,
++            usedPercent: 63,
++            resetsAt: "2026-10-05T21:40:00.000Z",
++            windowDurationMins: 300,
++          },
++        ],
++      },
++    });
++
++    expect(merged?.windows).toEqual([
++      expect.objectContaining({
++        id: "five_hour",
++        source: "account",
++        usedPercent: 1,
++        resetsAt: "2026-10-06T02:40:00.000Z",
++      }),
++    ]);
++  });
++});
++
++describe("window fetch times", () => {
++  const newer = "2026-09-03T12:01:00.000Z";
++  const middle = "2026-09-03T12:00:30.000Z";
++
++  it("rejects a stale probe per window but accepts its newer weekly data", () => {
++    const live = applyUsageLimitsUpdate({
++      previous: published,
++      checkedAt: newer,
++      update: {
++        windows: [{ id: session.id, kind: session.kind, label: session.label, usedPercent: 60 }],
++      },
++    });
++    const merged = resolveUsageLimitsAfterProbe({
++      published: live,
++      probed: {
++        checkedAt: middle,
++        windows: [
++          { ...session, checkedAt: middle, usedPercent: 51 },
++          { ...weekly, checkedAt: middle, usedPercent: 25 },
++        ],
++      },
++    });
++    expect(merged?.checkedAt).toBe(newer);
++    expect(merged?.windows).toEqual([
++      { ...session, checkedAt: newer, usedPercent: 60 },
++      { ...weekly, checkedAt: middle, usedPercent: 25 },
++    ]);
++  });
++
++  it("rejects old turn events and refreshes timestamps even when numbers stay the same", () => {
++    const fresh = applyUsageLimitsUpdate({
++      previous: published,
++      checkedAt: newer,
++      update: {
++        windows: [{ id: session.id, kind: session.kind, label: session.label, usedPercent: 40 }],
++      },
++    });
++    expect(fresh?.windows[0]?.checkedAt).toBe(newer);
++    expect(fresh?.windows[1]?.checkedAt).toBe(checkedAt);
++    expect(
++      applyUsageLimitsUpdate({
++        previous: fresh,
++        checkedAt: middle,
++        update: {
++          windows: [{ id: session.id, kind: session.kind, label: session.label, usedPercent: 51 }],
++        },
++      }),
++    ).toBe(fresh);
++    expect(
++      resolveUsageLimitsAfterProbe({
++        published: fresh,
++        probed: {
++          checkedAt: middle,
++          windows: [],
++          unavailable: { reason: "probeFailed" },
++        },
++      }),
++    ).toBe(fresh);
++  });
++
++  it("keeps fresher reset credits when a cached SDK snapshot lands", () => {
++    const merged = resolveUsageLimitsAfterProbe({
++      published: {
++        checkedAt: newer,
++        windows: [{ ...session, checkedAt: newer, usedPercent: 60 }],
++        resetCredits: { availableCount: 2 },
++      },
++      probed: { ...published, resetCredits: { availableCount: 1 } },
++    });
++    expect(merged?.resetCredits?.availableCount).toBe(2);
++    expect(merged?.windows[0]?.usedPercent).toBe(60);
++  });
++
++  it("never lets a probe replace a recent account or turn reading", () => {
++    const newer = "2026-09-03T12:05:00.000Z";
++    for (const source of ["account", "turn"] as const) {
++      const merged = applyUsageLimitsUpdate({
++        previous: {
++          checkedAt,
++          windows: [{ ...session, source, usedPercent: 8 }],
++        },
++        checkedAt: newer,
++        update: {
++          windows: [
++            {
++              ...session,
++              source: "probe",
++              checkedAt: newer,
++              usedPercent: 63,
++            },
++          ],
++        },
++      });
++      expect(merged?.windows[0]).toMatchObject({ source, usedPercent: 8 });
++    }
++  });
++});
++
++describe("reset expiry", () => {
++  it("zeroes a window after its reset and clears the pending state on a new reading", () => {
++    const resetAt = "2026-09-03T12:30:00.000Z";
++    const expired = applyUsageLimitsUpdate({
++      previous: {
++        checkedAt,
++        windows: [{ ...session, source: "account", resetsAt: resetAt, usedPercent: 63 }],
++      },
++      update: { windows: [] },
++      checkedAt: "2026-09-03T12:31:00.000Z",
++    });
++    expect(expired?.windows[0]).toMatchObject({
++      usedPercent: 0,
++      resetPending: true,
++      resetsAt: resetAt,
++    });
++
++    const refreshed = applyUsageLimitsUpdate({
++      previous: expired,
++      update: {
++        windows: [
++          {
++            ...session,
++            source: "account",
++            checkedAt: "2026-09-03T12:32:00.000Z",
++            resetsAt: "2026-09-03T17:30:00.000Z",
++            usedPercent: 4,
++          },
++        ],
++      },
++      checkedAt: "2026-09-03T12:32:00.000Z",
++    });
++    expect(refreshed?.windows[0]).toMatchObject({ usedPercent: 4 });
++    expect(refreshed?.windows[0]?.resetPending).toBeUndefined();
++  });
++});
++
++it("records unchanged fetches so delayed events cannot revert newer observations", () => {
++  const update = {
++    windows: [{ id: session.id, kind: session.kind, label: session.label, usedPercent: 40 }],
++  };
++  const observed = applyUsageLimitsUpdate({
++    previous: published,
++    update,
++    checkedAt: "2026-09-03T12:00:15.000Z",
++  });
++  expect(observed?.windows[0]?.checkedAt).toBe("2026-09-03T12:00:15.000Z");
++  expect(
++    applyUsageLimitsUpdate({
++      previous: observed,
++      update: { windows: [{ ...update.windows[0]!, usedPercent: 51 }] },
++      checkedAt: "2026-09-03T12:00:10.000Z",
++    }),
++  ).toBe(observed);
+ });
+diff --git a/packages/provider-core/src/server/usageLimits.ts b/packages/provider-core/src/server/usageLimits.ts
+index bcb234b91..6bcde8c38 100644
+--- a/packages/provider-core/src/server/usageLimits.ts
++++ b/packages/provider-core/src/server/usageLimits.ts
+@@ -11,6 +11,8 @@ const WINDOW_KIND_ORDER: Record<ServerProviderUsageWindow["kind"], number> = {
+   other: 3,
+ };
+ 
++const PROBE_AUTHORITY_WINDOW_MS = 15 * 60_000;
++
+ export function clampPercent(value: number): number {
+   return Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0;
+ }
+@@ -25,11 +27,88 @@ function sortWindows(
+   );
+ }
+ 
++function parseTimeMs(value: string | undefined): number | undefined {
++  if (value === undefined) return undefined;
++  const parsed = Date.parse(value);
++  return Number.isFinite(parsed) ? parsed : undefined;
++}
++
++/**
++ * A reset that has passed must not leave the old percentage looking current.
++ * Keep the window so the client can show the reset state until a fresh reading
++ * replaces it.
++ */
++function normalizeUsageWindow(
++  window: ServerProviderUsageWindow,
++  nowMs: number,
++): ServerProviderUsageWindow {
++  const resetMs = parseTimeMs(window.resetsAt);
++  if (window.resetPending === true && resetMs === undefined) {
++    return { ...window, usedPercent: 0 };
++  }
++  if (resetMs !== undefined && resetMs <= nowMs) {
++    return { ...window, usedPercent: 0, resetPending: true };
++  }
++  if (window.resetPending !== true) return window;
++  const { resetPending: _resetPending, ...cleared } = window;
++  return cleared;
++}
++
++function normalizeUsageLimitsAt(
++  limits: ServerProviderUsageLimits,
++  nowMs: number,
++): ServerProviderUsageLimits {
++  let changed = false;
++  const windows = limits.windows.map((window) => {
++    const withCheckedAt =
++      window.checkedAt === undefined ? { ...window, checkedAt: limits.checkedAt } : window;
++    if (withCheckedAt !== window) changed = true;
++    const normalized = normalizeUsageWindow(withCheckedAt, nowMs);
++    if (normalized !== withCheckedAt) changed = true;
++    return normalized;
++  });
++  return changed ? { ...limits, windows } : limits;
++}
++
++function windowFetchMs(window: ServerProviderUsageWindow, fallback: string): number | undefined {
++  return parseTimeMs(window.checkedAt ?? fallback);
++}
++
++/** A reading may not carry a reset that already happened before it was fetched. */
++function isPreResetReading(window: ServerProviderUsageWindow, fallbackCheckedAt: string): boolean {
++  const fetchedAtMs = windowFetchMs(window, fallbackCheckedAt);
++  const resetMs = parseTimeMs(window.resetsAt);
++  return fetchedAtMs !== undefined && resetMs !== undefined && resetMs <= fetchedAtMs;
++}
++
++function hasRecentAuthority(
++  existing: ServerProviderUsageWindow,
++  incomingFetchMs: number | undefined,
++): boolean {
++  if (incomingFetchMs === undefined) return false;
++  const source = existing.source;
++  if (source !== "account" && source !== "turn") return false;
++  const existingFetchMs = parseTimeMs(existing.checkedAt);
++  return (
++    existingFetchMs !== undefined &&
++    incomingFetchMs >= existingFetchMs &&
++    incomingFetchMs - existingFetchMs < PROBE_AUTHORITY_WINDOW_MS
++  );
++}
++
+ export function makeUsageLimits(input: {
+   readonly checkedAt: string;
+   readonly windows: Iterable<ServerProviderUsageWindow>;
+ }): ServerProviderUsageLimits {
+-  return { checkedAt: input.checkedAt, windows: sortWindows(input.windows) };
++  const nowMs = parseTimeMs(input.checkedAt);
++  return {
++    checkedAt: input.checkedAt,
++    windows: sortWindows(
++      [...input.windows].map((window) =>
++        nowMs === undefined ? window : normalizeUsageWindow(window, nowMs),
++      ),
++    ),
++  };
+ }
+ 
+ export function makeUnavailableUsageLimits(input: {
+@@ -53,58 +132,146 @@ export function applyUsageLimitsUpdate(input: {
+   readonly checkedAt: string;
+ }): ServerProviderUsageLimits | undefined {
+   const { previous, update } = input;
+-  if (update.windows.length === 0 || previous?.unavailable?.reason === "unsupported") {
++  if (previous?.unavailable?.reason === "unsupported") {
+     return previous;
+   }
+-  const merged = new Map(previous?.windows.map((window) => [window.id, window] as const));
+-  // Codex sends this notification beside every token-usage tick, almost
+-  // always with unchanged numbers. Decide "nothing changed" per window on
+-  // the way through so the no-op case never allocates a new snapshot.
+-  let changed = false;
++  const previousCheckedAtMs = parseTimeMs(previous?.checkedAt);
++  const updateCheckedAtMs = parseTimeMs(input.checkedAt);
++  const mergeNowMs =
++    previousCheckedAtMs !== undefined && updateCheckedAtMs !== undefined
++      ? Math.max(previousCheckedAtMs, updateCheckedAtMs)
++      : (updateCheckedAtMs ?? previousCheckedAtMs);
++  const normalizedPrevious =
++    previous === undefined || mergeNowMs === undefined
++      ? previous
++      : normalizeUsageLimitsAt(previous, mergeNowMs);
++  if (update.windows.length === 0) return normalizedPrevious;
++  const merged = new Map(normalizedPrevious?.windows.map((window) => [window.id, window] as const));
++  // Retain the newest fetch even when values are unchanged: otherwise a
++  // delayed event could appear newer than the last value we published.
++  let changed = normalizedPrevious !== previous;
+   for (const window of update.windows) {
+     const existing = merged.get(window.id);
+-    const next: ServerProviderUsageWindow = {
+-      ...window,
+-      usedPercent: clampPercent(window.usedPercent),
+-      ...(window.resetsAt === undefined && existing?.resetsAt !== undefined
+-        ? { resetsAt: existing.resetsAt }
+-        : {}),
+-      ...(window.windowDurationMins === undefined && existing?.windowDurationMins !== undefined
+-        ? { windowDurationMins: existing.windowDurationMins }
+-        : {}),
+-    };
+-    if (existing === undefined || !usageWindowEquals(existing, next)) {
++    const checkedAt = window.checkedAt ?? input.checkedAt;
++    if (isPreResetReading(window, input.checkedAt)) continue;
++    const incomingFetchMs = windowFetchMs(window, input.checkedAt);
++    const incomingSource = window.source ?? "probe";
++    if (existing && incomingSource === "probe" && hasRecentAuthority(existing, incomingFetchMs)) {
++      continue;
++    }
++    const checkedAtMs = parseTimeMs(checkedAt);
++    const existingCheckedAtMs = parseTimeMs(existing?.checkedAt);
++    if (
++      checkedAtMs !== undefined &&
++      existingCheckedAtMs !== undefined &&
++      checkedAtMs < existingCheckedAtMs
++    ) {
++      continue;
++    }
++    const next = normalizeUsageWindow(
++      {
++        ...window,
++        checkedAt,
++        usedPercent: clampPercent(window.usedPercent),
++        ...(window.resetsAt === undefined && existing?.resetsAt !== undefined
++          ? { resetsAt: existing.resetsAt }
++          : {}),
++        ...(window.windowDurationMins === undefined && existing?.windowDurationMins !== undefined
++          ? { windowDurationMins: existing.windowDurationMins }
++          : {}),
++      },
++      mergeNowMs ?? Date.parse(checkedAt),
++    );
++    if (
++      existing === undefined ||
++      !usageWindowEquals(existing, next) ||
++      existing.checkedAt !== checkedAt
++    ) {
+       merged.set(window.id, next);
+       changed = true;
+     }
+   }
+-  if (!changed && previous !== undefined && previous.unavailable === undefined) {
+-    return previous;
++  if (!changed) {
++    return normalizedPrevious;
+   }
+   return {
+-    ...makeUsageLimits({ checkedAt: input.checkedAt, windows: merged.values() }),
+-    ...(previous?.resetCredits !== undefined ? { resetCredits: previous.resetCredits } : {}),
++    ...makeUsageLimits({
++      checkedAt:
++        normalizedPrevious && Date.parse(normalizedPrevious.checkedAt) > Date.parse(input.checkedAt)
++          ? normalizedPrevious.checkedAt
++          : input.checkedAt,
++      windows: merged.values(),
++    }),
++    ...(normalizedPrevious?.resetCredits !== undefined
++      ? { resetCredits: normalizedPrevious.resetCredits }
++      : {}),
+   };
+ }
+ 
+-function usageWindowEquals(a: ServerProviderUsageWindow, b: ServerProviderUsageWindow): boolean {
++export function usageWindowEquals(
++  a: ServerProviderUsageWindow,
++  b: ServerProviderUsageWindow,
++): boolean {
+   return (
+     a.id === b.id &&
+     a.kind === b.kind &&
+     a.label === b.label &&
++    a.source === b.source &&
+     a.usedPercent === b.usedPercent &&
+     a.resetsAt === b.resetsAt &&
++    a.resetPending === b.resetPending &&
+     a.windowDurationMins === b.windowDurationMins
+   );
+ }
+ 
++/** Merge full reads by window fetch time, retaining newer sparse turn updates. */
+ export function resolveUsageLimitsAfterProbe(input: {
+   readonly published: ServerProviderUsageLimits | undefined;
+   readonly probed: ServerProviderUsageLimits | undefined;
+ }): ServerProviderUsageLimits | undefined {
+   const { published, probed } = input;
+-  if (probed?.unavailable?.reason === "probeFailed" && published && !published.unavailable) {
+-    return published;
++  if (!probed) return published;
++  if (!published) return probed.unavailable ? probed : makeUsageLimitsSnapshot(probed);
++  const probeCheckedAtMs = parseTimeMs(probed.checkedAt);
++  const publishedCheckedAtMs = parseTimeMs(published.checkedAt);
++  const mergeNowMs =
++    probeCheckedAtMs !== undefined && publishedCheckedAtMs !== undefined
++      ? Math.max(probeCheckedAtMs, publishedCheckedAtMs)
++      : (probeCheckedAtMs ?? publishedCheckedAtMs);
++  const normalizedPublished =
++    mergeNowMs === undefined ? published : normalizeUsageLimitsAt(published, mergeNowMs);
++  if (probed.unavailable?.reason === "probeFailed") return normalizedPublished;
++  if (probed.unavailable?.reason === "unsupported") {
++    return Date.parse(probed.checkedAt) >= Date.parse(published.checkedAt)
++      ? probed
++      : normalizedPublished;
+   }
+-  return probed;
++  const merged = applyUsageLimitsUpdate({
++    previous: normalizedPublished.unavailable ? undefined : normalizedPublished,
++    update: probed,
++    checkedAt: probed.checkedAt,
++  });
++  if (!merged) return normalizedPublished;
++  // Credits and credential metadata belong to the newest full read.
++  const metadata =
++    Date.parse(probed.checkedAt) >= Date.parse(normalizedPublished.checkedAt)
++      ? probed
++      : normalizedPublished;
++  const { unavailable: _unavailable, ...metadataWithoutFailure } = metadata;
++  const { resetCredits: _resetCredits, ...mergedWindows } = merged;
++  return { ...metadataWithoutFailure, ...mergedWindows };
++}
++
++function makeUsageLimitsSnapshot(limits: ServerProviderUsageLimits): ServerProviderUsageLimits {
++  const nowMs = parseTimeMs(limits.checkedAt);
++  return {
++    ...limits,
++    windows: limits.windows.map((window) => {
++      const withCheckedAt = {
++        ...window,
++        checkedAt: window.checkedAt ?? limits.checkedAt,
++      };
++      return nowMs === undefined ? withCheckedAt : normalizeUsageWindow(withCheckedAt, nowMs);
++    }),
++  };
+ }
+diff --git a/packages/provider-cursor/src/server/usageLimits.ts b/packages/provider-cursor/src/server/usageLimits.ts
+index 049e646d2..49228632d 100644
+--- a/packages/provider-cursor/src/server/usageLimits.ts
++++ b/packages/provider-cursor/src/server/usageLimits.ts
+@@ -51,6 +51,7 @@ export function cursorUsageResponseToLimits(
+         id,
+         kind: "monthly",
+         label,
++        source: "account",
+         usedPercent: clampPercent(usedPercent),
+         ...(resetsAt ? { resetsAt } : {}),
+       });
+diff --git a/packages/provider-grok/src/server/usageLimits.ts b/packages/provider-grok/src/server/usageLimits.ts
+index 2d7a16fbb..a04c10e40 100644
+--- a/packages/provider-grok/src/server/usageLimits.ts
++++ b/packages/provider-grok/src/server/usageLimits.ts
+@@ -58,6 +58,7 @@ export function grokUsageResponseToLimits(
+     id: "subscription",
+     kind,
+     label: kind === "weekly" ? "Weekly" : kind === "monthly" ? "Monthly" : "Subscription",
++    source: "account",
+     usedPercent: clampPercent(usedPercent),
+     ...(Option.isSome(reset) ? { resetsAt: DateTime.formatIso(reset.value) } : {}),
+   };
+diff --git a/packages/provider-opencode/src/server/usageLimits.ts b/packages/provider-opencode/src/server/usageLimits.ts
+index 52689da27..600463311 100644
+--- a/packages/provider-opencode/src/server/usageLimits.ts
++++ b/packages/provider-opencode/src/server/usageLimits.ts
+@@ -82,6 +82,7 @@ export const readOpenCodeGoUsageLimits = Effect.fn("readOpenCodeGoUsageLimits")(
+         id: "go_rolling",
+         kind: "session",
+         label: "Go · Session",
++        source: "account",
+         windowDurationMins: 5 * 60,
+         usedPercent: clampPercent(body.usage.rolling.percent),
+         resetsAt: DateTime.formatIso(body.usage.rolling.resetsAt),
+@@ -90,6 +91,7 @@ export const readOpenCodeGoUsageLimits = Effect.fn("readOpenCodeGoUsageLimits")(
+         id: "go_weekly",
+         kind: "weekly",
+         label: "Go · Weekly",
++        source: "account",
+         windowDurationMins: 7 * 24 * 60,
+         usedPercent: clampPercent(body.usage.weekly.percent),
+         resetsAt: DateTime.formatIso(body.usage.weekly.resetsAt),
+@@ -98,6 +100,7 @@ export const readOpenCodeGoUsageLimits = Effect.fn("readOpenCodeGoUsageLimits")(
+         id: "go_monthly",
+         kind: "monthly",
+         label: "Go · Monthly",
++        source: "account",
+         usedPercent: clampPercent(body.usage.monthly.percent),
+         resetsAt: DateTime.formatIso(body.usage.monthly.resetsAt),
+       },
