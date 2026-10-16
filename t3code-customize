@@ -1516,6 +1516,9 @@ def remote_identity(alias, probe):
         return None
 
 
+PATCH_FOLDERS = ('patches', 'patches-port', 'patches-tt', 'patches-ios')
+
+
 def sync_repo(alias, path, wanted, say_as):
     """Make the machine's copy of this repo match ours: wait for Syncthing, else copy the files."""
     probe = f'python3 "$HOME"/{shlex.quote(path)}/{NAME} identity 2>/dev/null'
@@ -1530,9 +1533,14 @@ def sync_repo(alias, path, wanted, say_as):
         time.sleep(15)
     say_as('copying the repo files over SSH...')
     # No AppleDouble files from a Mac in the copy.
-    pack = subprocess.Popen(['tar', '-C', str(REPO), '-cf', '-', *repo_files()], stdout=subprocess.PIPE,
+    xattrs = ['--no-xattrs', '--no-mac-metadata'] if MAC else []
+    pack = subprocess.Popen(['tar', *xattrs, '-C', str(REPO), '-cf', '-', *repo_files()], stdout=subprocess.PIPE,
                             env=dict(os.environ, COPYFILE_DISABLE='1'))
-    unpack = remote(alias, f'mkdir -p "$HOME"/{shlex.quote(path)} && tar -C "$HOME"/{shlex.quote(path)} -xf -',
+    # A copy only adds files; patches deleted here (patches-port/ once upstream caught up) must go there
+    # too, or they change the recipe.
+    folders = ' '.join(PATCH_FOLDERS)
+    unpack = remote(alias, f'mkdir -p "$HOME"/{shlex.quote(path)} && cd "$HOME"/{shlex.quote(path)}'
+                           f' && rm -r -f -- {folders} && tar -xf -',
                     stdin=pack.stdout, capture_output=True, text=True)
     pack.wait()
     if unpack.returncode or remote_identity(alias, probe) != wanted:
