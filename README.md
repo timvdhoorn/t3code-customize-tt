@@ -131,8 +131,10 @@ The label next to the T3 logo shows which customized build you run (the first ch
 
 When a nightly changes code the patches touch, you get a notification and T3 Code stays stock.
 Ask a coding agent in this repo to port the patches (see [AGENTS.md](AGENTS.md)), or turn on
-`autoupdate on --fix claude` so Claude Code ports them unattended; afterwards commit the ported
-patches and run `t3code-customize fleet`.
+`autoupdate on --fix claude` so Claude Code ports them unattended. In a git clone with `gh` (the
+MacBook Pro) it then opens a PR with the port and, under the standing grant in AGENTS.md
+("Unattended ports"), merges it and runs `t3code-customize fleet`; elsewhere commit the ported
+patches and run `fleet` yourself.
 
 ## iOS app (TestFlight)
 

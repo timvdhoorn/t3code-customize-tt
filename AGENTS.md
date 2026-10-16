@@ -94,16 +94,23 @@ run the same patches.
   that holds a machine's checkout (up to 30 min, naming the holder), moves devbox1 to the newest
   nightly, restarts devbox1's T3 server once no thread works there (open sessions reconnect; say so
   when you report) and turns `autoupdate on` on every machine with its `machines.json` settings.
-- **Never interrupt a running thread.** Nothing in this tool quits or relaunches the Mac app. Every
-  restart of a T3 server (`t3 update --yes`, the restart in `server` and `server-off`) first waits
-  until that server is idle: no row in `orchestration_v2_projection_runs` of
-  `~/.t3/userdata/statev2.sqlite` with status `preparing`, `queued`, `starting`, `running` or
-  `waiting` (the statuses the server itself recovers after a restart, so a turn in progress, a queued
-  send and a run waiting on approval or input all count; threads that are deleted do not; an
-  unreadable database counts as busy). It checks every minute for up to 4 hours
-  (`T3CODE_CUSTOMIZE_IDLE_WAIT_MINUTES`), then stops with `deferred: threads busy` (exit 4, fleet
-  says the same) without changing anything; the next run tries again. Run from a T3 agent on devbox1,
-  `server` moves itself to a systemd unit, so it waits for that agent's turn to end.
+- **Never interrupt a running thread.** Nothing in this tool quits or relaunches the Mac app. A
+  T3 server restarts only in `server` and `server-off`, once per run, and only while it is idle:
+  `busy_threads` finds no live work in `~/.t3/userdata/statev2.sqlite`, by the rules the server
+  itself uses to recover work after a restart: a run in `orchestration_v2_projection_runs` that is
+  `preparing`, `starting`, `running` or `waiting` (on approval or input), a `queued` run that is not
+  held (`queueHeld`), or a provider thread with `pendingBackgroundTasks`. Deleted threads do not
+  count; an unreadable database, or a missing one on a machine with a T3 server, counts as busy.
+  Everything slow happens first: `t3 update` without `--yes` only stages the new version (no
+  terminal, so the service keeps running until its next restart), and the customized server is
+  built, copied and probed as `*.customize-new`. Then it checks every minute for up to 4 hours
+  (`T3CODE_CUSTOMIZE_IDLE_WAIT_MINUTES`), swaps the files in by renaming and checks once more right
+  before `systemctl restart`. Still busy: it stops with `deferred: threads busy` (exit 4, fleet says
+  the same) and restarts nothing; the next run tries again. A failed health check rolls back to stock
+  and restarts only while idle; otherwise stock waits on disk for the next restart. Run from a T3
+  agent on devbox1, `server` moves itself to a systemd unit, which waits for that agent's turn to
+  end, so never wait on that unit in the same turn: end the turn and check
+  `journalctl --user -u t3code-customize-server-run` later.
 - **How each machine gets a new nightly:**
   - Mac: T3's own updater. In the customized build it downloads a new nightly as soon as it finds
     one and installs it when Tim quits the app (`patches-tt/0007`); nothing restarts the app for
@@ -113,10 +120,13 @@ run the same patches.
     nightly and uploads it to TestFlight. A re-signed copy at `~/Applications/T3 Code (Customized).app`
     from older versions of this tool ran with `T3CODE_DISABLE_AUTO_UPDATE=true`, so it never
     updated; `install_mac_launcher` removes it, and none may remain.
-  - devbox1: the `autoupdate` timer at 04:30 runs `t3 update --yes` (only when npm has a newer
-    `t3@nightly`, and once no thread works), then rebuilds the customized server for it and restarts
-    once idle. Its `--fix claude` (`"fix"` in `machines.json`) ports broken patches unattended; see
-    "Unattended ports".
+  - devbox1: the `autoupdate` timer at 04:30 runs `server --t3-update`: `t3 update` stages the
+    newest `t3@nightly` (a no-op when it already runs it), the customized server is built for it, and
+    the one restart waits for idle as above. devbox1 has no `--fix`: its repo is a Syncthing copy
+    without `.git` or `gh`, so it cannot publish a port. When the patches break there, it stays on
+    its working version and the MacBook Pro's port reaches it through `fleet`.
+  - The MacBook Pro (`"fix": "claude"` in `machines.json`) ports broken patches unattended and
+    publishes them; see "Unattended ports".
 - **Asked to update** ("update", "zijn er updates", "update alles"): follow
   `.agents/playbooks/update.md`.
 - **A new machine:** follow "A new machine" in `README.md`. A new Linux box is first set up
@@ -135,12 +145,23 @@ against `main`. It merges that PR (squash) and starts `fleet`, without asking, o
 1. every test, typecheck and lint in `checks.json` and `checks-*.json` that the run applies passed
    (the port did not run with `--skip-checks`), and
 2. each patch keeps exactly the same code: per patch (shared set, `patches-tt/`, `patches-ios/`,
-   matched by number) the sorted list of added and removed lines, without blank and comment lines
-   (`//`, `/*`, `*`, `#`, `<!--`), is identical to the committed one, and no patch was added or
-   dropped. Only context, comments, hunk positions and line numbers moved (`code_unchanged`).
+   matched by number) the files it changes, in order by their `diff --git` path, each with its
+   added and removed lines in order, without blank and comment-only lines, are identical to the
+   committed ones, and no patch was added or dropped. A comment-only line starts with `//`, is a
+   `/*` or `<!--` line that ends its comment or runs on, or a `*` continuation; `#` is code, and so
+   is `/* x */ code();`. A patch that changes a binary file or a file mode never qualifies. Only
+   context, comments, hunk positions and line numbers moved (`code_unchanged`), and
+3. nothing else changed: `checks-tt.json`, `checks-ios.json`, the script and every other file are
+   byte-identical to `main`, and the repo was on `main`. The PR holds only the `*.patch` and
+   `base.txt` files of the patch folders (a changed check list goes along, for review).
 
-Anything else leaves the PR open and notifies Tim; that machine already runs the port. The grant
-covers exactly this case. An agent porting by hand follows the normal PR flow.
+The run publishes the port right after exporting it, before it waits for idle threads, so a
+deferred or failed restart never loses it. A `port/nightly-<version>` branch that holds commits
+the tool did not make is left alone; the port goes to `-2`, `-3` and so on. After a merge it starts
+`fleet --wait-lock 180` detached, which waits for the run that merged (an iOS build may follow).
+Only a machine with git and `gh` can publish; in `machines.json` that is the MacBook Pro. Anything
+else leaves the PR open and notifies Tim; that machine already runs the port. The grant covers
+exactly this case. An agent porting by hand follows the normal PR flow.
 
 ### Changing a patch yourself
 
@@ -209,11 +230,11 @@ names its holder and Python 3.9 compatibility, then run `python3 -m py_compile t
 | iOS session or subagent label (`patches-ios/0007`) | `apps/mobile/src/features/threads/{threadAgentsPresentation.ts,SubagentRow.tsx}` | The mobile child-agent rows (the inline subagent card and its expanded group in the thread timeline, and the Agents sheet) read "Session · Working" for a `delegate_task` worker and "Subagent · Working" for a provider-native one, with the shared `subagentKindLabel` from `patches-tt/0008`. The kind is in the secondary text color, the status keeps its tone color, and VoiceOver reads the kind with the row. No label when the origin is unknown. Depends on `patches-tt/0008`. | Tests in `checks-ios.json`. In the app, a thread with a `delegate_task` worker and a Claude Agent-tool subagent shows "Session" and "Subagent" before their status in the timeline card and the Agents sheet. |
 | iOS build | `t3code-customize` (`cmd_ios`, `build_ios`, `ios_app_id`, `ios_testers`), `ios.json` | Builds `apps/mobile` for the nightly commit installed on the Mac with `expo prebuild` and `xcodebuild archive` (automatic signing with the App Store Connect API key), uploads with asc-cli and keeps the internal TestFlight group and its testers. Depends on upstream's `apps/mobile/app.config.ts` version field and Expo prebuild layout. | `./t3code-customize ios` ends with the build on TestFlight; `asccli builds list --app-id <id>` shows it. |
 | macOS launcher | `t3code-customize` (`install_mac_launcher`, `cmd_update`, `cmd_autoupdate`) | Upstream's overlay: the signed `T3 Code (Nightly).app` stays untouched (passkeys, keychain, T3's updater work); the launcher in `/Applications/T3 Code (Customized).app` (fork: upstream uses `~/Applications`, which stays the fallback when `/Applications` is not writable) starts it with `--inspect-brk` and loads the build from `~/.local/share/t3code-customize/builds/<build>/overlay`. The fork adds: the launcher removes the re-signed app copy and the launcher earlier versions put in `~/Applications`. `autoupdate on` is a LaunchAgent that watches the app's `Info.plist` and `app.asar` (`WatchPaths`) plus an hourly check; it runs `update --background`, which waits until T3's updater stops writing (`app_settled`), rebuilds and notifies "quit and reopen". A launcher opened on an outdated build opens stock and starts that rebuild (`start_background_update`). When the patches conflict, the notification says to ask an agent in this repo to port them (with `--fix claude` the agent ports unattended and `publish_port` opens, and under the standing grant merges, its PR; see "Unattended ports"). With `--ios` (`autoupdate on --ios`) the run then builds the iOS app when the nightly changed (`update_ios`). | `./t3code-customize status` says the next launch opens the customized build; opening the launcher logs "Opened T3 Code with the customization" in `~/.cache/t3code-customize/logs/launch.log`, and the app shows the stats and child threads. |
-| T3 server | `t3code-customize` (`cmd_server`, `build_server`, `install_server_build`, `restart_server`, `server_autoupdate`) | Patched `t3` and `client/` in `~/.t3/runtime/versions/<active>/`, built from tag `v<version>` with `VP_NODE_VERSION` = upstream's `SEA_NODE_VERSION`; originals kept as `*.stock`; health check on port 3773 or back to stock. With `--t3-update` it first runs `t3 update --yes`; that and the install plus restart wait until no thread works (`wait_until_idle`). Depends on upstream's `apps/server/scripts/cli.ts build-exe` and the runtime layout. | `./t3code-customize status` on devbox1 shows "Customized: yes"; `curl` on port 3773 gives 200; `t3 connect status --json` is still linked. |
-| Fleet | `t3code-customize` (`cmd_fleet`, `sync_repo`, `fleet_command`, `autoupdate_command`), `machines.json` | One command updates every machine from any machine; files arrive by Syncthing or SSH copy, identical script and recipe hash required before building. Each machine's run waits up to 30 min for a run holding its checkout (`--wait-lock`, printing the holder), a server first runs `t3 update` (`--t3-update`), and afterwards fleet runs `autoupdate on` there with the machine's `fix` and `ios` from `machines.json` (devbox1 `--fix claude`, the MacBook Pro `--ios`). | `./t3code-customize fleet` ends with every machine `ok`. `tests/test_unattended_updates.py`. |
-| Unattended updates | `t3code-customize` (`busy_threads`, `wait_until_idle`, `update_t3_server`, `acquire_lock`, `publish_port`, `code_unchanged`, `update_ios`), `machines.json` | New nightlies reach every machine and TestFlight without Tim and never interrupt a running thread: the idle gate and the per-machine route in "Machines", the standing grant in "Unattended ports". Depends on upstream's `statev2.sqlite` projection (`orchestration_v2_projection_runs.status`, `orchestration_v2_projection_threads.deleted_at`), `t3 update --yes` and npm's `t3@nightly` tag. | `tests/test_unattended_updates.py` (idle gate on a real SQLite file, deferral, lock wait, merge decision incl. a changed code line, fleet commands). On devbox1, `sqlite3 -readonly ~/.t3/userdata/statev2.sqlite "select status,count(*) from orchestration_v2_projection_runs group by 1"` lists `running` while an agent works. |
+| T3 server | `t3code-customize` (`cmd_server`, `build_server`, `install_server_build`, `restart_server`, `server_autoupdate`) | Patched `t3` and `client/` in `~/.t3/runtime/versions/<active>/`, built from tag `v<version>` with `VP_NODE_VERSION` = upstream's `SEA_NODE_VERSION`; originals kept as `*.stock`; health check on port 3773 or back to stock. With `--t3-update` it first stages the newest nightly (`t3 update`, no `--yes`, no terminal); the build is copied and probed as `*.customize-new` (`stage_server_build`), and only the renames and the one restart wait until no thread works (`wait_until_idle`, then `restart_service` checks once more). A rollback restarts only while idle. Depends on upstream's `apps/server/scripts/cli.ts build-exe` and the runtime layout. | `./t3code-customize status` on devbox1 shows "Customized: yes"; `curl` on port 3773 gives 200; `t3 connect status --json` is still linked. |
+| Fleet | `t3code-customize` (`cmd_fleet`, `sync_repo`, `fleet_command`, `autoupdate_command`), `machines.json` | One command updates every machine from any machine; files arrive by Syncthing or SSH copy, identical script and recipe hash required before building. Each machine's run waits up to 30 min for a run holding its checkout (`fleet --wait-lock`, printing the holder; a merged port starts it with 180), a server first stages the newest T3 (`--t3-update`), and afterwards fleet runs `autoupdate on` there with the machine's `fix` and `ios` from `machines.json` (the MacBook Pro `--fix claude --ios`, the others neither). | `./t3code-customize fleet` ends with every machine `ok`. `tests/test_unattended_updates.py`. |
+| Unattended updates | `t3code-customize` (`busy_threads`, `wait_until_idle`, `restart_service`, `stage_t3_update`, `acquire_lock`, `publish_port`, `code_unchanged`, `update_ios`), `machines.json`, `.gitignore` | New nightlies reach every machine and TestFlight without Tim and never interrupt a running thread: the idle gate and the per-machine route in "Machines", the standing grant in "Unattended ports". Depends on upstream's `statev2.sqlite` projection (`orchestration_v2_projection_runs.status` and `payload_json.queueHeld`, `orchestration_v2_projection_provider_threads.payload_json.pendingBackgroundTasks`, `orchestration_v2_projection_threads.deleted_at`; compare `ProjectionStore`'s runtime recovery query on each nightly) and on `t3 update` staging without restarting when it has no terminal (`apps/server/src/cli/update.ts`). The iOS attempt (`ios-attempt.json`) is recorded once the iOS build worked, so a failed build tries again next hour and a failed upload does not. | `tests/test_unattended_updates.py` (idle gate on a real SQLite file incl. held queues and background tasks, deferral, the last check before a restart, the gated rollback, lock wait, merge decision incl. reordered, `#`, `++`, binary and mode lines, staged files, branch reuse, fleet commands). On devbox1, `sqlite3 -readonly ~/.t3/userdata/statev2.sqlite "select status,count(*) from orchestration_v2_projection_runs group by 1"` lists `running` while an agent works. |
 | Hermetic checks | `t3code-customize` (`checks`) | Tests and typechecks run with `HOME` set to an empty temp dir, as in upstream's CI, and `TMPDIR` under `~/.cache/t3code-customize/tmp` (devbox1's `/tmp` is a tmpfs with a user quota that filled up mid-test, `EDQUOT`). Upstream's ClaudeAdapterV2 steer test "(never answers)" reads the real `~/.claude/skills` mid-steer and hangs once there are many skills (devbox1, 73). Upstream's `vp lint` also runs on every file the patches add or change: its `no-hermes-unsupported-apis` rule catches APIs Hermes lacks (`Array#toSorted` crashed the iOS composer stats), which tests on Node and typechecks miss. Before the typechecks `checks` runs `effect-tsgo patch`, as upstream's `prepare` and CI do: `--ignore-scripts` skips it, so a checkout once installed with scripts checked `globalDateInEffect` (`Date.now()` in Effect code) and fresh worktrees did not, and a patch that passed in a worktree failed on the MacBook Pro. | `./t3code-customize build --resume` passes the checks on devbox1. |
-| Checkout guard | `t3code-customize` (`prepare`, `main`) | A fresh build stops instead of aborting a stopped rebase or `git am` or discarding uncommitted edits in the source checkout, since they may be a port in progress; the lock file `~/.cache/t3code-customize/lock` names the run that holds it, and a second run says so. A build undoes its own rewrites of tracked files when its build step ends, also on failure (`build_rewrites_discarded`: prepare left the checkout clean, so whatever is modified then came from the build, such as TanStack Router's `routeTree.gen.ts` or Expo prebuild's `apps/mobile/uniwind-types.d.ts`). For a run killed before that, `GENERATED` lists those files and `prepare` restores them first when nothing else changed, so a finished build never blocks the next one. | With a tracked edit in the checkout, `prepare` stops and the edit survives; with the lock held, a second run prints the holder. `tests/test_checkout_guard.py`. |
+| Checkout guard | `t3code-customize` (`prepare`, `main`) | A fresh build stops instead of aborting a stopped rebase or `git am` or discarding uncommitted edits in the source checkout, since they may be a port in progress; the lock file `~/.cache/t3code-customize/lock` names the run that holds it, and a second run says so. A build undoes its own rewrites of tracked files when its build step ends, also on failure (`build_rewrites_discarded`: prepare left the checkout clean, so whatever is modified then came from the build, such as TanStack Router's `routeTree.gen.ts` or Expo prebuild's `apps/mobile/uniwind-types.d.ts`). For a run killed before that, `GENERATED` lists those files and `prepare` restores them first when nothing else changed, so a finished build never blocks the next one. That also drops a hand edit to only those files: they are generated, so change their generator or a patch commit instead; next to any other change they stay and the guard stops. | With a tracked edit in the checkout, `prepare` stops and the edit survives; with the lock held, a second run prints the holder. `tests/test_checkout_guard.py`. |
 | Ported-PR check | `t3code-customize` (`report_ported_prs`, `main`), `ported-prs.json` | `status`, and `build`, `update` and `server` when they end (also after a conflict), print each PR in `ported-prs.json` with its upstream state and action: open with the ported head (keep), head moved (port the new commits), merged (drop once the nightly has it; "in your nightly" when its merge commit is in the installed nightly), closed (ask Tim). Without `gh` or offline it prints one skip line and carries on. | `./t3code-customize status` ends with one line per ported PR. |
 | Upstream merge | `t3code-customize` (`pull_latest`) | Each run merges `upstream/main` when it merges cleanly, else continues with the patches it has. | `git log upstream/main..HEAD` shows only fork commits after a run. |
 

@@ -19,14 +19,17 @@ can do. AGENTS.md "Machines" and "Unattended ports" are the rules; this is the o
    build downloads it itself and installs on quit (`patches-tt/0007`). Do not quit or relaunch the
    app; tell Tim it installs the next time he quits T3 Code, unless he asks you to wait for it.
 4. Port when the patches no longer apply: `./t3code-customize build` (or `server` on devbox1)
-   reports a conflict or failing check. Port per "Porting own patches" in your own detached
-   worktree when another run holds the checkout, then export and commit to a branch and open a PR.
+   reports a conflict or failing check. Port on the MacBook Pro (devbox1's repo has no `.git` or
+   `gh`), per "Porting own patches", in your own detached worktree when another run holds the
+   checkout, then export and commit to a branch and open a PR.
 5. Merge only under the standing grant in "Unattended ports": all checks passed and every patch
    keeps the same code lines. Otherwise leave the PR open and report it as needing Tim's review.
 6. Run `./t3code-customize fleet` once the patches on `main` fit the newest nightly. It waits for a
-   held lock, moves devbox1 to the newest nightly and restarts its server only when no thread works
-   there, and turns `autoupdate on` everywhere. Run it in the background and wait on its exit; from
-   a thread on devbox1, `server` detaches into its own unit, so your own turn never blocks it.
+   held lock, stages the newest nightly on devbox1 and restarts its server only when no thread
+   works there, and turns `autoupdate on` everywhere (the MacBook Pro with `--fix claude --ios`).
+   Run it in the background and wait on its exit. From a thread on devbox1, `server` detaches into
+   its own unit that waits for your turn to end: do not wait on that unit in the same turn; end the
+   turn and read `journalctl --user -u t3code-customize-server-run` in a later one.
    `deferred: threads busy` is a valid result: report which threads, do not interrupt them.
 7. iOS: on the MacBook Pro run `./t3code-customize ios` when `status` says the iOS app is behind
    (its `autoupdate --ios` also does this after each rebuild).
