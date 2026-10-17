@@ -4,24 +4,27 @@ Date: Fri, 16 Oct 2026 22:01:23 +0200
 Subject: [PATCH 8/8] feat(web): label child agents as agent or subagent
 
 ---
- apps/web/src/components/ChatView.tsx          |   6 +-
+ apps/web/src/components/ChatView.tsx          |   8 +-
+ .../components/chat/MessagesTimeline.test.tsx |  21 ++-
  .../src/components/chat/MessagesTimeline.tsx  |   8 +-
  .../chat/SubagentTooltipContent.tsx           |   5 +
- .../ThreadRelationshipsControl.kind.test.tsx  | 113 ++++++++++++++++++
- .../chat/ThreadRelationshipsControl.logic.ts  |  39 ++++++
- .../chat/ThreadRelationshipsControl.tsx       |  29 +++--
- .../chat/V2LifecycleRow.kind.test.tsx         |  85 +++++++++++++
- .../src/components/chat/V2LifecycleRow.tsx    |  26 ++--
- .../src/state/subagentDisplay.kind.test.ts    |  57 +++++++++
- .../src/state/subagentDisplay.ts              |  40 ++++++-
- .../src/state/threadExecution.kind.test.ts    |  93 ++++++++++++++
- .../src/state/threadExecution.ts              |  80 ++++++++-----
- .../src/state/threadShell.kind.test.ts        |  23 ++++
+ ...ThreadRelationshipsControl.agents.test.tsx |  25 ++-
+ .../ThreadRelationshipsControl.kind.test.tsx  | 158 ++++++++++++++++++
+ .../chat/ThreadRelationshipsControl.logic.ts  |  39 +++++
+ .../chat/ThreadRelationshipsControl.tsx       |  42 +++--
+ .../chat/V2LifecycleRow.kind.test.tsx         |  85 ++++++++++
+ .../src/components/chat/V2LifecycleRow.tsx    |  26 ++-
+ .../src/state/subagentDisplay.kind.test.ts    |  57 +++++++
+ .../src/state/subagentDisplay.ts              |  40 ++++-
+ .../src/state/threadExecution.kind.test.ts    |  95 +++++++++++
+ .../src/state/threadExecution.test.ts         |  10 +-
+ .../src/state/threadExecution.ts              |  83 +++++----
+ .../src/state/threadShell.kind.test.ts        |  23 +++
  .../src/state/threadShell.test.ts             |   2 +-
  .../client-runtime/src/state/threadShell.ts   |  13 +-
  packages/contracts/src/orchestrationV2.ts     |   1 +
  .../orchestrationV2PendingBackgroundWork.ts   |   2 +
- 17 files changed, 561 insertions(+), 61 deletions(-)
+ 20 files changed, 667 insertions(+), 76 deletions(-)
  create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.kind.test.tsx
  create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.logic.ts
  create mode 100644 apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx
@@ -30,7 +33,7 @@ Subject: [PATCH 8/8] feat(web): label child agents as agent or subagent
  create mode 100644 packages/client-runtime/src/state/threadShell.kind.test.ts
 
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index 3fc00dad8..2a671a3b2 100644
+index 3fc00dad8..416314dae 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
 @@ -98,6 +98,7 @@ import { readPastedComposerContext } from "./composerInlineTokenPaste";
@@ -54,6 +57,51 @@ index 3fc00dad8..2a671a3b2 100644
    );
    const threadError = isServerThread
      ? (localServerError ?? serverRuntime?.lastError ?? null)
+@@ -7316,7 +7320,7 @@ export default function ChatView(props: ChatViewProps) {
+                     <span className="whitespace-nowrap">
+                       <InlineButton
+                         tone="muted"
+-                        aria-label={`Open subagent ${item.label}`}
++                        aria-label={`Open ${item.noun} ${item.label}`}
+                         onClick={() => onOpenRelatedThreadStable(childThreadId)}
+                       >
+                         {item.label}
+diff --git a/apps/web/src/components/chat/MessagesTimeline.test.tsx b/apps/web/src/components/chat/MessagesTimeline.test.tsx
+index 9a5f92044..a8fd0ce71 100644
+--- a/apps/web/src/components/chat/MessagesTimeline.test.tsx
++++ b/apps/web/src/components/chat/MessagesTimeline.test.tsx
+@@ -1580,11 +1580,30 @@ describe("MessagesTimeline", () => {
+     );
+ 
+     expect(markup).toContain('aria-label="Open parent thread"');
+-    expect(markup).toContain("Subagent of");
++    expect(markup).toContain("subagent of");
+     expect(markup).toContain("Architecture audit");
+     expect(markup).not.toContain("Send a message to start the conversation");
+   });
+ 
++  it("names a delegate_task worker's parent-thread link agent of", async () => {
++    const { MessagesTimeline } = await import("./MessagesTimeline");
++    const markup = renderToStaticMarkup(
++      <MessagesTimeline
++        {...buildProps()}
++        timelineEntries={[]}
++        parentThreadLink={{
++          threadId: ThreadId.make("thread-parent"),
++          title: "Architecture audit",
++          label: "agent of",
++        }}
++      />,
++    );
++
++    expect(markup).toContain("agent of");
++    expect(markup).not.toContain("subagent of");
++    expect(markup).toContain("Architecture audit");
++  });
++
+   it("keeps steer intent visible on committed user messages", async () => {
+     const { MessagesTimeline } = await import("./MessagesTimeline");
+     const entry = buildUserTimelineEntry("Adjust the current turn");
 diff --git a/apps/web/src/components/chat/MessagesTimeline.tsx b/apps/web/src/components/chat/MessagesTimeline.tsx
 index e2a3b9dfd..5826f4ee8 100644
 --- a/apps/web/src/components/chat/MessagesTimeline.tsx
@@ -130,19 +178,107 @@ index 65b373167..544d9b604 100644
          </span>
          {props.elapsed}
        </div>
+diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.agents.test.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.agents.test.tsx
+index 251d69475..6a2ae20b9 100644
+--- a/apps/web/src/components/chat/ThreadRelationshipsControl.agents.test.tsx
++++ b/apps/web/src/components/chat/ThreadRelationshipsControl.agents.test.tsx
+@@ -62,6 +62,12 @@ import { ThreadRelationshipsPanel } from "./ThreadRelationshipsControl";
+ 
+ let renderer: ReactTestRenderer;
+ 
++/** Stop buttons for the "Worker" child, named "Stop agent" or "Stop subagent" by its origin. */
++const findStopButtons = () =>
++  renderer.root.findAll((node) =>
++    /^Stop (sub)?agent Worker$/.test(String(node.props["aria-label"] ?? "")),
++  );
++
+ afterEach(async () => {
+   await act(async () => renderer?.unmount());
+   vi.unstubAllGlobals();
+@@ -159,7 +165,7 @@ it("stops the entire native workflow through its parent without changing state b
+   expect(state.command).not.toHaveBeenCalled();
+   expect(state.navigate).not.toHaveBeenCalled();
+   expect(stopButton().props.disabled).toBe(true);
+-  expect(renderer.root.findByProps({ "aria-label": "Stop subagent Worker" }).props.disabled).toBe(
++  expect(renderer.root.findByProps({ "aria-label": "Stop agent Worker" }).props.disabled).toBe(
+     true,
+   );
+   expect(renderer.root.findByProps({ "aria-label": "Open Checker chat" })).toBeDefined();
+@@ -527,12 +533,15 @@ it.each([
+       renderer = create(panel);
+     });
+     if (!canStop) {
+-      expect(renderer.root.findAllByProps({ "aria-label": "Stop subagent Worker" })).toHaveLength(
++      expect(findStopButtons()).toHaveLength(
+         0,
+       );
+       return;
+     }
+-    const stopButton = () => renderer.root.findByProps({ "aria-label": "Stop subagent Worker" });
++    const stopButton = () =>
++      renderer.root.findByProps({
++        "aria-label": origin === "app_owned" ? "Stop agent Worker" : "Stop subagent Worker",
++      });
+     await act(async () => stopButton().props.onClick());
+     expect(state.command).toHaveBeenCalledWith({
+       environmentId: "test",
+@@ -560,13 +569,13 @@ it.each([
+         subagents: [{ ...agent, origin: "provider_native", status: "completed" }],
+       };
+       await act(async () => renderer.update(cloneElement(panel)));
+-      expect(renderer.root.findAllByProps({ "aria-label": "Stop subagent Worker" })).toHaveLength(
++      expect(findStopButtons()).toHaveLength(
+         0,
+       );
+       state.projection = { ...projection, subagents: [{ ...agent, status: "completed" }] };
+       await act(async () => renderer.update(cloneElement(panel)));
+       if (origin === "provider_native") {
+-        expect(renderer.root.findAllByProps({ "aria-label": "Stop subagent Worker" })).toHaveLength(
++        expect(findStopButtons()).toHaveLength(
+           0,
+         );
+         continue;
+@@ -582,19 +591,19 @@ it.each([
+     for (const status of ["completed", "failed", "interrupted"]) {
+       state.projection = { ...projection, subagents: [{ ...agent, status }] };
+       await act(async () => renderer.update(cloneElement(panel)));
+-      expect(renderer.root.findAllByProps({ "aria-label": "Stop subagent Worker" })).toHaveLength(
++      expect(findStopButtons()).toHaveLength(
+         0,
+       );
+     }
+     state.projection = { ...projection, subagents: [{ ...agent, startedAt: null }] };
+     await act(async () => renderer.update(cloneElement(panel)));
+-    expect(renderer.root.findAllByProps({ "aria-label": "Stop subagent Worker" })).toHaveLength(0);
++    expect(findStopButtons()).toHaveLength(0);
+     state.projection = {
+       ...projection,
+       subagents: [{ ...agent, origin: "provider_native", driver: "codex" }],
+     };
+     await act(async () => renderer.update(cloneElement(panel)));
+-    expect(renderer.root.findAllByProps({ "aria-label": "Stop subagent Worker" })).toHaveLength(0);
++    expect(findStopButtons()).toHaveLength(0);
+   },
+ );
+ 
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.kind.test.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.kind.test.tsx
 new file mode 100644
-index 000000000..9c038bc0c
+index 000000000..0fc774b38
 --- /dev/null
 +++ b/apps/web/src/components/chat/ThreadRelationshipsControl.kind.test.tsx
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,158 @@
 +import { act, cloneElement, type ReactElement, type ReactNode } from "react";
 +import { create, type ReactTestRenderer } from "react-test-renderer";
 +import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 +import * as DateTime from "effect/DateTime";
 +import { afterEach, expect, it, vi } from "vite-plus/test";
 +
-+const state = vi.hoisted(() => ({ projection: null as unknown, showTooltips: false }));
++const state = vi.hoisted(() => ({
++  projection: null as unknown,
++  showTooltips: false,
++  toast: vi.fn(),
++  interrupt: vi.fn(async () => ({ _tag: "Failure" })),
++}));
 +
 +vi.mock("@tanstack/react-router", () => ({ useNavigate: () => vi.fn() }));
 +vi.mock("../../state/entities", () => ({
@@ -154,13 +290,14 @@ index 000000000..9c038bc0c
 +vi.mock("../../lib/archivedThreadsState", () => ({
 +  useArchivedThreadSnapshots: () => ({ snapshots: [] }),
 +}));
-+vi.mock("../../state/use-atom-command", () => ({ useAtomCommand: () => vi.fn() }));
-+vi.mock("../ui/toast", () => ({ toastManager: { add: vi.fn() } }));
++vi.mock("../../state/use-atom-command", () => ({ useAtomCommand: () => state.interrupt }));
++vi.mock("../ui/toast", () => ({ toastManager: { add: state.toast } }));
 +vi.mock("../ui/tooltip", () => ({
 +  Tooltip: ({ children }: { children: ReactNode }) => children,
 +  TooltipTrigger: ({ render, children }: { render: ReactElement; children: ReactNode }) =>
 +    cloneElement(render, {}, children),
-+  TooltipPopup: ({ children }: { children: ReactNode }) => (state.showTooltips ? children : null),
++  TooltipPopup: ({ children }: { children: ReactNode }) =>
++    state.showTooltips ? <span>{children}</span> : null,
 +}));
 +
 +import { ThreadRelationshipsPanel } from "./ThreadRelationshipsControl";
@@ -249,6 +386,45 @@ index 000000000..9c038bc0c
 +  expect(relationshipLabel(edge, current)).toBe("subagent");
 +  expect(relationshipLabel(edge, ThreadId.make("child"))).toBe("parent agent");
 +});
++
++it("stops a delegate_task worker as an agent and a provider-native child as a subagent", async () => {
++  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
++  state.projection = {
++    thread: { id: "parent", lineage: { relationshipToParent: null }, activeProviderThreadId: null },
++    runs: [],
++    providerThreads: [],
++    providerSessions: [],
++    contextTransfers: [],
++    subagents: [
++      agent({ id: "worker", title: "Port the patches", origin: "app_owned" }),
++      {
++        ...agent({ id: "native", title: "Explore the sidebar", origin: "provider_native" }),
++        threadId: "parent",
++        runId: "run-1",
++        nativeStatus: "running",
++        nativeTaskRef: { strength: "strong", nativeId: "task-1" },
++      },
++    ],
++  };
++  state.showTooltips = true;
++  await act(async () => {
++    renderer = create(
++      <ThreadRelationshipsPanel
++        environmentId={EnvironmentId.make("test")}
++        threadId={ThreadId.make("parent")}
++      />,
++    );
++  });
++  const stop = renderer.root.find((node) => node.props["aria-label"] === "Stop agent Port the patches");
++  expect(
++    renderer.root.findAll(
++      (node) => node.props["aria-label"] === "Stop subagent Explore the sidebar",
++    ),
++  ).not.toHaveLength(0);
++  expect(text()).toMatch(/Explore the sidebar.*Stop subagent Port the patches.*Stop agent$/);
++  await act(async () => stop.props.onClick());
++  expect(state.toast).toHaveBeenCalledWith({ type: "error", title: "Could not stop agent" });
++});
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.logic.ts b/apps/web/src/components/chat/ThreadRelationshipsControl.logic.ts
 new file mode 100644
 index 000000000..deeab95cd
@@ -295,7 +471,7 @@ index 000000000..deeab95cd
 +  return edge.sourceThreadId === currentThreadId ? "Fork" : "Parent thread";
 +}
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
-index 536fd7981..0074485d3 100644
+index 536fd7981..e60d12673 100644
 --- a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
 +++ b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
 @@ -1,5 +1,6 @@
@@ -305,18 +481,27 @@ index 536fd7981..0074485d3 100644
  import { ThreadHoverCardPopup } from "../ThreadHoverCard";
  import { ThreadDetailsSection } from "./ThreadDetailsSection";
  import { CollapsibleSectionHeader, SectionHeaderStatus } from "../ui/collapsible-section-header";
-@@ -11,7 +12,10 @@ import {
+@@ -11,7 +12,11 @@ import {
    projectedSubagentsToRuntime,
    type RuntimeSubagent,
  } from "@t3tools/client-runtime/state/subagentRuntime";
 -import { formatSubagentDisplayTitle } from "@t3tools/client-runtime/state/subagent-display";
 +import {
 +  formatSubagentDisplayTitle,
++  subagentFallbackTitle,
 +  subagentKindLabel,
 +} from "@t3tools/client-runtime/state/subagent-display";
  import {
    deriveThreadRelationshipGraph,
    immediateThreadRelationships,
+@@ -19,7 +24,6 @@ import {
+   threadRelationshipRowStatus,
+   orderWebThreadLineageRows,
+   resolveMergeBackTargetThreadId,
+-  type ThreadRelationshipEdge,
+   type ThreadRelationshipWalkRow,
+ } from "@t3tools/client-runtime/state/thread-relationships";
+ import {
 @@ -157,14 +161,6 @@ function ThreadLineageGroup(props: {
    );
  }
@@ -332,7 +517,19 @@ index 536fd7981..0074485d3 100644
  function relationshipThreadTitle(input: {
    readonly title: string;
    readonly isSubagent: boolean;
-@@ -434,7 +430,6 @@ export function ThreadRelationshipsPanel(props: {
+@@ -367,7 +363,10 @@ export function ThreadRelationshipsPanel(props: {
+     });
+     setStoppingId(null);
+     if (result._tag === "Failure") {
+-      toastManager.add({ type: "error", title: "Could not stop subagent" });
++      toastManager.add({
++        type: "error",
++        title: `Could not stop ${subagentFallbackTitle(agent.origin)}`,
++      });
+     }
+   };
+ 
+@@ -434,7 +433,6 @@ export function ThreadRelationshipsPanel(props: {
                  : isSubagent
                    ? BotIcon
                    : GitForkIcon;
@@ -340,7 +537,7 @@ index 536fd7981..0074485d3 100644
                const projectedAgent =
                  isSubagent && !isParent ? subagentsByThreadId.get(threadId) : undefined;
                const workflowGroup =
-@@ -444,6 +439,11 @@ export function ThreadRelationshipsPanel(props: {
+@@ -444,6 +442,11 @@ export function ThreadRelationshipsPanel(props: {
                const agent = workflowGroup
                  ? projectedAgent
                  : currentSubagent(projectedAgent, node?.thread);
@@ -352,7 +549,7 @@ index 536fd7981..0074485d3 100644
                const failed = rowStatus === "failed" || rowStatus === "error";
                const canStop =
                  agent &&
-@@ -513,10 +513,15 @@ export function ThreadRelationshipsPanel(props: {
+@@ -513,10 +516,15 @@ export function ThreadRelationshipsPanel(props: {
                      fallbackIcon={RelationshipIcon}
                      status={rowStatus}
                    />
@@ -370,6 +567,26 @@ index 536fd7981..0074485d3 100644
                    </span>
                    {agent ? null : (
                      <ArrowRightIcon className="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
+@@ -655,7 +663,7 @@ export function ThreadRelationshipsPanel(props: {
+                               variant="ghost"
+                               part="icon"
+                               tone="destructive"
+-                              aria-label={`Stop subagent ${threadTitle}`}
++                              aria-label={`Stop ${subagentFallbackTitle(agent.origin)} ${threadTitle}`}
+                               disabled={stoppingId !== null}
+                               onClick={() => void stopSubagent(threadId, agent)}
+                             />
+@@ -667,7 +675,9 @@ export function ThreadRelationshipsPanel(props: {
+                             <SquareIcon aria-hidden className="size-3 fill-current" />
+                           )}
+                         </TooltipTrigger>
+-                        <TooltipPopup side="left">Stop subagent</TooltipPopup>
++                        <TooltipPopup side="left">
++                          Stop {subagentFallbackTitle(agent.origin)}
++                        </TooltipPopup>
+                       </Tooltip>
+                     </div>
+                   ) : null}
 diff --git a/apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx b/apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx
 new file mode 100644
 index 000000000..22f059315
@@ -680,10 +897,10 @@ index d4d0db34e..df1b2895e 100644
  ): string {
 diff --git a/packages/client-runtime/src/state/threadExecution.kind.test.ts b/packages/client-runtime/src/state/threadExecution.kind.test.ts
 new file mode 100644
-index 000000000..736b4db71
+index 000000000..73698e688
 --- /dev/null
 +++ b/packages/client-runtime/src/state/threadExecution.kind.test.ts
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,95 @@
 +import { RunId, ThreadId } from "@t3tools/contracts";
 +import { derivePendingBackgroundWork } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 +import { describe, expect, it } from "vite-plus/test";
@@ -704,6 +921,7 @@ index 000000000..736b4db71
 +      },
 +    ]);
 +    expect(presentation?.title).toBe("Waiting on agent Mobiel dashboard");
++    expect(presentation?.items[0]?.noun).toBe("agent");
 +  });
 +
 +  it("waits on a subagent for a provider-native child", () => {
@@ -717,6 +935,7 @@ index 000000000..736b4db71
 +      },
 +    ]);
 +    expect(presentation?.title).toBe("Waiting on subagent Mobiel dashboard");
++    expect(presentation?.items[0]?.noun).toBe("subagent");
 +  });
 +
 +  it("keeps subagent when the origin is unknown", () => {
@@ -777,11 +996,32 @@ index 000000000..736b4db71
 +    expect(presentPendingBackgroundWork(tasks)?.title).toBe("Waiting on agent Mobiel dashboard");
 +  });
 +});
+diff --git a/packages/client-runtime/src/state/threadExecution.test.ts b/packages/client-runtime/src/state/threadExecution.test.ts
+index bbc0c9775..b1c8e9141 100644
+--- a/packages/client-runtime/src/state/threadExecution.test.ts
++++ b/packages/client-runtime/src/state/threadExecution.test.ts
+@@ -538,7 +538,15 @@ describe("presentPendingBackgroundWork", () => {
+ 
+     expect(presentation).toEqual({
+       title: "Waiting on subagent Luna Window Properties",
+-      items: [{ taskId: "luna", kind: "subagent", label: "Luna Window Properties", childThreadId }],
++      items: [
++        {
++          taskId: "luna",
++          kind: "subagent",
++          label: "Luna Window Properties",
++          noun: "subagent",
++          childThreadId,
++        },
++      ],
+       waiting: true,
+     });
+   });
 diff --git a/packages/client-runtime/src/state/threadExecution.ts b/packages/client-runtime/src/state/threadExecution.ts
-index 738a50d69..a9eaf0620 100644
+index 738a50d69..df1d45a36 100644
 --- a/packages/client-runtime/src/state/threadExecution.ts
 +++ b/packages/client-runtime/src/state/threadExecution.ts
-@@ -268,16 +268,33 @@ export function threadRuntimeHasInterruptibleRun(
+@@ -268,20 +268,39 @@ export function threadRuntimeHasInterruptibleRun(
  
  type BackgroundWorkKind = OrchestrationV2PendingBackgroundTask["kind"];
  
@@ -823,7 +1063,13 @@ index 738a50d69..a9eaf0620 100644
  export interface PendingBackgroundWorkItem {
    readonly taskId: string;
    readonly kind: BackgroundWorkKind;
-@@ -301,47 +318,44 @@ export function presentPendingBackgroundWork(
+   readonly label: string;
++  /** The item's noun, such as "agent" or "subagent", for an accessible "Open agent <label>". */
++  readonly noun: string;
+   readonly childThreadId: ThreadId | undefined;
+ }
+ 
+@@ -301,47 +320,45 @@ export function presentPendingBackgroundWork(
  ): PendingBackgroundWorkPresentation | null {
    if (tasks.length === 0) return null;
    const waiting = backgroundWorkHoldsCompletion(tasks);
@@ -846,6 +1092,7 @@ index 738a50d69..a9eaf0620 100644
 -            ? BACKGROUND_WORK_KINDS[task.kind].singular
 -            : label,
 +        label: label === undefined || label.length === 0 ? noun.singular : label,
++        noun: noun.singular,
          childThreadId: task.kind === "subagent" ? task.childThreadId : undefined,
        };
 +      return { item, noun };

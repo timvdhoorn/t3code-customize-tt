@@ -4,13 +4,14 @@ Date: Fri, 16 Oct 2026 22:07:48 +0200
 Subject: [PATCH 7/7] feat(mobile): label child agents as agent or subagent
 
 ---
- .../src/features/threads/SubagentRow.tsx      | 15 ++---
- .../threads/thread-subagent-group.tsx         |  7 ++-
- .../threadAgentsPresentation.kind.test.ts     | 46 ++++++++++++++
- .../threads/threadAgentsPresentation.ts       | 15 ++++-
- .../src/lib/threadActivity.kind.test.ts       | 61 +++++++++++++++++++
- apps/mobile/src/lib/threadActivity.ts         |  8 ++-
- 6 files changed, 138 insertions(+), 14 deletions(-)
+ .../src/features/threads/SubagentRow.tsx      | 15 ++--
+ .../threads/thread-subagent-group.tsx         |  7 +-
+ .../src/features/threads/thread-work-log.tsx  |  7 +-
+ .../threadAgentsPresentation.kind.test.ts     | 77 +++++++++++++++++++
+ .../threads/threadAgentsPresentation.ts       | 26 ++++++-
+ .../src/lib/threadActivity.kind.test.ts       | 61 +++++++++++++++
+ apps/mobile/src/lib/threadActivity.ts         | 11 ++-
+ 7 files changed, 185 insertions(+), 19 deletions(-)
  create mode 100644 apps/mobile/src/features/threads/threadAgentsPresentation.kind.test.ts
  create mode 100644 apps/mobile/src/lib/threadActivity.kind.test.ts
 
@@ -72,15 +73,40 @@ index cf99eafa0..d97d37c0b 100644
    const summary = summarizeSubagentStatuses(agents.map((agent) => agent.status));
    const expanded = props.expandedRows[props.anchorKey] ?? false;
    const iconUrl = (item: SubagentItem) =>
+diff --git a/apps/mobile/src/features/threads/thread-work-log.tsx b/apps/mobile/src/features/threads/thread-work-log.tsx
+index 6dd5cf22b..28594fcc8 100644
+--- a/apps/mobile/src/features/threads/thread-work-log.tsx
++++ b/apps/mobile/src/features/threads/thread-work-log.tsx
+@@ -68,6 +68,7 @@ import {
+   type ThreadFeedActivity,
+   workEntryRowLabel,
+ } from "../../lib/threadActivity";
++import { agentSpawnCardHint } from "./threadAgentsPresentation";
+ import {
+   toolCallLines,
+   turnItemOutputImages,
+@@ -1405,11 +1406,7 @@ export const ThreadAgentSpawnCard = memo(function ThreadAgentSpawnCard(props: {
+         accessibilityRole={canExpand ? "button" : undefined}
+         accessibilityState={canExpand ? { expanded } : undefined}
+         accessibilityLabel={`${summary.title}, ${summary.status}`}
+-        accessibilityHint={
+-          canExpand
+-            ? `Double tap to ${expanded ? "hide" : "show"} ${memberCount} ${memberCount === 1 ? "subagent" : "subagents"}. Long press to copy.`
+-            : "Long press to copy."
+-        }
++        accessibilityHint={agentSpawnCardHint({ members: summary.members, expanded })}
+         hitSlop={4}
+         onPress={() => {
+           if (!canExpand) return;
 diff --git a/apps/mobile/src/features/threads/threadAgentsPresentation.kind.test.ts b/apps/mobile/src/features/threads/threadAgentsPresentation.kind.test.ts
 new file mode 100644
-index 000000000..dc8459dbc
+index 000000000..cb0945036
 --- /dev/null
 +++ b/apps/mobile/src/features/threads/threadAgentsPresentation.kind.test.ts
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,77 @@
 +import { describe, expect, it } from "vite-plus/test";
 +
-+import { resolveSubagentRowPresentation } from "./threadAgentsPresentation";
++import { agentSpawnCardHint, resolveSubagentRowPresentation } from "./threadAgentsPresentation";
 +
 +const base = {
 +  title: "Port the patches",
@@ -124,12 +150,44 @@ index 000000000..dc8459dbc
 +    );
 +  });
 +});
++
++describe("agentSpawnCardHint", () => {
++  it("counts delegate_task workers as agents", () => {
++    const members = [{ origin: "app_owned" as const }, { origin: "app_owned" as const }];
++    expect(agentSpawnCardHint({ members, expanded: false })).toBe(
++      "Double tap to show 2 agents. Long press to copy.",
++    );
++  });
++
++  it("counts provider-native and unknown children as subagents", () => {
++    const members = [{ origin: "provider_native" as const }, {}];
++    expect(agentSpawnCardHint({ members, expanded: true })).toBe(
++      "Double tap to hide 2 subagents. Long press to copy.",
++    );
++  });
++
++  it("names both kinds in a mixed card", () => {
++    const members = [
++      { origin: "app_owned" as const },
++      { origin: "provider_native" as const },
++      { origin: "provider_native" as const },
++    ];
++    expect(agentSpawnCardHint({ members, expanded: false })).toBe(
++      "Double tap to show 1 agent and 2 subagents. Long press to copy.",
++    );
++  });
++
++  it("only offers copy without members", () => {
++    expect(agentSpawnCardHint({ members: [], expanded: false })).toBe("Long press to copy.");
++  });
++});
 diff --git a/apps/mobile/src/features/threads/threadAgentsPresentation.ts b/apps/mobile/src/features/threads/threadAgentsPresentation.ts
-index 96981ab3a..d42d46ae2 100644
+index 96981ab3a..5785d8ac5 100644
 --- a/apps/mobile/src/features/threads/threadAgentsPresentation.ts
 +++ b/apps/mobile/src/features/threads/threadAgentsPresentation.ts
-@@ -1,6 +1,8 @@
+@@ -1,6 +1,9 @@
  import {
++  childAgentCountLabel,
    formatSubagentDisplayTitle,
    subagentDetailPreview,
 +  subagentFallbackTitle,
@@ -137,7 +195,7 @@ index 96981ab3a..d42d46ae2 100644
  } from "@t3tools/client-runtime/state/subagent-display";
  import { isActiveSubagentStatus } from "@t3tools/client-runtime/state/subagentRuntime";
  import type { OrchestrationV2Subagent } from "@t3tools/contracts";
-@@ -13,16 +15,22 @@ export interface SubagentRowPresentation {
+@@ -13,16 +16,22 @@ export interface SubagentRowPresentation {
    readonly title: string;
    readonly detail: string | null;
    readonly statusLabel: string;
@@ -162,7 +220,7 @@ index 96981ab3a..d42d46ae2 100644
    return prompt.length > PROMPT_TITLE_LIMIT
      ? `${prompt.slice(0, PROMPT_TITLE_LIMIT - 3)}...`
      : prompt;
-@@ -59,13 +67,14 @@ export function resolveSubagentRowPresentation(
+@@ -59,15 +68,26 @@ export function resolveSubagentRowPresentation(
    subagent: Pick<
      OrchestrationV2Subagent,
      "title" | "prompt" | "status" | "progress" | "result" | "childThreadId"
@@ -178,6 +236,18 @@ index 96981ab3a..d42d46ae2 100644
      tone: rowTone(subagent.status),
      live,
      canOpenThread: subagent.childThreadId !== null,
+   };
+ }
++
++/** VoiceOver hint for a spawn card, counting its members by kind: "show 1 agent and 2 subagents". */
++export function agentSpawnCardHint(input: {
++  readonly members: ReadonlyArray<{ readonly origin?: OrchestrationV2Subagent["origin"] }>;
++  readonly expanded: boolean;
++}): string {
++  if (input.members.length === 0) return "Long press to copy.";
++  const count = childAgentCountLabel(input.members.map(({ origin }) => origin));
++  return `Double tap to ${input.expanded ? "hide" : "show"} ${count}. Long press to copy.`;
++}
 diff --git a/apps/mobile/src/lib/threadActivity.kind.test.ts b/apps/mobile/src/lib/threadActivity.kind.test.ts
 new file mode 100644
 index 000000000..52626bbb6
@@ -246,7 +316,7 @@ index 000000000..52626bbb6
 +  });
 +});
 diff --git a/apps/mobile/src/lib/threadActivity.ts b/apps/mobile/src/lib/threadActivity.ts
-index fb8bbe29a..e0c7b1bf0 100644
+index fb8bbe29a..b4a731298 100644
 --- a/apps/mobile/src/lib/threadActivity.ts
 +++ b/apps/mobile/src/lib/threadActivity.ts
 @@ -4,7 +4,10 @@ import type {
@@ -261,7 +331,24 @@ index fb8bbe29a..e0c7b1bf0 100644
  import { isLiveSubagentTurnItem } from "@t3tools/client-runtime/state/subagentRuntime";
  import { extractToolActivityPresentation } from "@t3tools/client-runtime/work-log/tool-presentation";
  import {
-@@ -595,7 +598,8 @@ function itemSummary(
+@@ -46,6 +49,7 @@ import type {
+   OrchestrationV2ProjectedTurnItem,
+   OrchestrationV2RunAttempt,
+   OrchestrationV2RunStatus,
++  OrchestrationV2Subagent,
+   OrchestrationV2TurnItem,
+   OrchestrationV2UserMessageInputIntent,
+   RunAttemptId,
+@@ -246,6 +250,8 @@ export interface AgentSpawnSummary {
+     readonly tone: "working" | "completed" | "failed" | "stopped";
+     readonly detail: string | undefined;
+     readonly updatedAt: string;
++    /** `app_owned` counts as an agent, `provider_native` or unknown as a subagent. */
++    readonly origin?: OrchestrationV2Subagent["origin"] | undefined;
+   }>;
+ }
+ 
+@@ -595,7 +601,8 @@ function itemSummary(
      (item.type === "dynamic_tool"
        ? dynamicToolTitle(item.toolName, item.input, item.title)
        : undefined) ?? item.title?.trim();
