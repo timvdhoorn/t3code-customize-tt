@@ -4,7 +4,8 @@ Date: Fri, 16 Oct 2026 22:01:23 +0200
 Subject: [PATCH 8/8] feat(web): label child agents as agent or subagent
 
 ---
- apps/web/src/components/ChatView.tsx          |   8 +-
+ .../orchestration-v2/ProjectionStore.test.ts  |   8 +-
+ apps/web/src/components/ChatView.tsx          |   6 +-
  .../components/chat/MessagesTimeline.test.tsx |  21 ++-
  .../src/components/chat/MessagesTimeline.tsx  |   8 +-
  .../chat/SubagentTooltipContent.tsx           |   5 +
@@ -24,7 +25,7 @@ Subject: [PATCH 8/8] feat(web): label child agents as agent or subagent
  .../client-runtime/src/state/threadShell.ts   |  13 +-
  packages/contracts/src/orchestrationV2.ts     |   1 +
  .../orchestrationV2PendingBackgroundWork.ts   |   2 +
- 20 files changed, 667 insertions(+), 76 deletions(-)
+ 21 files changed, 673 insertions(+), 76 deletions(-)
  create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.kind.test.tsx
  create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.logic.ts
  create mode 100644 apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx
@@ -32,11 +33,30 @@ Subject: [PATCH 8/8] feat(web): label child agents as agent or subagent
  create mode 100644 packages/client-runtime/src/state/threadExecution.kind.test.ts
  create mode 100644 packages/client-runtime/src/state/threadShell.kind.test.ts
 
+diff --git a/apps/server/src/orchestration-v2/ProjectionStore.test.ts b/apps/server/src/orchestration-v2/ProjectionStore.test.ts
+index deb79acd14..c30bc46142 100644
+--- a/apps/server/src/orchestration-v2/ProjectionStore.test.ts
++++ b/apps/server/src/orchestration-v2/ProjectionStore.test.ts
+@@ -326,7 +326,13 @@ it.effect.each([
+         }
+       });
+       const owned = [
+-        { taskId: nativeTaskId, description: item.title, kind: "subagent", providerInstanceId },
++        {
++          taskId: nativeTaskId,
++          description: item.title,
++          kind: "subagent",
++          providerInstanceId,
++          origin: "provider_native",
++        },
+       ];
+       yield* assertOwners(threadId, owned);
+       yield* assertOwners(otherThreadId, owned);
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index 3fc00dad8..416314dae 100644
+index ab322c275c..d84b95eb82 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -98,6 +98,7 @@ import { readPastedComposerContext } from "./composerInlineTokenPaste";
+@@ -90,6 +90,7 @@ import { readPastedComposerContext } from "./composerInlineTokenPaste";
  import { isPasteAsTextShortcut } from "@t3tools/client-runtime/text-paste";
  import { effectiveSnoozed, threadWokeAt } from "@t3tools/client-runtime/state/thread-settled";
  import { childThreadInputsTitle } from "@t3tools/client-runtime/state/threads";
@@ -44,20 +64,17 @@ index 3fc00dad8..416314dae 100644
  import { useAcknowledgeThreadWoke, useThreadActions } from "../hooks/useThreadActions";
  import {
    deriveProviderSubagentStatus,
-@@ -2225,8 +2226,11 @@ export default function ChatView(props: ChatViewProps) {
-         : {
-             threadId: parentSubagentThreadRef.threadId,
-             title: parentSubagentThread?.title ?? "Parent thread",
-+            label: `${subagentFallbackTitle(
-+              serverThread?.delegatedByThreadId === undefined ? "provider_native" : "app_owned",
-+            )} of`,
-           },
--    [parentSubagentThread?.title, parentSubagentThreadRef],
-+    [parentSubagentThread?.title, parentSubagentThreadRef, serverThread?.delegatedByThreadId],
-   );
+@@ -1513,6 +1514,9 @@ export default function ChatView(props: ChatViewProps) {
+       : {
+           threadId: parentSubagentThreadRef.threadId,
+           title: parentSubagentThread?.title ?? "Parent thread",
++          label: `${subagentFallbackTitle(
++            serverThread?.delegatedByThreadId === undefined ? "provider_native" : "app_owned",
++          )} of`,
+         };
    const threadError = isServerThread
      ? (localServerError ?? serverRuntime?.lastError ?? null)
-@@ -7316,7 +7320,7 @@ export default function ChatView(props: ChatViewProps) {
+@@ -5347,7 +5351,7 @@ export default function ChatView(props: ChatViewProps) {
                      <span className="whitespace-nowrap">
                        <InlineButton
                          tone="muted"
@@ -67,7 +84,7 @@ index 3fc00dad8..416314dae 100644
                        >
                          {item.label}
 diff --git a/apps/web/src/components/chat/MessagesTimeline.test.tsx b/apps/web/src/components/chat/MessagesTimeline.test.tsx
-index 9a5f92044..a8fd0ce71 100644
+index 9a5f920445..a8fd0ce717 100644
 --- a/apps/web/src/components/chat/MessagesTimeline.test.tsx
 +++ b/apps/web/src/components/chat/MessagesTimeline.test.tsx
 @@ -1580,11 +1580,30 @@ describe("MessagesTimeline", () => {
@@ -103,10 +120,10 @@ index 9a5f92044..a8fd0ce71 100644
      const { MessagesTimeline } = await import("./MessagesTimeline");
      const entry = buildUserTimelineEntry("Adjust the current turn");
 diff --git a/apps/web/src/components/chat/MessagesTimeline.tsx b/apps/web/src/components/chat/MessagesTimeline.tsx
-index e2a3b9dfd..5826f4ee8 100644
+index 8f16ffd2f6..b8d85233fd 100644
 --- a/apps/web/src/components/chat/MessagesTimeline.tsx
 +++ b/apps/web/src/components/chat/MessagesTimeline.tsx
-@@ -54,6 +54,7 @@ import {
+@@ -55,6 +55,7 @@ import {
  } from "@t3tools/client-runtime/work-log/item-detail";
  import { formatAttachmentSize } from "@t3tools/client-runtime/state/attachments";
  import {
@@ -114,7 +131,7 @@ index e2a3b9dfd..5826f4ee8 100644
    subagentGroupSummary,
    summarizeSubagentStatuses,
  } from "@t3tools/client-runtime/state/subagent-display";
-@@ -453,6 +454,8 @@ interface MessagesTimelineProps {
+@@ -469,6 +470,8 @@ interface MessagesTimelineProps {
    parentThreadLink?: {
      readonly threadId: ThreadId;
      readonly title: string;
@@ -123,16 +140,16 @@ index e2a3b9dfd..5826f4ee8 100644
    } | null;
    onForkFromRun: (input: {
      readonly sourceThreadId: ThreadId;
-@@ -1395,7 +1398,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
-         <div className="messages-timeline-row-frame">
-           <div className="chat-content-lane pt-1 sm:pt-2">
-             <TimelineSystemDivider
--              label="Subagent of"
-+              label={parentThreadLink.label ?? "subagent of"}
-               detail={parentThreadLink.title}
-               icon={BotIcon}
-               actionLabel="Open parent thread"
-@@ -3333,13 +3336,14 @@ const V2SubagentGroup = memo(function V2SubagentGroup({
+@@ -1277,7 +1280,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
+       <div className="messages-timeline-row-frame">
+         <div className="chat-content-lane pt-1 sm:pt-2">
+           <TimelineSystemDivider
+-            label="Subagent of"
++            label={parentThreadLink.label ?? "subagent of"}
+             detail={parentThreadLink.title}
+             icon={BotIcon}
+             actionLabel="Open parent thread"
+@@ -3156,13 +3159,14 @@ const V2SubagentGroup = memo(function V2SubagentGroup({
      const live = liveAgents?.find((agent) => agent.id === item.subagentId);
      return {
        item,
@@ -149,7 +166,7 @@ index e2a3b9dfd..5826f4ee8 100644
    const toggleExpanded = (open: boolean) => {
      ctx.onToggleWorkEntry(row.id, expanded);
 diff --git a/apps/web/src/components/chat/SubagentTooltipContent.tsx b/apps/web/src/components/chat/SubagentTooltipContent.tsx
-index 65b373167..544d9b604 100644
+index 65b3731673..544d9b604f 100644
 --- a/apps/web/src/components/chat/SubagentTooltipContent.tsx
 +++ b/apps/web/src/components/chat/SubagentTooltipContent.tsx
 @@ -10,6 +10,7 @@ import type {
@@ -179,7 +196,7 @@ index 65b373167..544d9b604 100644
          {props.elapsed}
        </div>
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.agents.test.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.agents.test.tsx
-index 251d69475..6a2ae20b9 100644
+index 251d694753..6a2ae20b9c 100644
 --- a/apps/web/src/components/chat/ThreadRelationshipsControl.agents.test.tsx
 +++ b/apps/web/src/components/chat/ThreadRelationshipsControl.agents.test.tsx
 @@ -62,6 +62,12 @@ import { ThreadRelationshipsPanel } from "./ThreadRelationshipsControl";
@@ -263,7 +280,7 @@ index 251d69475..6a2ae20b9 100644
  
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.kind.test.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.kind.test.tsx
 new file mode 100644
-index 000000000..0fc774b38
+index 0000000000..0fc774b382
 --- /dev/null
 +++ b/apps/web/src/components/chat/ThreadRelationshipsControl.kind.test.tsx
 @@ -0,0 +1,158 @@
@@ -427,7 +444,7 @@ index 000000000..0fc774b38
 +});
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.logic.ts b/apps/web/src/components/chat/ThreadRelationshipsControl.logic.ts
 new file mode 100644
-index 000000000..deeab95cd
+index 0000000000..deeab95cdf
 --- /dev/null
 +++ b/apps/web/src/components/chat/ThreadRelationshipsControl.logic.ts
 @@ -0,0 +1,39 @@
@@ -471,7 +488,7 @@ index 000000000..deeab95cd
 +  return edge.sourceThreadId === currentThreadId ? "Fork" : "Parent thread";
 +}
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
-index 536fd7981..e60d12673 100644
+index 536fd79811..e60d126731 100644
 --- a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
 +++ b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
 @@ -1,5 +1,6 @@
@@ -589,7 +606,7 @@ index 536fd7981..e60d12673 100644
                    ) : null}
 diff --git a/apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx b/apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx
 new file mode 100644
-index 000000000..22f059315
+index 0000000000..22f059315c
 --- /dev/null
 +++ b/apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx
 @@ -0,0 +1,85 @@
@@ -679,7 +696,7 @@ index 000000000..22f059315
 +  });
 +});
 diff --git a/apps/web/src/components/chat/V2LifecycleRow.tsx b/apps/web/src/components/chat/V2LifecycleRow.tsx
-index e9a4cc1a4..1a82b68f2 100644
+index e9a4cc1a46..1a82b68f2a 100644
 --- a/apps/web/src/components/chat/V2LifecycleRow.tsx
 +++ b/apps/web/src/components/chat/V2LifecycleRow.tsx
 @@ -15,7 +15,11 @@ import {
@@ -767,7 +784,7 @@ index e9a4cc1a4..1a82b68f2 100644
                  className,
 diff --git a/packages/client-runtime/src/state/subagentDisplay.kind.test.ts b/packages/client-runtime/src/state/subagentDisplay.kind.test.ts
 new file mode 100644
-index 000000000..ddc152c58
+index 0000000000..ddc152c586
 --- /dev/null
 +++ b/packages/client-runtime/src/state/subagentDisplay.kind.test.ts
 @@ -0,0 +1,57 @@
@@ -829,7 +846,7 @@ index 000000000..ddc152c58
 +  });
 +});
 diff --git a/packages/client-runtime/src/state/subagentDisplay.ts b/packages/client-runtime/src/state/subagentDisplay.ts
-index d4d0db34e..df1b2895e 100644
+index d4d0db34e2..df1b2895e8 100644
 --- a/packages/client-runtime/src/state/subagentDisplay.ts
 +++ b/packages/client-runtime/src/state/subagentDisplay.ts
 @@ -1,4 +1,5 @@
@@ -897,7 +914,7 @@ index d4d0db34e..df1b2895e 100644
  ): string {
 diff --git a/packages/client-runtime/src/state/threadExecution.kind.test.ts b/packages/client-runtime/src/state/threadExecution.kind.test.ts
 new file mode 100644
-index 000000000..73698e688
+index 0000000000..73698e6885
 --- /dev/null
 +++ b/packages/client-runtime/src/state/threadExecution.kind.test.ts
 @@ -0,0 +1,95 @@
@@ -997,7 +1014,7 @@ index 000000000..73698e688
 +  });
 +});
 diff --git a/packages/client-runtime/src/state/threadExecution.test.ts b/packages/client-runtime/src/state/threadExecution.test.ts
-index bbc0c9775..b1c8e9141 100644
+index bbc0c97754..b1c8e91410 100644
 --- a/packages/client-runtime/src/state/threadExecution.test.ts
 +++ b/packages/client-runtime/src/state/threadExecution.test.ts
 @@ -538,7 +538,15 @@ describe("presentPendingBackgroundWork", () => {
@@ -1018,7 +1035,7 @@ index bbc0c9775..b1c8e9141 100644
      });
    });
 diff --git a/packages/client-runtime/src/state/threadExecution.ts b/packages/client-runtime/src/state/threadExecution.ts
-index 738a50d69..df1d45a36 100644
+index 738a50d69a..df1d45a36a 100644
 --- a/packages/client-runtime/src/state/threadExecution.ts
 +++ b/packages/client-runtime/src/state/threadExecution.ts
 @@ -268,20 +268,39 @@ export function threadRuntimeHasInterruptibleRun(
@@ -1142,7 +1159,7 @@ index 738a50d69..df1d45a36 100644
  
 diff --git a/packages/client-runtime/src/state/threadShell.kind.test.ts b/packages/client-runtime/src/state/threadShell.kind.test.ts
 new file mode 100644
-index 000000000..9f66e6f57
+index 0000000000..9f66e6f578
 --- /dev/null
 +++ b/packages/client-runtime/src/state/threadShell.kind.test.ts
 @@ -0,0 +1,23 @@
@@ -1170,7 +1187,7 @@ index 000000000..9f66e6f57
 +  });
 +});
 diff --git a/packages/client-runtime/src/state/threadShell.test.ts b/packages/client-runtime/src/state/threadShell.test.ts
-index b1d87b794..2fe2056af 100644
+index b1d87b794a..2fe2056af9 100644
 --- a/packages/client-runtime/src/state/threadShell.test.ts
 +++ b/packages/client-runtime/src/state/threadShell.test.ts
 @@ -237,7 +237,7 @@ describe("v2 thread shell lists", () => {
@@ -1183,7 +1200,7 @@ index b1d87b794..2fe2056af 100644
      registry.set(snapshotAtom(environmentId), {
        ...v2ShellSnapshot,
 diff --git a/packages/client-runtime/src/state/threadShell.ts b/packages/client-runtime/src/state/threadShell.ts
-index 1710eb38b..beec64abe 100644
+index 1710eb38bf..beec64abe6 100644
 --- a/packages/client-runtime/src/state/threadShell.ts
 +++ b/packages/client-runtime/src/state/threadShell.ts
 @@ -13,6 +13,7 @@ import { Atom } from "effect/reactivity";
@@ -1218,22 +1235,22 @@ index 1710eb38b..beec64abe 100644
  
  export function createEnvironmentThreadShellAtoms(input: {
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
-index c552f2e49..3a5f817cc 100644
+index 4c270a4948..e68b6dfb59 100644
 --- a/packages/contracts/src/orchestrationV2.ts
 +++ b/packages/contracts/src/orchestrationV2.ts
-@@ -827,6 +827,7 @@ export const OrchestrationV2PendingBackgroundTask = kindUnionWithFallback(
-       ...PendingBackgroundTaskFields,
-       kind: Schema.Literal("subagent"),
+@@ -831,6 +831,7 @@ export const OrchestrationV2PendingBackgroundTask = kindUnionWithFallback(
+       /** The owning provider thread's instance, populated in derived pending work. */
+       providerInstanceId: Schema.optional(ProviderInstanceId),
        childThreadId: Schema.optional(ThreadId),
 +      origin: Schema.optional(Schema.Literals(["provider_native", "app_owned"])),
      }),
      Schema.Struct({ ...PendingBackgroundTaskFields, kind: Schema.Literal("command") }),
      Schema.Struct({ ...PendingBackgroundTaskFields, kind: Schema.Literal("monitor") }),
 diff --git a/packages/shared/src/orchestrationV2PendingBackgroundWork.ts b/packages/shared/src/orchestrationV2PendingBackgroundWork.ts
-index 356903e46..548501010 100644
+index 392f1d1335..19cecf4b16 100644
 --- a/packages/shared/src/orchestrationV2PendingBackgroundWork.ts
 +++ b/packages/shared/src/orchestrationV2PendingBackgroundWork.ts
-@@ -93,6 +93,7 @@ type PendingBackgroundWorkTurnItem = {
+@@ -95,6 +95,7 @@ type PendingBackgroundWorkTurnItem = {
    readonly input?: unknown;
    readonly prompt?: string | undefined;
    readonly childThreadId?: ThreadId | null;
@@ -1241,9 +1258,9 @@ index 356903e46..548501010 100644
  };
  
  function isLatestRunSettledForBackgroundWait(
-@@ -144,6 +145,7 @@ function pendingTaskFromTurnItem(
-         ...named,
-         kind: "subagent",
+@@ -149,6 +150,7 @@ function pendingTaskFromTurnItem(
+           ? {}
+           : { providerInstanceId: item.owningProviderInstanceId }),
          ...(item.childThreadId == null ? {} : { childThreadId: item.childThreadId }),
 +        ...(item.origin === undefined ? {} : { origin: item.origin }),
        };

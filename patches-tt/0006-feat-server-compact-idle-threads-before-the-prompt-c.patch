@@ -24,19 +24,19 @@ with its opener (patches-tt/0003).
  .../OrchestratorMcpService.activity.test.ts   |  12 +
  apps/server/src/mcp/OrchestratorMcpService.ts |  11 +-
  .../src/mcp/toolkits/thread/handlers.ts       |   7 +-
- .../orchestration-v2/CommandPolicy.test.ts    |  45 +-
- .../src/orchestration-v2/CommandPolicy.ts     |  13 +
+ .../orchestration-v2/CommandPolicy.test.ts    |  13 +
+ .../src/orchestration-v2/CommandPolicy.ts     |   3 +
  .../orchestration-v2/ContextHandoffService.ts |   5 +
  .../src/orchestration-v2/IdleCompaction.ts    | 153 +++++
  .../IdleCompactionService.test.ts             | 602 ++++++++++++++++++
  .../orchestration-v2/IdleCompactionService.ts | 146 +++++
- .../src/orchestration-v2/Orchestrator.ts      | 159 ++++-
+ .../src/orchestration-v2/Orchestrator.ts      | 154 ++++-
  .../ProjectionSettlement.test.ts              |  41 +-
  .../orchestration-v2/ProjectionStore.test.ts  |  77 +++
  .../src/orchestration-v2/ProjectionStore.ts   | 176 ++++-
  .../ProviderTurnControlService.test.ts        |   1 +
  .../ProviderTurnStartService.ts               |   2 +
- .../orchestration-v2/RestartContinuation.ts   |  13 +-
+ .../orchestration-v2/RestartContinuation.ts   |   5 +-
  .../RunExecutionService.test.ts               |  88 ++-
  .../orchestration-v2/RunExecutionService.ts   |  64 +-
  .../SubagentProjection.test.ts                |  22 +
@@ -72,13 +72,13 @@ with its opener (patches-tt/0003).
  .../orchestrationV2PendingBackgroundWork.ts   |  10 +-
  .../shared/src/orchestrationV2ThreadError.ts  |  32 +
  .../shared/src/orchestrationV2Timeline.ts     |  16 +-
- 54 files changed, 2147 insertions(+), 105 deletions(-)
+ 54 files changed, 2096 insertions(+), 101 deletions(-)
  create mode 100644 apps/server/src/orchestration-v2/IdleCompaction.ts
  create mode 100644 apps/server/src/orchestration-v2/IdleCompactionService.test.ts
  create mode 100644 apps/server/src/orchestration-v2/IdleCompactionService.ts
 
 diff --git a/apps/mobile/src/state/use-thread-selection.ts b/apps/mobile/src/state/use-thread-selection.ts
-index 9df012f34..63cdd5767 100644
+index 9df012f342..63cdd57674 100644
 --- a/apps/mobile/src/state/use-thread-selection.ts
 +++ b/apps/mobile/src/state/use-thread-selection.ts
 @@ -46,9 +46,12 @@ function firstRouteParam(value: string | string[] | undefined): string | null {
@@ -96,7 +96,7 @@ index 9df012f34..63cdd5767 100644
      }
    }
 diff --git a/apps/server/src/cli/config.ts b/apps/server/src/cli/config.ts
-index f9b8730b7..9063b5972 100644
+index f9b8730b7d..9063b59723 100644
 --- a/apps/server/src/cli/config.ts
 +++ b/apps/server/src/cli/config.ts
 @@ -100,6 +100,13 @@ const EnvServerConfig = Config.all({
@@ -122,7 +122,7 @@ index f9b8730b7..9063b5972 100644
        traceMaxFiles: env.traceMaxFiles,
        otlpTracesUrl: traces?.url,
 diff --git a/apps/server/src/config.ts b/apps/server/src/config.ts
-index ef6f71a46..8aa34b5f6 100644
+index ef6f71a46a..8aa34b5f68 100644
 --- a/apps/server/src/config.ts
 +++ b/apps/server/src/config.ts
 @@ -71,6 +71,8 @@ export class ServerConfig extends Context.Service<
@@ -135,10 +135,10 @@ index ef6f71a46..8aa34b5f6 100644
      readonly startupPresentation: StartupPresentation;
      readonly desktopBootstrapToken: string | undefined;
 diff --git a/apps/server/src/mcp/OrchestratorMcpService.activity.test.ts b/apps/server/src/mcp/OrchestratorMcpService.activity.test.ts
-index 72497c582..784bd766a 100644
+index 12e7f7fd0d..c5fbed556e 100644
 --- a/apps/server/src/mcp/OrchestratorMcpService.activity.test.ts
 +++ b/apps/server/src/mcp/OrchestratorMcpService.activity.test.ts
-@@ -39,6 +39,7 @@ const parentThreadId = ThreadId.make("thread-mcp-orchestrator-parent");
+@@ -40,6 +40,7 @@ const parentThreadId = ThreadId.make("thread-mcp-orchestrator-parent");
  const childThreadId = ThreadId.make("thread-mcp-orchestrator-child");
  const activeRunId = RunId.make("run-mcp-active");
  const cancelledRunId = RunId.make("run-mcp-cancelled");
@@ -146,7 +146,7 @@ index 72497c582..784bd766a 100644
  const childRunId = RunId.make("run-mcp-child");
  const taskId = NodeId.make("node-mcp-task-1");
  const now = DateTime.makeUnsafe("2026-08-04T12:00:00.000Z");
-@@ -125,6 +126,10 @@ it("readThread prefers activity-run status over a newer cancelled queued run", a
+@@ -126,6 +127,10 @@ it("readThread prefers activity-run status over a newer cancelled queued run", a
      runs: [
        makeRun({ id: activeRunId, ordinal: 1, status: "running" }),
        makeRun({ id: cancelledRunId, ordinal: 2, status: "cancelled" }),
@@ -157,7 +157,7 @@ index 72497c582..784bd766a 100644
      ],
      visibleTurnItems: [],
      runtimeRequests: [],
-@@ -177,6 +182,13 @@ it("readThread prefers activity-run status over a newer cancelled queued run", a
+@@ -178,6 +183,13 @@ it("readThread prefers activity-run status over a newer cancelled queued run", a
      expect(result.thread.status).toBe("running");
      expect(result.thread.latestRunId).toBe(cancelledRunId);
      expect(result.thread.activeRunId).toBe(activeRunId);
@@ -172,10 +172,10 @@ index 72497c582..784bd766a 100644
  });
  
 diff --git a/apps/server/src/mcp/OrchestratorMcpService.ts b/apps/server/src/mcp/OrchestratorMcpService.ts
-index be40e588e..206ec1fcb 100644
+index 86c07ee03c..b9a88a82cc 100644
 --- a/apps/server/src/mcp/OrchestratorMcpService.ts
 +++ b/apps/server/src/mcp/OrchestratorMcpService.ts
-@@ -58,7 +58,7 @@ import {
+@@ -59,7 +59,7 @@ import {
    type ServerProvider,
    ThreadId,
  } from "@t3tools/contracts";
@@ -184,7 +184,7 @@ index be40e588e..206ec1fcb 100644
  import * as Clock from "effect/Clock";
  import * as Context from "effect/Context";
  import * as Crypto from "effect/Crypto";
-@@ -364,6 +364,7 @@ export function hasPendingChildRuns(
+@@ -388,6 +388,7 @@ export function hasPendingChildRuns(
  ): boolean {
    return childProjection.runs.some(
      (run) =>
@@ -192,7 +192,7 @@ index be40e588e..206ec1fcb 100644
        !ThreadManagementService.isTerminalRunStatus(run.status) &&
        !(run.status === "queued" && run.queueHeld === true) &&
        (delegatedRun === undefined || run.ordinal > delegatedRun.ordinal),
-@@ -487,6 +488,7 @@ function latestTerminalResultRun(
+@@ -511,6 +512,7 @@ function latestTerminalResultRun(
      .filter(
        (run) =>
          ThreadManagementService.isTerminalRunStatus(run.status) &&
@@ -200,7 +200,7 @@ index be40e588e..206ec1fcb 100644
          !monitorRunIds.has(run.id) &&
          run.status !== "rolled_back" &&
          (run.id === delegatedRun?.id || run.startedAt !== null),
-@@ -739,7 +741,7 @@ function threadDetail(
+@@ -763,7 +765,7 @@ function threadDetail(
      worktreePath: projection.thread.worktreePath,
      parentThreadId: projection.thread.lineage.parentThreadId,
      relationshipToParent: projection.thread.lineage.relationshipToParent,
@@ -209,7 +209,7 @@ index be40e588e..206ec1fcb 100644
      itemCount,
      pendingRequestCount: projection.runtimeRequests.filter(
        (request) => request.status === "pending",
-@@ -1903,7 +1905,7 @@ const make = Effect.gen(function* () {
+@@ -1940,7 +1942,7 @@ const make = Effect.gen(function* () {
        Effect.gen(function* () {
          const { scope, parent } = yield* loadThreadCaller(callerScope, "delegate_task");
          const parentRun = parent.runs
@@ -218,7 +218,7 @@ index be40e588e..206ec1fcb 100644
            .toSorted((left, right) => right.ordinal - left.ordinal)[0];
          if (
            parentRun === undefined ||
-@@ -2321,7 +2323,7 @@ const make = Effect.gen(function* () {
+@@ -2358,7 +2360,7 @@ const make = Effect.gen(function* () {
                    );
                }
                const projection = yield* loadProjection(threadId);
@@ -227,7 +227,7 @@ index be40e588e..206ec1fcb 100644
                yield* threadManagement
                  .dispatch({
                    type: "thread.created.record",
-@@ -2486,6 +2488,7 @@ const make = Effect.gen(function* () {
+@@ -2523,6 +2525,7 @@ const make = Effect.gen(function* () {
          return {
            thread: threadDetail(target, timeline.totalItems, shell, yield* Clock.currentTimeMillis),
            recentRuns: target.runs
@@ -236,7 +236,7 @@ index be40e588e..206ec1fcb 100644
              .slice(0, input.runLimit ?? DEFAULT_THREAD_RUN_LIMIT)
              .map(threadRun),
 diff --git a/apps/server/src/mcp/toolkits/thread/handlers.ts b/apps/server/src/mcp/toolkits/thread/handlers.ts
-index e1bf858ca..d5078c495 100644
+index e1bf858ca8..d5078c4957 100644
 --- a/apps/server/src/mcp/toolkits/thread/handlers.ts
 +++ b/apps/server/src/mcp/toolkits/thread/handlers.ts
 @@ -9,6 +9,7 @@ import {
@@ -268,80 +268,14 @@ index e1bf858ca..d5078c495 100644
        const end = cursor + (input.limit ?? 20);
        return {
 diff --git a/apps/server/src/orchestration-v2/CommandPolicy.test.ts b/apps/server/src/orchestration-v2/CommandPolicy.test.ts
-index 70f9a7e3f..528fe0477 100644
+index d3c9f38a49..5aeb72b776 100644
 --- a/apps/server/src/orchestration-v2/CommandPolicy.test.ts
 +++ b/apps/server/src/orchestration-v2/CommandPolicy.test.ts
-@@ -1,6 +1,7 @@
- import { assert, it } from "@effect/vitest";
- import {
-   CommandId,
-+  MessageId,
-   type OrchestrationV2ProviderCapabilities,
-   type OrchestrationV2ThreadProjection,
-   ProviderInstanceId,
-@@ -30,20 +31,33 @@ function capabilities(
- 
- function dispatchProjection(
-   sessionCapabilities?: OrchestrationV2ProviderCapabilities,
-+  activeMessageText?: string,
- ): OrchestrationV2ThreadProjection {
-   const providerThreadId = ProviderThreadId.make("command-policy-provider-thread");
-   const providerSessionId = ProviderSessionId.make("command-policy-provider-session");
-+  const activeMessageId = MessageId.make("command-policy-active-message");
-   return {
-     runs:
-       sessionCapabilities === undefined
-         ? []
--        : [{ id: activeRunId, status: "running", providerThreadId }],
-+        : [
-+            {
-+              id: activeRunId,
-+              status: "running",
-+              providerThreadId,
-+              ...(activeMessageText === undefined ? {} : { userMessageId: activeMessageId }),
-+            },
-+          ],
-     providerThreads:
-       sessionCapabilities === undefined ? [] : [{ id: providerThreadId, providerSessionId }],
-     providerSessions:
-       sessionCapabilities === undefined
-         ? []
-         : [{ id: providerSessionId, capabilities: sessionCapabilities }],
-+    messages:
-+      activeMessageText === undefined
-+        ? []
-+        : [{ id: activeMessageId, role: "user", text: activeMessageText, attachments: [] }],
-   } as unknown as OrchestrationV2ThreadProjection;
- }
- 
-@@ -64,6 +78,14 @@ it("resolves automatic message delivery from authoritative provider capabilities
-     ),
-     { type: "steer_active", targetRunId: activeRunId },
-   );
-+  assert.deepEqual(
-+    CommandPolicy.resolveMessageDispatchIntent(
-+      dispatchProjection(baseCapabilities, "/compact"),
-+      { type: "start_immediately" },
-+      "auto",
-+    ),
-+    { type: "queue_after_active" },
-+  );
-   assert.deepEqual(
-     CommandPolicy.resolveMessageDispatchIntent(
-       dispatchProjection(
-@@ -139,6 +161,27 @@ it("targets the latest active run for explicit steer and restart intent", () =>
+@@ -142,6 +142,19 @@ it("targets the latest active run for explicit steer and restart intent", () =>
      ),
      { type: "start_immediately" },
    );
-+  assert.deepEqual(
-+    CommandPolicy.resolveMessageDispatchIntent(
-+      dispatchProjection(baseCapabilities, "/compact"),
-+      { type: "start_immediately" },
-+      "steer",
-+    ),
-+    { type: "steer_active", targetRunId: activeRunId },
-+  );
-+  const idleCompaction = dispatchProjection(baseCapabilities, "/compact");
++  const idleCompaction = dispatchProjection(baseCapabilities);
 +  const idleRuns = idleCompaction.runs.map((run) => ({
 +    ...run,
 +    idleCompactionOfRunId: RunId.make("command-policy-previous-run"),
@@ -356,12 +290,12 @@ index 70f9a7e3f..528fe0477 100644
 +  );
  });
  
- const layer = it.layer(CommandPolicy.layer);
+ it.each(["/compact", " /LOGOUT "])("queues a steer sent while %s runs", (text) => {
 diff --git a/apps/server/src/orchestration-v2/CommandPolicy.ts b/apps/server/src/orchestration-v2/CommandPolicy.ts
-index 1098c72c3..b7d777263 100644
+index 751ce08f72..b93233e43e 100644
 --- a/apps/server/src/orchestration-v2/CommandPolicy.ts
 +++ b/apps/server/src/orchestration-v2/CommandPolicy.ts
-@@ -131,6 +131,9 @@ export function resolveMessageDispatchIntent(
+@@ -159,6 +159,9 @@ function resolveDeliveryIntent(
        run.status === "waiting",
    );
    if (activeRun === undefined) return { type: "start_immediately" };
@@ -371,25 +305,8 @@ index 1098c72c3..b7d777263 100644
    if (deliveryIntent === "steer") {
      return { type: "steer_active", targetRunId: activeRun.id };
    }
-@@ -140,6 +143,16 @@ export function resolveMessageDispatchIntent(
-   if (activeRun.status === "preparing" || activeRun.status === "starting") {
-     return { type: "queue_after_active" };
-   }
-+  const activeMessage = projection.messages.find(
-+    (message) => message.id === activeRun.userMessageId,
-+  );
-+  if (
-+    activeMessage !== undefined &&
-+    activeMessage.attachments.length === 0 &&
-+    ["/compact", "/logout"].includes(activeMessage.text.trim().toLowerCase())
-+  ) {
-+    return { type: "queue_after_active" };
-+  }
- 
-   const providerThread = projection.providerThreads.find(
-     (candidate) => candidate.id === activeRun.providerThreadId,
 diff --git a/apps/server/src/orchestration-v2/ContextHandoffService.ts b/apps/server/src/orchestration-v2/ContextHandoffService.ts
-index 137f61771..b4dc19c8d 100644
+index 137f617710..b4dc19c8df 100644
 --- a/apps/server/src/orchestration-v2/ContextHandoffService.ts
 +++ b/apps/server/src/orchestration-v2/ContextHandoffService.ts
 @@ -445,9 +445,14 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
@@ -409,7 +326,7 @@ index 137f61771..b4dc19c8d 100644
              ? []
 diff --git a/apps/server/src/orchestration-v2/IdleCompaction.ts b/apps/server/src/orchestration-v2/IdleCompaction.ts
 new file mode 100644
-index 000000000..8c7981f6f
+index 0000000000..8c7981f6f9
 --- /dev/null
 +++ b/apps/server/src/orchestration-v2/IdleCompaction.ts
 @@ -0,0 +1,153 @@
@@ -568,7 +485,7 @@ index 000000000..8c7981f6f
 +}
 diff --git a/apps/server/src/orchestration-v2/IdleCompactionService.test.ts b/apps/server/src/orchestration-v2/IdleCompactionService.test.ts
 new file mode 100644
-index 000000000..639f3270e
+index 0000000000..639f3270e2
 --- /dev/null
 +++ b/apps/server/src/orchestration-v2/IdleCompactionService.test.ts
 @@ -0,0 +1,602 @@
@@ -1176,7 +1093,7 @@ index 000000000..639f3270e
 +);
 diff --git a/apps/server/src/orchestration-v2/IdleCompactionService.ts b/apps/server/src/orchestration-v2/IdleCompactionService.ts
 new file mode 100644
-index 000000000..41255b423
+index 0000000000..41255b423d
 --- /dev/null
 +++ b/apps/server/src/orchestration-v2/IdleCompactionService.ts
 @@ -0,0 +1,146 @@
@@ -1327,7 +1244,7 @@ index 000000000..41255b423
 +  return { start, drain: worker.drain } satisfies IdleCompactionServiceV2["Service"];
 +});
 diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
-index 368409b0a..bbe2197c4 100644
+index 745e3f351f..7664c3b06c 100644
 --- a/apps/server/src/orchestration-v2/Orchestrator.ts
 +++ b/apps/server/src/orchestration-v2/Orchestrator.ts
 @@ -4,6 +4,7 @@ import type {
@@ -1346,7 +1263,7 @@ index 368409b0a..bbe2197c4 100644
    type ProviderSessionId,
    RunId,
    RuntimeMode,
-@@ -136,6 +138,7 @@ import {
+@@ -144,6 +146,7 @@ import {
  import { planThreadDeletion } from "./ThreadDeletion.ts";
  import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
  import * as ServerSettings from "../serverSettings.ts";
@@ -1354,7 +1271,7 @@ index 368409b0a..bbe2197c4 100644
  
  export class OrchestratorDispatchError extends Schema.TaggedError<OrchestratorDispatchError>()(
    "OrchestratorDispatchError",
-@@ -396,7 +399,9 @@ function wakeWorkStartedAt(
+@@ -404,7 +407,9 @@ function wakeWorkStartedAt(
      return {};
    }
    const previous = runs
@@ -1365,7 +1282,7 @@ index 368409b0a..bbe2197c4 100644
      .toSorted(
        (left, right) =>
          DateTime.Order(right.startedAt, left.startedAt) || right.run.ordinal - left.run.ordinal,
-@@ -529,7 +534,9 @@ function isBlockingRun(run: OrchestrationV2Run): boolean {
+@@ -526,7 +531,9 @@ function isBlockingRun(run: OrchestrationV2Run): boolean {
   */
  function hasLiveRun(projection: Pick<OrchestrationV2ThreadProjection, "runs">): boolean {
    return projection.runs.some(
@@ -1376,7 +1293,7 @@ index 368409b0a..bbe2197c4 100644
    );
  }
  
-@@ -607,7 +614,9 @@ function latestStableRun(
+@@ -604,7 +611,9 @@ function latestStableRun(
  ): OrchestrationV2Run | null {
    return (
      projection.runs
@@ -1387,7 +1304,7 @@ index 368409b0a..bbe2197c4 100644
        .toSorted((left, right) => right.ordinal - left.ordinal)[0] ?? null
    );
  }
-@@ -622,15 +631,19 @@ function runForSourcePoint(
+@@ -619,15 +628,19 @@ function runForSourcePoint(
    switch (sourcePoint.type) {
      case "latest_stable":
        return latestStableRun(projection);
@@ -1409,7 +1326,7 @@ index 368409b0a..bbe2197c4 100644
      }
    }
  }
-@@ -774,7 +787,10 @@ function rootProviderThreadsForProvider(
+@@ -771,7 +784,10 @@ function rootProviderThreadsForProvider(
  }
  
  function isHandoffSourceRun(run: OrchestrationV2Run): boolean {
@@ -1421,7 +1338,7 @@ index 368409b0a..bbe2197c4 100644
  }
  
  function lastDeliveredRunForProviderThread(
-@@ -1445,7 +1461,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -1442,7 +1458,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
              }),
          ),
        );
@@ -1432,7 +1349,7 @@ index 368409b0a..bbe2197c4 100644
        const latestHandoffRun = projection.runs.findLast(isHandoffSourceRun);
        const targetLastCompletedRun = lastDeliveredRunForProviderThread(
          projection,
-@@ -2653,11 +2671,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -2650,11 +2668,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
        const automaticQueuedRuns = projection.runs.filter(
          (run) => run.status === "queued" && automaticMessageIds.has(run.userMessageId),
        );
@@ -1451,7 +1368,7 @@ index 368409b0a..bbe2197c4 100644
        );
        const pendingRequests = projection.runtimeRequests.filter(
          (request) => request.status === "pending",
-@@ -2804,7 +2826,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -2801,7 +2823,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
            cause: `Thread ${command.threadId} has a pending approval or user-input request and cannot be snoozed.`,
          });
        }
@@ -1462,7 +1379,7 @@ index 368409b0a..bbe2197c4 100644
        const queuedMessages =
          queuedRuns.length === 0
            ? []
-@@ -2831,7 +2855,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -2828,7 +2852,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
      let markUnreadVisitedAt: DateTime.Utc | null = null;
      if (command.type === "thread.mark-unread") {
        const projection = yield* loadProjectionForCommand(command, ["runs"]);
@@ -1472,7 +1389,7 @@ index 368409b0a..bbe2197c4 100644
        if (latestRunCompletedAt === null) {
          return yield* new OrchestratorDispatchError({
            commandId: command.commandId,
-@@ -4533,6 +4558,41 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -4530,6 +4555,41 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
    ) =>
      Effect.gen(function* () {
        let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
@@ -1514,20 +1431,15 @@ index 368409b0a..bbe2197c4 100644
        if (command.manualContinuationOfRunId !== undefined) {
          const source = projection.runs.find((run) => run.id === command.manualContinuationOfRunId);
          const limited = latestRootProviderFailure(source ?? null, projection.turnItems);
-@@ -4606,7 +4666,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
-           projection.thread.deletedAt !== null ||
+@@ -4604,6 +4664,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
            projection.thread.providerInstanceId !== source.providerInstanceId ||
            projection.runs.some(
--            (run) => run.id !== source.id && run.status !== "queued" && runRanAfter(run, source),
-+            (run) =>
+             (run) =>
 +              isUserFacingRun(run) &&
-+              run.id !== source.id &&
-+              run.status !== "queued" &&
-+              runRanAfter(run, source),
-           ) ||
-           (yield* stopReachedRun(command, command.threadId, source.id))
-         ) {
-@@ -4629,7 +4693,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+               run.id !== source.id &&
+               run.status !== "queued" &&
+               !cancelledBeforeStart(run) &&
+@@ -4630,7 +4691,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
          (run) => run.id === command.restartContinuationOfRunId,
        )?.delegatedTaskId;
  
@@ -1539,7 +1451,7 @@ index 368409b0a..bbe2197c4 100644
          const now = yield* DateTime.now;
          const thread: OrchestrationV2AppThread = {
            ...projection.thread,
-@@ -4653,7 +4720,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -4654,7 +4718,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
          });
          projection = yield* getProjectionWithPendingEvents(command.threadId, events);
        }
@@ -1548,7 +1460,7 @@ index 368409b0a..bbe2197c4 100644
          const now = yield* DateTime.now;
          const thread: OrchestrationV2AppThread = {
            ...projection.thread,
-@@ -4800,7 +4867,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -4801,7 +4865,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
            (id) => projection.subagents.find((task) => task.id === id)?.completionWake === "always",
          )
        ) {
@@ -1559,7 +1471,7 @@ index 368409b0a..bbe2197c4 100644
          const providerThread = projection.providerThreads.find(
            (row) => row.id === active?.providerThreadId,
          );
-@@ -4940,7 +5009,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -4941,7 +5007,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
            return yield* new OrchestratorDispatchError({
              commandId: command.commandId,
              commandType: command.type,
@@ -1573,7 +1485,7 @@ index 368409b0a..bbe2197c4 100644
            });
          }
          const queueProviderThread =
-@@ -5252,7 +5326,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -5253,7 +5324,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
        }
        const ordinal = nextRunOrdinal(projection);
        const runId = idAllocator.derive.run({ threadId: command.threadId, ordinal });
@@ -1584,7 +1496,7 @@ index 368409b0a..bbe2197c4 100644
        const latestHandoffRun = projection.runs.findLast(isHandoffSourceRun);
        const legacyImportItems =
          projection.thread.historyOrigin === "v1_import"
-@@ -5401,6 +5477,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -5402,6 +5475,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
            completedAt: null,
            checkpointId: null,
            contextHandoffId: legacyImportHandoff?.id ?? null,
@@ -1594,7 +1506,7 @@ index 368409b0a..bbe2197c4 100644
            ...(command.sourcePlanRef === undefined ? {} : { sourcePlanRef: command.sourcePlanRef }),
            ...(command.restartContinuationOfRunId === undefined
              ? {}
-@@ -6017,7 +6096,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -6018,7 +6094,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
            : yield* readHandoffItems(
                mergeBackSourceProjection.thread.id,
                mergeBackSourceProjection.runs
@@ -1603,7 +1515,7 @@ index 368409b0a..bbe2197c4 100644
                  .map((run) => run.id),
              );
        const mergeBackHandoff =
-@@ -6102,6 +6181,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -6103,6 +6179,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
          ...(command.restartContinuationOfRunId === undefined
            ? {}
            : { restartContinuationOfRunId: command.restartContinuationOfRunId }),
@@ -1613,7 +1525,7 @@ index 368409b0a..bbe2197c4 100644
          ...(continuedTaskId === undefined ? {} : { delegatedTaskId: continuedTaskId }),
          ...wakeWorkStartedAt(projection.runs, command),
        };
-@@ -6882,8 +6964,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -6883,8 +6962,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
      );
      if (original === undefined || original.result === null) return;
      const owner =
@@ -1625,7 +1537,7 @@ index 368409b0a..bbe2197c4 100644
      if (owner === null || owner.rootNodeId === null) return;
      const now = message.createdAt;
      const adapter = yield* providerAdapters.get(run.providerInstanceId);
-@@ -7463,7 +7546,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -7464,7 +7544,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
          } = yield* projectionStore
            .getRunningTurnContext(command.threadId)
            .pipe(mapDispatchError(command));
@@ -1639,7 +1551,7 @@ index 368409b0a..bbe2197c4 100644
            const activeSession = yield* providerSessions
              .get(activeProviderThread.providerSessionId)
              .pipe(
-@@ -9140,7 +9228,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -9141,7 +9226,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
            ? undefined
            : projection.providerThreads.find((candidate) => candidate.id === run?.providerThreadId);
        const hasBackgroundWork =
@@ -1651,7 +1563,7 @@ index 368409b0a..bbe2197c4 100644
          derivePendingBackgroundWork({
            latestRun: run,
            providerThreads: projection.providerThreads,
-@@ -9495,11 +9586,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -9496,11 +9584,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
            ),
          );
        if (projection.thread.deletedAt !== null) return undefined;
@@ -1668,7 +1580,7 @@ index 368409b0a..bbe2197c4 100644
          ) ??
          (derivePendingBackgroundWork({
            latestRun,
-@@ -9577,6 +9671,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -9578,6 +9669,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
            cause: "No active provider thread exists for rollback.",
          });
        }
@@ -1691,7 +1603,7 @@ index 368409b0a..bbe2197c4 100644
          return yield* new OrchestratorDispatchError({
            commandId: command.commandId,
 diff --git a/apps/server/src/orchestration-v2/ProjectionSettlement.test.ts b/apps/server/src/orchestration-v2/ProjectionSettlement.test.ts
-index 0c31bcafc..a8dd70624 100644
+index 0c31bcafc9..a8dd706243 100644
 --- a/apps/server/src/orchestration-v2/ProjectionSettlement.test.ts
 +++ b/apps/server/src/orchestration-v2/ProjectionSettlement.test.ts
 @@ -23,7 +23,11 @@ import * as Statement from "effect/sql/Statement";
@@ -1764,10 +1676,10 @@ index 0c31bcafc..a8dd70624 100644
    ["sql", layerSql],
    ["memory", ProjectionStore.layerMemory],
 diff --git a/apps/server/src/orchestration-v2/ProjectionStore.test.ts b/apps/server/src/orchestration-v2/ProjectionStore.test.ts
-index 75c12c761..f1b536c64 100644
+index 6d605a963c..deb79acd14 100644
 --- a/apps/server/src/orchestration-v2/ProjectionStore.test.ts
 +++ b/apps/server/src/orchestration-v2/ProjectionStore.test.ts
-@@ -2992,6 +2992,57 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
+@@ -3177,6 +3177,57 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
            DateTime.toEpochMillis(now),
          );
        }
@@ -1825,7 +1737,7 @@ index 75c12c761..f1b536c64 100644
      }),
    );
  
-@@ -3278,6 +3329,14 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
+@@ -3463,6 +3514,14 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
        });
        yield* applyRun("failed");
        yield* assertSummary("Plan limit reached.", "usage_limit");
@@ -1840,7 +1752,7 @@ index 75c12c761..f1b536c64 100644
        const queuedRunId = RunId.make("run:limit-shell:queued");
        yield* store.apply({
          id: EventId.make("event:limit-shell:queued"),
-@@ -5563,6 +5622,24 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
+@@ -5748,6 +5807,24 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
          ],
        );
  
@@ -1866,7 +1778,7 @@ index 75c12c761..f1b536c64 100644
          DELETE FROM orchestration_v2_projection_turn_items
          WHERE run_id IN (${sourceRun1Id}, ${sourceRun2Id})
 diff --git a/apps/server/src/orchestration-v2/ProjectionStore.ts b/apps/server/src/orchestration-v2/ProjectionStore.ts
-index d551845b6..211947168 100644
+index a31dc773a5..7f50cb1e90 100644
 --- a/apps/server/src/orchestration-v2/ProjectionStore.ts
 +++ b/apps/server/src/orchestration-v2/ProjectionStore.ts
 @@ -1,5 +1,10 @@
@@ -1891,10 +1803,10 @@ index d551845b6..211947168 100644
    threadErrorSummary,
    usageLimitRunPresentedAsLatest,
  } from "@t3tools/shared/orchestrationV2ThreadError";
-@@ -34,6 +41,7 @@ import type {
+@@ -33,6 +40,7 @@ import type {
+   OrchestrationV2ThreadProjection,
    OrchestrationV2TurnItem,
    ProjectId,
-   ProviderInstanceId,
 +  ProviderDriverKind,
    ProviderSessionId,
    ProviderThreadId,
@@ -1932,7 +1844,7 @@ index d551845b6..211947168 100644
                  run.delegatedTaskId === task.id &&
                  ["completed", "interrupted", "failed", "cancelled", "rolled_back"].includes(
                    run.status,
-@@ -1329,8 +1349,16 @@ function visibleTurnItemsThroughRun(input: {
+@@ -1356,8 +1376,16 @@ function visibleTurnItemsThroughRun(input: {
        sourceItemId: row.sourceItemId,
        item: row.item,
      }));
@@ -1949,7 +1861,7 @@ index d551845b6..211947168 100644
        if (
          isOrchestrationV2SupersededInterrupt({
            item,
-@@ -1416,21 +1444,25 @@ export function threadShellFromProjection(
+@@ -1443,21 +1471,25 @@ export function threadShellFromProjection(
          (left, right) =>
            DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
        )[0] ?? null;
@@ -1983,7 +1895,7 @@ index d551845b6..211947168 100644
    const pendingRuntimeRequest =
      projection.runtimeRequests
        .filter((request) => request.status === "pending")
-@@ -1453,7 +1485,10 @@ export function threadShellFromProjection(
+@@ -1480,7 +1512,10 @@ export function threadShellFromProjection(
          )[0] ?? null,
      );
    const userMessages = projection.messages
@@ -1995,7 +1907,7 @@ index d551845b6..211947168 100644
      .toSorted(
        (left, right) =>
          DateTime.toEpochMillis(right.updatedAt) - DateTime.toEpochMillis(left.updatedAt),
-@@ -1510,10 +1545,7 @@ export function threadShellFromProjection(
+@@ -1537,10 +1572,7 @@ export function threadShellFromProjection(
      activityRunStartedAt:
        activityRun === null ? null : orchestrationV2RunWorkStartedAt(activityRun),
      status: latestRun?.status ?? "idle",
@@ -2007,7 +1919,7 @@ index d551845b6..211947168 100644
      pendingRuntimeRequest:
        pendingRuntimeRequest === null
          ? null
-@@ -1601,7 +1633,7 @@ function isActivityRunForShell(
+@@ -1628,7 +1660,7 @@ function isActivityRunForShell(
  ): run is OrchestrationV2ThreadProjection["runs"][number] & {
    readonly status: ShellActivityRunStatus;
  } {
@@ -2016,7 +1928,7 @@ index d551845b6..211947168 100644
  }
  
  type ShellThreadState = {
-@@ -3553,6 +3585,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -3580,6 +3612,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
              SELECT latest.run_id FROM orchestration_v2_projection_runs latest
              WHERE latest.thread_id = t.thread_id
                AND latest.status <> 'queued'
@@ -2024,7 +1936,7 @@ index d551845b6..211947168 100644
                AND NOT (
                  latest.status = 'cancelled'
                  AND json_extract(latest.payload_json, '$.startedAt') IS NULL
-@@ -3667,6 +3700,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -3694,6 +3727,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                      JOIN orchestration_v2_projection_subagents AS task
                        ON task.subagent_id = json_extract(requested.payload_json, '$.delegatedTaskId')
                      WHERE requested.thread_id = child.thread_id
@@ -2032,7 +1944,7 @@ index d551845b6..211947168 100644
                        AND requested.status IN ('completed', 'interrupted', 'failed', 'cancelled', 'rolled_back')
                        AND task.child_thread_id = child.thread_id
                        AND json_extract(task.payload_json, '$.origin') = 'app_owned'
-@@ -3675,6 +3709,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -3702,6 +3736,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                      -- The original task still waits for the latest unheld work.
                      (SELECT status FROM orchestration_v2_projection_runs
                       WHERE thread_id = child.thread_id
@@ -2040,7 +1952,7 @@ index d551845b6..211947168 100644
                         AND NOT (status = 'queued' AND json_extract(payload_json, '$.queueHeld') IS 1)
                       ORDER BY ordinal DESC LIMIT 1
                      ) IN ('completed', 'interrupted', 'failed', 'cancelled', 'rolled_back')
-@@ -4960,12 +4995,22 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -5001,12 +5036,22 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
          if (sourceRun !== undefined) {
            const ordinals = new Map(source.records.runs.map((run) => [run.id, run.ordinal]));
            const sourceItems = source.local.map((row) => row.item);
@@ -2063,7 +1975,7 @@ index d551845b6..211947168 100644
                  !isOrchestrationV2SupersededInterrupt({
                    item: row.item,
                    attempts: source.records.attempts,
-@@ -5254,6 +5299,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -5295,6 +5340,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                  FROM orchestration_v2_projection_runs r
                  WHERE r.thread_id = t.thread_id
                    AND r.status IN ('preparing', 'starting', 'running')
@@ -2071,7 +1983,7 @@ index d551845b6..211947168 100644
                  ORDER BY r.ordinal DESC, r.run_id DESC
                  LIMIT 1
                ) AS active_run_id,
-@@ -5262,6 +5308,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -5303,6 +5349,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                  FROM orchestration_v2_projection_runs r
                  WHERE r.thread_id = t.thread_id
                    AND r.status IN ('preparing', 'starting', 'running', 'waiting')
@@ -2079,7 +1991,7 @@ index d551845b6..211947168 100644
                  ORDER BY r.ordinal DESC, r.run_id DESC
                  LIMIT 1
                ) AS activity_run_status,
-@@ -5275,6 +5322,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -5316,6 +5363,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                  FROM orchestration_v2_projection_runs r
                  WHERE r.thread_id = t.thread_id
                    AND r.status IN ('preparing', 'starting', 'running', 'waiting')
@@ -2087,7 +1999,7 @@ index d551845b6..211947168 100644
                  ORDER BY r.ordinal DESC, r.run_id DESC
                  LIMIT 1
                ) AS activity_run_started_at,
-@@ -5286,6 +5334,19 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -5327,6 +5375,19 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                    ON session.provider_session_id = binding.provider_session_id
                  WHERE binding.thread_id = t.thread_id
                    AND session.provider_instance_id = t.provider_instance_id
@@ -2107,7 +2019,7 @@ index d551845b6..211947168 100644
                  ORDER BY session.updated_at DESC, session.provider_session_id DESC
                  LIMIT 1
                ) AS last_error,
-@@ -5331,6 +5392,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -5372,6 +5433,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                    INDEXED BY orchestration_v2_projection_turn_items_thread_run_idx
                  WHERE r.thread_id = t.thread_id
                    AND r.status IN ('preparing', 'starting', 'running', 'waiting')
@@ -2115,7 +2027,7 @@ index d551845b6..211947168 100644
                    AND secret.thread_id = t.thread_id AND secret.run_id = r.run_id
                    AND secret.type = 'secret_request' AND secret.status = 'waiting'
                  ORDER BY secret.updated_at DESC, secret.turn_item_id DESC
-@@ -5341,6 +5403,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -5382,6 +5444,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                  FROM orchestration_v2_projection_messages message
                  WHERE message.thread_id = t.thread_id
                    AND message.role = 'user'
@@ -2127,7 +2039,7 @@ index d551845b6..211947168 100644
                  ORDER BY message.updated_at DESC, message.message_id DESC
                  LIMIT 1
                ) AS latest_user_message_at,
-@@ -5386,6 +5453,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -5427,6 +5494,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                SELECT candidate.run_id
                FROM orchestration_v2_projection_runs candidate
                WHERE candidate.thread_id = t.thread_id
@@ -2135,7 +2047,7 @@ index d551845b6..211947168 100644
                  AND NOT (
                    candidate.status = 'queued'
                    AND json_extract(candidate.payload_json, '$.queueHeld') IS 1
-@@ -5397,6 +5465,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -5438,6 +5506,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                SELECT candidate.run_id
                FROM orchestration_v2_projection_runs candidate
                WHERE candidate.thread_id = t.thread_id
@@ -2143,7 +2055,7 @@ index d551845b6..211947168 100644
                  AND candidate.status <> 'queued'
                  AND NOT (
                    candidate.status = 'cancelled'
-@@ -5545,6 +5614,65 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -5599,6 +5668,65 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
          return { providerThreadsByThreadId, pendingTurnItemsByThreadId };
        });
  
@@ -2209,7 +2121,7 @@ index d551845b6..211947168 100644
      const getSettlementCandidates: ProjectionStoreV2Shape["getSettlementCandidates"] = (threadId) =>
        sql
          .withTransaction(
-@@ -5560,6 +5688,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -5614,6 +5742,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                  SELECT message.updated_at
                  FROM orchestration_v2_projection_messages message
                  WHERE message.thread_id = t.thread_id AND message.role = 'user'
@@ -2221,7 +2133,7 @@ index d551845b6..211947168 100644
                  ORDER BY message.updated_at DESC, message.message_id DESC
                  LIMIT 1
                ) AS latest_user_message_at,
-@@ -5575,6 +5708,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -5629,6 +5762,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
              LEFT JOIN orchestration_v2_projection_runs r ON r.run_id = (
                SELECT latest.run_id FROM orchestration_v2_projection_runs latest
                WHERE latest.thread_id = t.thread_id
@@ -2229,7 +2141,7 @@ index d551845b6..211947168 100644
                ORDER BY latest.ordinal DESC, latest.run_id DESC
                LIMIT 1
              )
-@@ -5586,6 +5720,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -5640,6 +5774,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                AND NOT EXISTS (
                  SELECT 1 FROM orchestration_v2_projection_runs active
                  WHERE active.thread_id = t.thread_id
@@ -2237,7 +2149,7 @@ index d551845b6..211947168 100644
                    AND active.status IN ('preparing', 'starting', 'running', 'waiting')
                )
                AND NOT EXISTS (
-@@ -6033,6 +6168,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -6087,6 +6222,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
        getThreadShell,
        getThread,
        getSettlementCandidates,
@@ -2245,7 +2157,7 @@ index d551845b6..211947168 100644
        getThreadsWithPullRequests,
        getThreadWorktreePaths,
        getThreadProjection,
-@@ -6155,6 +6291,18 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
+@@ -6210,6 +6346,18 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
            }
            return projection.thread;
          }),
@@ -2265,7 +2177,7 @@ index d551845b6..211947168 100644
          Effect.gen(function* () {
            const projections = (yield* Ref.get(replayState)).projections;
 diff --git a/apps/server/src/orchestration-v2/ProviderTurnControlService.test.ts b/apps/server/src/orchestration-v2/ProviderTurnControlService.test.ts
-index b60c42158..5cbb4a4c9 100644
+index b60c421585..5cbb4a4c97 100644
 --- a/apps/server/src/orchestration-v2/ProviderTurnControlService.test.ts
 +++ b/apps/server/src/orchestration-v2/ProviderTurnControlService.test.ts
 @@ -215,6 +215,7 @@ it.effect(
@@ -2277,7 +2189,7 @@ index b60c42158..5cbb4a4c9 100644
            getThreadWorktreePaths: () => Effect.die("unused getThreadWorktreePaths"),
            getThreadProjection: () => Effect.die("control effects must not load transcript"),
 diff --git a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
-index 36354f8c1..ead6f3905 100644
+index 36354f8c1f..ead6f3905b 100644
 --- a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
 +++ b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
 @@ -1,4 +1,5 @@
@@ -2295,7 +2207,7 @@ index 36354f8c1..ead6f3905 100644
            source.providerThreadId === providerThread.id &&
            (source.status === "failed" || source.status === "interrupted") &&
 diff --git a/apps/server/src/orchestration-v2/RestartContinuation.ts b/apps/server/src/orchestration-v2/RestartContinuation.ts
-index 152252233..c8d7d9533 100644
+index 3339133c9a..01bb112477 100644
 --- a/apps/server/src/orchestration-v2/RestartContinuation.ts
 +++ b/apps/server/src/orchestration-v2/RestartContinuation.ts
 @@ -1,4 +1,4 @@
@@ -2304,18 +2216,15 @@ index 152252233..c8d7d9533 100644
  import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
  import {
    CommandId,
-@@ -124,7 +124,9 @@ export function restartContinuationRun(
+@@ -128,6 +128,7 @@ export function restartContinuationRun(
  ): OrchestrationV2Run | undefined {
    const run = projection.runs.reduce<OrchestrationV2Run | undefined>(
      (latest, candidate) =>
--      candidate.status !== "queued" && (!latest || runRanAfter(candidate, latest))
 +      isUserFacingRun(candidate) &&
-+      candidate.status !== "queued" &&
-+      (!latest || runRanAfter(candidate, latest))
-         ? candidate
-         : latest,
-     undefined,
-@@ -200,6 +202,7 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
+       candidate.status !== "queued" &&
+       !neverStarted(candidate) &&
+       (!latest || runRanAfter(candidate, latest))
+@@ -206,6 +207,7 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
      const source = projection.runs.find((run) => run.id === input.sourceRunId);
      if (
        !source ||
@@ -2323,21 +2232,16 @@ index 152252233..c8d7d9533 100644
        !isRestartContinuationSource(source, projection.providerTurns) ||
        restartContinuationBlocked(
          projection,
-@@ -211,7 +214,11 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
-       return;
+@@ -218,6 +220,7 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
      if (
        projection.runs.some(
--        (run) => run.id !== source.id && run.status !== "queued" && runRanAfter(run, source),
-+        (run) =>
+         (run) =>
 +          isUserFacingRun(run) &&
-+          run.id !== source.id &&
-+          run.status !== "queued" &&
-+          runRanAfter(run, source),
-       )
-     )
-       return;
+           run.id !== source.id &&
+           run.status !== "queued" &&
+           !cancelledBeforeStart(run) &&
 diff --git a/apps/server/src/orchestration-v2/RunExecutionService.test.ts b/apps/server/src/orchestration-v2/RunExecutionService.test.ts
-index df76234e9..af8ef83e1 100644
+index df76234e96..af8ef83e14 100644
 --- a/apps/server/src/orchestration-v2/RunExecutionService.test.ts
 +++ b/apps/server/src/orchestration-v2/RunExecutionService.test.ts
 @@ -3976,6 +3976,76 @@ it.effect("keeps completed runs completed when pull request refresh fails", () =
@@ -2471,7 +2375,7 @@ index df76234e9..af8ef83e1 100644
          modelSelection: { instanceId: providerInstanceId, model: "gpt-5.4" },
          runtimePolicy: {
 diff --git a/apps/server/src/orchestration-v2/RunExecutionService.ts b/apps/server/src/orchestration-v2/RunExecutionService.ts
-index 0ff489445..82168ce3d 100644
+index 0ff4894457..82168ce3d9 100644
 --- a/apps/server/src/orchestration-v2/RunExecutionService.ts
 +++ b/apps/server/src/orchestration-v2/RunExecutionService.ts
 @@ -587,6 +587,7 @@ export const layer: Layer.Layer<
@@ -2581,7 +2485,7 @@ index 0ff489445..82168ce3d 100644
                      isRootProviderThreadUpdate &&
                      rootTerminalAlreadySeen &&
 diff --git a/apps/server/src/orchestration-v2/SubagentProjection.test.ts b/apps/server/src/orchestration-v2/SubagentProjection.test.ts
-index 65f3b917f..86fa4c179 100644
+index 65f3b917fc..86fa4c179c 100644
 --- a/apps/server/src/orchestration-v2/SubagentProjection.test.ts
 +++ b/apps/server/src/orchestration-v2/SubagentProjection.test.ts
 @@ -190,6 +190,28 @@ it("reports the run that ended last, not the highest ordinal", () => {
@@ -2614,7 +2518,7 @@ index 65f3b917f..86fa4c179 100644
    const { projection, run } = taskFixture();
    assert.equal(
 diff --git a/apps/server/src/orchestration-v2/ThreadManagementService.test.ts b/apps/server/src/orchestration-v2/ThreadManagementService.test.ts
-index b46129e3c..2f48bb546 100644
+index b46129e3c9..2f48bb5462 100644
 --- a/apps/server/src/orchestration-v2/ThreadManagementService.test.ts
 +++ b/apps/server/src/orchestration-v2/ThreadManagementService.test.ts
 @@ -5,6 +5,7 @@ import {
@@ -2697,7 +2601,7 @@ index b46129e3c..2f48bb546 100644
    const sourceThreadId = ThreadId.make("thread:thread-management:source");
    const targetThreadId = ThreadId.make("thread:thread-management:target");
 diff --git a/apps/server/src/orchestration-v2/ThreadManagementService.ts b/apps/server/src/orchestration-v2/ThreadManagementService.ts
-index dda7c4bd0..a8f68b42c 100644
+index dda7c4bd0e..a8f68b42cc 100644
 --- a/apps/server/src/orchestration-v2/ThreadManagementService.ts
 +++ b/apps/server/src/orchestration-v2/ThreadManagementService.ts
 @@ -2,6 +2,7 @@ import type {
@@ -2759,7 +2663,7 @@ index dda7c4bd0..a8f68b42c 100644
          return yield* new ThreadManagementRunNotFoundError({
            threadId: input.threadId,
 diff --git a/apps/server/src/orchestration-v2/ThreadSearch.ts b/apps/server/src/orchestration-v2/ThreadSearch.ts
-index 0862c5160..e3bf7e298 100644
+index 0862c5160d..e3bf7e2983 100644
 --- a/apps/server/src/orchestration-v2/ThreadSearch.ts
 +++ b/apps/server/src/orchestration-v2/ThreadSearch.ts
 @@ -96,6 +96,12 @@ export const make = Effect.gen(function* () {
@@ -2776,7 +2680,7 @@ index 0862c5160..e3bf7e298 100644
        ranked AS (
          SELECT
 diff --git a/apps/server/src/orchestration-v2/ThreadTitleRegenerationService.ts b/apps/server/src/orchestration-v2/ThreadTitleRegenerationService.ts
-index bf242696c..9df3b5889 100644
+index bf242696c5..9df3b5889c 100644
 --- a/apps/server/src/orchestration-v2/ThreadTitleRegenerationService.ts
 +++ b/apps/server/src/orchestration-v2/ThreadTitleRegenerationService.ts
 @@ -1,3 +1,4 @@
@@ -2811,10 +2715,10 @@ index bf242696c..9df3b5889 100644
        }
        if (context.message.length === 0 && context.attachments.length === 0) {
 diff --git a/apps/server/src/orchestration-v2/runtimeLayer.test.ts b/apps/server/src/orchestration-v2/runtimeLayer.test.ts
-index e9d0b7517..4218dfce8 100644
+index b7e9142cef..a1d856227f 100644
 --- a/apps/server/src/orchestration-v2/runtimeLayer.test.ts
 +++ b/apps/server/src/orchestration-v2/runtimeLayer.test.ts
-@@ -3974,13 +3974,20 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
+@@ -3990,13 +3990,20 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
      }),
    );
  
@@ -2839,7 +2743,7 @@ index e9d0b7517..4218dfce8 100644
  
          yield* orchestrator.dispatch({
            type: "thread.create",
-@@ -4081,15 +4088,28 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
+@@ -4097,15 +4104,28 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
                nodeId: activeRun.rootNodeId,
                providerInstanceId: activeRun.providerInstanceId,
                occurredAt: now,
@@ -2870,7 +2774,7 @@ index e9d0b7517..4218dfce8 100644
              type: "queue.resume",
              commandId: CommandId.make(`${threadId}:resume`),
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.test.ts b/apps/server/src/relay/AgentAwarenessRelay.test.ts
-index 055f9d52f..95ca6e86e 100644
+index 055f9d52f7..95ca6e86eb 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.test.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.test.ts
 @@ -6,6 +6,7 @@ import {
@@ -2995,7 +2899,7 @@ index 055f9d52f..95ca6e86e 100644
      Effect.gen(function* () {
        const direct: Array<boolean | undefined> = [];
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.ts b/apps/server/src/relay/AgentAwarenessRelay.ts
-index d79231fdb..dc56717e8 100644
+index d79231fdb8..dc56717e8f 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.ts
 @@ -533,6 +533,23 @@ export const make = Effect.gen(function* () {
@@ -3023,7 +2927,7 @@ index d79231fdb..dc56717e8 100644
        threadShell?.lineage.relationshipToParent === "subagent" &&
        !(yield* Ref.get(publishedStateByThreadRef)).has(threadId)
 diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
-index 638abcb3e..db9c27285 100644
+index 638abcb3eb..db9c272854 100644
 --- a/apps/server/src/server.ts
 +++ b/apps/server/src/server.ts
 @@ -171,6 +171,7 @@ import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
@@ -3054,10 +2958,10 @@ index 638abcb3e..db9c27285 100644
    DatabaseStorage.layer.pipe(
      Layer.provide(ProjectionMaintenance.layer),
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index f84371349..3fc00dad8 100644
+index 865227cafa..ab322c275c 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -28,6 +28,7 @@ import { useStableCallback } from "../hooks/useStableCallback";
+@@ -32,6 +32,7 @@ import { usePendingThreadRequests } from "./chat/usePendingThreadRequests";
  import { isScratchProject } from "@t3tools/client-runtime/state/projects";
  import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
  import {
@@ -3065,7 +2969,7 @@ index f84371349..3fc00dad8 100644
    latestExecutedRun,
    latestRootProviderFailure,
  } from "@t3tools/shared/orchestrationV2ThreadError";
-@@ -2192,8 +2193,9 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1481,8 +1482,9 @@ export default function ChatView(props: ChatViewProps) {
    const activeRuntime = isServerThread ? serverRuntime : (activeThread?.runtime ?? null);
    const hasHeldQueuedRuns =
      isServerThread &&
@@ -3074,10 +2978,10 @@ index f84371349..3fc00dad8 100644
 +    serverProjection?.runs.some(
 +      (run) => isUserFacingRun(run) && run.status === "queued" && run.queueHeld === true,
 +    ) === true;
-   const resumableRunId = useMemo(() => {
+   const resumableRunId = (() => {
      if (!isServerThread || serverProjection === null) return null;
      const run = latestExecutedRun(serverProjection.runs);
-@@ -3559,7 +3561,12 @@ export default function ChatView(props: ChatViewProps) {
+@@ -2581,7 +2583,12 @@ export default function ChatView(props: ChatViewProps) {
      activeThread,
      activeLatestRun,
      latestUserMessageId:
@@ -3091,7 +2995,7 @@ index f84371349..3fc00dad8 100644
      phase,
      activePendingApproval: activePendingApproval?.requestId ?? null,
      activePendingUserInput: activePendingUserInput?.requestId ?? null,
-@@ -4560,7 +4567,10 @@ export default function ChatView(props: ChatViewProps) {
+@@ -3450,7 +3457,10 @@ export default function ChatView(props: ChatViewProps) {
        return;
      const result = await interruptThreadTurn({
        environmentId,
@@ -3104,7 +3008,7 @@ index f84371349..3fc00dad8 100644
      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
        const error = squashAtomCommandFailure(result);
 diff --git a/apps/web/src/components/chat/V2LifecycleRow.tsx b/apps/web/src/components/chat/V2LifecycleRow.tsx
-index 015017527..e9a4cc1a4 100644
+index 015017527c..e9a4cc1a46 100644
 --- a/apps/web/src/components/chat/V2LifecycleRow.tsx
 +++ b/apps/web/src/components/chat/V2LifecycleRow.tsx
 @@ -118,7 +118,9 @@ export function V2LifecycleRow(props: {
@@ -3119,10 +3023,10 @@ index 015017527..e9a4cc1a4 100644
        <TimelineSystemDivider label={label} detail={item.summary ?? tokenDetail} icon={MinusIcon} />
      );
 diff --git a/apps/web/src/components/settings/SettingsPanels.tsx b/apps/web/src/components/settings/SettingsPanels.tsx
-index dff3629ec..5475932fc 100644
+index 897c902806..dddc8783d1 100644
 --- a/apps/web/src/components/settings/SettingsPanels.tsx
 +++ b/apps/web/src/components/settings/SettingsPanels.tsx
-@@ -2388,6 +2388,35 @@ export function GeneralSettingsPanel() {
+@@ -2302,6 +2302,35 @@ export function GeneralSettingsPanel() {
            }
          />
  
@@ -3159,7 +3063,7 @@ index dff3629ec..5475932fc 100644
            <>
              <SettingsRow
 diff --git a/apps/web/src/components/settings/settingsSearch.ts b/apps/web/src/components/settings/settingsSearch.ts
-index c5458e54c..1a75f2b9c 100644
+index ed6f8cdd50..c1037ae2b6 100644
 --- a/apps/web/src/components/settings/settingsSearch.ts
 +++ b/apps/web/src/components/settings/settingsSearch.ts
 @@ -330,6 +330,13 @@ export const SETTINGS_SEARCH_ITEMS = [
@@ -3177,7 +3081,7 @@ index c5458e54c..1a75f2b9c 100644
      id: "auto-settle-merged-threads",
      title: "Auto-settle merged threads",
 diff --git a/docs/user/composer.md b/docs/user/composer.md
-index d27aa04de..d411c5c4c 100644
+index d27aa04dee..d411c5c4c7 100644
 --- a/docs/user/composer.md
 +++ b/docs/user/composer.md
 @@ -236,6 +236,12 @@ Provider commands must start the message to run. T3 Code commands such as
@@ -3194,7 +3098,7 @@ index d27aa04de..d411c5c4c 100644
  
  With Codex and Claude, send `/goal` followed by what "done" means, for example
 diff --git a/packages/client-runtime/src/handoff.ts b/packages/client-runtime/src/handoff.ts
-index 1ac4db202..298ed03f1 100644
+index 1ac4db202b..298ed03f1a 100644
 --- a/packages/client-runtime/src/handoff.ts
 +++ b/packages/client-runtime/src/handoff.ts
 @@ -6,6 +6,7 @@ import type {
@@ -3215,7 +3119,7 @@ index 1ac4db202..298ed03f1 100644
    if (from === undefined || selection == null) return null;
    const source = providers.find((provider) => provider.instanceId === from.instanceId);
 diff --git a/packages/client-runtime/src/operations/commands.test.ts b/packages/client-runtime/src/operations/commands.test.ts
-index a02554bb0..7fb893545 100644
+index a02554bb0f..7fb8935459 100644
 --- a/packages/client-runtime/src/operations/commands.test.ts
 +++ b/packages/client-runtime/src/operations/commands.test.ts
 @@ -503,6 +503,53 @@ describe("V2 environment commands", () => {
@@ -3273,7 +3177,7 @@ index a02554bb0..7fb893545 100644
      Effect.gen(function* () {
        const link = {
 diff --git a/packages/client-runtime/src/operations/commands.ts b/packages/client-runtime/src/operations/commands.ts
-index b16a2f5b4..c206eb252 100644
+index b16a2f5b48..c206eb252a 100644
 --- a/packages/client-runtime/src/operations/commands.ts
 +++ b/packages/client-runtime/src/operations/commands.ts
 @@ -29,6 +29,7 @@ import {
@@ -3339,7 +3243,7 @@ index b16a2f5b4..c206eb252 100644
      if (checkpoint === undefined || checkpoint.status !== "ready") {
        const target =
 diff --git a/packages/client-runtime/src/state/threadCheckpoints.ts b/packages/client-runtime/src/state/threadCheckpoints.ts
-index 476a4d8b1..2c3875ba8 100644
+index 476a4d8b16..2c3875ba8a 100644
 --- a/packages/client-runtime/src/state/threadCheckpoints.ts
 +++ b/packages/client-runtime/src/state/threadCheckpoints.ts
 @@ -6,6 +6,7 @@ import type {
@@ -3365,7 +3269,7 @@ index 476a4d8b1..2c3875ba8 100644
        projection.messages.findLast(
          (message) => message.runId === checkpoint.runId && message.role === "assistant",
 diff --git a/packages/client-runtime/src/state/threadExecution.test.ts b/packages/client-runtime/src/state/threadExecution.test.ts
-index 2d61f6d95..bbc0c9775 100644
+index 2d61f6d95f..bbc0c97754 100644
 --- a/packages/client-runtime/src/state/threadExecution.test.ts
 +++ b/packages/client-runtime/src/state/threadExecution.test.ts
 @@ -191,6 +191,27 @@ describe("thread execution presentation", () => {
@@ -3397,7 +3301,7 @@ index 2d61f6d95..bbc0c9775 100644
      const interrupted = { ...run("run-interrupted", 1, "interrupted"), completedAt: now };
      const held = { ...run("run-held", 2, "queued"), queueHeld: true };
 diff --git a/packages/client-runtime/src/state/threadExecution.ts b/packages/client-runtime/src/state/threadExecution.ts
-index 75ae3404e..738a50d69 100644
+index 75ae3404e4..738a50d69a 100644
 --- a/packages/client-runtime/src/state/threadExecution.ts
 +++ b/packages/client-runtime/src/state/threadExecution.ts
 @@ -1,6 +1,8 @@
@@ -3449,7 +3353,7 @@ index 75ae3404e..738a50d69 100644
      updatedAt: DateTime.formatIso(projection.updatedAt),
    };
 diff --git a/packages/client-runtime/src/state/threadWorkflows.test.ts b/packages/client-runtime/src/state/threadWorkflows.test.ts
-index 23722260b..12d60a147 100644
+index 23722260b8..12d60a147e 100644
 --- a/packages/client-runtime/src/state/threadWorkflows.test.ts
 +++ b/packages/client-runtime/src/state/threadWorkflows.test.ts
 @@ -5,6 +5,7 @@ import {
@@ -3485,7 +3389,7 @@ index 23722260b..12d60a147 100644
      "does not merge older history while a newer run is %s",
      (status) => {
 diff --git a/packages/client-runtime/src/state/threadWorkflows.ts b/packages/client-runtime/src/state/threadWorkflows.ts
-index 69e691840..edfaa268e 100644
+index 69e691840b..edfaa268ed 100644
 --- a/packages/client-runtime/src/state/threadWorkflows.ts
 +++ b/packages/client-runtime/src/state/threadWorkflows.ts
 @@ -5,6 +5,7 @@ import type {
@@ -3552,7 +3456,7 @@ index 69e691840..edfaa268e 100644
      canPromoteToSteer:
        hasSteerableProviderTurn &&
 diff --git a/packages/client-runtime/src/work-log/presentation.ts b/packages/client-runtime/src/work-log/presentation.ts
-index 727f1b4cc..faef4cb65 100644
+index 727f1b4ccd..faef4cb65c 100644
 --- a/packages/client-runtime/src/work-log/presentation.ts
 +++ b/packages/client-runtime/src/work-log/presentation.ts
 @@ -51,14 +51,19 @@ export function toolItemForDisplay(item: OrchestrationV2TurnItem): Orchestration
@@ -3580,7 +3484,7 @@ index 727f1b4cc..faef4cb65 100644
  
  export interface WorkLogPresentationEntry {
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
-index 580d096ec..c552f2e49 100644
+index 3e68e80fc1..4c270a4948 100644
 --- a/packages/contracts/src/orchestrationV2.ts
 +++ b/packages/contracts/src/orchestrationV2.ts
 @@ -554,6 +554,8 @@ export const OrchestrationV2Run = Schema.Struct({
@@ -3592,7 +3496,7 @@ index 580d096ec..c552f2e49 100644
    delegatedTaskId: Schema.optional(NodeId),
    workStartedAt: Schema.optional(Schema.DateTimeUtc),
    restartCancelledBackgroundWork: Schema.optional(
-@@ -1474,6 +1476,7 @@ export const OrchestrationV2TurnItem = Schema.Union([
+@@ -1479,6 +1481,7 @@ export const OrchestrationV2TurnItem = Schema.Union([
    Schema.Struct({
      ...OrchestrationV2TurnItemBaseFields,
      type: Schema.Literal("compaction"),
@@ -3600,7 +3504,7 @@ index 580d096ec..c552f2e49 100644
      driver: Schema.NullOr(ProviderDriverKind),
      summary: Schema.optional(Schema.String),
      beforeTokenCount: Schema.optional(NonNegativeInt),
-@@ -2233,6 +2236,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
+@@ -2238,6 +2241,7 @@ export const OrchestrationV2TurnItemJson = Schema.Union([
    Schema.Struct({
      ...OrchestrationV2TurnItemJsonBaseFields,
      type: Schema.Literal("compaction"),
@@ -3608,7 +3512,7 @@ index 580d096ec..c552f2e49 100644
      driver: Schema.NullOr(ProviderDriverKind),
      summary: Schema.optional(Schema.String),
      beforeTokenCount: Schema.optional(NonNegativeInt),
-@@ -2806,6 +2810,8 @@ export const OrchestrationV2Command = Schema.Union([
+@@ -2811,6 +2815,8 @@ export const OrchestrationV2Command = Schema.Union([
      restartContinuationOfRunId: Schema.optional(RunId),
      usageLimitContinuationOfRunId: Schema.optional(RunId),
      manualContinuationOfRunId: Schema.optional(RunId),
@@ -3618,7 +3522,7 @@ index 580d096ec..c552f2e49 100644
      deliveryIntent: Schema.optional(Schema.Literals(["auto", "steer", "restart"])),
      delegatedCompletion: Schema.optional(
 diff --git a/packages/contracts/src/settings.ts b/packages/contracts/src/settings.ts
-index 1b7b4099e..9ec03a3bd 100644
+index 1b7b4099e8..9ec03a3bd5 100644
 --- a/packages/contracts/src/settings.ts
 +++ b/packages/contracts/src/settings.ts
 @@ -1103,6 +1103,7 @@ export const ServerSettings = Schema.Struct({
@@ -3638,7 +3542,7 @@ index 1b7b4099e..9ec03a3bd 100644
    sidebarAutoSettleOnMerge: Schema.optionalKey(Schema.Boolean),
    autoResumeLimitedThreads: Schema.optionalKey(Schema.Boolean),
 diff --git a/packages/provider-core/src/server/subagentProjection.ts b/packages/provider-core/src/server/subagentProjection.ts
-index 4ae439725..29c4c3f32 100644
+index 4ae4397251..29c4c3f320 100644
 --- a/packages/provider-core/src/server/subagentProjection.ts
 +++ b/packages/provider-core/src/server/subagentProjection.ts
 @@ -18,7 +18,7 @@ import type {
@@ -3660,7 +3564,7 @@ index 4ae439725..29c4c3f32 100644
    const active = workRuns.some(
      (run) => !terminal(run.status) && !(run.status === "queued" && run.queueHeld === true),
 diff --git a/packages/provider-muse/src/server/adapter.ts b/packages/provider-muse/src/server/adapter.ts
-index bad108c6c..34f4c4540 100644
+index bad108c6c3..34f4c45404 100644
 --- a/packages/provider-muse/src/server/adapter.ts
 +++ b/packages/provider-muse/src/server/adapter.ts
 @@ -1882,6 +1882,7 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
@@ -3694,7 +3598,7 @@ index bad108c6c..34f4c4540 100644
            if (compact) {
              const result = yield* request("session/compact", {}, true, nativeId).pipe(
 diff --git a/packages/provider-opencode/src/server/v2/adapter.ts b/packages/provider-opencode/src/server/v2/adapter.ts
-index a1ed0275f..deaa6ce7b 100644
+index a1ed0275f8..deaa6ce7bb 100644
 --- a/packages/provider-opencode/src/server/v2/adapter.ts
 +++ b/packages/provider-opencode/src/server/v2/adapter.ts
 @@ -3500,6 +3500,23 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
@@ -3722,7 +3626,7 @@ index a1ed0275f..deaa6ce7b 100644
                  yield* client.session.switchModel({ sessionID: Session.ID.make(sessionId), model });
                  state.model = model;
 diff --git a/packages/provider-pi/src/server/adapter.ts b/packages/provider-pi/src/server/adapter.ts
-index 25c398424..b5aa75bb6 100644
+index 25c3984246..b5aa75bb65 100644
 --- a/packages/provider-pi/src/server/adapter.ts
 +++ b/packages/provider-pi/src/server/adapter.ts
 @@ -2522,6 +2522,13 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
@@ -3740,10 +3644,10 @@ index 25c398424..b5aa75bb6 100644
                state.providerThread = turnInput.providerThread;
                state.activeTurn = activeTurn;
 diff --git a/packages/shared/src/orchestrationV2PendingBackgroundWork.test.ts b/packages/shared/src/orchestrationV2PendingBackgroundWork.test.ts
-index 1031eb0a4..7ffa3afb1 100644
+index db701d3f4d..119d53d195 100644
 --- a/packages/shared/src/orchestrationV2PendingBackgroundWork.test.ts
 +++ b/packages/shared/src/orchestrationV2PendingBackgroundWork.test.ts
-@@ -443,6 +443,30 @@ describe("derivePendingBackgroundWork", () => {
+@@ -491,6 +491,30 @@ describe("derivePendingBackgroundWork", () => {
      expect(tasks).toEqual([]);
    });
  
@@ -3775,7 +3679,7 @@ index 1031eb0a4..7ffa3afb1 100644
      const tasks = derivePendingBackgroundWork({
        latestRun: { id: "run-1" as never, ordinal: 1, status: "completed" },
 diff --git a/packages/shared/src/orchestrationV2PendingBackgroundWork.ts b/packages/shared/src/orchestrationV2PendingBackgroundWork.ts
-index 95a5c1897..356903e46 100644
+index 15453ae018..392f1d1335 100644
 --- a/packages/shared/src/orchestrationV2PendingBackgroundWork.ts
 +++ b/packages/shared/src/orchestrationV2PendingBackgroundWork.ts
 @@ -8,6 +8,7 @@ import type {
@@ -3798,7 +3702,7 @@ index 95a5c1897..356903e46 100644
  
  type PendingBackgroundWorkPullRequest = Pick<
    ThreadPullRequestLink,
-@@ -195,7 +199,9 @@ export function derivePendingBackgroundWork(input: {
+@@ -200,7 +204,9 @@ export function derivePendingBackgroundWork(input: {
    const hasActiveRun =
      input.hasActiveRun ??
      input.runs?.some(
@@ -3810,7 +3714,7 @@ index 95a5c1897..356903e46 100644
      false;
    if (hasActiveRun) {
 diff --git a/packages/shared/src/orchestrationV2ThreadError.ts b/packages/shared/src/orchestrationV2ThreadError.ts
-index c1e92cc13..60fc420f2 100644
+index c1e92cc133..60fc420f27 100644
 --- a/packages/shared/src/orchestrationV2ThreadError.ts
 +++ b/packages/shared/src/orchestrationV2ThreadError.ts
 @@ -5,6 +5,31 @@ import type {
@@ -3867,7 +3771,7 @@ index c1e92cc13..60fc420f2 100644
    }
    return latest;
 diff --git a/packages/shared/src/orchestrationV2Timeline.ts b/packages/shared/src/orchestrationV2Timeline.ts
-index d160b318a..3aaf99712 100644
+index d160b318a3..3aaf997126 100644
 --- a/packages/shared/src/orchestrationV2Timeline.ts
 +++ b/packages/shared/src/orchestrationV2Timeline.ts
 @@ -5,7 +5,7 @@ import type {
