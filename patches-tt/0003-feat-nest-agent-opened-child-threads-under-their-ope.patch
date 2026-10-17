@@ -23,7 +23,7 @@ guide line, context-menu collapse and a summary stub.
  .../src/orchestration-v2/runtimeLayer.test.ts |  20 +
  .../src/components/Sidebar.families.test.ts   | 575 ++++++++++++++++++
  apps/web/src/components/Sidebar.families.ts   | 453 ++++++++++++++
- apps/web/src/components/Sidebar.tsx           | 574 ++++++++++++++---
+ apps/web/src/components/Sidebar.tsx           | 528 ++++++++++++++--
  .../components/threadActionMenu.logic.test.ts |  11 +
  .../src/components/threadActionMenu.logic.ts  |  13 +
  apps/web/src/contextMenuFallback.ts           |   7 +
@@ -32,15 +32,15 @@ guide line, context-menu collapse and a summary stub.
  .../src/state/threadCommands.ts               |  14 +-
  .../src/state/threadShell.test.ts             |  37 ++
  packages/contracts/src/orchestrationV2.ts     |  25 +
- 23 files changed, 1932 insertions(+), 92 deletions(-)
+ 23 files changed, 1908 insertions(+), 70 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.families.test.ts
  create mode 100644 apps/web/src/components/Sidebar.families.ts
 
 diff --git a/apps/server/src/mcp/OrchestratorMcpService.ts b/apps/server/src/mcp/OrchestratorMcpService.ts
-index 9378251eb..be40e588e 100644
+index 71ab210715..86c07ee03c 100644
 --- a/apps/server/src/mcp/OrchestratorMcpService.ts
 +++ b/apps/server/src/mcp/OrchestratorMcpService.ts
-@@ -2277,6 +2277,7 @@ const make = Effect.gen(function* () {
+@@ -2314,6 +2314,7 @@ const make = Effect.gen(function* () {
                    interactionMode,
                    branch: parent.thread.branch,
                    worktreePath: parent.thread.worktreePath,
@@ -49,7 +49,7 @@ index 9378251eb..be40e588e 100644
                  .pipe(
                    Effect.mapError((error) =>
 diff --git a/apps/server/src/mcp/toolkits/project/handlers.test.ts b/apps/server/src/mcp/toolkits/project/handlers.test.ts
-index 29a830535..5a8328e8c 100644
+index 29a8305358..5a8328e8c7 100644
 --- a/apps/server/src/mcp/toolkits/project/handlers.test.ts
 +++ b/apps/server/src/mcp/toolkits/project/handlers.test.ts
 @@ -29,7 +29,7 @@ import * as McpToolAccess from "../../McpToolAccess.ts";
@@ -94,7 +94,7 @@ index 29a830535..5a8328e8c 100644
      const escalated = yield* handle({ title: "Fix", projectId, runtimeMode: "full-access" });
      expect(escalated.at(-1)?.result).toMatchObject({ code: "runtime_mode_escalation_denied" });
 diff --git a/apps/server/src/mcp/toolkits/project/handlers.ts b/apps/server/src/mcp/toolkits/project/handlers.ts
-index ca47192c9..1d5c14f12 100644
+index ca47192c98..1d5c14f128 100644
 --- a/apps/server/src/mcp/toolkits/project/handlers.ts
 +++ b/apps/server/src/mcp/toolkits/project/handlers.ts
 @@ -152,6 +152,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
@@ -106,10 +106,10 @@ index ca47192c9..1d5c14f12 100644
            creationSource: "mcp",
          }).pipe(
 diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
-index 584433ea3..368409b0a 100644
+index 602352dd11..745e3f351f 100644
 --- a/apps/server/src/orchestration-v2/Orchestrator.ts
 +++ b/apps/server/src/orchestration-v2/Orchestrator.ts
-@@ -2232,6 +2232,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -2229,6 +2229,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
          relationshipToParent: null,
          rootThreadId: command.threadId,
        },
@@ -119,7 +119,7 @@ index 584433ea3..368409b0a 100644
        forkedFrom: null,
        createdAt: now,
        updatedAt: now,
-@@ -2854,8 +2857,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -2851,8 +2854,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
            const wasPinned = thread.pinnedAt != null;
            const alreadySettled =
              thread.settledOverride === "settled" && thread.settledAt !== null && !wasPinned;
@@ -133,7 +133,7 @@ index 584433ea3..368409b0a 100644
              settledOverride: "settled",
              settledAt: alreadySettled ? thread.settledAt : (command.settledAt ?? now),
              pullRequests: thread.pullRequests?.map((link) => withPullRequestWatch(link, undefined)),
-@@ -10703,6 +10710,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -10704,6 +10711,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
              type: "thread.settle",
              commandId: command.commandId,
              threadId: command.threadId,
@@ -142,10 +142,10 @@ index 584433ea3..368409b0a 100644
            },
            events,
 diff --git a/apps/server/src/orchestration-v2/ProjectionStore.ts b/apps/server/src/orchestration-v2/ProjectionStore.ts
-index 7f3e224ad..d551845b6 100644
+index 74913f1180..a31dc773a5 100644
 --- a/apps/server/src/orchestration-v2/ProjectionStore.ts
 +++ b/apps/server/src/orchestration-v2/ProjectionStore.ts
-@@ -1490,6 +1490,12 @@ export function threadShellFromProjection(
+@@ -1517,6 +1517,12 @@ export function threadShellFromProjection(
        ? {}
        : { activeOrderKey: projection.thread.activeOrderKey }),
      lineage: projection.thread.lineage,
@@ -158,7 +158,7 @@ index 7f3e224ad..d551845b6 100644
      forkedFrom: projection.thread.forkedFrom,
      activeProviderThreadId: projection.thread.activeProviderThreadId,
      ...(projection.thread.historyOrigin === undefined
-@@ -1544,6 +1550,7 @@ export function threadShellFromProjection(
+@@ -1571,6 +1577,7 @@ export function threadShellFromProjection(
      unsettledAt: projection.thread.unsettledAt ?? null,
      snoozedUntil: projection.thread.snoozedUntil ?? null,
      snoozedAt: projection.thread.snoozedAt ?? null,
@@ -166,7 +166,7 @@ index 7f3e224ad..d551845b6 100644
      pinnedAt: projection.thread.pinnedAt ?? null,
  
      autoSettleDisabledAt: projection.thread.autoSettleDisabledAt ?? null,
-@@ -1747,6 +1754,12 @@ function shellFromState(input: {
+@@ -1774,6 +1781,12 @@ function shellFromState(input: {
        ? {}
        : { activeOrderKey: input.state.thread.activeOrderKey }),
      lineage: input.state.thread.lineage,
@@ -179,7 +179,7 @@ index 7f3e224ad..d551845b6 100644
      forkedFrom: input.state.thread.forkedFrom,
      activeProviderThreadId: input.state.thread.activeProviderThreadId,
      ...(input.state.thread.historyOrigin === undefined
-@@ -1788,6 +1801,7 @@ function shellFromState(input: {
+@@ -1815,6 +1828,7 @@ function shellFromState(input: {
      unsettledAt: input.state.thread.unsettledAt ?? null,
      snoozedUntil: input.state.thread.snoozedUntil ?? null,
      snoozedAt: input.state.thread.snoozedAt ?? null,
@@ -187,7 +187,7 @@ index 7f3e224ad..d551845b6 100644
      pinnedAt: input.state.thread.pinnedAt ?? null,
  
      autoSettleDisabledAt: input.state.thread.autoSettleDisabledAt ?? null,
-@@ -5600,6 +5614,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -5654,6 +5668,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                    autoSettleDisabledAt: thread.autoSettleDisabledAt ?? null,
                    snoozedUntil: thread.snoozedUntil ?? null,
                    snoozedAt: thread.snoozedAt ?? null,
@@ -196,7 +196,7 @@ index 7f3e224ad..d551845b6 100644
                    latestRunId,
                    latestRunRequestedAt:
 diff --git a/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts b/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
-index f462c6f88..64c0344e1 100644
+index 6df98b9809..90dcf54c0f 100644
 --- a/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
 +++ b/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
 @@ -409,6 +409,25 @@ it.effect("retains automation and sender attribution while a message waits in th
@@ -226,7 +226,7 @@ index f462c6f88..64c0344e1 100644
    Effect.gen(function* () {
      const worktreeEntered = yield* Deferred.make<void>();
 diff --git a/apps/server/src/orchestration-v2/ThreadLaunchService.ts b/apps/server/src/orchestration-v2/ThreadLaunchService.ts
-index dc98263a6..8f970e863 100644
+index dc98263a65..8f970e8638 100644
 --- a/apps/server/src/orchestration-v2/ThreadLaunchService.ts
 +++ b/apps/server/src/orchestration-v2/ThreadLaunchService.ts
 @@ -85,6 +85,8 @@ export interface ThreadLaunchInput {
@@ -249,7 +249,7 @@ index dc98263a6..8f970e863 100644
                    ? {}
                    : { importedNativeThread: input.importedNativeThread }),
 diff --git a/apps/server/src/orchestration-v2/ThreadManagementService.test.ts b/apps/server/src/orchestration-v2/ThreadManagementService.test.ts
-index 1f05d1c8d..b46129e3c 100644
+index 1f05d1c8d4..b46129e3c9 100644
 --- a/apps/server/src/orchestration-v2/ThreadManagementService.test.ts
 +++ b/apps/server/src/orchestration-v2/ThreadManagementService.test.ts
 @@ -1060,7 +1060,11 @@ it.effect.each([
@@ -275,7 +275,7 @@ index 1f05d1c8d..b46129e3c 100644
    }),
  );
 diff --git a/apps/server/src/orchestration-v2/ThreadManagementService.ts b/apps/server/src/orchestration-v2/ThreadManagementService.ts
-index d83dd9578..dda7c4bd0 100644
+index d83dd9578c..dda7c4bd0e 100644
 --- a/apps/server/src/orchestration-v2/ThreadManagementService.ts
 +++ b/apps/server/src/orchestration-v2/ThreadManagementService.ts
 @@ -936,6 +936,7 @@ const make = Effect.gen(function* () {
@@ -295,7 +295,7 @@ index d83dd9578..dda7c4bd0 100644
      return { sequence: result.sequence };
    });
 diff --git a/apps/server/src/orchestration-v2/ThreadSettlementService.test.ts b/apps/server/src/orchestration-v2/ThreadSettlementService.test.ts
-index b4ca137f3..98b02a1c3 100644
+index b4ca137f3f..98b02a1c31 100644
 --- a/apps/server/src/orchestration-v2/ThreadSettlementService.test.ts
 +++ b/apps/server/src/orchestration-v2/ThreadSettlementService.test.ts
 @@ -437,6 +437,7 @@ describe("autoSettlementSettingsKey", () => {
@@ -470,7 +470,7 @@ index b4ca137f3..98b02a1c3 100644
 +  });
 +});
 diff --git a/apps/server/src/orchestration-v2/ThreadSettlementService.ts b/apps/server/src/orchestration-v2/ThreadSettlementService.ts
-index bba955cb2..050b72027 100644
+index bba955cb2e..050b720278 100644
 --- a/apps/server/src/orchestration-v2/ThreadSettlementService.ts
 +++ b/apps/server/src/orchestration-v2/ThreadSettlementService.ts
 @@ -3,6 +3,7 @@ import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
@@ -590,7 +590,7 @@ index bba955cb2..050b72027 100644
  
  export const layer = Layer.effect(ThreadSettlementServiceV2, make);
 diff --git a/apps/server/src/orchestration-v2/runtimeLayer.test.ts b/apps/server/src/orchestration-v2/runtimeLayer.test.ts
-index 0eb6579e2..e9d0b7517 100644
+index 086c52296e..b7e9142cef 100644
 --- a/apps/server/src/orchestration-v2/runtimeLayer.test.ts
 +++ b/apps/server/src/orchestration-v2/runtimeLayer.test.ts
 @@ -1835,6 +1835,12 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
@@ -622,7 +622,7 @@ index 0eb6579e2..e9d0b7517 100644
  
        yield* orchestrator.dispatch({
          type: "thread.unsettle",
-@@ -4684,6 +4699,11 @@ it.layer(layerSharedApplicationDataPlaneTest)("snooze projection", (it) => {
+@@ -4700,6 +4715,11 @@ it.layer(layerSharedApplicationDataPlaneTest)("snooze projection", (it) => {
        );
        const [candidate] = yield* projections.getSettlementCandidates(threadId);
        assert.deepEqual(candidate?.lastSnoozeWakeAt, yield* DateTime.now);
@@ -636,7 +636,7 @@ index 0eb6579e2..e9d0b7517 100644
          commandId: CommandId.make("runtime-layer-snoozed-thread-snooze-after-wake"),
 diff --git a/apps/web/src/components/Sidebar.families.test.ts b/apps/web/src/components/Sidebar.families.test.ts
 new file mode 100644
-index 000000000..005b8d5e8
+index 0000000000..005b8d5e81
 --- /dev/null
 +++ b/apps/web/src/components/Sidebar.families.test.ts
 @@ -0,0 +1,575 @@
@@ -1217,7 +1217,7 @@ index 000000000..005b8d5e8
 +});
 diff --git a/apps/web/src/components/Sidebar.families.ts b/apps/web/src/components/Sidebar.families.ts
 new file mode 100644
-index 000000000..c9b9bed00
+index 0000000000..c9b9bed009
 --- /dev/null
 +++ b/apps/web/src/components/Sidebar.families.ts
 @@ -0,0 +1,453 @@
@@ -1675,10 +1675,10 @@ index 000000000..c9b9bed00
 +  ].join(", ");
 +}
 diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
-index f59084188..e665ff686 100644
+index 3558e1306f..ac60c77588 100644
 --- a/apps/web/src/components/Sidebar.tsx
 +++ b/apps/web/src/components/Sidebar.tsx
-@@ -69,6 +69,7 @@ import {
+@@ -66,6 +66,7 @@ import {
    AlarmClockOffIcon,
    ArrowRightLeftIcon,
    CheckIcon,
@@ -1686,7 +1686,7 @@ index f59084188..e665ff686 100644
    CircleAlertIcon,
    CircleCheckIcon,
    CircleDashedIcon,
-@@ -234,6 +235,25 @@ import {
+@@ -228,6 +229,25 @@ import {
    type SidebarListMarker,
    type SidebarSection,
  } from "./Sidebar.logic";
@@ -1712,7 +1712,7 @@ index f59084188..e665ff686 100644
  import { resolveLocalCheckoutBranchMismatch } from "./BranchToolbar.logic";
  import {
    createSidebarCollisionDetection,
-@@ -306,6 +326,45 @@ const SETTLED_TAIL_PAGE_COUNT = 25;
+@@ -297,6 +317,43 @@ const SETTLED_TAIL_PAGE_COUNT = 25;
  const SETTLED_SHELF_EXPANDED_KEY = "t3code:sidebar:settled-expanded";
  const SNOOZED_SHELF_EXPANDED_KEY = "t3code:sidebar:snoozed-expanded";
  const WORKING_SHELF_EXPANDED_KEY = "t3code:sidebar:working-expanded";
@@ -1743,8 +1743,6 @@ index f59084188..e665ff686 100644
 +const isFoldedSettledChild = (thread: EnvironmentThreadShell) =>
 +  thread.settledOverride === "settled" && !childThreadStillRuns(resolveSidebarThreadStatus(thread));
 +
-+const threadKeyOf = (thread: EnvironmentThreadShell) =>
-+  scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
 +const openerKeyOf = (thread: EnvironmentThreadShell) => {
 +  const openerId = thread.openedByThreadId ?? thread.delegatedByThreadId;
 +  return openerId === undefined
@@ -1758,7 +1756,262 @@ index f59084188..e665ff686 100644
  
  const inboxReturns = createInboxReturnTracker();
  
-@@ -1035,9 +1094,143 @@ const dropVerbBadge: Record<SidebarDropVerb, ReactNode> = {
+@@ -432,33 +489,143 @@ function useSidebarThreads(input: {
+ 
+   const { pinnedThreads, activeThreads, workingThreads, snoozedThreads, settledThreads } =
+     partition;
+-  const visibleSettledThreads = (() => {
+-    if (settledThreads.length <= settledVisibleCount) return settledThreads;
+-    const visible = settledThreads.slice(0, settledVisibleCount);
+-    if (routeThreadKey !== null) {
+-      const routeThread = settledThreads
+-        .slice(settledVisibleCount)
+-        .find((thread) => threadShellKey(thread) === routeThreadKey);
+-      if (routeThread !== undefined) visible.push(routeThread);
+-    }
+-    return visible;
++  // Settled pages a family at a time, so a child never shows without its
++  // head. The open thread must never hide under "Show more": navigating into a
++  // deep settled thread (search, deep link) pulls its family into the visible
++  // tail so the highlight and the un-settle affordance stay reachable.
++  const settledPage = pageSidebarThreadFamilies(settledThreads, threadShellKey, openerKeyOf, {
++    limit: settledVisibleCount,
++    keepKey: routeThreadKey,
++    pageSize: SETTLED_TAIL_PAGE_COUNT,
++  });
++  const visibleSettledThreads = settledPage.visible;
++  // A collapsed shelf keeps the open thread's family, which folds down to its
++  // head and the open thread.
++  const renderedSettledThreads = (() => {
++    if (settledShelfExpanded) return visibleSettledThreads;
++    if (routeThreadKey === null) return EMPTY_THREADS;
++    const routeFamily = buildSidebarThreadFamilies(
++      visibleSettledThreads,
++      threadShellKey,
++      openerKeyOf,
++    ).find((family) =>
++      [family.head, ...family.children].some((thread) => threadShellKey(thread) === routeThreadKey),
++    );
++    return routeFamily === undefined ? EMPTY_THREADS : flattenSidebarThreadFamilies([routeFamily]);
+   })();
+-  const renderedSettledThreads = settledShelfExpanded
+-    ? visibleSettledThreads
+-    : routeThreadOnly(visibleSettledThreads, routeThreadKey);
+   const visibleSnoozedThreads = snoozedShelfExpanded
+     ? snoozedThreads
+     : routeThreadOnly(snoozedThreads, routeThreadKey);
+   const visibleWorkingThreads = workingShelfExpanded
+     ? workingThreads
+     : routeThreadOnly(workingThreads, routeThreadKey);
++
++  // Child threads (Sidebar.families.ts): a thread an agent opened renders
++  // under its opener when both sit in the same section. A collapsed family
++  // keeps only children that need the user, plus the open thread.
++  // Families start expanded, except in Settled, where each settle starts
++  // collapsed.
++  const [collapsedChildThreadKeys, setCollapsedChildThreadKeys] = useLocalStorage(
++    COLLAPSED_CHILD_THREADS_KEY,
++    EMPTY_KEYS,
++    ChildThreadFoldKeys,
++  );
++  const [expandedSettledChildThreadKeys, setExpandedSettledChildThreadKeys] = useLocalStorage(
++    EXPANDED_SETTLED_CHILD_THREADS_KEY,
++    EMPTY_KEYS,
++    ChildThreadFoldKeys,
++  );
++  // Opened "N settled" rows, by head key; they start closed each session.
++  const [shownSettledChildThreadKeys, setShownSettledChildThreadKeys] = useState<
++    ReadonlySet<string>
++  >(() => new Set());
++  const childThreadFolds: ChildThreadFolds = {
++    collapsed: collapsedChildThreadKeys,
++    expandedInSettled: expandedSettledChildThreadKeys,
++  };
++  // Drops folds of families that left Settled or are gone (Sidebar.families.ts),
++  // so a family that comes back to Settled starts collapsed again.
++  const foldNow = partition.snoozeNow;
++  useEffect(() => {
++    const stateOf = childThreadFoldHeadStateOf(threads, threadShellKey, (thread) => {
++      const capabilities = serverConfigs.get(thread.environmentId)?.environment.capabilities;
++      if (capabilities === undefined) return null;
++      return (
++        thread.archivedAt === null &&
++        capabilities.threadSettlement === true &&
++        thread.settledOverride === "settled" &&
++        !(capabilities.threadSnooze === true && effectiveSnoozed(thread, { now: foldNow }))
++      );
++    });
++    const folds = {
++      collapsed: collapsedChildThreadKeys,
++      expandedInSettled: expandedSettledChildThreadKeys,
++    };
++    const pruned = pruneChildThreadFolds(folds, stateOf);
++    if (pruned.collapsed !== folds.collapsed) setCollapsedChildThreadKeys(pruned.collapsed);
++    if (pruned.expandedInSettled !== folds.expandedInSettled) {
++      setExpandedSettledChildThreadKeys(pruned.expandedInSettled);
++    }
++  }, [
++    collapsedChildThreadKeys,
++    expandedSettledChildThreadKeys,
++    foldNow,
++    serverConfigs,
++    setCollapsedChildThreadKeys,
++    setExpandedSettledChildThreadKeys,
++    threads,
++  ]);
++  const familiesOf = (
++    list: readonly EnvironmentThreadShell[],
++    section: SidebarSection,
++  ): readonly RenderedChildThreadFamily[] =>
++    buildSidebarThreadFamilies(list, threadShellKey, openerKeyOf).map((family) => {
++      const headKey = threadShellKey(family.head);
++      const place: ChildThreadFoldPlace =
++        section === "settled"
++          ? { section: "settled", headKey, entry: settledEntryOf(family.head) }
++          : { section: "live", headKey };
++      const collapsed = isChildThreadFamilyCollapsed(childThreadFolds, place);
++      const settledShown = shownSettledChildThreadKeys.has(headKey);
++      const { shown, hidden, settled } = foldSidebarThreadFamily(family.children, {
++        collapsed,
++        ...(section === "settled" ? {} : { isSettled: isFoldedSettledChild, settledShown }),
++        keepVisible: (child) =>
++          threadShellKey(child) === routeThreadKey ||
++          childThreadNeedsUser(resolveSidebarThreadStatus(child)),
++      });
++      return {
++        head: family.head,
++        children: shown,
++        hidden,
++        hasChildren: family.children.length > 0,
++        collapsed,
++        place,
++        settled,
++        settledShown,
++        all: family.children,
++      };
++    });
++  const sectionFamilies = {
++    pinned: familiesOf(pinnedThreads, "pinned"),
++    active: familiesOf(activeThreads, "active"),
++    working: familiesOf(visibleWorkingThreads, "working"),
++    snoozed: familiesOf(visibleSnoozedThreads, "snoozed"),
++    settled: familiesOf(renderedSettledThreads, "settled"),
++  };
+   const orderedThreads = [
+-    ...pinnedThreads,
+-    ...activeThreads,
+-    ...visibleWorkingThreads,
+-    ...visibleSnoozedThreads,
+-    ...renderedSettledThreads,
+-  ];
++    sectionFamilies.pinned,
++    sectionFamilies.active,
++    sectionFamilies.working,
++    sectionFamilies.snoozed,
++    sectionFamilies.settled,
++  ].flatMap((families) =>
++    // An opened "N settled" row renders its children after the live ones.
++    families.flatMap((family) => [
++      ...flattenSidebarThreadFamilies([family]),
++      ...(family.settledShown ? family.settled : []),
++    ]),
++  );
+   const sectionByThreadKey = new Map<string, SidebarSection>();
+   for (const [list, section] of [
+     [pinnedThreads, "pinned"],
+@@ -481,7 +648,8 @@ function useSidebarThreads(input: {
+       ...settledThreads,
+     ],
+     settledVisibleCount,
+-    hiddenSettledCount: settledThreads.length - visibleSettledThreads.length,
++    hiddenSettledCount: settledPage.hiddenCount,
++    nextSettledPageCount: settledPage.nextPageCount,
+     showMoreSettled: () =>
+       setSettledTail((current) => ({
+         scopeKey: current.scopeKey,
+@@ -494,15 +662,43 @@ function useSidebarThreads(input: {
+     workingShelfExpanded,
+     toggleWorkingShelf: () => setWorkingShelfExpanded((value) => !value),
+     renderedSettledThreads,
+-    visibleSnoozedThreads,
+-    visibleWorkingThreads,
+     orderedThreadKeys: orderedThreads.map(threadShellKey),
+     threadByKey: new Map(orderedThreads.map((thread) => [threadShellKey(thread), thread] as const)),
+     settledThreadKeys: new Set(settledThreads.map(threadShellKey)),
+     snoozedThreadKeys: new Set(snoozedThreads.map(threadShellKey)),
+     sectionByThreadKey,
+-    pinnedKeys: pinnedThreads.map(threadShellKey),
+-    activeKeys: activeThreads.map(threadShellKey),
++    sectionFamilies,
++    familyByHeadKey: new Map(
++      Object.values(sectionFamilies).flatMap((families) =>
++        families.map((family) => [threadShellKey(family.head), family] as const),
++      ),
++    ),
++    // The disclosure row and the context menu flip the same fold.
++    toggleChildThreadsCollapsed: (family: RenderedChildThreadFamily) => {
++      const { place } = family;
++      if (place.section === "settled") {
++        setExpandedSettledChildThreadKeys(
++          (keys) =>
++            toggleChildThreadFamily({ collapsed: EMPTY_KEYS, expandedInSettled: keys }, place)
++              .expandedInSettled,
++        );
++      } else {
++        setCollapsedChildThreadKeys(
++          (keys) =>
++            toggleChildThreadFamily({ collapsed: keys, expandedInSettled: EMPTY_KEYS }, place)
++              .collapsed,
++        );
++      }
++    },
++    toggleSettledChildThreadsShown: (family: RenderedChildThreadFamily) =>
++      setShownSettledChildThreadKeys((keys) => {
++        const next = new Set(keys);
++        if (!next.delete(family.place.headKey)) next.add(family.place.headKey);
++        return next;
++      }),
++    // Children move with their head, so drop orders list heads only.
++    pinnedKeys: sectionFamilies.pinned.map((family) => threadShellKey(family.head)),
++    activeKeys: sectionFamilies.active.map((family) => threadShellKey(family.head)),
+     pinnedKeysById: new Map(
+       threads.map((thread) => [threadShellKey(thread), thread.pinOrderKey ?? null] as const),
+     ),
+@@ -515,6 +711,8 @@ function useSidebarThreads(input: {
+ function partitionSidebarThreads(input: SidebarThreadPartitionInput) {
+   const { threads, scopedProjectKeys, serverConfigs, optimisticDrop, workingShelfEnabled } = input;
+   const preciseNow = new Date().toISOString();
++  // Subagents stay out of the sidebar roster (v2 models them as real threads
++  // with lineage); delegated tasks are added back under their delegator below.
+   const visible = filterSidebarV2VisibleThreads(threads, scopedProjectKeys);
+   inboxReturns.observe(workingShelfEnabled ? threads : null);
+   const pinned: EnvironmentThreadShell[] = [];
+@@ -568,6 +766,24 @@ function partitionSidebarThreads(input: SidebarThreadPartitionInput) {
+       ).push(thread);
+     }
+   }
++  // Delegated tasks render under the thread that delegated them, in its
++  // section; other subagents stay out of the roster. A settled child stays
++  // with an opener that is not settled, folded away in its family, and
++  // reaches Settled with the opener (Sidebar.families.ts).
++  placeChildThreadSections({
++    live: [pinned, active, working, snoozed],
++    settled,
++    delegated: threads.filter(
++      (thread) =>
++        thread.archivedAt === null &&
++        thread.delegatedByThreadId !== undefined &&
++        (scopedProjectKeys === null ||
++          scopedProjectKeys.has(`${thread.environmentId}:${thread.projectId}`)),
++    ),
++    keyOf: threadShellKey,
++    openerKeyOf,
++    delegatorKeyOf,
++  });
+   // Server capability only gates DRAGGING — it must not influence the
+   // sort, or mixed-version fleets would render different pinned orders on
+   // web and mobile from the same data.
+@@ -1449,9 +1665,143 @@ const dropVerbBadge: Record<SidebarDropVerb, ReactNode> = {
    ),
  };
  
@@ -1806,7 +2059,7 @@ index f59084188..e665ff686 100644
 +        ...thread,
 +        lastVisitedAt: resolveThreadLastVisitedAt(
 +          thread.lastVisitedAt,
-+          lastVisitedAtById[threadKeyOf(thread)],
++          lastVisitedAtById[threadShellKey(thread)],
 +        ),
 +      }),
 +    })),
@@ -1902,7 +2155,7 @@ index f59084188..e665ff686 100644
    variantAction: SidebarSweepAction;
    settlementSupported: boolean;
    snoozeSupported: boolean;
-@@ -1660,7 +1853,11 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
+@@ -2005,7 +2355,11 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                  aria-current={accessibility.current}
                  data-testid="sidebar-row-slim"
                  aria-busy={isRegeneratingTitle || undefined}
@@ -1915,7 +2168,7 @@ index f59084188..e665ff686 100644
                  onClick={handleClick}
                  onDoubleClick={handleDoubleClick}
                  onKeyDown={handleKeyDown}
-@@ -1669,15 +1866,19 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
+@@ -2014,15 +2368,19 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
              }
            >
              {accessibleTitle}
@@ -1944,7 +2197,7 @@ index f59084188..e665ff686 100644
              {draftIndicator}
              {title}
              {pinIndicator}
-@@ -1724,6 +1925,24 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
+@@ -2069,6 +2427,24 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                        />
                        <TooltipPopup side="top">Dismiss Woke notification</TooltipPopup>
                      </Tooltip>
@@ -1969,7 +2222,7 @@ index f59084188..e665ff686 100644
                    ) : (
                      <span className="text-xs">
                        {variantAction === "unsettle"
-@@ -1889,19 +2108,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
+@@ -2234,19 +2610,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                              topStatus.className,
                            )}
                          >
@@ -1990,307 +2243,36 @@ index f59084188..e665ff686 100644
                            {/* The label alone is the live region: a role="status"
                              wrapper around the ticking duration would make
                              screen readers announce every second. */}
-@@ -2586,6 +2793,8 @@ export default function Sidebar() {
-   } = useMemo(() => {
-     void snoozeWakeTick;
-     const preciseNow = new Date().toISOString();
-+    // sidebar roster (v2 models them as real threads with lineage); delegated
-+    // tasks are added back under their delegator below.
-     const visible = filterSidebarV2VisibleThreads(threads, scopedProjectKeys);
-     inboxReturns.observe(workingShelfEnabled ? threads : null);
-     const pinned: EnvironmentThreadShell[] = [];
-@@ -2639,6 +2848,24 @@ export default function Sidebar() {
-         ).push(thread);
-       }
-     }
-+    // Delegated tasks render under the thread that delegated them, in its
-+    // section; other subagents stay out of the roster. A settled child stays
-+    // with an opener that is not settled, folded away in its family, and
-+    // reaches Settled with the opener (Sidebar.families.ts).
-+    placeChildThreadSections({
-+      live: [pinned, active, working, snoozed],
-+      settled,
-+      delegated: threads.filter(
-+        (thread) =>
-+          thread.archivedAt === null &&
-+          thread.delegatedByThreadId !== undefined &&
-+          (scopedProjectKeys === null ||
-+            scopedProjectKeys.has(`${thread.environmentId}:${thread.projectId}`)),
-+      ),
-+      keyOf: threadKeyOf,
-+      openerKeyOf,
-+      delegatorKeyOf,
-+    });
-     // Server capability only gates DRAGGING — it must not influence the
-     // sort, or mixed-version fleets would render different pinned orders on
-     // web and mobile from the same data.
-@@ -2750,21 +2977,22 @@ export default function Sidebar() {
-     lastSettledResetKeyRef.current = settledResetKey;
-     setSettledVisibleCount(SETTLED_TAIL_INITIAL_COUNT);
-   }
--  const visibleSettledThreads = useMemo(() => {
--    if (settledThreads.length <= settledVisibleCount) return settledThreads;
--    const visible = settledThreads.slice(0, settledVisibleCount);
--    if (routeThreadKey !== null) {
--      const routeThread = settledThreads
--        .slice(settledVisibleCount)
--        .find(
--          (thread) =>
--            scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)) === routeThreadKey,
--        );
--      if (routeThread !== undefined) visible.push(routeThread);
--    }
--    return visible;
--  }, [routeThreadKey, settledThreads, settledVisibleCount]);
--  const hiddenSettledCount = settledThreads.length - visibleSettledThreads.length;
-+  // Settled pages a family at a time, so a child never shows without its
-+  // head. The open thread must never hide under "Show more": navigating into a
-+  // deep settled thread (search, deep link) pulls its family into the visible
-+  // tail so the highlight and the un-settle affordance stay reachable.
-+  const settledPage = useMemo(
-+    () =>
-+      pageSidebarThreadFamilies(settledThreads, threadKeyOf, openerKeyOf, {
-+        limit: settledVisibleCount,
-+        keepKey: routeThreadKey,
-+        pageSize: SETTLED_TAIL_PAGE_COUNT,
-+      }),
-+    [routeThreadKey, settledThreads, settledVisibleCount],
-+  );
-+  const visibleSettledThreads = settledPage.visible;
-+  const hiddenSettledCount = settledPage.hiddenCount;
-+  const nextSettledPageCount = settledPage.nextPageCount;
-   const showMoreSettled = useCallback(
-     () => setSettledVisibleCount((count) => count + SETTLED_TAIL_PAGE_COUNT),
-     [],
-@@ -2781,11 +3009,16 @@ export default function Sidebar() {
-   const renderedSettledThreads = useMemo(() => {
-     if (settledShelfExpanded) return visibleSettledThreads;
-     if (routeThreadKey === null) return EMPTY_THREADS;
--    const routeThread = visibleSettledThreads.find(
--      (thread) =>
--        scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)) === routeThreadKey,
-+    // A collapsed shelf keeps the open thread's family, which folds down to
-+    // its head and the open thread.
-+    const routeFamily = buildSidebarThreadFamilies(
-+      visibleSettledThreads,
-+      threadKeyOf,
-+      openerKeyOf,
-+    ).find((family) =>
-+      [family.head, ...family.children].some((thread) => threadKeyOf(thread) === routeThreadKey),
-     );
--    return routeThread === undefined ? EMPTY_THREADS : [routeThread];
-+    return routeFamily === undefined ? EMPTY_THREADS : flattenSidebarThreadFamilies([routeFamily]);
-   }, [routeThreadKey, settledShelfExpanded, visibleSettledThreads]);
- 
-   const [snoozedShelfExpanded, setSnoozedShelfExpanded] = useLocalStorage(
-@@ -2826,21 +3059,164 @@ export default function Sidebar() {
-     return routeThread === undefined ? EMPTY_THREADS : [routeThread];
-   }, [routeThreadKey, workingShelfExpanded, workingThreads]);
- 
-+  // Child threads (Sidebar.families.ts): a thread an agent opened renders
-+  // under its opener when both sit in the same section. A collapsed family
-+  // keeps only children that need the user, plus the open thread.
-+  // Families start expanded, except in Settled, where each settle starts
-+  // collapsed.
-+  const [collapsedChildThreadKeys, setCollapsedChildThreadKeys] = useLocalStorage(
-+    COLLAPSED_CHILD_THREADS_KEY,
-+    EMPTY_KEYS,
-+    ChildThreadFoldKeys,
-+  );
-+  const [expandedSettledChildThreadKeys, setExpandedSettledChildThreadKeys] = useLocalStorage(
-+    EXPANDED_SETTLED_CHILD_THREADS_KEY,
-+    EMPTY_KEYS,
-+    ChildThreadFoldKeys,
-+  );
-+  // Opened "N settled" rows, by head key; they start closed each session.
-+  const [shownSettledChildThreadKeys, setShownSettledChildThreadKeys] = useState<
-+    ReadonlySet<string>
-+  >(() => new Set());
-+  const toggleSettledChildThreadsShown = useCallback(
-+    (family: RenderedChildThreadFamily) =>
-+      setShownSettledChildThreadKeys((keys) => {
-+        const next = new Set(keys);
-+        if (!next.delete(family.place.headKey)) next.add(family.place.headKey);
-+        return next;
-+      }),
-+    [],
-+  );
-+  const childThreadFolds = useMemo(
-+    (): ChildThreadFolds => ({
-+      collapsed: collapsedChildThreadKeys,
-+      expandedInSettled: expandedSettledChildThreadKeys,
-+    }),
-+    [collapsedChildThreadKeys, expandedSettledChildThreadKeys],
-+  );
-+  // Drops folds of families that left Settled or are gone (Sidebar.families.ts),
-+  // so a family that comes back to Settled starts collapsed again.
-+  useEffect(() => {
-+    const now = new Date().toISOString();
-+    const stateOf = childThreadFoldHeadStateOf(threads, threadKeyOf, (thread) => {
-+      const capabilities = serverConfigs.get(thread.environmentId)?.environment.capabilities;
-+      if (capabilities === undefined) return null;
-+      return (
-+        thread.archivedAt === null &&
-+        capabilities.threadSettlement === true &&
-+        thread.settledOverride === "settled" &&
-+        !(capabilities.threadSnooze === true && effectiveSnoozed(thread, { now }))
-+      );
-+    });
-+    const pruned = pruneChildThreadFolds(childThreadFolds, stateOf);
-+    if (pruned.collapsed !== childThreadFolds.collapsed) {
-+      setCollapsedChildThreadKeys(pruned.collapsed);
-+    }
-+    if (pruned.expandedInSettled !== childThreadFolds.expandedInSettled) {
-+      setExpandedSettledChildThreadKeys(pruned.expandedInSettled);
-+    }
-+  }, [
-+    childThreadFolds,
-+    nowMinute,
-+    serverConfigs,
-+    setCollapsedChildThreadKeys,
-+    setExpandedSettledChildThreadKeys,
-+    threads,
-+  ]);
-+  const sectionFamilies = useMemo(() => {
-+    const familiesOf = (
-+      threads: readonly EnvironmentThreadShell[],
-+      section: SidebarSection,
-+    ): readonly RenderedChildThreadFamily[] =>
-+      buildSidebarThreadFamilies(threads, threadKeyOf, openerKeyOf).map((family) => {
-+        const headKey = threadKeyOf(family.head);
-+        const place: ChildThreadFoldPlace =
-+          section === "settled"
-+            ? { section: "settled", headKey, entry: settledEntryOf(family.head) }
-+            : { section: "live", headKey };
-+        const collapsed = isChildThreadFamilyCollapsed(childThreadFolds, place);
-+        const settledShown = shownSettledChildThreadKeys.has(headKey);
-+        const { shown, hidden, settled } = foldSidebarThreadFamily(family.children, {
-+          collapsed,
-+          ...(section === "settled" ? {} : { isSettled: isFoldedSettledChild, settledShown }),
-+          keepVisible: (child) =>
-+            threadKeyOf(child) === routeThreadKey ||
-+            childThreadNeedsUser(resolveSidebarThreadStatus(child)),
-+        });
-+        return {
-+          head: family.head,
-+          children: shown,
-+          hidden,
-+          hasChildren: family.children.length > 0,
-+          collapsed,
-+          place,
-+          settled,
-+          settledShown,
-+          all: family.children,
-+        };
-+      });
-+    return {
-+      pinned: familiesOf(pinnedThreads, "pinned"),
-+      active: familiesOf(activeThreads, "active"),
-+      working: familiesOf(visibleWorkingThreads, "working"),
-+      snoozed: familiesOf(visibleSnoozedThreads, "snoozed"),
-+      settled: familiesOf(renderedSettledThreads, "settled"),
-+    };
-+  }, [
-+    childThreadFolds,
-+    shownSettledChildThreadKeys,
-+    routeThreadKey,
-+    pinnedThreads,
-+    activeThreads,
-+    visibleWorkingThreads,
-+    visibleSnoozedThreads,
-+    renderedSettledThreads,
-+  ]);
-+  const familyByHeadKey = useMemo(
-+    () =>
-+      new Map(
-+        Object.values(sectionFamilies).flatMap((families) =>
-+          families.map((family) => [threadKeyOf(family.head), family] as const),
-+        ),
-+      ),
-+    [sectionFamilies],
-+  );
-+  // The disclosure row and the context menu flip the same fold.
-+  const toggleChildThreadsCollapsed = useCallback(
-+    (family: RenderedChildThreadFamily) => {
-+      const { place } = family;
-+      if (place.section === "settled") {
-+        setExpandedSettledChildThreadKeys(
-+          (keys) =>
-+            toggleChildThreadFamily({ collapsed: EMPTY_KEYS, expandedInSettled: keys }, place)
-+              .expandedInSettled,
-+        );
-+      } else {
-+        setCollapsedChildThreadKeys(
-+          (keys) =>
-+            toggleChildThreadFamily({ collapsed: keys, expandedInSettled: EMPTY_KEYS }, place)
-+              .collapsed,
-+        );
-+      }
-+    },
-+    [setCollapsedChildThreadKeys, setExpandedSettledChildThreadKeys],
-+  );
-   const orderedThreads = useMemo(
--    () => [
--      ...pinnedThreads,
--      ...activeThreads,
--      ...visibleWorkingThreads,
--      ...visibleSnoozedThreads,
--      ...renderedSettledThreads,
--    ],
--    [
--      pinnedThreads,
--      activeThreads,
--      visibleWorkingThreads,
--      visibleSnoozedThreads,
--      renderedSettledThreads,
--    ],
-+    () =>
-+      [
-+        sectionFamilies.pinned,
-+        sectionFamilies.active,
-+        sectionFamilies.working,
-+        sectionFamilies.snoozed,
-+        sectionFamilies.settled,
-+      ].flatMap((families) =>
-+        // An opened "N settled" row renders its children after the live ones.
-+        families.flatMap((family) => [
-+          ...flattenSidebarThreadFamilies([family]),
-+          ...(family.settledShown ? family.settled : []),
-+        ]),
-+      ),
-+    [sectionFamilies],
-   );
-   const orderedThreadKeys = useMemo(
-     () =>
-@@ -3354,19 +3730,14 @@ export default function Sidebar() {
-       });
-     },
-   );
-+  // Children move with their head, so drop orders list heads only.
-   const pinnedKeys = useMemo(
--    () =>
--      pinnedThreads.map((thread) =>
--        scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
--      ),
--    [pinnedThreads],
-+    () => sectionFamilies.pinned.map((family) => threadKeyOf(family.head)),
-+    [sectionFamilies.pinned],
-   );
-   const activeKeys = useMemo(
--    () =>
--      activeThreads.map((thread) =>
--        scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
--      ),
--    [activeThreads],
-+    () => sectionFamilies.active.map((family) => threadKeyOf(family.head)),
-+    [sectionFamilies.active],
-   );
-   useEffect(() => {
-     if (optimisticDrop === null) return;
-@@ -3508,14 +3879,13 @@ export default function Sidebar() {
-     [sectionByThreadKey],
-   );
-   const sidebarListItems = useMemo((): readonly SidebarListItem[] => {
+@@ -2875,6 +3239,7 @@ export default function Sidebar() {
+     searchableThreads,
+     settledVisibleCount,
+     hiddenSettledCount,
++    nextSettledPageCount,
+     showMoreSettled,
+     settledShelfExpanded,
+     toggleSettledShelf,
+@@ -2883,13 +3248,15 @@ export default function Sidebar() {
+     workingShelfExpanded,
+     toggleWorkingShelf,
+     renderedSettledThreads,
+-    visibleSnoozedThreads,
+-    visibleWorkingThreads,
+     orderedThreadKeys,
+     threadByKey,
+     settledThreadKeys,
+     snoozedThreadKeys,
+     sectionByThreadKey,
++    sectionFamilies,
++    familyByHeadKey,
++    toggleChildThreadsCollapsed,
++    toggleSettledChildThreadsShown,
+     pinnedKeys,
+     activeKeys,
+     pinnedKeysById,
+@@ -3420,14 +3787,13 @@ export default function Sidebar() {
+     });
+   };
+   const sidebarListItemsFresh = ((): readonly SidebarListItem[] => {
 +    // Only family heads are list items: children render with their head
 +    // and never take a drop slot of their own.
      const rowsOf = (
@@ -2302,11 +2284,11 @@ index f59084188..e665ff686 100644
 -        const key = scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
 -        return { kind: "thread", key, section };
 -      });
-+      families.map((family) => ({ kind: "thread", key: threadKeyOf(family.head), section }));
++      families.map((family) => ({ kind: "thread", key: threadShellKey(family.head), section }));
      if (
        pinnedThreads.length +
          activeThreads.length +
-@@ -3527,33 +3897,31 @@ export default function Sidebar() {
+@@ -3439,22 +3805,22 @@ export default function Sidebar() {
        return [];
      }
      const items: SidebarListItem[] = [{ kind: "marker", marker: "pinned-header" }];
@@ -2334,21 +2316,7 @@ index f59084188..e665ff686 100644
      items.push({ kind: "marker", marker: "settled-placeholder" });
      items.push(...settledRows);
      return items;
-   }, [
--    activeThreads,
--    pinnedThreads,
--    renderedSettledThreads,
-+    activeThreads.length,
-+    pinnedThreads.length,
-+    sectionFamilies,
-     settledThreads.length,
-     snoozedThreads.length,
--    visibleSnoozedThreads,
--    visibleWorkingThreads,
-     workingThreads.length,
-   ]);
-   useEffect(() => {
-@@ -4323,6 +4691,9 @@ export default function Sidebar() {
+@@ -4140,6 +4506,9 @@ export default function Sidebar() {
                  titleRegeneration: supportsTitleRegeneration,
                },
                snoozePresets,
@@ -2358,7 +2326,7 @@ index f59084188..e665ff686 100644
              }),
              position,
            ),
-@@ -4432,6 +4803,12 @@ export default function Sidebar() {
+@@ -4249,6 +4618,12 @@ export default function Sidebar() {
            case "mark-unread":
              markThreadUnread(threadRef);
              return;
@@ -2371,7 +2339,7 @@ index f59084188..e665ff686 100644
            case "copy-path":
              if (!threadWorkspacePath) {
                toastManager.add(
-@@ -4877,18 +5254,22 @@ export default function Sidebar() {
+@@ -4685,18 +5060,22 @@ export default function Sidebar() {
                          thread: EnvironmentThreadShell,
                          section: SidebarSection,
                          sortable?: SortableThreadRowBag,
@@ -2395,7 +2363,7 @@ index f59084188..e665ff686 100644
                              variantAction={
                                section === "snoozed"
                                  ? "unsnooze"
-@@ -5019,6 +5400,33 @@ export default function Sidebar() {
+@@ -4823,6 +5202,33 @@ export default function Sidebar() {
                        for (const item of sidebarListItems) {
                          if (item.kind === "thread") {
                            items.push(renderThreadRow(threadByKey.get(item.key)!, item.section));
@@ -2429,7 +2397,7 @@ index f59084188..e665ff686 100644
                            continue;
                          }
                          switch (item.marker) {
-@@ -5150,7 +5558,7 @@ export default function Sidebar() {
+@@ -4954,7 +5360,7 @@ export default function Sidebar() {
                            className="flex h-9 w-full cursor-pointer items-center gap-2.5 rounded-md px-2.5 text-left text-sm text-sidebar-muted-foreground/55 hover:bg-sidebar-row-hover hover:text-sidebar-foreground"
                          >
                            <PlusIcon aria-hidden className="size-4 shrink-0" />
@@ -2439,7 +2407,7 @@ index f59084188..e665ff686 100644
                        </li>
                      ) : null}
 diff --git a/apps/web/src/components/threadActionMenu.logic.test.ts b/apps/web/src/components/threadActionMenu.logic.test.ts
-index a51f09064..52e5386e5 100644
+index a51f090646..52e5386e53 100644
 --- a/apps/web/src/components/threadActionMenu.logic.test.ts
 +++ b/apps/web/src/components/threadActionMenu.logic.test.ts
 @@ -40,6 +40,17 @@ function allIds(state: ThreadActionMenuState): string[] {
@@ -2461,7 +2429,7 @@ index a51f09064..52e5386e5 100644
      "disables both lifecycle directions without permission (reversed: %s)",
      (reversed) => {
 diff --git a/apps/web/src/components/threadActionMenu.logic.ts b/apps/web/src/components/threadActionMenu.logic.ts
-index cca7bcf20..309c0899d 100644
+index cca7bcf20e..309c0899d3 100644
 --- a/apps/web/src/components/threadActionMenu.logic.ts
 +++ b/apps/web/src/components/threadActionMenu.logic.ts
 @@ -18,6 +18,8 @@ export type ThreadActionMenuId =
@@ -2506,7 +2474,7 @@ index cca7bcf20..309c0899d 100644
        ? [
            {
 diff --git a/apps/web/src/contextMenuFallback.ts b/apps/web/src/contextMenuFallback.ts
-index c6f831efc..43a143990 100644
+index c6f831efcb..43a1439903 100644
 --- a/apps/web/src/contextMenuFallback.ts
 +++ b/apps/web/src/contextMenuFallback.ts
 @@ -110,6 +110,13 @@ const ICON_PATHS: Record<string, ReadonlyArray<{ tag: string; attrs: Record<stri
@@ -2524,7 +2492,7 @@ index c6f831efc..43a143990 100644
      {
        tag: "path",
 diff --git a/packages/client-runtime/src/state/models.ts b/packages/client-runtime/src/state/models.ts
-index 020b690a6..bf877ea73 100644
+index 020b690a60..bf877ea735 100644
 --- a/packages/client-runtime/src/state/models.ts
 +++ b/packages/client-runtime/src/state/models.ts
 @@ -1,5 +1,6 @@
@@ -2580,7 +2548,7 @@ index 020b690a6..bf877ea73 100644
      pinnedAt: nullableIso(thread.pinnedAt ?? null),
      autoSettleDisabledAt: nullableIso(thread.autoSettleDisabledAt ?? null),
 diff --git a/packages/client-runtime/src/state/threadCommands.test.ts b/packages/client-runtime/src/state/threadCommands.test.ts
-index cf36760ba..970f2938d 100644
+index cf36760bae..970f2938df 100644
 --- a/packages/client-runtime/src/state/threadCommands.test.ts
 +++ b/packages/client-runtime/src/state/threadCommands.test.ts
 @@ -129,7 +129,11 @@ describe("remote thread lifecycle commands", () => {
@@ -2597,10 +2565,10 @@ index cf36760ba..970f2938d 100644
      ["unpin", {}, { pinnedAt: null, pinOrderKey: null }],
      ["setAutoSettle", { enabled: false }, { autoSettleDisabledAt: expect.any(Object) }],
 diff --git a/packages/client-runtime/src/state/threadCommands.ts b/packages/client-runtime/src/state/threadCommands.ts
-index 0bb601b64..f5a07a570 100644
+index 7ba723ab35..1dac1e3e28 100644
 --- a/packages/client-runtime/src/state/threadCommands.ts
 +++ b/packages/client-runtime/src/state/threadCommands.ts
-@@ -138,6 +138,13 @@ export type {
+@@ -139,6 +139,13 @@ export type {
    WatchThreadPullRequestInput,
  } from "../operations/commands.ts";
  
@@ -2614,7 +2582,7 @@ index 0bb601b64..f5a07a570 100644
  export function createThreadEnvironmentAtoms<R, E>(
    runtime: Atom.AtomRuntime<EnvironmentRegistry | Crypto.Crypto | R, E>,
    snapshotAtom: (environmentId: EnvironmentId) => Atom.Atom<OrchestrationV2ShellSnapshot | null>,
-@@ -414,7 +421,8 @@ export function createThreadEnvironmentAtoms<R, E>(
+@@ -415,7 +422,8 @@ export function createThreadEnvironmentAtoms<R, E>(
          ["preparing", "queued", "starting", "running", "waiting"].includes(thread.status))
          ? thread
          : {
@@ -2624,7 +2592,7 @@ index 0bb601b64..f5a07a570 100644
              pendingRuntimeRequest: null,
              settledOverride: "settled",
              settledAt: thread.settledOverride === "settled" ? (thread.settledAt ?? now) : now,
-@@ -449,10 +457,12 @@ export function createThreadEnvironmentAtoms<R, E>(
+@@ -450,10 +458,12 @@ export function createThreadEnvironmentAtoms<R, E>(
                  : now,
            },
      ),
@@ -2639,7 +2607,7 @@ index 0bb601b64..f5a07a570 100644
      setAutoSettle: optimistic.wrap(commands.setAutoSettle, (thread, input, now) => ({
        ...thread,
 diff --git a/packages/client-runtime/src/state/threadShell.test.ts b/packages/client-runtime/src/state/threadShell.test.ts
-index b32169830..b1d87b794 100644
+index b32169830f..b1d87b794a 100644
 --- a/packages/client-runtime/src/state/threadShell.test.ts
 +++ b/packages/client-runtime/src/state/threadShell.test.ts
 @@ -106,6 +106,43 @@ describe("v2 thread shell lists", () => {
@@ -2687,7 +2655,7 @@ index b32169830..b1d87b794 100644
      const { registry, threads, snapshotAtom } = makeHarness();
      const root = v2ThreadShell;
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
-index 695daf1d3..580d096ec 100644
+index 30146c51ce..3e68e80fc1 100644
 --- a/packages/contracts/src/orchestrationV2.ts
 +++ b/packages/contracts/src/orchestrationV2.ts
 @@ -370,6 +370,13 @@ export const OrchestrationV2AppThread = Schema.Struct({
@@ -2722,7 +2690,7 @@ index 695daf1d3..580d096ec 100644
  export const OrchestrationV2RunStatus = Schema.Literals([
    "preparing",
    "queued",
-@@ -1809,6 +1827,8 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
+@@ -1814,6 +1832,8 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
    pullRequests: Schema.optional(Schema.Array(ThreadPullRequestLink)),
    branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
    lineage: OrchestrationV2AppThreadLineage,
@@ -2731,7 +2699,7 @@ index 695daf1d3..580d096ec 100644
    forkedFrom: Schema.NullOr(OrchestrationV2AppThread.fields.forkedFrom),
    activeProviderThreadId: Schema.NullOr(ProviderThreadId),
    historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
-@@ -1851,6 +1871,8 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
+@@ -1856,6 +1876,8 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
    unsettledAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
    snoozedUntil: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
    snoozedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
@@ -2740,7 +2708,7 @@ index 695daf1d3..580d096ec 100644
    limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecovery)),
    pinnedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
    autoSettleDisabledAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
-@@ -2561,6 +2583,7 @@ export const OrchestrationV2Command = Schema.Union([
+@@ -2566,6 +2588,7 @@ export const OrchestrationV2Command = Schema.Union([
      interactionMode: ProviderInteractionMode,
      branch: Schema.NullOr(TrimmedNonEmptyString),
      worktreePath: Schema.NullOr(TrimmedNonEmptyString),
@@ -2748,7 +2716,7 @@ index 695daf1d3..580d096ec 100644
      importedNativeThread: Schema.optional(
        Schema.Struct({
          ref: Schema.Struct({
-@@ -2592,6 +2615,8 @@ export const OrchestrationV2Command = Schema.Union([
+@@ -2597,6 +2620,8 @@ export const OrchestrationV2Command = Schema.Union([
      commandId: CommandId,
      threadId: ThreadId,
      settledAt: Schema.optional(Schema.DateTimeUtc),

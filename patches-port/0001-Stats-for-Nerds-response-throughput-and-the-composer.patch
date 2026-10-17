@@ -19,14 +19,14 @@ Subject: [PATCH 1/5] Stats for Nerds: response throughput and the composer
  .../chat/ComposerStats.logic.test.ts          | 439 ++++++++++++++
  .../components/chat/ComposerStats.logic.ts    | 250 ++++++++
  .../web/src/components/chat/ComposerStats.tsx | 541 ++++++++++++++++++
- .../components/settings/SettingsPanels.tsx    |  31 +
+ .../components/settings/SettingsPanels.tsx    |  30 +
  .../src/components/settings/settingsSearch.ts |   6 +
  .../state/orchestrationV2Projection.test.ts   |  13 +
  .../src/state/orchestrationV2Projection.ts    |  15 +-
  .../contracts/src/orchestrationV2.test.ts     |  71 +++
  packages/contracts/src/orchestrationV2.ts     |  10 +
  packages/contracts/src/settings.ts            |   2 +
- 21 files changed, 2757 insertions(+), 51 deletions(-)
+ 21 files changed, 2756 insertions(+), 51 deletions(-)
  create mode 100644 apps/server/src/orchestration-v2/Adapters/ClaudeResponseThroughput.test.ts
  create mode 100644 apps/server/src/orchestration-v2/Adapters/ClaudeResponseThroughput.ts
  create mode 100644 apps/server/src/orchestration-v2/Adapters/CodexResponseThroughput.test.ts
@@ -36,7 +36,7 @@ Subject: [PATCH 1/5] Stats for Nerds: response throughput and the composer
  create mode 100644 apps/web/src/components/chat/ComposerStats.tsx
 
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-index b4991241e..8d38e92cc 100644
+index 00d6f36be3..4a386971f4 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
 @@ -4,6 +4,7 @@ import * as NodeFS from "node:fs";
@@ -254,7 +254,7 @@ index b4991241e..8d38e92cc 100644
      "projects Claude thinking blocks when %s",
      (status) =>
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-index 897ac1922..f84a32191 100644
+index 75a3bbd891..79291a5b55 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 @@ -1,3 +1,5 @@
@@ -274,7 +274,7 @@ index 897ac1922..f84a32191 100644
              Stream.tap((message) =>
                logProtocolEvent({
                  direction: "incoming",
-@@ -2953,6 +2959,7 @@ function formatClaudeUsageLimitWait(waitMs: number): string {
+@@ -2959,6 +2965,7 @@ function formatClaudeUsageLimitWait(waitMs: number): string {
  }
  
  interface ActiveClaudeTurnContext {
@@ -282,7 +282,7 @@ index 897ac1922..f84a32191 100644
    readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
    readonly nativeThreadId: string;
    readonly nativeTurnId: string;
-@@ -4100,6 +4107,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -4106,6 +4113,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
              return ordinal;
            });
  
@@ -291,7 +291,7 @@ index 897ac1922..f84a32191 100644
          const providerTurnPayload = (input: {
            readonly context: ActiveClaudeTurnContext;
            readonly status: OrchestrationV2ProviderTurn["status"];
-@@ -4118,6 +4127,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -4124,6 +4133,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
            status: input.status,
            startedAt: input.context.startedAt,
            completedAt: input.completedAt,
@@ -301,7 +301,7 @@ index 897ac1922..f84a32191 100644
          });
  
          const buildToolCallArtifacts = (input: {
-@@ -5771,6 +5783,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -5777,6 +5789,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                    failure: null,
                    threadDisposition,
                  };
@@ -309,7 +309,7 @@ index 897ac1922..f84a32191 100644
            yield* Effect.all(
              [
                emitProviderEvent({
-@@ -6563,6 +6576,20 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -6570,6 +6583,20 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
            }
            yield* trackClaudeGoal({ nativeThreadId: liveQuery.nativeThreadId, context, message });
  
@@ -330,7 +330,7 @@ index 897ac1922..f84a32191 100644
            if (message.type === "stream_event" && !message.parent_tool_use_id) {
              const event = message.event;
              const reasoning = context.reasoning;
-@@ -8177,8 +8204,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -8184,8 +8211,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
            };
            yield* Ref.set(queryContext, context);
            yield* querySession.messages.pipe(
@@ -343,7 +343,7 @@ index 897ac1922..f84a32191 100644
                  Effect.suspend(() => {
                    if (
                      message.type === "system" &&
-@@ -8189,8 +8218,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -8196,8 +8225,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                    }
                    return handleSdkMessage({ query: querySession, message });
                  }),
@@ -354,7 +354,7 @@ index 897ac1922..f84a32191 100644
              Effect.exit,
              Effect.flatMap(
                Effect.fnUntraced(function* (exit: ClaudeQueryStreamExit) {
-@@ -8270,6 +8299,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -8277,6 +8306,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                goalsByNativeThread.set(nativeThreadId, turnInput.providerThread.goal ?? null);
              }
              const context: ActiveClaudeTurnContext = {
@@ -364,7 +364,7 @@ index 897ac1922..f84a32191 100644
                nativeTurnId,
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeResponseThroughput.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeResponseThroughput.test.ts
 new file mode 100644
-index 000000000..948cefdf7
+index 0000000000..948cefdf7e
 --- /dev/null
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeResponseThroughput.test.ts
 @@ -0,0 +1,230 @@
@@ -600,7 +600,7 @@ index 000000000..948cefdf7
 +});
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeResponseThroughput.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeResponseThroughput.ts
 new file mode 100644
-index 000000000..4e2ee1812
+index 0000000000..4e2ee18122
 --- /dev/null
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeResponseThroughput.ts
 @@ -0,0 +1,155 @@
@@ -760,7 +760,7 @@ index 000000000..4e2ee1812
 +  }
 +}
 diff --git a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
-index 6e4a6494f..e111b2826 100644
+index 6e4a6494fb..e111b2826a 100644
 --- a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
 @@ -1961,6 +1961,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
@@ -1021,7 +1021,7 @@ index 6e4a6494f..e111b2826 100644
      Effect.scoped(
        Effect.gen(function* () {
 diff --git a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
-index 19d1e7b7f..3e3e56614 100644
+index 19d1e7b7ff..3e3e56614e 100644
 --- a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
 @@ -1,3 +1,4 @@
@@ -1359,7 +1359,7 @@ index 19d1e7b7f..3e3e56614 100644
                  yield* emitProviderEvent({
 diff --git a/apps/server/src/orchestration-v2/Adapters/CodexResponseThroughput.test.ts b/apps/server/src/orchestration-v2/Adapters/CodexResponseThroughput.test.ts
 new file mode 100644
-index 000000000..9e6d8b284
+index 0000000000..9e6d8b2848
 --- /dev/null
 +++ b/apps/server/src/orchestration-v2/Adapters/CodexResponseThroughput.test.ts
 @@ -0,0 +1,203 @@
@@ -1568,7 +1568,7 @@ index 000000000..9e6d8b284
 +});
 diff --git a/apps/server/src/orchestration-v2/Adapters/CodexResponseThroughput.ts b/apps/server/src/orchestration-v2/Adapters/CodexResponseThroughput.ts
 new file mode 100644
-index 000000000..1df8c4443
+index 0000000000..1df8c44435
 --- /dev/null
 +++ b/apps/server/src/orchestration-v2/Adapters/CodexResponseThroughput.ts
 @@ -0,0 +1,150 @@
@@ -1723,10 +1723,10 @@ index 000000000..1df8c4443
 +  }
 +}
 diff --git a/apps/server/src/orchestration-v2/ProjectionStore.test.ts b/apps/server/src/orchestration-v2/ProjectionStore.test.ts
-index 9a7d56511..75c12c761 100644
+index 3c23bf4231..6d605a963c 100644
 --- a/apps/server/src/orchestration-v2/ProjectionStore.test.ts
 +++ b/apps/server/src/orchestration-v2/ProjectionStore.test.ts
-@@ -766,6 +766,13 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
+@@ -951,6 +951,13 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
          outputTokens: 1_000,
          updatedAt: "2026-08-29T12:00:00.000Z",
        } as const;
@@ -1740,7 +1740,7 @@ index 9a7d56511..75c12c761 100644
        const replacementUsage = {
          usedTokens: 18_000,
          maxTokens: 200_000,
-@@ -822,10 +829,10 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
+@@ -1007,10 +1014,10 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
          nodeId,
          driver,
          occurredAt: now,
@@ -1753,7 +1753,7 @@ index 9a7d56511..75c12c761 100644
          type: "provider-turn.updated",
          threadId,
          nodeId,
-@@ -833,9 +840,28 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
+@@ -1018,9 +1025,28 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
          occurredAt: now,
          payload: { ...providerTurn, status: "completed", completedAt: now },
        });
@@ -1783,7 +1783,7 @@ index 9a7d56511..75c12c761 100644
        assert.strictEqual(reloaded.providerTurns[0]?.status, "completed");
  
        yield* projectionStore.apply({
-@@ -850,11 +876,16 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
+@@ -1035,11 +1061,16 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
            status: "completed",
            completedAt: now,
            tokenUsage: replacementUsage,
@@ -1801,7 +1801,7 @@ index 9a7d56511..75c12c761 100644
    );
  
 diff --git a/apps/server/src/orchestration-v2/ProjectionStore.ts b/apps/server/src/orchestration-v2/ProjectionStore.ts
-index 1a1cdff54..7f3e224ad 100644
+index 4222c3c270..74913f1180 100644
 --- a/apps/server/src/orchestration-v2/ProjectionStore.ts
 +++ b/apps/server/src/orchestration-v2/ProjectionStore.ts
 @@ -651,6 +651,9 @@ export function upsertProviderTurn(
@@ -1814,7 +1814,7 @@ index 1a1cdff54..7f3e224ad 100644
    });
  }
  
-@@ -2264,7 +2267,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -2291,7 +2294,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
            }
            case "provider-turn.updated": {
              const existingRows =
@@ -1825,10 +1825,10 @@ index 1a1cdff54..7f3e224ad 100644
                      SELECT payload_json
                      FROM orchestration_v2_projection_provider_turns
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index d5599f8c4..d7ce16f85 100644
+index b9e5fc037d..42f4f4b3ba 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -500,6 +500,8 @@ import { useLinkedThreadPullRequest } from "./ThreadStatusIndicators";
+@@ -438,6 +438,8 @@ import { useAgentOpenedPreviews } from "./preview/useAgentOpenedPreviews";
  import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
  import { ThreadStatusLine } from "./chat/ThreadStatusLine";
  import { formatRelativeTimeLabel, formatRelativeTimeUntilLabel } from "../timestampFormat";
@@ -1837,14 +1837,14 @@ index d5599f8c4..d7ce16f85 100644
  import { ComposerSurface } from "./chat/ComposerSurface";
  import { resolveThreadSyncPhase } from "../threadSync";
  import {
-@@ -3602,6 +3604,31 @@ export default function ChatView(props: ChatViewProps) {
-       ),
-     [activeThreadLiveTokenUsage, serverVisibleTurnItems, serverProjection],
+@@ -2620,6 +2622,31 @@ export default function ChatView(props: ChatViewProps) {
+       (thread) => thread.id === serverProjection.thread.activeProviderThreadId,
+     ),
    );
 +  const activeUsageLimits = activeProviderStatus?.usageLimits;
 +  const activeProviderName =
 +    activeProviderStatus?.displayName?.trim() || activeProviderStatus?.instanceId || "";
-+  const composerStats = useMemo(() => {
++  const composerStats = (() => {
 +    if (!settings.statsForNerdsEnabled) return null;
 +    const usageLimits = activeUsageLimits
 +      ? { limits: activeUsageLimits, providerName: activeProviderName }
@@ -1865,11 +1865,11 @@ index d5599f8c4..d7ce16f85 100644
 +        ),
 +      ),
 +    };
-+  }, [settings.statsForNerdsEnabled, serverProjection, activeUsageLimits, activeProviderName]);
-   const pendingBackgroundTasks = useMemo(() => {
++  })();
+   const pendingBackgroundTasks = (() => {
      if (serverProjection === null || serverProjection === undefined) {
        return [];
-@@ -11396,10 +11423,14 @@ export default function ChatView(props: ChatViewProps) {
+@@ -8532,10 +8559,14 @@ export default function ChatView(props: ChatViewProps) {
                          </div>
                        </div>
                      </ComposerSurface.Shell>
@@ -1890,7 +1890,7 @@ index d5599f8c4..d7ce16f85 100644
                </div>
 diff --git a/apps/web/src/components/chat/ComposerStats.logic.test.ts b/apps/web/src/components/chat/ComposerStats.logic.test.ts
 new file mode 100644
-index 000000000..479e94b19
+index 0000000000..479e94b193
 --- /dev/null
 +++ b/apps/web/src/components/chat/ComposerStats.logic.test.ts
 @@ -0,0 +1,439 @@
@@ -2335,7 +2335,7 @@ index 000000000..479e94b19
 +});
 diff --git a/apps/web/src/components/chat/ComposerStats.logic.ts b/apps/web/src/components/chat/ComposerStats.logic.ts
 new file mode 100644
-index 000000000..b4f72291f
+index 0000000000..b4f72291f8
 --- /dev/null
 +++ b/apps/web/src/components/chat/ComposerStats.logic.ts
 @@ -0,0 +1,250 @@
@@ -2591,7 +2591,7 @@ index 000000000..b4f72291f
 +}
 diff --git a/apps/web/src/components/chat/ComposerStats.tsx b/apps/web/src/components/chat/ComposerStats.tsx
 new file mode 100644
-index 000000000..025f57253
+index 0000000000..025f57253e
 --- /dev/null
 +++ b/apps/web/src/components/chat/ComposerStats.tsx
 @@ -0,0 +1,541 @@
@@ -3137,28 +3137,20 @@ index 000000000..025f57253
 +  );
 +}
 diff --git a/apps/web/src/components/settings/SettingsPanels.tsx b/apps/web/src/components/settings/SettingsPanels.tsx
-index fcdc35b3c..439072651 100644
+index cd14f5233d..dd0179eece 100644
 --- a/apps/web/src/components/settings/SettingsPanels.tsx
 +++ b/apps/web/src/components/settings/SettingsPanels.tsx
-@@ -620,6 +620,9 @@ export function useSettingsRestore(onRestored?: () => void) {
-       ...(settings.followUpBehavior !== DEFAULT_UNIFIED_SETTINGS.followUpBehavior
-         ? ["Follow-up behavior"]
-         : []),
-+      ...(settings.statsForNerdsEnabled !== DEFAULT_UNIFIED_SETTINGS.statsForNerdsEnabled
-+        ? ["Stats for nerds"]
-+        : []),
-       ...(settings.contextWindowMeterEnabled !== DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled
-         ? ["Context window indicator"]
-         : []),
-@@ -693,6 +696,7 @@ export function useSettingsRestore(onRestored?: () => void) {
-       settings.diffLayout,
-       settings.proactivePanelsEnabled,
-       settings.environmentIdentificationMode,
-+      settings.statsForNerdsEnabled,
-       settings.contextWindowMeterEnabled,
-       settings.fontFamilyCode,
-       settings.fontFamilyComposer,
-@@ -802,6 +806,7 @@ export function useSettingsRestore(onRestored?: () => void) {
+@@ -614,6 +614,9 @@ export function useSettingsRestore(onRestored?: () => void) {
+     ...(settings.followUpBehavior !== DEFAULT_UNIFIED_SETTINGS.followUpBehavior
+       ? ["Follow-up behavior"]
+       : []),
++    ...(settings.statsForNerdsEnabled !== DEFAULT_UNIFIED_SETTINGS.statsForNerdsEnabled
++      ? ["Stats for nerds"]
++      : []),
+     ...(settings.contextWindowMeterEnabled !== DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled
+       ? ["Context window indicator"]
+       : []),
+@@ -729,6 +732,7 @@ export function useSettingsRestore(onRestored?: () => void) {
        composerRichTextEnabled: DEFAULT_UNIFIED_SETTINGS.composerRichTextEnabled,
        sendShortcut: DEFAULT_UNIFIED_SETTINGS.sendShortcut,
        followUpBehavior: DEFAULT_UNIFIED_SETTINGS.followUpBehavior,
@@ -3166,7 +3158,7 @@ index fcdc35b3c..439072651 100644
        contextWindowMeterEnabled: DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled,
        environmentIdentificationMode: DEFAULT_UNIFIED_SETTINGS.environmentIdentificationMode,
        glassOpacity: DEFAULT_UNIFIED_SETTINGS.glassOpacity,
-@@ -2761,6 +2766,32 @@ export function GeneralSettingsPanel() {
+@@ -2676,6 +2680,32 @@ export function GeneralSettingsPanel() {
            }
          />
  
@@ -3200,7 +3192,7 @@ index fcdc35b3c..439072651 100644
            {...searchableSetting("send-shortcut")}
            description="Choose when Enter sends a prompt or inserts a new line"
 diff --git a/apps/web/src/components/settings/settingsSearch.ts b/apps/web/src/components/settings/settingsSearch.ts
-index 53032977f..c5458e54c 100644
+index 1999ff83d3..ed6f8cdd50 100644
 --- a/apps/web/src/components/settings/settingsSearch.ts
 +++ b/apps/web/src/components/settings/settingsSearch.ts
 @@ -414,6 +414,12 @@ export const SETTINGS_SEARCH_ITEMS = [
@@ -3217,7 +3209,7 @@ index 53032977f..c5458e54c 100644
      id: "send-shortcut",
      title: "Send shortcut",
 diff --git a/packages/client-runtime/src/state/orchestrationV2Projection.test.ts b/packages/client-runtime/src/state/orchestrationV2Projection.test.ts
-index eb7a6217c..019239a72 100644
+index eb7a6217c7..019239a720 100644
 --- a/packages/client-runtime/src/state/orchestrationV2Projection.test.ts
 +++ b/packages/client-runtime/src/state/orchestrationV2Projection.test.ts
 @@ -146,6 +146,13 @@ describe("applyOrchestrationV2ProjectionEvent", () => {
@@ -3255,7 +3247,7 @@ index eb7a6217c..019239a72 100644
  
    it("applies thread lifecycle payloads instead of leaving stale metadata", () => {
 diff --git a/packages/client-runtime/src/state/orchestrationV2Projection.ts b/packages/client-runtime/src/state/orchestrationV2Projection.ts
-index c93044e93..065caf434 100644
+index c93044e93f..065caf4348 100644
 --- a/packages/client-runtime/src/state/orchestrationV2Projection.ts
 +++ b/packages/client-runtime/src/state/orchestrationV2Projection.ts
 @@ -270,22 +270,23 @@ export function applyOrchestrationV2ProjectionEvent(
@@ -3290,7 +3282,7 @@ index c93044e93..065caf434 100644
        return { ...base, runtimeRequests: upsertEntity(base.runtimeRequests, event.payload) };
      case "message.updated":
 diff --git a/packages/contracts/src/orchestrationV2.test.ts b/packages/contracts/src/orchestrationV2.test.ts
-index 7f31463a1..42de3f6f3 100644
+index 3f4be6092a..38d7959a6e 100644
 --- a/packages/contracts/src/orchestrationV2.test.ts
 +++ b/packages/contracts/src/orchestrationV2.test.ts
 @@ -17,6 +17,7 @@ import {
@@ -3309,7 +3301,7 @@ index 7f31463a1..42de3f6f3 100644
    OrchestrationV2RpcSchemas,
    OrchestrationV2ShellSnapshot,
    OrchestrationV2SubscribeThreadInput,
-@@ -1551,3 +1553,72 @@ describe("latestProviderTurnForAttempt", () => {
+@@ -1554,3 +1556,72 @@ describe("latestProviderTurnForAttempt", () => {
      expect(latestProviderTurnForAttempt(turns, null)).toBeUndefined();
    });
  });
@@ -3383,10 +3375,10 @@ index 7f31463a1..42de3f6f3 100644
 +  });
 +});
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
-index fa4b7738e..d66b643be 100644
+index 04bec81a07..c9eb3b8f37 100644
 --- a/packages/contracts/src/orchestrationV2.ts
 +++ b/packages/contracts/src/orchestrationV2.ts
-@@ -977,6 +977,16 @@ export const OrchestrationV2ProviderTurn = Schema.Struct({
+@@ -982,6 +982,16 @@ export const OrchestrationV2ProviderTurn = Schema.Struct({
    completedAt: Schema.NullOr(Schema.DateTimeUtc),
    tokenUsage: Schema.optional(OrchestrationV2ProviderTurnTokenUsage),
    turnTokenUsage: Schema.optional(TurnTokenUsage),
@@ -3404,7 +3396,7 @@ index fa4b7738e..d66b643be 100644
  export type OrchestrationV2ProviderTurn = typeof OrchestrationV2ProviderTurn.Type;
  
 diff --git a/packages/contracts/src/settings.ts b/packages/contracts/src/settings.ts
-index 60d2aceed..1b7b4099e 100644
+index 60d2aceed7..1b7b4099e8 100644
 --- a/packages/contracts/src/settings.ts
 +++ b/packages/contracts/src/settings.ts
 @@ -404,6 +404,7 @@ export const ClientSettingsSchema = Schema.Struct({
