@@ -1,20 +1,25 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Fri, 16 Oct 2026 22:01:23 +0200
-Subject: [PATCH 8/8] feat(web): label child agents as Session or Subagent
+Subject: [PATCH 8/8] feat(web): label child agents as agent or subagent
 
 ---
  .../chat/SubagentTooltipContent.tsx           |  5 +
- .../ThreadRelationshipsControl.kind.test.tsx  | 91 +++++++++++++++++++
+ .../ThreadRelationshipsControl.kind.test.tsx  | 91 ++++++++++++++++++
  .../chat/ThreadRelationshipsControl.tsx       | 15 ++-
- .../chat/V2LifecycleRow.kind.test.tsx         | 74 +++++++++++++++
+ .../chat/V2LifecycleRow.kind.test.tsx         | 76 +++++++++++++++
  .../src/components/chat/V2LifecycleRow.tsx    | 21 ++++-
  .../src/state/subagentDisplay.kind.test.ts    | 13 +++
  .../src/state/subagentDisplay.ts              | 13 +++
- 7 files changed, 224 insertions(+), 8 deletions(-)
+ .../src/state/threadExecution.kind.test.ts    | 93 +++++++++++++++++++
+ .../src/state/threadExecution.ts              | 80 +++++++++-------
+ packages/contracts/src/orchestrationV2.ts     |  1 +
+ .../orchestrationV2PendingBackgroundWork.ts   |  2 +
+ 11 files changed, 369 insertions(+), 41 deletions(-)
  create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.kind.test.tsx
  create mode 100644 apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx
  create mode 100644 packages/client-runtime/src/state/subagentDisplay.kind.test.ts
+ create mode 100644 packages/client-runtime/src/state/threadExecution.kind.test.ts
 
 diff --git a/apps/web/src/components/chat/SubagentTooltipContent.tsx b/apps/web/src/components/chat/SubagentTooltipContent.tsx
 index 65b373167..544d9b604 100644
@@ -48,7 +53,7 @@ index 65b373167..544d9b604 100644
        </div>
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.kind.test.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.kind.test.tsx
 new file mode 100644
-index 000000000..44cb58058
+index 000000000..fcb6466a0
 --- /dev/null
 +++ b/apps/web/src/components/chat/ThreadRelationshipsControl.kind.test.tsx
 @@ -0,0 +1,91 @@
@@ -135,13 +140,13 @@ index 000000000..44cb58058
 +  await act(async () => {
 +    renderer = create(panel);
 +  });
-+  expect(text()).toContain("Port the patches Session");
-+  expect(text()).toContain("Explore the sidebar Subagent");
++  expect(text()).toContain("Port the patches agent");
++  expect(text()).toContain("Explore the sidebar subagent");
 +
 +  state.showTooltips = true;
 +  await act(async () => renderer.update(cloneElement(panel)));
-+  expect(text()).toMatch(/running · Session/);
-+  expect(text()).toMatch(/running · Subagent/);
++  expect(text()).toMatch(/running · agent/);
++  expect(text()).toMatch(/running · subagent/);
 +});
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
 index 536fd7981..24d5b8954 100644
@@ -187,10 +192,10 @@ index 536fd7981..24d5b8954 100644
                      <ArrowRightIcon className="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
 diff --git a/apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx b/apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx
 new file mode 100644
-index 000000000..540fa7278
+index 000000000..7e86bbc18
 --- /dev/null
 +++ b/apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,76 @@
 +import { type ReactNode } from "react";
 +import { renderToStaticMarkup } from "react-dom/server";
 +import { EnvironmentId, type OrchestrationV2TurnItem } from "@t3tools/contracts";
@@ -250,17 +255,19 @@ index 000000000..540fa7278
 +  ).replace(/<[^>]+>/g, " ");
 +
 +describe("subagent timeline card", () => {
-+  it("prefixes the status with Session for a delegate_task worker", () => {
-+    expect(render(subagentItem("app_owned"))).toContain("Session · Running");
++  it("prefixes the status with agent for a delegate_task worker", () => {
++    const html = render(subagentItem("app_owned"));
++    expect(html).toMatch(/(^|\s)agent · Running/);
++    expect(html).not.toContain("subagent");
 +  });
 +
-+  it("prefixes the status with Subagent for a provider-native child", () => {
-+    expect(render(subagentItem("provider_native"))).toContain("Subagent · Running");
++  it("prefixes the status with subagent for a provider-native child", () => {
++    expect(render(subagentItem("provider_native"))).toContain("subagent · Running");
 +  });
 +
 +  it("keeps the kind beside the title when a completed card shows its result", () => {
 +    const html = render(subagentItem("app_owned", { status: "completed", result: "All done" }));
-+    expect(html).toContain("Session");
++    expect(html).toMatch(/(^|\s)agent(\s|$)/);
 +    expect(html).toContain("All done");
 +    expect(html).not.toContain("Completed");
 +  });
@@ -335,7 +342,7 @@ index e9a4cc1a4..648b743e6 100644
                  className,
 diff --git a/packages/client-runtime/src/state/subagentDisplay.kind.test.ts b/packages/client-runtime/src/state/subagentDisplay.kind.test.ts
 new file mode 100644
-index 000000000..674c6f5b7
+index 000000000..60cd9adca
 --- /dev/null
 +++ b/packages/client-runtime/src/state/subagentDisplay.kind.test.ts
 @@ -0,0 +1,13 @@
@@ -343,9 +350,9 @@ index 000000000..674c6f5b7
 +import { subagentKindLabel } from "./subagentDisplay.js";
 +
 +describe("subagentKindLabel", () => {
-+  it("names a delegate_task worker a session and a provider-native child a subagent", () => {
-+    expect(subagentKindLabel("app_owned")).toBe("Session");
-+    expect(subagentKindLabel("provider_native")).toBe("Subagent");
++  it("names a delegate_task worker an agent and a provider-native child a subagent", () => {
++    expect(subagentKindLabel("app_owned")).toBe("agent");
++    expect(subagentKindLabel("provider_native")).toBe("subagent");
 +  });
 +
 +  it("names nothing when the origin is unknown", () => {
@@ -353,7 +360,7 @@ index 000000000..674c6f5b7
 +  });
 +});
 diff --git a/packages/client-runtime/src/state/subagentDisplay.ts b/packages/client-runtime/src/state/subagentDisplay.ts
-index d4d0db34e..2282c076d 100644
+index d4d0db34e..901152a7d 100644
 --- a/packages/client-runtime/src/state/subagentDisplay.ts
 +++ b/packages/client-runtime/src/state/subagentDisplay.ts
 @@ -1,4 +1,5 @@
@@ -372,12 +379,259 @@ index d4d0db34e..2282c076d 100644
 + */
 +export function subagentKindLabel(
 +  origin: OrchestrationV2Subagent["origin"] | undefined,
-+): "Session" | "Subagent" | null {
-+  if (origin === "app_owned") return "Session";
-+  if (origin === "provider_native") return "Subagent";
++): "agent" | "subagent" | null {
++  if (origin === "app_owned") return "agent";
++  if (origin === "provider_native") return "subagent";
 +  return null;
 +}
 +
  export function summarizeSubagentStatuses(
    statuses: ReadonlyArray<OrchestrationV2TurnItemStatus>,
  ): string {
+diff --git a/packages/client-runtime/src/state/threadExecution.kind.test.ts b/packages/client-runtime/src/state/threadExecution.kind.test.ts
+new file mode 100644
+index 000000000..736b4db71
+--- /dev/null
++++ b/packages/client-runtime/src/state/threadExecution.kind.test.ts
+@@ -0,0 +1,93 @@
++import { RunId, ThreadId } from "@t3tools/contracts";
++import { derivePendingBackgroundWork } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
++import { describe, expect, it } from "vite-plus/test";
++
++import { presentPendingBackgroundWork } from "./threadExecution.ts";
++
++const childThreadId = ThreadId.make("thread:child");
++
++describe("pending background work kind", () => {
++  it("waits on an agent for a delegate_task worker", () => {
++    const presentation = presentPendingBackgroundWork([
++      {
++        taskId: "worker",
++        kind: "subagent",
++        description: "Mobiel dashboard",
++        childThreadId,
++        origin: "app_owned",
++      },
++    ]);
++    expect(presentation?.title).toBe("Waiting on agent Mobiel dashboard");
++  });
++
++  it("waits on a subagent for a provider-native child", () => {
++    const presentation = presentPendingBackgroundWork([
++      {
++        taskId: "native",
++        kind: "subagent",
++        description: "Mobiel dashboard",
++        childThreadId,
++        origin: "provider_native",
++      },
++    ]);
++    expect(presentation?.title).toBe("Waiting on subagent Mobiel dashboard");
++  });
++
++  it("keeps subagent when the origin is unknown", () => {
++    const presentation = presentPendingBackgroundWork([
++      { taskId: "native", kind: "subagent", description: "Mobiel dashboard" },
++    ]);
++    expect(presentation?.title).toBe("Waiting on subagent Mobiel dashboard");
++  });
++
++  it("names an unnamed worker with its article", () => {
++    const presentation = presentPendingBackgroundWork([
++      { taskId: "worker", kind: "subagent", origin: "app_owned" },
++    ]);
++    expect(presentation?.title).toBe("Waiting on an agent");
++    expect(presentation?.items[0]?.label).toBe("agent");
++  });
++
++  it("counts agents and subagents apart, agents first", () => {
++    const presentation = presentPendingBackgroundWork([
++      { taskId: "native", kind: "subagent", description: "Explore", origin: "provider_native" },
++      { taskId: "worker-1", kind: "subagent", description: "Port", origin: "app_owned" },
++      { taskId: "worker-2", kind: "subagent", description: "Review", origin: "app_owned" },
++      { taskId: "command", kind: "command", description: "pnpm test" },
++    ]);
++    expect(presentation?.title).toBe("Waiting on 2 agents, 1 subagent and 1 command");
++    expect(presentation?.items.map((item) => item.taskId)).toEqual([
++      "worker-1",
++      "worker-2",
++      "native",
++      "command",
++    ]);
++  });
++
++  it("carries the subagent origin from the turn item into the pending task", () => {
++    const tasks = derivePendingBackgroundWork({
++      latestRun: { id: RunId.make("run"), ordinal: 1, status: "completed" },
++      providerThreads: [],
++      turnItems: [
++        {
++          id: "worker",
++          type: "subagent",
++          status: "running",
++          title: "Mobiel dashboard",
++          childThreadId,
++          origin: "app_owned",
++        },
++      ],
++    });
++    expect(tasks).toEqual([
++      {
++        taskId: "worker",
++        kind: "subagent",
++        description: "Mobiel dashboard",
++        childThreadId,
++        origin: "app_owned",
++      },
++    ]);
++    expect(presentPendingBackgroundWork(tasks)?.title).toBe("Waiting on agent Mobiel dashboard");
++  });
++});
+diff --git a/packages/client-runtime/src/state/threadExecution.ts b/packages/client-runtime/src/state/threadExecution.ts
+index 738a50d69..a9eaf0620 100644
+--- a/packages/client-runtime/src/state/threadExecution.ts
++++ b/packages/client-runtime/src/state/threadExecution.ts
+@@ -268,16 +268,33 @@ export function threadRuntimeHasInterruptibleRun(
+ 
+ type BackgroundWorkKind = OrchestrationV2PendingBackgroundTask["kind"];
+ 
+-const BACKGROUND_WORK_KINDS: Record<
+-  BackgroundWorkKind,
+-  { readonly order: number; readonly singular: string; readonly plural: string }
+-> = {
+-  subagent: { order: 0, singular: "subagent", plural: "subagents" },
+-  command: { order: 1, singular: "command", plural: "commands" },
+-  monitor: { order: 2, singular: "monitor", plural: "monitors" },
+-  background_task: { order: 3, singular: "background task", plural: "background tasks" },
++interface BackgroundWorkNoun {
++  readonly order: number;
++  readonly article: string;
++  readonly singular: string;
++  readonly plural: string;
++}
++
++const BACKGROUND_WORK_KINDS: Record<BackgroundWorkKind | "agent", BackgroundWorkNoun> = {
++  agent: { order: 0, article: "an", singular: "agent", plural: "agents" },
++  subagent: { order: 1, article: "a", singular: "subagent", plural: "subagents" },
++  command: { order: 2, article: "a", singular: "command", plural: "commands" },
++  monitor: { order: 3, article: "a", singular: "monitor", plural: "monitors" },
++  background_task: {
++    order: 4,
++    article: "a",
++    singular: "background task",
++    plural: "background tasks",
++  },
+ };
+ 
++/** A T3 `delegate_task` worker reads "agent", a provider-native subagent "subagent". */
++function backgroundWorkNoun(task: OrchestrationV2PendingBackgroundTask): BackgroundWorkNoun {
++  return BACKGROUND_WORK_KINDS[
++    task.kind === "subagent" && task.origin === "app_owned" ? "agent" : task.kind
++  ];
++}
++
+ export interface PendingBackgroundWorkItem {
+   readonly taskId: string;
+   readonly kind: BackgroundWorkKind;
+@@ -301,47 +318,44 @@ export function presentPendingBackgroundWork(
+ ): PendingBackgroundWorkPresentation | null {
+   if (tasks.length === 0) return null;
+   const waiting = backgroundWorkHoldsCompletion(tasks);
+-  const items = tasks
+-    .map((task): PendingBackgroundWorkItem => {
++  const entries = tasks
++    .map((task) => {
++      const noun = backgroundWorkNoun(task);
+       const description = task.description?.trim();
+       const label =
+         task.kind === "subagent" && description !== undefined
+           ? formatSubagentDisplayTitle(description).trim()
+           : description;
+-      return {
++      const item: PendingBackgroundWorkItem = {
+         taskId: task.taskId,
+         kind: task.kind,
+-        label:
+-          label === undefined || label.length === 0
+-            ? BACKGROUND_WORK_KINDS[task.kind].singular
+-            : label,
++        label: label === undefined || label.length === 0 ? noun.singular : label,
+         childThreadId: task.kind === "subagent" ? task.childThreadId : undefined,
+       };
++      return { item, noun };
+     })
+     // `map` returned a new array; Hermes has no `toSorted`.
+-    .sort(
+-      (left, right) =>
+-        BACKGROUND_WORK_KINDS[left.kind].order - BACKGROUND_WORK_KINDS[right.kind].order,
+-    );
+-  const [only] = items;
+-  if (items.length === 1 && only !== undefined) {
+-    const noun = BACKGROUND_WORK_KINDS[only.kind].singular;
+-    const named = only.label !== noun;
++    .sort((left, right) => left.noun.order - right.noun.order);
++  const items = entries.map(({ item }) => item);
++  const [only] = entries;
++  if (entries.length === 1 && only !== undefined) {
++    const { item, noun } = only;
++    const named = item.label !== noun.singular;
+     const title = waiting
+       ? named
+-        ? `${only.kind === "monitor" ? "" : `Waiting on ${noun} `}${only.label}`
+-        : `Waiting on a ${noun}`
++        ? `${item.kind === "monitor" ? "" : `Waiting on ${noun.singular} `}${item.label}`
++        : `Waiting on ${noun.article} ${noun.singular}`
+       : named
+-        ? `Running: ${only.label}`
+-        : `Running a ${noun}`;
++        ? `Running: ${item.label}`
++        : `Running ${noun.article} ${noun.singular}`;
+     return { title, items, waiting };
+   }
+-  const counts = new Map<BackgroundWorkKind, number>();
+-  for (const item of items) counts.set(item.kind, (counts.get(item.kind) ?? 0) + 1);
+-  const groups = Array.from(counts, ([kind, count]) => {
+-    const { singular, plural } = BACKGROUND_WORK_KINDS[kind];
+-    return `${count} ${count === 1 ? singular : plural}`;
+-  });
++  const counts = new Map<BackgroundWorkNoun, number>();
++  for (const { noun } of entries) counts.set(noun, (counts.get(noun) ?? 0) + 1);
++  const groups = Array.from(
++    counts,
++    ([{ singular, plural }, count]) => `${count} ${count === 1 ? singular : plural}`,
++  );
+   return { title: `${waiting ? "Waiting on" : "Running"} ${joinWithAnd(groups)}`, items, waiting };
+ }
+ 
+diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
+index c552f2e49..3a5f817cc 100644
+--- a/packages/contracts/src/orchestrationV2.ts
++++ b/packages/contracts/src/orchestrationV2.ts
+@@ -827,6 +827,7 @@ export const OrchestrationV2PendingBackgroundTask = kindUnionWithFallback(
+       ...PendingBackgroundTaskFields,
+       kind: Schema.Literal("subagent"),
+       childThreadId: Schema.optional(ThreadId),
++      origin: Schema.optional(Schema.Literals(["provider_native", "app_owned"])),
+     }),
+     Schema.Struct({ ...PendingBackgroundTaskFields, kind: Schema.Literal("command") }),
+     Schema.Struct({ ...PendingBackgroundTaskFields, kind: Schema.Literal("monitor") }),
+diff --git a/packages/shared/src/orchestrationV2PendingBackgroundWork.ts b/packages/shared/src/orchestrationV2PendingBackgroundWork.ts
+index 356903e46..548501010 100644
+--- a/packages/shared/src/orchestrationV2PendingBackgroundWork.ts
++++ b/packages/shared/src/orchestrationV2PendingBackgroundWork.ts
+@@ -93,6 +93,7 @@ type PendingBackgroundWorkTurnItem = {
+   readonly input?: unknown;
+   readonly prompt?: string | undefined;
+   readonly childThreadId?: ThreadId | null;
++  readonly origin?: Extract<OrchestrationV2TurnItem, { type: "subagent" }>["origin"];
+ };
+ 
+ function isLatestRunSettledForBackgroundWait(
+@@ -144,6 +145,7 @@ function pendingTaskFromTurnItem(
+         ...named,
+         kind: "subagent",
+         ...(item.childThreadId == null ? {} : { childThreadId: item.childThreadId }),
++        ...(item.origin === undefined ? {} : { origin: item.origin }),
+       };
+     case "command_execution":
+       return { ...named, kind: "command" };
