@@ -1,0 +1,360 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t3code-customize <t3code-customize@localhost>
+Date: Fri, 16 Oct 2026 22:07:48 +0200
+Subject: [PATCH 7/7] feat(mobile): label child agents as agent or subagent
+
+---
+ .../src/features/threads/SubagentRow.tsx      | 15 ++--
+ .../threads/thread-subagent-group.tsx         |  7 +-
+ .../src/features/threads/thread-work-log.tsx  |  7 +-
+ .../threadAgentsPresentation.kind.test.ts     | 77 +++++++++++++++++++
+ .../threads/threadAgentsPresentation.ts       | 26 ++++++-
+ .../src/lib/threadActivity.kind.test.ts       | 61 +++++++++++++++
+ apps/mobile/src/lib/threadActivity.ts         | 11 ++-
+ 7 files changed, 185 insertions(+), 19 deletions(-)
+ create mode 100644 apps/mobile/src/features/threads/threadAgentsPresentation.kind.test.ts
+ create mode 100644 apps/mobile/src/lib/threadActivity.kind.test.ts
+
+diff --git a/apps/mobile/src/features/threads/SubagentRow.tsx b/apps/mobile/src/features/threads/SubagentRow.tsx
+index ea66da928..1ae47f755 100644
+--- a/apps/mobile/src/features/threads/SubagentRow.tsx
++++ b/apps/mobile/src/features/threads/SubagentRow.tsx
+@@ -18,6 +18,7 @@ type SubagentRowSubagent = Pick<
+   OrchestrationV2Subagent,
+   | "threadId"
+   | "childThreadId"
++  | "origin"
+   | "model"
+   | "driver"
+   | "providerInstanceId"
+@@ -56,13 +57,13 @@ export function SubagentRow(props: {
+             >
+               ·
+             </Text>
+-            <Text
+-              className={cn(
+-                "shrink-0 text-xs font-t3-medium",
+-                SUBAGENT_TONE_TEXT_CLASS[presentation.tone],
+-              )}
+-            >
+-              {presentation.statusLabel}
++            <Text className="shrink-0 text-xs text-foreground-muted">
++              {presentation.kindLabel ? `${presentation.kindLabel} · ` : null}
++              <Text
++                className={cn("text-xs font-t3-medium", SUBAGENT_TONE_TEXT_CLASS[presentation.tone])}
++              >
++                {presentation.statusLabel}
++              </Text>
+             </Text>
+           </View>
+           {props.elapsed}
+diff --git a/apps/mobile/src/features/threads/thread-subagent-group.tsx b/apps/mobile/src/features/threads/thread-subagent-group.tsx
+index cf99eafa0..d97d37c0b 100644
+--- a/apps/mobile/src/features/threads/thread-subagent-group.tsx
++++ b/apps/mobile/src/features/threads/thread-subagent-group.tsx
+@@ -1,7 +1,10 @@
+ import { useAtomValue } from "@effect/atom-react";
+ import { StackActions, useIsFocused, useNavigation } from "@react-navigation/native";
+ import { scopeThreadRef } from "@t3tools/client-runtime/environment";
+-import { summarizeSubagentStatuses } from "@t3tools/client-runtime/state/subagent-display";
++import {
++  childAgentCountLabel,
++  summarizeSubagentStatuses,
++} from "@t3tools/client-runtime/state/subagent-display";
+ import { isActiveSubagentStatus } from "@t3tools/client-runtime/state/subagentRuntime";
+ import type {
+   EnvironmentId,
+@@ -92,7 +95,7 @@ export function ThreadSubagentGroup(props: {
+     };
+   });
+   const grouped = agents.length > 1;
+-  const label = `${agents.length} subagents`;
++  const label = childAgentCountLabel(agents.map((agent) => agent.origin));
+   const summary = summarizeSubagentStatuses(agents.map((agent) => agent.status));
+   const expanded = props.expandedRows[props.anchorKey] ?? false;
+   const iconUrl = (item: SubagentItem) =>
+diff --git a/apps/mobile/src/features/threads/thread-work-log.tsx b/apps/mobile/src/features/threads/thread-work-log.tsx
+index 6dd5cf22b..28594fcc8 100644
+--- a/apps/mobile/src/features/threads/thread-work-log.tsx
++++ b/apps/mobile/src/features/threads/thread-work-log.tsx
+@@ -68,6 +68,7 @@ import {
+   type ThreadFeedActivity,
+   workEntryRowLabel,
+ } from "../../lib/threadActivity";
++import { agentSpawnCardHint } from "./threadAgentsPresentation";
+ import {
+   toolCallLines,
+   turnItemOutputImages,
+@@ -1405,11 +1406,7 @@ export const ThreadAgentSpawnCard = memo(function ThreadAgentSpawnCard(props: {
+         accessibilityRole={canExpand ? "button" : undefined}
+         accessibilityState={canExpand ? { expanded } : undefined}
+         accessibilityLabel={`${summary.title}, ${summary.status}`}
+-        accessibilityHint={
+-          canExpand
+-            ? `Double tap to ${expanded ? "hide" : "show"} ${memberCount} ${memberCount === 1 ? "subagent" : "subagents"}. Long press to copy.`
+-            : "Long press to copy."
+-        }
++        accessibilityHint={agentSpawnCardHint({ members: summary.members, expanded })}
+         hitSlop={4}
+         onPress={() => {
+           if (!canExpand) return;
+diff --git a/apps/mobile/src/features/threads/threadAgentsPresentation.kind.test.ts b/apps/mobile/src/features/threads/threadAgentsPresentation.kind.test.ts
+new file mode 100644
+index 000000000..cb0945036
+--- /dev/null
++++ b/apps/mobile/src/features/threads/threadAgentsPresentation.kind.test.ts
+@@ -0,0 +1,77 @@
++import { describe, expect, it } from "vite-plus/test";
++
++import { agentSpawnCardHint, resolveSubagentRowPresentation } from "./threadAgentsPresentation";
++
++const base = {
++  title: "Port the patches",
++  prompt: "Port the patches",
++  status: "running" as const,
++  progress: undefined,
++  result: null,
++  childThreadId: "thread-child" as never,
++};
++
++describe("resolveSubagentRowPresentation kind", () => {
++  it("names a delegate_task worker an agent", () => {
++    const row = resolveSubagentRowPresentation({ ...base, origin: "app_owned" });
++    expect(row.kindLabel).toBe("agent");
++    expect(row.statusLabel).toBe("Working");
++  });
++
++  it("names a provider-native child a subagent", () => {
++    const row = resolveSubagentRowPresentation({
++      ...base,
++      origin: "provider_native",
++      childThreadId: null,
++    });
++    expect(row.kindLabel).toBe("subagent");
++  });
++
++  it("names nothing without an origin", () => {
++    expect(resolveSubagentRowPresentation(base).kindLabel).toBeNull();
++  });
++});
++
++describe("resolveSubagentRowPresentation fallback title", () => {
++  const untitled = { ...base, title: null, prompt: " " };
++
++  it("titles an untitled row by its kind", () => {
++    expect(resolveSubagentRowPresentation({ ...untitled, origin: "app_owned" }).title).toBe(
++      "agent",
++    );
++    expect(resolveSubagentRowPresentation({ ...untitled, origin: "provider_native" }).title).toBe(
++      "subagent",
++    );
++  });
++});
++
++describe("agentSpawnCardHint", () => {
++  it("counts delegate_task workers as agents", () => {
++    const members = [{ origin: "app_owned" as const }, { origin: "app_owned" as const }];
++    expect(agentSpawnCardHint({ members, expanded: false })).toBe(
++      "Double tap to show 2 agents. Long press to copy.",
++    );
++  });
++
++  it("counts provider-native and unknown children as subagents", () => {
++    const members = [{ origin: "provider_native" as const }, {}];
++    expect(agentSpawnCardHint({ members, expanded: true })).toBe(
++      "Double tap to hide 2 subagents. Long press to copy.",
++    );
++  });
++
++  it("names both kinds in a mixed card", () => {
++    const members = [
++      { origin: "app_owned" as const },
++      { origin: "provider_native" as const },
++      { origin: "provider_native" as const },
++    ];
++    expect(agentSpawnCardHint({ members, expanded: false })).toBe(
++      "Double tap to show 1 agent and 2 subagents. Long press to copy.",
++    );
++  });
++
++  it("only offers copy without members", () => {
++    expect(agentSpawnCardHint({ members: [], expanded: false })).toBe("Long press to copy.");
++  });
++});
+diff --git a/apps/mobile/src/features/threads/threadAgentsPresentation.ts b/apps/mobile/src/features/threads/threadAgentsPresentation.ts
+index 96981ab3a..5785d8ac5 100644
+--- a/apps/mobile/src/features/threads/threadAgentsPresentation.ts
++++ b/apps/mobile/src/features/threads/threadAgentsPresentation.ts
+@@ -1,6 +1,9 @@
+ import {
++  childAgentCountLabel,
+   formatSubagentDisplayTitle,
+   subagentDetailPreview,
++  subagentFallbackTitle,
++  subagentKindLabel,
+ } from "@t3tools/client-runtime/state/subagent-display";
+ import { isActiveSubagentStatus } from "@t3tools/client-runtime/state/subagentRuntime";
+ import type { OrchestrationV2Subagent } from "@t3tools/contracts";
+@@ -13,16 +16,22 @@ export interface SubagentRowPresentation {
+   readonly title: string;
+   readonly detail: string | null;
+   readonly statusLabel: string;
++  /** "agent" for a T3 delegate_task worker, "subagent" for a provider-native one. */
++  readonly kindLabel: "agent" | "subagent" | null;
+   readonly tone: SubagentRowTone;
+   readonly live: boolean;
+   readonly canOpenThread: boolean;
+ }
+ 
+-function rowTitle(subagent: Pick<OrchestrationV2Subagent, "title" | "prompt">): string {
++function rowTitle(
++  subagent: Pick<OrchestrationV2Subagent, "title" | "prompt"> & {
++    readonly origin?: OrchestrationV2Subagent["origin"];
++  },
++): string {
+   const title = subagent.title?.trim();
+   if (title) return formatSubagentDisplayTitle(title);
+   const prompt = subagent.prompt.trim();
+-  if (prompt.length === 0) return "Subagent";
++  if (prompt.length === 0) return subagentFallbackTitle(subagent.origin);
+   return prompt.length > PROMPT_TITLE_LIMIT
+     ? `${prompt.slice(0, PROMPT_TITLE_LIMIT - 3)}...`
+     : prompt;
+@@ -59,15 +68,26 @@ export function resolveSubagentRowPresentation(
+   subagent: Pick<
+     OrchestrationV2Subagent,
+     "title" | "prompt" | "status" | "progress" | "result" | "childThreadId"
+-  >,
++  > & { readonly origin?: OrchestrationV2Subagent["origin"] },
+ ): SubagentRowPresentation {
+   const live = isActiveSubagentStatus(subagent.status);
+   return {
+     title: rowTitle(subagent),
+     detail: subagentDetailPreview(subagent),
+     statusLabel: rowStatusLabel(subagent.status),
++    kindLabel: subagentKindLabel(subagent.origin),
+     tone: rowTone(subagent.status),
+     live,
+     canOpenThread: subagent.childThreadId !== null,
+   };
+ }
++
++/** VoiceOver hint for a spawn card, counting its members by kind: "show 1 agent and 2 subagents". */
++export function agentSpawnCardHint(input: {
++  readonly members: ReadonlyArray<{ readonly origin?: OrchestrationV2Subagent["origin"] }>;
++  readonly expanded: boolean;
++}): string {
++  if (input.members.length === 0) return "Long press to copy.";
++  const count = childAgentCountLabel(input.members.map(({ origin }) => origin));
++  return `Double tap to ${input.expanded ? "hide" : "show"} ${count}. Long press to copy.`;
++}
+diff --git a/apps/mobile/src/lib/threadActivity.kind.test.ts b/apps/mobile/src/lib/threadActivity.kind.test.ts
+new file mode 100644
+index 000000000..52626bbb6
+--- /dev/null
++++ b/apps/mobile/src/lib/threadActivity.kind.test.ts
+@@ -0,0 +1,61 @@
++import {
++  NodeId,
++  ProviderDriverKind,
++  ProviderInstanceId,
++  RunId,
++  ThreadId,
++  TurnItemId,
++  type OrchestrationV2TurnItem,
++} from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++import { describe, expect, it } from "vite-plus/test";
++
++import { buildThreadFeed } from "./threadActivity";
++
++const threadId = ThreadId.make("thread-kind");
++const timestamp = DateTime.makeUnsafe("2026-10-17T12:00:00.000Z");
++
++const untitledChild = (origin: "app_owned" | "provider_native", ordinal: number) =>
++  ({
++    id: TurnItemId.make(`item-${origin}`),
++    threadId,
++    runId: RunId.make("run-kind"),
++    nodeId: null,
++    providerThreadId: null,
++    providerTurnId: null,
++    nativeItemRef: null,
++    parentItemId: null,
++    ordinal,
++    status: "completed",
++    title: null,
++    startedAt: timestamp,
++    completedAt: timestamp,
++    updatedAt: timestamp,
++    type: "subagent",
++    subagentId: NodeId.make(`agent-${origin}`),
++    origin,
++    driver: ProviderDriverKind.make("codex"),
++    providerInstanceId: ProviderInstanceId.make("codex"),
++    childThreadId: ThreadId.make(`child-${origin}`),
++    prompt: "Inspect",
++    result: null,
++  }) satisfies OrchestrationV2TurnItem;
++
++describe("untitled child agent summary", () => {
++  it("names a delegate_task worker an agent and a provider-native child a subagent", () => {
++    const summaries = buildThreadFeed(
++      [untitledChild("app_owned", 0), untitledChild("provider_native", 1)].map(
++        (item, position) => ({
++          position,
++          visibility: "local" as const,
++          sourceThreadId: threadId,
++          sourceItemId: item.id,
++          item,
++        }),
++      ),
++    ).flatMap((entry) =>
++      entry.type === "activity-group" ? entry.activities.map((activity) => activity.summary) : [],
++    );
++    expect(summaries).toEqual(["agent", "subagent"]);
++  });
++});
+diff --git a/apps/mobile/src/lib/threadActivity.ts b/apps/mobile/src/lib/threadActivity.ts
+index fb8bbe29a..b4a731298 100644
+--- a/apps/mobile/src/lib/threadActivity.ts
++++ b/apps/mobile/src/lib/threadActivity.ts
+@@ -4,7 +4,10 @@ import type {
+   ThreadUserInputQuestion,
+ } from "@t3tools/client-runtime/state/thread-requests";
+ import { turnItemIsWorkspacePreparation } from "@t3tools/client-runtime/state/turn-item-presentation";
+-import { formatSubagentDisplayTitle } from "@t3tools/client-runtime/state/subagent-display";
++import {
++  formatSubagentDisplayTitle,
++  subagentFallbackTitle,
++} from "@t3tools/client-runtime/state/subagent-display";
+ import { isLiveSubagentTurnItem } from "@t3tools/client-runtime/state/subagentRuntime";
+ import { extractToolActivityPresentation } from "@t3tools/client-runtime/work-log/tool-presentation";
+ import {
+@@ -46,6 +49,7 @@ import type {
+   OrchestrationV2ProjectedTurnItem,
+   OrchestrationV2RunAttempt,
+   OrchestrationV2RunStatus,
++  OrchestrationV2Subagent,
+   OrchestrationV2TurnItem,
+   OrchestrationV2UserMessageInputIntent,
+   RunAttemptId,
+@@ -246,6 +250,8 @@ export interface AgentSpawnSummary {
+     readonly tone: "working" | "completed" | "failed" | "stopped";
+     readonly detail: string | undefined;
+     readonly updatedAt: string;
++    /** `app_owned` counts as an agent, `provider_native` or unknown as a subagent. */
++    readonly origin?: OrchestrationV2Subagent["origin"] | undefined;
+   }>;
+ }
+ 
+@@ -595,7 +601,8 @@ function itemSummary(
+     (item.type === "dynamic_tool"
+       ? dynamicToolTitle(item.toolName, item.input, item.title)
+       : undefined) ?? item.title?.trim();
+-  if (item.type === "subagent") return formatSubagentDisplayTitle(title || "Subagent");
++  if (item.type === "subagent")
++    return formatSubagentDisplayTitle(title || subagentFallbackTitle(item.origin));
+   if (title) return toolPresentation?.displayName ?? capitalizePhrase(title);
+   switch (item.type) {
+     case "reasoning":
