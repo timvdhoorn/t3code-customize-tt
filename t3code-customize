@@ -20,6 +20,7 @@ import plistlib
 import re
 import shlex
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -679,8 +680,6 @@ def checks(env, log, target):
     # (Array#toSorted crashes the iOS app at render). Lint what the patches add or change.
     changed = [f for f in git('diff', '--name-only', '--diff-filter=AM', target + '..HEAD').split()
                if f.endswith(('.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs'))]
-    if changed:
-        steps.append((['vp', 'lint', *changed], 'Lint failed on files the patches change.'))
     # Run against an empty home, as upstream's CI does: the server tests read the user's
     # real ~/.claude/skills, and a large set of skills races their TestClock steps.
     # Temporary files go to disk under the cache, as in the build: a tmpfs /tmp with a user
@@ -693,6 +692,84 @@ def checks(env, log, target):
         for args, message, *cwd in steps:
             if run(args, cwd=SOURCE / cwd[0] if cwd else SOURCE, env=check_env, log=log, check=False).returncode:
                 raise NeedsFix(message + ' Command: ' + ' '.join(args))
+        if changed:
+            lint_changed(changed, check_env, log)
+
+
+# A lint of every changed file takes 10 to 30 seconds. One hung for 35 minutes in an unattended
+# port (oxlint idle at 0% CPU), which blocks every update, so the step has a hard limit.
+LINT_TIMEOUT = int(os.environ.get('T3CODE_CUSTOMIZE_LINT_TIMEOUT_SECONDS', '600'))
+
+
+def run_bounded(args, env, log, timeout):
+    """Run args in SOURCE with stdout captured and stderr to the log. After timeout seconds the
+    whole process tree is killed (vp runs oxlint, which runs node workers) and NeedsFix raised."""
+    windows = os.name == 'nt'
+    log.flush()
+    process = subprocess.Popen(command_args(args, env), cwd=SOURCE, env=env, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=log, start_new_session=not windows,
+                               creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if windows else 0)
+    try:
+        stdout, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if windows:
+            subprocess.run(['taskkill', '/T', '/F', '/PID', str(process.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        raise NeedsFix(f'Lint did not finish within {timeout} seconds and was stopped'
+                       f' (T3CODE_CUSTOMIZE_LINT_TIMEOUT_SECONDS). Command: {" ".join(map(str, args))}')
+    return process.returncode, stdout.decode('utf-8', 'replace')
+
+
+def lint_report(output):
+    """The JSON report of `vp lint -f json`; vp may print a note before it."""
+    start = output.find('{')
+    try:
+        report = json.loads(output[start:]) if start >= 0 else None
+    except ValueError:
+        report = None
+    if not isinstance(report, dict) or not isinstance(report.get('number_of_files'), int):
+        raise NeedsFix('Lint printed no report, so it is unknown what it checked:\n' + output[-2000:])
+    return report
+
+
+def lint_changed(changed, env, log, timeout=None):
+    """Lint the files the patches change, and prove it did: lint first lists the files it would
+    check (its ignorePatterns drop generated ones such as apps/mobile/uniwind-types.d.ts), then
+    lints exactly those and must report the same number of files."""
+    timeout = LINT_TIMEOUT if timeout is None else timeout
+    flags = ['--no-error-on-unmatched-pattern']
+    code, listed = run_bounded(['vp', 'lint', '--debug=files', *flags, *changed], env, log, timeout)
+    if code:
+        raise NeedsFix('Lint could not list the files to check. Command: vp lint --debug=files')
+    listed = {os.path.normpath(line.strip()) for line in listed.splitlines() if line.strip()}
+    lintable = [f for f in changed if os.path.normpath(f) in listed]
+    ignored = [f for f in changed if f not in lintable]
+    if ignored:
+        log.write('Lint ignores (ignorePatterns): ' + ', '.join(ignored) + '\n')
+    if not lintable:
+        return
+    started = time.monotonic()
+    code, output = run_bounded(['vp', 'lint', '-f', 'json', *flags, *lintable], env, log, timeout)
+    report = lint_report(output)
+    errors = []
+    for diagnostic in report.get('diagnostics', []):
+        span = (diagnostic.get('labels') or [{}])[0].get('span', {})
+        line = (f"{diagnostic.get('filename')}:{span.get('line', 0)}:{span.get('column', 0)}:"
+                f" {diagnostic.get('severity')} {diagnostic.get('code')}: {diagnostic.get('message')}")
+        log.write(line + '\n')
+        if diagnostic.get('severity') == 'error':
+            errors.append(line)
+    log.write(f"Lint checked {report['number_of_files']} of {len(changed)} changed files"
+              f' in {time.monotonic() - started:.0f}s.\n')
+    log.flush()
+    if code or errors:
+        raise NeedsFix('Lint failed on files the patches change:\n' + '\n'.join('  ' + e for e in errors[:20]))
+    if report['number_of_files'] != len(lintable):
+        raise NeedsFix(f"Lint checked {report['number_of_files']} files, expected {len(lintable)}.")
 
 
 def install_playwright_browser(env, browsers, cwd, log):
