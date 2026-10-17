@@ -4,11 +4,15 @@ Date: Fri, 16 Oct 2026 22:07:48 +0200
 Subject: [PATCH 7/7] feat(mobile): label child agents as agent or subagent
 
 ---
- .../src/features/threads/SubagentRow.tsx      | 15 +++++----
- .../threadAgentsPresentation.kind.test.ts     | 33 +++++++++++++++++++
- .../threads/threadAgentsPresentation.ts       |  6 +++-
- 3 files changed, 46 insertions(+), 8 deletions(-)
+ .../src/features/threads/SubagentRow.tsx      | 15 ++---
+ .../threads/thread-subagent-group.tsx         |  7 ++-
+ .../threadAgentsPresentation.kind.test.ts     | 46 ++++++++++++++
+ .../threads/threadAgentsPresentation.ts       | 15 ++++-
+ .../src/lib/threadActivity.kind.test.ts       | 61 +++++++++++++++++++
+ apps/mobile/src/lib/threadActivity.ts         |  8 ++-
+ 6 files changed, 138 insertions(+), 14 deletions(-)
  create mode 100644 apps/mobile/src/features/threads/threadAgentsPresentation.kind.test.ts
+ create mode 100644 apps/mobile/src/lib/threadActivity.kind.test.ts
 
 diff --git a/apps/mobile/src/features/threads/SubagentRow.tsx b/apps/mobile/src/features/threads/SubagentRow.tsx
 index ea66da928..1ae47f755 100644
@@ -43,12 +47,37 @@ index ea66da928..1ae47f755 100644
              </Text>
            </View>
            {props.elapsed}
+diff --git a/apps/mobile/src/features/threads/thread-subagent-group.tsx b/apps/mobile/src/features/threads/thread-subagent-group.tsx
+index cf99eafa0..d97d37c0b 100644
+--- a/apps/mobile/src/features/threads/thread-subagent-group.tsx
++++ b/apps/mobile/src/features/threads/thread-subagent-group.tsx
+@@ -1,7 +1,10 @@
+ import { useAtomValue } from "@effect/atom-react";
+ import { StackActions, useIsFocused, useNavigation } from "@react-navigation/native";
+ import { scopeThreadRef } from "@t3tools/client-runtime/environment";
+-import { summarizeSubagentStatuses } from "@t3tools/client-runtime/state/subagent-display";
++import {
++  childAgentCountLabel,
++  summarizeSubagentStatuses,
++} from "@t3tools/client-runtime/state/subagent-display";
+ import { isActiveSubagentStatus } from "@t3tools/client-runtime/state/subagentRuntime";
+ import type {
+   EnvironmentId,
+@@ -92,7 +95,7 @@ export function ThreadSubagentGroup(props: {
+     };
+   });
+   const grouped = agents.length > 1;
+-  const label = `${agents.length} subagents`;
++  const label = childAgentCountLabel(agents.map((agent) => agent.origin));
+   const summary = summarizeSubagentStatuses(agents.map((agent) => agent.status));
+   const expanded = props.expandedRows[props.anchorKey] ?? false;
+   const iconUrl = (item: SubagentItem) =>
 diff --git a/apps/mobile/src/features/threads/threadAgentsPresentation.kind.test.ts b/apps/mobile/src/features/threads/threadAgentsPresentation.kind.test.ts
 new file mode 100644
-index 000000000..2d33e449f
+index 000000000..dc8459dbc
 --- /dev/null
 +++ b/apps/mobile/src/features/threads/threadAgentsPresentation.kind.test.ts
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,46 @@
 +import { describe, expect, it } from "vite-plus/test";
 +
 +import { resolveSubagentRowPresentation } from "./threadAgentsPresentation";
@@ -82,19 +111,33 @@ index 000000000..2d33e449f
 +    expect(resolveSubagentRowPresentation(base).kindLabel).toBeNull();
 +  });
 +});
++
++describe("resolveSubagentRowPresentation fallback title", () => {
++  const untitled = { ...base, title: null, prompt: " " };
++
++  it("titles an untitled row by its kind", () => {
++    expect(resolveSubagentRowPresentation({ ...untitled, origin: "app_owned" }).title).toBe(
++      "agent",
++    );
++    expect(resolveSubagentRowPresentation({ ...untitled, origin: "provider_native" }).title).toBe(
++      "subagent",
++    );
++  });
++});
 diff --git a/apps/mobile/src/features/threads/threadAgentsPresentation.ts b/apps/mobile/src/features/threads/threadAgentsPresentation.ts
-index 96981ab3a..09a9563f1 100644
+index 96981ab3a..d42d46ae2 100644
 --- a/apps/mobile/src/features/threads/threadAgentsPresentation.ts
 +++ b/apps/mobile/src/features/threads/threadAgentsPresentation.ts
-@@ -1,6 +1,7 @@
+@@ -1,6 +1,8 @@
  import {
    formatSubagentDisplayTitle,
    subagentDetailPreview,
++  subagentFallbackTitle,
 +  subagentKindLabel,
  } from "@t3tools/client-runtime/state/subagent-display";
  import { isActiveSubagentStatus } from "@t3tools/client-runtime/state/subagentRuntime";
  import type { OrchestrationV2Subagent } from "@t3tools/contracts";
-@@ -13,6 +14,8 @@ export interface SubagentRowPresentation {
+@@ -13,16 +15,22 @@ export interface SubagentRowPresentation {
    readonly title: string;
    readonly detail: string | null;
    readonly statusLabel: string;
@@ -103,7 +146,23 @@ index 96981ab3a..09a9563f1 100644
    readonly tone: SubagentRowTone;
    readonly live: boolean;
    readonly canOpenThread: boolean;
-@@ -59,13 +62,14 @@ export function resolveSubagentRowPresentation(
+ }
+ 
+-function rowTitle(subagent: Pick<OrchestrationV2Subagent, "title" | "prompt">): string {
++function rowTitle(
++  subagent: Pick<OrchestrationV2Subagent, "title" | "prompt"> & {
++    readonly origin?: OrchestrationV2Subagent["origin"];
++  },
++): string {
+   const title = subagent.title?.trim();
+   if (title) return formatSubagentDisplayTitle(title);
+   const prompt = subagent.prompt.trim();
+-  if (prompt.length === 0) return "Subagent";
++  if (prompt.length === 0) return subagentFallbackTitle(subagent.origin);
+   return prompt.length > PROMPT_TITLE_LIMIT
+     ? `${prompt.slice(0, PROMPT_TITLE_LIMIT - 3)}...`
+     : prompt;
+@@ -59,13 +67,14 @@ export function resolveSubagentRowPresentation(
    subagent: Pick<
      OrchestrationV2Subagent,
      "title" | "prompt" | "status" | "progress" | "result" | "childThreadId"
@@ -119,3 +178,96 @@ index 96981ab3a..09a9563f1 100644
      tone: rowTone(subagent.status),
      live,
      canOpenThread: subagent.childThreadId !== null,
+diff --git a/apps/mobile/src/lib/threadActivity.kind.test.ts b/apps/mobile/src/lib/threadActivity.kind.test.ts
+new file mode 100644
+index 000000000..52626bbb6
+--- /dev/null
++++ b/apps/mobile/src/lib/threadActivity.kind.test.ts
+@@ -0,0 +1,61 @@
++import {
++  NodeId,
++  ProviderDriverKind,
++  ProviderInstanceId,
++  RunId,
++  ThreadId,
++  TurnItemId,
++  type OrchestrationV2TurnItem,
++} from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++import { describe, expect, it } from "vite-plus/test";
++
++import { buildThreadFeed } from "./threadActivity";
++
++const threadId = ThreadId.make("thread-kind");
++const timestamp = DateTime.makeUnsafe("2026-10-17T12:00:00.000Z");
++
++const untitledChild = (origin: "app_owned" | "provider_native", ordinal: number) =>
++  ({
++    id: TurnItemId.make(`item-${origin}`),
++    threadId,
++    runId: RunId.make("run-kind"),
++    nodeId: null,
++    providerThreadId: null,
++    providerTurnId: null,
++    nativeItemRef: null,
++    parentItemId: null,
++    ordinal,
++    status: "completed",
++    title: null,
++    startedAt: timestamp,
++    completedAt: timestamp,
++    updatedAt: timestamp,
++    type: "subagent",
++    subagentId: NodeId.make(`agent-${origin}`),
++    origin,
++    driver: ProviderDriverKind.make("codex"),
++    providerInstanceId: ProviderInstanceId.make("codex"),
++    childThreadId: ThreadId.make(`child-${origin}`),
++    prompt: "Inspect",
++    result: null,
++  }) satisfies OrchestrationV2TurnItem;
++
++describe("untitled child agent summary", () => {
++  it("names a delegate_task worker an agent and a provider-native child a subagent", () => {
++    const summaries = buildThreadFeed(
++      [untitledChild("app_owned", 0), untitledChild("provider_native", 1)].map(
++        (item, position) => ({
++          position,
++          visibility: "local" as const,
++          sourceThreadId: threadId,
++          sourceItemId: item.id,
++          item,
++        }),
++      ),
++    ).flatMap((entry) =>
++      entry.type === "activity-group" ? entry.activities.map((activity) => activity.summary) : [],
++    );
++    expect(summaries).toEqual(["agent", "subagent"]);
++  });
++});
+diff --git a/apps/mobile/src/lib/threadActivity.ts b/apps/mobile/src/lib/threadActivity.ts
+index fb8bbe29a..e0c7b1bf0 100644
+--- a/apps/mobile/src/lib/threadActivity.ts
++++ b/apps/mobile/src/lib/threadActivity.ts
+@@ -4,7 +4,10 @@ import type {
+   ThreadUserInputQuestion,
+ } from "@t3tools/client-runtime/state/thread-requests";
+ import { turnItemIsWorkspacePreparation } from "@t3tools/client-runtime/state/turn-item-presentation";
+-import { formatSubagentDisplayTitle } from "@t3tools/client-runtime/state/subagent-display";
++import {
++  formatSubagentDisplayTitle,
++  subagentFallbackTitle,
++} from "@t3tools/client-runtime/state/subagent-display";
+ import { isLiveSubagentTurnItem } from "@t3tools/client-runtime/state/subagentRuntime";
+ import { extractToolActivityPresentation } from "@t3tools/client-runtime/work-log/tool-presentation";
+ import {
+@@ -595,7 +598,8 @@ function itemSummary(
+     (item.type === "dynamic_tool"
+       ? dynamicToolTitle(item.toolName, item.input, item.title)
+       : undefined) ?? item.title?.trim();
+-  if (item.type === "subagent") return formatSubagentDisplayTitle(title || "Subagent");
++  if (item.type === "subagent")
++    return formatSubagentDisplayTitle(title || subagentFallbackTitle(item.origin));
+   if (title) return toolPresentation?.displayName ?? capitalizePhrase(title);
+   switch (item.type) {
+     case "reasoning":
