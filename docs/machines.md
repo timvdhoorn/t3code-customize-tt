@@ -9,6 +9,10 @@ run the same patches.
   that holds a machine's checkout (up to 30 min, naming the holder), moves devbox1 to the newest
   nightly, restarts devbox1's T3 server once no thread works there (open sessions reconnect; say so
   when you report) and turns `autoupdate on` on every machine with its `machines.json` settings.
+  Run from a T3 agent on devbox1 it reruns itself in the systemd unit `t3code-customize-fleet`
+  (one at a time) and returns at once, since its server step waits for that agent's thread too: do
+  not wait on it in that turn, check `journalctl --user -u t3code-customize-fleet` later
+  (`--foreground` runs it inline). On a Mac it runs inline and says not to wait on it.
 - **Never interrupt a running thread.** Nothing in this tool quits or relaunches the Mac app. A
   T3 server restarts only in `server` and `server-off`, once per run, and only while it is idle:
   `busy_threads` finds no live work in `~/.t3/userdata/statev2.sqlite`, by the rules the server
@@ -33,7 +37,8 @@ run the same patches.
   and a run that finds the build already installed still restarts (gated) while that marker, or
   T3's own `.restart-pending` for the active version, is there. A failed health check rolls back to stock
   and restarts only while idle; otherwise stock waits on disk for the next restart. Run from a T3
-  agent on devbox1, `server` moves itself to a systemd unit, which waits for that agent's turn to
+  agent on devbox1 (`inside_t3_agent`: the service's `T3_BOOT_SERVICE_UNIT` in the environment, or a
+  cgroup in `app-t3code-agents*.slice` or `t3code.service`), `server` moves itself to a systemd unit, which waits for that agent's turn to
   end, so never wait on that unit in the same turn: end the turn and check
   `journalctl --user -u t3code-customize-server-run` later.
 - **How each machine gets a new nightly:**

@@ -155,7 +155,7 @@ class OwedRestartTest(unittest.TestCase):
 
     def run_server(self, mark_version='1.1-nightly'):
         args = argparse.Namespace(no_restart=False, no_pull=True, resume=False, t3_update=False, force=False)
-        with patch.object(customize, 'MAC', False), patch.object(customize, 'inside_t3_service', return_value=False), \
+        with patch.object(customize, 'MAC', False), patch.object(customize, 'inside_t3_agent', return_value=False), \
                 patch.object(customize, 'server_runtime', return_value=('1.1-nightly', self.runtime)), \
                 patch.object(customize, 'server_installing', return_value=False), \
                 patch.object(customize, 'recipe_hash', return_value='r'), \
@@ -246,7 +246,7 @@ class ServerRunLockTest(unittest.TestCase):
         customize.CHECKOUT_LOCK = lock
         self.addCleanup(setattr, customize, 'CHECKOUT_LOCK', None)
         recipes = patch.object(customize, 'recipe_hash', return_value=recipe) if recipe else contextlib.nullcontext()
-        with patch.object(customize, 'inside_t3_service', return_value=False), \
+        with patch.object(customize, 'inside_t3_agent', return_value=False), \
                 patch.object(customize, 'server_runtime', side_effect=lambda: self.runtime), \
                 patch.object(customize, 'server_installing', return_value=False), recipes, \
                 patch.object(customize, 'public_config_from', return_value=dict(customize.PUBLIC_CONFIG)), \
@@ -431,7 +431,7 @@ class ServerRunLockTest(unittest.TestCase):
         self.addCleanup(setattr, customize, 'CHECKOUT_LOCK', None)
         free = []
         args = argparse.Namespace(no_restart=False, no_pull=True, resume=False, t3_update=False, force=False)
-        with patch.object(customize, 'inside_t3_service', return_value=False), \
+        with patch.object(customize, 'inside_t3_agent', return_value=False), \
                 patch.object(customize, 'server_runtime', return_value=self.runtime), \
                 patch.object(customize, 'server_installing', return_value=False), \
                 patch.object(customize, 'recipe_hash', return_value='r'), \
@@ -441,6 +441,92 @@ class ServerRunLockTest(unittest.TestCase):
             customize.cmd_server(args)
         self.assertEqual(free, [True])
         restart.assert_called_once()
+
+
+class InsideT3AgentTest(unittest.TestCase):
+    """A run that waits for idle threads must notice it is part of a T3 agent's turn."""
+
+    def inside(self, cgroup, env=None):
+        with tempfile.NamedTemporaryFile('w') as proc:
+            proc.write(cgroup)
+            proc.flush()
+            with patch.object(customize, 'PROC_CGROUP', Path(proc.name)), patch.dict(customize.os.environ, env or {}):
+                if not env:
+                    customize.os.environ.pop('T3_BOOT_SERVICE_UNIT', None)
+                return customize.inside_t3_agent()
+
+    def test_an_agent_scope_in_the_t3_agents_slice_is_inside(self):
+        self.assertTrue(self.inside('0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-t3code.slice/'
+                                    'app-t3code-agents.slice/app-t3code-agents-0123456789ab.slice/t3code-claude-1.scope\n'))
+
+    def test_the_t3_service_itself_is_inside(self):
+        self.assertTrue(self.inside('0::/user.slice/user-1000.slice/user@1000.service/app.slice/t3code.service\n'))
+
+    def test_the_service_environment_is_inside_whatever_the_cgroup(self):
+        self.assertTrue(self.inside('0::/user.slice/session-3.scope\n', {'T3_BOOT_SERVICE_UNIT': 't3code.service'}))
+
+    def test_a_transient_unit_of_this_tool_and_a_terminal_are_outside(self):
+        # What publish_port's detached fleet and the detached fleet itself run in.
+        self.assertFalse(self.inside('0::/user.slice/user-1000.slice/user@1000.service/app.slice/'
+                                     't3code-customize-fleet.service\n'))
+        self.assertFalse(self.inside('0::/user.slice/user-1000.slice/session-3.scope\n'))
+
+
+class FleetDetachTest(unittest.TestCase):
+    def fleet(self, inside=True, mac=False, active=False, started=0, foreground=False, interactive=True, env=None):
+        args = argparse.Namespace(foreground=foreground, no_pull=True, only=None)
+        calls, lines = [], []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return argparse.Namespace(returncode=started, stderr='no bus', stdout='')
+
+        with patch.object(customize, 'MAC', mac), patch.object(customize, 'inside_t3_agent', return_value=inside), \
+                patch.object(customize, 'interactive', return_value=interactive), \
+                patch.object(customize.shutil, 'which', return_value='/usr/bin/systemd-run'), \
+                patch.object(customize, 'systemctl', return_value=argparse.Namespace(returncode=0 if active else 3)), \
+                patch.object(customize.subprocess, 'run', run), patch.object(customize, 'say', lines.append), \
+                patch.object(customize.sys, 'argv', ['t3code-customize', 'fleet', '--only', 'devbox1']), \
+                patch.dict(customize.os.environ, env or {}), \
+                patch.object(customize, 'load', side_effect=customize.Stop('ran inline')) as inline:
+            try:
+                customize.cmd_fleet(args)
+            except customize.Stop:
+                pass
+        return calls, lines, inline.called
+
+    def test_inside_an_agent_fleet_reruns_itself_in_its_own_unit_and_returns(self):
+        calls, lines, inline = self.fleet()
+        self.assertFalse(inline)
+        argv = calls[0]
+        self.assertEqual(argv[:5], ['systemd-run', '--user', '--collect', '--unit', 't3code-customize-fleet'])
+        self.assertEqual(argv[-5:], [str(customize.REPO / customize.NAME), 'fleet', '--only', 'devbox1', '--foreground'])
+        self.assertIn('journalctl --user -u t3code-customize-fleet', lines[-1])
+
+    def test_an_active_fleet_unit_is_pointed_at_instead_of_started_twice(self):
+        calls, lines, inline = self.fleet(active=True)
+        self.assertEqual(calls, [])
+        self.assertFalse(inline)
+        self.assertIn('already going', lines[-1])
+
+    def test_outside_an_agent_or_in_the_foreground_it_runs_inline(self):
+        for options in ({'inside': False}, {'foreground': True}, {'env': {'T3CODE_CUSTOMIZE_FOREGROUND': '1'}}):
+            calls, lines, inline = self.fleet(**options)
+            self.assertEqual(calls, [], options)
+            self.assertTrue(inline, options)
+
+    def test_when_systemd_run_fails_it_runs_inline_and_warns(self):
+        calls, lines, inline = self.fleet(started=1)
+        self.assertTrue(inline)
+        self.assertIn('Do not wait on it in this turn', lines[-1])
+
+    def test_on_macos_it_runs_inline_with_the_warning(self):
+        calls, lines, inline = self.fleet(mac=True, inside=False, interactive=False)
+        self.assertEqual(calls, [])
+        self.assertTrue(inline)
+        self.assertIn('do not wait on this fleet', lines[0])
+        calls, lines, inline = self.fleet(mac=True, inside=False, interactive=True)
+        self.assertEqual(lines, [])
 
 
 class AcquireLockTest(unittest.TestCase):
