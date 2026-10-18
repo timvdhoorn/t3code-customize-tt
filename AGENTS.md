@@ -101,7 +101,7 @@ personal data. Name where a secret lives (a 1Password item, a path under
 - **Asked to update** ("update", "zijn er updates", "update alles"):
   [.agents/playbooks/update.md](.agents/playbooks/update.md).
 - After every change to this repo that is committed and pushed, run `./t3code-customize fleet` and
-  report the summary per machine ([docs/machines.md](docs/machines.md)).
+  report the summary per machine ([docs/machines.md](docs/machines.md); from a T3 agent it detaches, so read it from its journal in a later turn).
 - Python stays compatible with macOS's system Python 3.9. Before reporting a change to the script:
   `python3 -m py_compile t3code-customize`, `python3 -m unittest discover -s tests` and
   `./t3code-customize status`.

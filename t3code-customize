@@ -2321,12 +2321,23 @@ def server_installing(version, folder):
     return isinstance(update, dict) and update.get('status') == 'pending'
 
 
-def inside_t3_service():
-    """True when this runs under the T3 server itself (a T3 agent on this box), which a restart kills."""
+PROC_CGROUP = Path('/proc/self/cgroup')
+
+
+def inside_t3_agent():
+    """True when this run is part of a T3 agent's turn on this machine (its shell or a background
+    command). That thread then counts as busy until this run ends, so a run that waits for idle
+    threads must not run here. The T3 server's unit sets T3_BOOT_SERVICE_UNIT, which every agent
+    process inherits; since agents moved into scopes of their own (app-t3code-agents*.slice, upstream
+    86534db4d) the cgroup no longer names the service, so both are checked. A transient unit of
+    this tool (systemd-run) gets neither."""
+    if os.environ.get('T3_BOOT_SERVICE_UNIT'):
+        return True
     try:
-        return SERVICE_UNIT in Path('/proc/self/cgroup').read_text()
+        cgroup = PROC_CGROUP.read_text()
     except OSError:
         return False
+    return SERVICE_UNIT in cgroup or '/app-t3code-agents' in cgroup
 
 
 # --- Never interrupting a running thread ---------------------------------------------
@@ -2638,8 +2649,9 @@ def cmd_server(args):
     """Build the customized server for the T3 version the service runs and switch the service to it."""
     if MAC:
         raise Stop(f'server is for a headless Linux T3 server; on macOS run {NAME} update.')
-    if inside_t3_service() and not args.no_restart:
-        # The restart would kill this very process; finish in a unit of its own.
+    if inside_t3_agent() and not args.no_restart:
+        # The idle wait would wait for this very agent's turn (and the restart could end it);
+        # finish in a unit of its own.
         argv = [sys.executable, str(REPO / NAME), *sys.argv[1:]]
         run(['systemd-run', '--user', '--collect', '--unit', NAME + '-server-run',
              '--setenv=PATH=' + os.environ.get('PATH', ''), *argv], capture=True)
@@ -3175,8 +3187,38 @@ def autoupdate_command(machine):
             + (['--ios'] if machine.get('ios') else []))
 
 
+FLEET_UNIT = NAME + '-fleet'
+
+
+def detach_fleet(argv):
+    """Rerun this fleet in a systemd user unit of its own, so the T3 thread that started it is not
+    kept busy by it (this machine's server step waits until no thread works, that one included).
+    True when it runs there now, or already did; False to run it here."""
+    if systemctl('is-active', '--quiet', FLEET_UNIT).returncode == 0:
+        say(f'A fleet run is already going outside this thread; check it with journalctl --user -u {FLEET_UNIT}')
+        return True
+    env = ['--setenv=' + name + '=' + os.environ[name] for name in ('PATH', 'SSH_AUTH_SOCK') if os.environ.get(name)]
+    started = subprocess.run(['systemd-run', '--user', '--collect', '--unit', FLEET_UNIT, *env, sys.executable,
+                              str(REPO / NAME), *argv, '--foreground'], capture_output=True, text=True)
+    if started.returncode:
+        say(f'Could not start fleet outside this thread ({started.stderr.strip()[:200]}); running it here.'
+            ' Do not wait on it in this turn.')
+        return False
+    say(f'Running outside this thread; check later with journalctl --user -u {FLEET_UNIT}'
+        ' (do not wait on it in this turn).')
+    return True
+
+
 def cmd_fleet(args):
     """Update every machine in machines.json: Macs install Nightly and rebuild, servers rebuild their T3 server."""
+    if not (args.foreground or os.environ.get('T3CODE_CUSTOMIZE_FOREGROUND')):
+        if MAC:
+            # No systemd here; an agent's shell has no terminal.
+            if inside_t3_agent() or not interactive():
+                say('Run from a T3 agent: do not wait on this fleet in the same turn. A server step waits until'
+                    ' no thread works there, and a thread waiting on fleet counts as working.')
+        elif inside_t3_agent() and shutil.which('systemd-run') and detach_fleet(sys.argv[1:]):
+            return
     if not args.no_pull:
         pull_latest()
     machines = load(MACHINES, {}).get('machines', [])
@@ -3541,6 +3583,8 @@ def main():
     fleet.add_argument('--no-pull', action='store_true', help='do not fetch newer patches first')
     fleet.add_argument('--wait-lock', type=int, default=30, metavar='MINUTES',
                        help='how long each machine waits for a run that holds its checkout (default 30)')
+    fleet.add_argument('--foreground', action='store_true',
+                       help='run here even inside a T3 agent (default there: a systemd unit of its own)')
     ios = sub.add_parser('ios', help='macOS: build the patched iOS app and upload it to TestFlight (see ios.json)')
     build_options(ios)
     port = sub.add_parser('port', help='port every patch layer onto a nightly with one agent session (the porter runs it)')
