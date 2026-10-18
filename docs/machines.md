@@ -18,9 +18,15 @@ run the same patches.
   count; an unreadable database, or a missing one on a machine with a T3 server, counts as busy.
   Everything slow happens first: `t3 update` without `--yes` only stages the new version (no
   terminal, so the service keeps running until its next restart), and the customized server is
-  built, copied and probed as `*.customize-new`. Then it checks every minute for up to 4 hours
-  (`T3CODE_CUSTOMIZE_IDLE_WAIT_MINUTES`), swaps the files in by renaming, runs `daemon-reload` (the
-  unit `t3 update` rewrote) and checks once more right before `systemctl restart`. Still busy: it
+  built, copied and probed as `*.customize-new`. Then it releases the checkout lock (nothing after
+  that touches the source checkout, so a port or another build need not wait for the idle wait,
+  which its own waiting threads would prolong) and checks every minute for up to 4 hours
+  (`T3CODE_CUSTOMIZE_IDLE_WAIT_MINUTES`). Staging, the swap and the restart take a short restart
+  lock (`~/.cache/t3code-customize/restart-lock`, after the checkout lock, never during an idle
+  wait); under it the run swaps only when the service still runs its version and the staged build
+  is still its own (`t3.customize-new.json`), else it yields to the newer run. It swaps the files in
+  by renaming, runs `daemon-reload` (the unit `t3 update` rewrote) and checks once more right before
+  `systemctl restart`. `server-off` and the owed restart below also wait for idle without the checkout lock. Still busy: it
   stops with `deferred: threads busy` (exit 4, fleet says the same) and restarts nothing; the next run
   tries again. A restart deferred after the swap leaves `~/.t3/runtime/.t3code-customize-restart-pending`,
   and a run that finds the build already installed still restarts (gated) while that marker, or
