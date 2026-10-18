@@ -643,6 +643,139 @@ class HistoryRecipeTest(Sandbox):
         self.assertEqual(customize.run_marker(), {})
 
 
+def dead_pid():
+    child = subprocess.Popen([sys.executable, '-c', 'pass'])
+    child.wait()
+    return child.pid
+
+
+class KilledSessionTest(Sandbox):
+    """A run killed during its agent session (reboot, OOM, unit stopped) never records its fingerprint."""
+
+    def killed(self, pid):
+        with self.assertRaises(customize.NeedsFix):
+            self.prepare(unattended=True)
+        customize.update_run_marker(stopped=None, agent={'pid': pid, 'ticks': customize.process_ticks(pid)})
+
+    def test_a_dead_session_nobody_claimed_is_aborted(self):
+        self.killed(dead_pid())
+        self.resolve('a.txt', 'half done\n')  # what the agent got to before the kill
+        with self.assertRaises(customize.NeedsFix) as stop:
+            self.quiet(self.prepare, unattended=True)
+        self.assertIn('The shared patches conflict', str(stop.exception))
+
+    def test_a_live_session_stays_protected(self):
+        self.killed(os.getpid())
+        with self.assertRaises(customize.Stop) as stop:
+            self.quiet(self.prepare, unattended=True)
+        self.assertIn('stopped rebase or git am', str(stop.exception))
+
+    def test_a_claimed_checkout_stays_protected_after_a_kill(self):
+        self.killed(dead_pid())
+        with self.assertRaises(customize.NeedsFix):
+            self.cont()
+        with self.assertRaises(customize.Stop) as stop:
+            self.quiet(self.prepare, unattended=True)
+        self.assertNotIsInstance(stop.exception, customize.NeedsFix)
+
+    def test_the_session_is_in_the_marker_while_it_runs_and_the_fingerprint_after(self):
+        with self.assertRaises(customize.NeedsFix):
+            self.prepare(unattended=True)
+        seen = []
+        real = customize.subprocess.run
+
+        def run(args, *rest, **kwargs):
+            if kwargs.get('input') is not None:
+                seen.append(customize.run_marker())
+                return subprocess.CompletedProcess(args, 0)
+            return real(args, *rest, **kwargs)
+        with patch.object(customize.subprocess, 'run', run), patch.object(customize, 'command_args', lambda a, env=None: a):
+            self.quiet(customize.agent_fix, 'claude', 'conflict', self.nightly, 'n2', self.log)
+        self.assertEqual(seen[0]['agent']['pid'], os.getpid())
+        self.assertFalse(seen[0]['stopped'])
+        after = customize.run_marker()
+        self.assertIsNone(after['agent'])
+        self.assertEqual(after['stopped'], customize.checkout_fingerprint())
+
+
+class FailedPortTest(Sandbox):
+    def args(self, force=False):
+        return argparse.Namespace(no_pull=True, resume=False, version='n2', commit=None, force=force, dry_run=False)
+
+    def test_a_recent_failure_stops_the_next_port_and_is_reported_once(self):
+        with self.assertRaises(customize.NeedsFix):
+            self.prepare(unattended=True)
+        self.quiet(customize.port_failed, 'n2', 'conflict', self.log)
+        self.notes.clear()
+        with patch.object(customize, 'port_pending', lambda v: None), \
+                patch.object(customize, 'tool_log', side_effect=AssertionError('ported again')):
+            for _ in range(2):
+                ported, out = self.quiet(customize.cmd_port, self.args())
+                self.assertFalse(ported)
+                self.assertIn('failed at', out)
+        self.assertEqual(len(self.notes), 1)
+        self.assertIn('port --force', self.notes[0])
+
+    def test_force_changed_patches_or_time_try_again(self):
+        customize.save(customize.PORTS, {'n2': {'failed': 'log', 'failedEpoch': 1e12, 'failedRecipe': customize.recipe_hash()}})
+        self.assertIsNotNone(customize.recent_failure('n2', clock=lambda: 1e12 + 60))
+        self.assertIsNone(customize.recent_failure('n2', clock=lambda: 1e12 + customize.HANDOFF_QUIET + 1))
+        with patch.object(customize, 'recipe_hash', return_value='other'):
+            self.assertIsNone(customize.recent_failure('n2', clock=lambda: 1e12 + 60))
+        with patch.object(customize, 'recent_failure', side_effect=AssertionError('checked with --force')), \
+                patch.object(customize, 'port_pending', lambda v: None), \
+                patch.object(customize, 'tool_log', side_effect=RuntimeError('ported')):
+            with self.assertRaises(RuntimeError):
+                self.quiet(customize.cmd_port, self.args(force=True))
+
+
+class SpawnDetachedTest(Sandbox):
+    def test_a_failed_systemd_run_falls_back_to_a_new_session(self):
+        started = []
+        with patch.dict(os.environ, INVOCATION_ID='x'), patch.object(customize.shutil, 'which', lambda n: n), \
+                patch.object(customize.subprocess, 'run', lambda *a, **k: subprocess.CompletedProcess(a, 1, '', 'Failed to connect to bus')), \
+                patch.object(customize.subprocess, 'Popen', lambda argv, **k: started.append((argv, k))):
+            self.assertEqual(customize.spawn_detached(['true'], 'port'), 'setsid')
+        self.assertTrue(started[0][1]['start_new_session'])
+        self.assertIn('systemd-run failed', (self.cache / 'logs/port.log').read_text())
+
+    def test_a_start_that_fails_is_a_recorded_hand_off_without_a_traceback(self):
+        machines = {'machines': [{'name': 'devbox1', 'hostname': 'devbox1', 'kind': 'server', 'fix': 'claude'}]}
+        customize.MACHINES.write_text(json.dumps(machines))
+
+        real = subprocess.Popen
+
+        def fail(argv, *rest, **kwargs):
+            if argv[0] == sys.executable:
+                raise OSError('no such file')
+            return real(argv, *rest, **kwargs)
+        args = argparse.Namespace(resume=False, skip_checks=True, fix='claude', background=True)
+        with patch.object(customize, 'this_machine', lambda m: m[0]), patch.dict(os.environ, {'INVOCATION_ID': ''}), \
+                patch.object(customize.subprocess, 'Popen', fail):
+            for _ in range(2):
+                with self.assertRaises(customize.NeedsFix) as stop:
+                    self.quiet(customize.apply_patches, args, self.nightly, 'n2', {}, self.log)
+                self.assertNotIsInstance(stop.exception, customize.PortHandedOff)
+                self.assertIn('Could not start port', str(stop.exception))
+                self.assertTrue(self.clean())
+        self.assertEqual(len(self.notes), 1)
+        self.assertIn('no such file', customize.load(customize.HANDOFFS)[self.nightly]['error'])
+
+
+class StuckMessageTest(Sandbox):
+    def test_a_stopped_port_names_port_continue_and_checks(self):
+        with self.assertRaises(customize.NeedsFix):
+            self.prepare()
+        with patch.object(customize, 'COMMAND', 'port'):
+            message = customize.stuck_message('conflict', self.nightly)
+        self.assertIn('t3code-customize continue --source', message)
+        self.assertIn('t3code-customize checks --source', message)
+        self.assertIn('port --source', message)
+        self.assertIn('--resume --version n2', message)
+        self.assertIn('--version n2 --fix claude', message)
+        self.assertNotIn(' ios', message)
+
+
 class OpenPrsTest(unittest.TestCase):
     def report(self, result):
         with patch.object(customize, 'fork_repo', lambda: 'o/r'), patch.object(customize.shutil, 'which', lambda n: n):

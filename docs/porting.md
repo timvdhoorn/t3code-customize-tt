@@ -59,7 +59,13 @@ push or build.
 
 The shared checkout belongs to whichever run holds `~/.cache/t3code-customize/lock` (the file names
 the holder). `continue`, `checks` and `build --resume` claim a stop there, so no unattended run
-cleans it up while you work on it. Work in your own detached worktree:
+cleans it up while you work on it.
+
+A run killed during its agent session (reboot, OOM, its unit stopped) never records how it left
+the checkout; the marker names that session (the run's pid and start time, and its unit). A later
+unattended run aborts such a stop when that run is gone and nobody claimed the checkout. The
+tradeoff: a hand edit made there after such a kill, without any tool call, is lost. Run `continue`
+or `checks` first; either claims the checkout and protects it. Work in your own detached worktree:
 
 ```sh
 git -C ~/.cache/t3code-customize/t3code worktree add --detach <dir> HEAD

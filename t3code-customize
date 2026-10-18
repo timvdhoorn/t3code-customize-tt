@@ -616,14 +616,45 @@ def claim_checkout():
         update_run_marker(unattended=False, claimed=' '.join(sys.argv[1:]))
 
 
+def process_ticks(pid):
+    """The start time of pid in clock ticks since boot (Linux), else None: a pid reused after a reboot or
+    by another process has another start time."""
+    try:
+        return int(Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def process_alive(pid, ticks=None):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return ticks is None or process_ticks(pid) in (None, ticks)
+
+
+def killed_agent_session(marker):
+    """True when the marker names an agent session whose run is gone (reboot, OOM, unit stopped)
+    before it could record how it left the checkout."""
+    session = marker.get('agent') or {}
+    return bool(session.get('pid')) and not process_alive(session['pid'], session.get('ticks'))
+
+
 def stopped_by_unattended_run():
     """True when the checkout holds a stopped rebase or git am, or uncommitted edits, exactly as an
     unattended run left them: started by an unattended run, never claimed by continue, checks or
     --resume, and not touched since (same fingerprint). This run holds the lock, so that run has ended."""
     stopped = rebase_in_progress() or bool(git('status', '--porcelain', '--untracked-files=no').strip())
     marker = run_marker()
-    return (stopped and marker.get('unattended') is True and bool(marker.get('stopped'))
-            and marker['stopped'] == checkout_fingerprint())
+    if not stopped or marker.get('unattended') is not True:
+        return False
+    if marker.get('stopped') and marker['stopped'] == checkout_fingerprint():
+        return True
+    # Killed during its agent session, so it never recorded the fingerprint. Nobody claimed the
+    # checkout since (continue, checks, --resume), and this run holds the lock.
+    return killed_agent_session(marker) and not marker.get('stopped')
 
 
 def has_commit(ref):
@@ -1134,8 +1165,16 @@ def agent_fix(agent, problem, target, version, log):
     log.flush()
     # The agent's continue and checks run inside this run, which holds the checkout lock.
     env = dict(os.environ, T3CODE_CUSTOMIZE_LOCK_HELD=str(os.getpid()))
-    result = subprocess.run(command_args(AGENTS[agent]), cwd=SOURCE, input=prompt, env=env,
-                            text=True, encoding='utf-8', stdout=log, stderr=log)
+    # A run killed during the session leaves this behind, so a later unattended run can tell (see
+    # stopped_by_unattended_run); the fingerprint is recorded again once the session ends.
+    update_run_marker(stopped=None, agent={'pid': os.getpid(), 'ticks': process_ticks(os.getpid()),
+                                           'unit': os.environ.get('INVOCATION_ID'), 'agentName': agent,
+                                           'started': time.strftime('%Y-%m-%dT%H:%M:%S')})
+    try:
+        result = subprocess.run(command_args(AGENTS[agent]), cwd=SOURCE, input=prompt, env=env,
+                                text=True, encoding='utf-8', stdout=log, stderr=log)
+    finally:
+        update_run_marker(agent=None, stopped=checkout_fingerprint())
     if result.returncode:
         say(f'{AGENT_NAMES[agent]} exited with {result.returncode}; checking what it left.')
 
@@ -1227,7 +1266,19 @@ def use_older_recipe(target, log):
     say(f'    This nightly is older than the patches; using the patch set from {commit[:12]}, made for it.')
 
 
+# The command this run is, when the advice differs from build's (port).
+COMMAND = None
+
+
 def stuck_message(problem, target):
+    if COMMAND == 'port':
+        version = run_marker().get('version')
+        where = source_option()
+        return (f'{problem}\n\nThe port stopped. Resolve each file, git add it, then run {NAME} continue{where}'
+                f' until it says "All patches applied.", then {NAME} checks{where} (see {REPO}/docs/porting.md),'
+                f' and finish with {NAME} port{where} --resume' + (f' --version {version}' if version else '') + '.\n'
+                f'Or let an agent port it: {NAME} port{where}' + (f' --version {version}' if version else '')
+                + ' --fix claude  (or --fix codex)')
     if older_than_patches(target):
         return (f'{problem}\n\nYour T3 Code is older than these patches. Update T3 Code, then run {NAME} again.\n'
                 'Your current T3 Code is untouched.')
@@ -1487,13 +1538,22 @@ def _publish_port(version, checked):
 def spawn_detached(argv, name):
     """Start argv so it outlives this run, also when this run is a systemd unit or a LaunchAgent."""
     (CACHE / 'logs').mkdir(parents=True, exist_ok=True)
-    if os.environ.get('INVOCATION_ID') and shutil.which('systemd-run'):
-        # systemd ends every process of a oneshot unit with it; a unit of its own survives.
-        subprocess.run(['systemd-run', '--user', '--collect', '--unit', f'{NAME}-{name}-{os.getpid()}',
-                        '--setenv=PATH=' + os.environ.get('PATH', ''), *argv], check=True, capture_output=True)
-        return
     with (CACHE / f'logs/{name}.log').open('a') as log:
-        subprocess.Popen(argv, cwd=REPO, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        if os.environ.get('INVOCATION_ID') and shutil.which('systemd-run'):
+            # systemd ends every process of a oneshot unit with it; a unit of its own survives.
+            started = subprocess.run(['systemd-run', '--user', '--collect', '--unit', f'{NAME}-{name}-{os.getpid()}',
+                                      '--setenv=PATH=' + os.environ.get('PATH', ''), *argv],
+                                     capture_output=True, text=True)
+            if started.returncode == 0:
+                return 'systemd-run'
+            # Without a user bus (or with another failure) a new session is the next best thing.
+            log.write(f'systemd-run failed ({started.returncode}): {started.stderr.strip()}; starting it with setsid\n')
+            log.flush()
+        try:
+            subprocess.Popen(argv, cwd=REPO, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        except OSError as error:
+            raise Stop(f'Could not start {name}: {error}')
+        return 'setsid'
 
 
 # --- Commands -----------------------------------------------------------------------
@@ -1696,10 +1756,21 @@ def port_failed(version, problem, log):
     abort_stopped(log)
     (git_dir() / RUN_MARK).unlink(missing_ok=True)
     ports = load(PORTS, {})
-    ports[version] = dict(ports.get(version, {}), failed=log.name, failedAt=time.strftime('%Y-%m-%dT%H:%M:%S'))
+    ports[version] = dict(ports.get(version, {}), failed=log.name, failedAt=time.strftime('%Y-%m-%dT%H:%M:%S'),
+                          failedEpoch=time.time(), failedRecipe=recipe_hash(), reported=False)
     save(PORTS, ports)
     notify(LAUNCHER_NAME, f'The port to {version} failed: the agent session left it unfinished. The checkout'
            f' is clean again; transcript {log.name}.')
+
+
+def recent_failure(version, clock=time.time):
+    """The ports.json record of a port to version that failed within the quiet window with the patches
+    as they are now, else None: porting it again would fail the same way."""
+    record = load(PORTS, {}).get(version or '', {})
+    if (record.get('failedEpoch') and clock() - record['failedEpoch'] < HANDOFF_QUIET
+            and record.get('failedRecipe') == recipe_hash()):
+        return record
+    return None
 
 
 def port_pending(version):
@@ -1799,7 +1870,15 @@ def hand_off_port(target, version, problem, log, clock=time.time):
                             f' ({time.strftime("%H:%M", time.localtime(earlier["at"]))}); waiting for its PR.')
     me = this_machine(load(MACHINES, {}).get('machines', []))
     if me and me.get('name') == name:
-        spawn_detached([sys.executable, str(REPO / NAME), *port_command(porter, target, version)], 'port')
+        try:
+            spawn_detached([sys.executable, str(REPO / NAME), *port_command(porter, target, version)], 'port')
+        except Stop as error:
+            if not recent:
+                handed[target] = {'version': version, 'porter': name, 'at': clock(), 'unreachable': True,
+                                  'error': str(error)}
+                save(HANDOFFS, handed)
+                notify(LAUNCHER_NAME, f'The patches do not fit {version} yet and the port could not start: {error}')
+            raise NeedsFix(f'{problem}\n\n{error}; nobody ports this nightly yet.')
     else:
         alias = ssh_target(porter)
         if not alias:
@@ -2070,9 +2149,23 @@ def cmd_port(args):
     version = args.version
     if not version and not args.commit:
         version, _ = newest_nightly()
+    global COMMAND
+    COMMAND = 'port'
     pending = port_pending(version) if version and not args.force and not args.dry_run else None
     if pending:
         say(f'The port to {version} is published already or waits for review: {pending}. Nothing to do.')
+        return False
+    failed = recent_failure(version) if not args.force else None
+    if failed:
+        message = (f'The port to {version} failed at {failed.get("failedAt")} with these patches (transcript'
+                   f' {failed.get("failed")}); not trying again until the patches change or {HANDOFF_QUIET // 3600} h'
+                   ' have passed. Run port --force to try now.')
+        say(message)
+        if not failed.get('reported'):
+            ports = load(PORTS, {})
+            ports[version]['reported'] = True
+            save(PORTS, ports)
+            notify(LAUNCHER_NAME, message)
         return False
     with tool_log('port') as log:
         env = build_env(ensure_node(log))
