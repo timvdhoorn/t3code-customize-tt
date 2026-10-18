@@ -495,7 +495,7 @@ class HandOffTest(Sandbox):
         with patch.object(customize.time, 'time', lambda: 1e12 + 60):
             customize.handed_off_already(self.nightly, 'n2', clock=lambda: 1e12 + 60)  # no raise
             customize.save(customize.HANDOFFS, {self.nightly: {'porter': 'devbox1', 'at': 1e12,
-                                                               'recipes': [customize.recipe_hash()]}})
+                                                               'recipes': [customize.recipe_hash(full=True)]}})
             with self.assertRaises(customize.PortHandedOff):
                 customize.handed_off_already(self.nightly, 'n2', clock=lambda: 1e12 + 60)
         # After the quiet window it tries again.
@@ -717,7 +717,7 @@ class FailedPortTest(Sandbox):
         self.assertIn('port --force', self.notes[0])
 
     def test_force_changed_patches_or_time_try_again(self):
-        customize.save(customize.PORTS, {'n2': {'failed': 'log', 'failedEpoch': 1e12, 'failedRecipe': customize.recipe_hash()}})
+        customize.save(customize.PORTS, {'n2': {'failed': 'log', 'failedEpoch': 1e12, 'failedRecipe': customize.recipe_hash(full=True)}})
         self.assertIsNotNone(customize.recent_failure('n2', clock=lambda: 1e12 + 60))
         self.assertIsNone(customize.recent_failure('n2', clock=lambda: 1e12 + customize.HANDOFF_QUIET + 1))
         with patch.object(customize, 'recipe_hash', return_value='other'):
