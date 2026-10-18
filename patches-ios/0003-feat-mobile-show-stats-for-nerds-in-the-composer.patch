@@ -15,7 +15,7 @@ Subject: [PATCH 3/7] feat(mobile): show stats for nerds in the composer
  .../src/persistence/mobile-preferences.ts     |   6 +
  apps/mobile/src/state/use-composer-stats.ts   |  42 ++
  .../src/state/use-thread-composer-state.ts    |  40 ++
- apps/web/src/components/ChatView.tsx          |  64 +-
+ apps/web/src/components/ChatView.tsx          |  59 +-
  apps/web/src/components/chat/ChatComposer.tsx |   2 +-
  .../chat/ComposerPrimaryActions.tsx           |   2 +-
  .../components/chat/ComposerStats.logic.ts    | 303 +-------
@@ -27,7 +27,7 @@ Subject: [PATCH 3/7] feat(mobile): show stats for nerds in the composer
  .../client-runtime/src/state/composerStats.ts | 427 +++++++++++
  .../src/state/contextWindow.test.ts           | 158 +++++
  .../client-runtime/src/state/contextWindow.ts | 177 +++++
- 23 files changed, 2517 insertions(+), 576 deletions(-)
+ 23 files changed, 2513 insertions(+), 575 deletions(-)
  create mode 100644 apps/mobile/src/features/threads/ComposerStats.tsx
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.test.ts
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.ts
@@ -708,7 +708,7 @@ index eac7ce224e..9c5c0e0fd0 100644
  
        <VideoPreviewModal source={previewVideo} onRequestClose={closePreview} />
 diff --git a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
-index d9da5f5066..c5d7719803 100644
+index 48f69837d6..cbba0fc08c 100644
 --- a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
 +++ b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
 @@ -145,6 +145,9 @@ import {
@@ -730,7 +730,7 @@ index d9da5f5066..c5d7719803 100644
    readonly onReconnectEnvironment: () => void;
    readonly canSwitchThreadProvider: boolean;
    readonly onUpdateThreadModelSelection: (modelSelection: ModelSelection) => void;
-@@ -547,7 +552,14 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
+@@ -552,7 +557,14 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
      ) ||
      (props.historyControls?.hasMoreHistory === true &&
        props.selectedThread.latestUserMessageAt !== null);
@@ -746,7 +746,7 @@ index d9da5f5066..c5d7719803 100644
    const composerOverlapHeight = composerChrome + composerBottomInset;
    const [collapsedUserInputRequestId, setCollapsedUserInputRequestId] =
      useState<RuntimeRequestId | null>(null);
-@@ -1347,6 +1359,32 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
+@@ -1352,6 +1364,32 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                          hasCompactableConversation={
                            hasCompactableConversation && !props.isCompacting
                          }
@@ -1239,31 +1239,19 @@ index d0866906f4..01ded6d56c 100644
      onUpdateRuntimeMode,
      onUpdateInteractionMode,
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index d84b95eb82..058f99032d 100644
+index 66e89c5bdc..9dc562cb5d 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -442,7 +442,10 @@ import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
+@@ -453,7 +453,7 @@ import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
  import { ThreadStatusLine } from "./chat/ThreadStatusLine";
  import { formatRelativeTimeLabel, formatRelativeTimeUntilLabel } from "../timestampFormat";
  import { ComposerStats } from "./chat/ComposerStats";
 -import { selectComposerStatsTurns, selectRecordedCompactions } from "./chat/ComposerStats.logic";
-+import {
-+  composerCompactDisabledReason,
-+  deriveComposerStats,
-+} from "@t3tools/client-runtime/state/composer-stats";
++import { composerCompactDisabledReason, deriveComposerStats } from "./chat/ComposerStats.logic";
  import { ComposerSurface } from "./chat/ComposerSurface";
  import { resolveThreadSyncPhase } from "../threadSync";
  import {
-@@ -453,7 +456,7 @@ import {
- import {
-   deriveLatestContextWindowSnapshot,
-   latestProviderTurnTokenUsage,
--} from "../lib/contextWindow";
-+} from "@t3tools/client-runtime/state/context-window";
- import {
-   DRAFT_HERO_TRANSITION_ANIMATION_ID,
-   DRAFT_HERO_TRANSITION_EASING,
-@@ -2649,45 +2652,11 @@ export default function ChatView(props: ChatViewProps) {
+@@ -2538,45 +2538,11 @@ export default function ChatView(props: ChatViewProps) {
      activeProviderStatus?.displayName?.trim() || activeProviderStatus?.instanceId || "";
    const composerStats = (() => {
      if (!settings.statsForNerdsEnabled) return null;
@@ -1313,7 +1301,7 @@ index d84b95eb82..058f99032d 100644
    })();
    const pendingBackgroundTasks = (() => {
      if (serverProjection === null || serverProjection === undefined) {
-@@ -8611,15 +8580,12 @@ export default function ChatView(props: ChatViewProps) {
+@@ -8424,15 +8390,12 @@ export default function ChatView(props: ChatViewProps) {
                            {...composerStats}
                            onCompact={() => composerRef.current?.compactContext()}
                            compactDisabled={compactDisabled}
@@ -1336,10 +1324,10 @@ index d84b95eb82..058f99032d 100644
                            subscriptionSwitch={{
                              providers: providerStatuses,
 diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
-index 120b367760..38ebbf736d 100644
+index ddca044b04..e54699e2b2 100644
 --- a/apps/web/src/components/chat/ChatComposer.tsx
 +++ b/apps/web/src/components/chat/ChatComposer.tsx
-@@ -1082,7 +1082,7 @@ import {
+@@ -1084,7 +1084,7 @@ import {
    resolveComposerDispatchMode,
    type ComposerDispatchMode,
  } from "@t3tools/client-runtime/state/composer-dispatch";
