@@ -93,7 +93,8 @@ against `main`. It merges that PR (squash) and starts `fleet`, without asking, o
 1. every test, typecheck and lint in `checks.json` and `checks-*.json` that the run applies passed
    (the port did not run with `--skip-checks`, which blocks the grant). The tool trusts the stamp
    `checks` writes (`t3code-customize-checks.json` in the checkout's git dir: HEAD, nightly, check
-   lists and `recipe_hash()`); a run that finds it current skips the checks, and
+   lists and `recipe_hash()`, which ignores operational code in the script: see "Recipe hash" in
+   `docs/fork-changes.md`); a run that finds it current skips the checks, and
 2. each patch keeps exactly the same code: per patch (shared set, `patches-tt/`, `patches-ios/`,
    matched by number) the files it changes, in order by their `diff --git` path, each with its
    added and removed lines in order, without blank and comment-only lines, are identical to the

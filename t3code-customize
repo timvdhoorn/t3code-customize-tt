@@ -10,6 +10,7 @@ Your installed app and your T3 data are never modified. `server` does the same
 for a headless T3 server, `ios` for the iOS app and `fleet` for every machine.
 """
 import argparse
+import ast
 import contextlib
 import copy
 import hashlib
@@ -224,7 +225,52 @@ def own_checks():
     return [OWN_CHECKS] + ([IOS_CHECKS] if WITH_IOS else [])
 
 
-def recipe_hash():
+# Top-level functions and classes of this script that cannot change what a build produces: fleet,
+# the server's idle wait and restart, locks, autoupdate scheduling, the port hand-off and PR flow,
+# notifications and status printing. recipe_hash() leaves their source out, so changing one does not
+# rebuild every machine. A deny list, not an allow list: a new function, every module-level constant
+# and anything not named here stays in the hash. When unsure, leave a name out. A test checks that
+# every name still exists.
+OPERATIONAL_CODE = frozenset({
+    'Deferred', 'PortHandedOff', 'MergedButStuck', 'say', 'step', 'notify', 'tool_log', 'lock_path',
+    'release_checkout_lock', 'lock_holder', 'acquire_lock', 'interactive', 'inside_t3_agent',
+    'this_machine', 'ssh_target', 'remote', 'repo_files', 'remote_identity', 'sync_repo',
+    'fleet_command', 'autoupdate_command', 'detach_fleet', 'cmd_fleet', 'identity', 'cmd_identity',
+    'busy_threads', 'wait_until_idle', 'restart_owed',
+    'restart_service', 'stage_t3_update', 'restart_lock', 'mark_staged', 'discard_staged',
+    'still_newest', 'restore_server_stock', 'systemctl', 'server_healthy', 'restart_server',
+    'cmd_server_off', 'server_autoupdate', 'cmd_on', 'cmd_off', 'cmd_uninstall', 'cmd_autoupdate',
+    'start_background_update', 'app_settled', 'cmd_status',
+    'report_ported_prs', '_report_ported_prs', 'fork_repo', 'report_open_prs', 'stuck_message',
+    'port_failed', 'recent_failure', 'port_pending', 'porter_machine', 'port_command', 'repo_path',
+    'remote_port_line', 'handed_off_already', 'hand_off_port', 'spawn_detached', 'publish_port',
+    '_publish_port', 'port_branch', 'port_changes', 'committed_folder', 'working_folder',
+    'is_port_file', 'newest_nightly', 'cmd_port', 'cmd_continue',
+    'available_agents', 'choose_agent', 'agent_prompt',
+})
+
+
+def build_source(text):
+    """The script's source without its OPERATIONAL_CODE definitions (decorators included), trailing
+    blanks and blank lines dropped. Plain text, so every Python version gives the same result."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return text
+    lines = text.splitlines()
+    skip = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in OPERATIONAL_CODE:
+            first = min([node.lineno] + [d.lineno for d in node.decorator_list])
+            skip.update(range(first, node.end_lineno + 1))
+    return '\n'.join(line.rstrip() for number, line in enumerate(lines, 1)
+                     if number not in skip and line.strip()) + '\n'
+
+
+def recipe_hash(full=False):
+    """What a build depends on: patches, checks, platform_support.py, macos/ and this script without
+    its OPERATIONAL_CODE. With full=True the whole script: for what must happen again after any fix
+    to the tool (a failed port, a port handed to the porter)."""
     digest = hashlib.sha256()
     # Only real files: sync tools leave hidden temporary files beside the patches.
     # Always this repo's files, also while a run applies an older patch set (use_recipe).
@@ -235,7 +281,10 @@ def recipe_hash():
     own = [p for folder in folders for p in sorted((REPO / folder).glob('*.patch'))]
     for path in (shared + own + [REPO / 'checks.json'] + [c for c in lists if c.exists()]
                  + [REPO / NAME, REPO / 'platform_support.py'] + sorted((REPO / 'macos').glob('*'))):
-        digest.update(path.name.encode() + path.read_bytes())
+        data = path.read_bytes()
+        if path.name == NAME and not full:
+            data = build_source(data.decode('utf-8')).encode('utf-8')
+        digest.update(path.name.encode() + data)
     return digest.hexdigest()[:12]
 
 
@@ -1757,7 +1806,7 @@ def port_failed(version, problem, log):
     (git_dir() / RUN_MARK).unlink(missing_ok=True)
     ports = load(PORTS, {})
     ports[version] = dict(ports.get(version, {}), failed=log.name, failedAt=time.strftime('%Y-%m-%dT%H:%M:%S'),
-                          failedEpoch=time.time(), failedRecipe=recipe_hash(), reported=False)
+                          failedEpoch=time.time(), failedRecipe=recipe_hash(full=True), reported=False)
     save(PORTS, ports)
     notify(LAUNCHER_NAME, f'The port to {version} failed: the agent session left it unfinished. The checkout'
            f' is clean again; transcript {log.name}.')
@@ -1768,7 +1817,7 @@ def recent_failure(version, clock=time.time):
     as they are now, else None: porting it again would fail the same way."""
     record = load(PORTS, {}).get(version or '', {})
     if (record.get('failedEpoch') and clock() - record['failedEpoch'] < HANDOFF_QUIET
-            and record.get('failedRecipe') == recipe_hash()):
+            and record.get('failedRecipe') == recipe_hash(full=True)):
         return record
     return None
 
@@ -1847,7 +1896,7 @@ def handed_off_already(target, version, clock=time.time):
     the quiet window and the patches here did not change since (the porter runs or ran that port)."""
     earlier = load(HANDOFFS, {}).get(target, {})
     if (earlier and not earlier.get('unreachable') and clock() - earlier.get('at', 0) < HANDOFF_QUIET
-            and recipe_hash() in earlier.get('recipes', [])):
+            and recipe_hash(full=True) in earlier.get('recipes', [])):
         raise PortHandedOff(f'The port to {version} was handed to {earlier.get("porter")} at'
                             f' {time.strftime("%H:%M", time.localtime(earlier["at"]))}; waiting for its PR.')
 
@@ -1864,7 +1913,7 @@ def hand_off_port(target, version, problem, log, clock=time.time):
     name = porter['name']
     recent = bool(earlier) and clock() - earlier.get('at', 0) < HANDOFF_QUIET
     if recent and not earlier.get('unreachable'):
-        earlier['recipes'] = sorted(set(earlier.get('recipes', [])) | {recipe_hash()})
+        earlier['recipes'] = sorted(set(earlier.get('recipes', [])) | {recipe_hash(full=True)})
         save(HANDOFFS, handed)
         raise PortHandedOff(f'{problem}\n\nThe port to {version} was handed to {name} already'
                             f' ({time.strftime("%H:%M", time.localtime(earlier["at"]))}); waiting for its PR.')
@@ -1894,7 +1943,7 @@ def hand_off_port(target, version, problem, log, clock=time.time):
         log.write(f'\n--- port handed to {name}: {started.returncode}\n{started.stdout}{started.stderr}\n')
         if started.returncode:
             raise NeedsFix(f'{problem}\n\nStarting the port on {name} failed: {(started.stderr or started.stdout).strip()[:200]}')
-    handed[target] = {'version': version, 'porter': name, 'at': clock(), 'recipes': [recipe_hash()]}
+    handed[target] = {'version': version, 'porter': name, 'at': clock(), 'recipes': [recipe_hash(full=True)]}
     save(HANDOFFS, handed)
     notify(LAUNCHER_NAME, f'The patches do not fit {version} yet: port running on {name}.'
            ' T3 Code stays as it is until the port is merged.')
