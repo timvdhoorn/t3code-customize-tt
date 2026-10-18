@@ -56,7 +56,8 @@ with its opener (patches-tt/0003).
  packages/client-runtime/src/handoff.ts        |   3 +-
  .../src/operations/commands.test.ts           |  47 ++
  .../client-runtime/src/operations/commands.ts |  26 +-
- .../src/state/threadCheckpoints.ts            |   6 +
+ .../src/state/threadCheckpoints.ts            |   8 +-
+ .../client-runtime/src/state/threadDetail.ts  |  13 +-
  .../src/state/threadExecution.test.ts         |  21 +
  .../src/state/threadExecution.ts              |  16 +-
  .../src/state/threadWorkflows.test.ts         |  18 +
@@ -72,13 +73,13 @@ with its opener (patches-tt/0003).
  .../orchestrationV2PendingBackgroundWork.ts   |  10 +-
  .../shared/src/orchestrationV2ThreadError.ts  |  32 +
  .../shared/src/orchestrationV2Timeline.ts     |  16 +-
- 54 files changed, 2096 insertions(+), 101 deletions(-)
+ 55 files changed, 2106 insertions(+), 106 deletions(-)
  create mode 100644 apps/server/src/orchestration-v2/IdleCompaction.ts
  create mode 100644 apps/server/src/orchestration-v2/IdleCompactionService.test.ts
  create mode 100644 apps/server/src/orchestration-v2/IdleCompactionService.ts
 
 diff --git a/apps/mobile/src/state/use-thread-selection.ts b/apps/mobile/src/state/use-thread-selection.ts
-index 9df012f342..63cdd57674 100644
+index 9df012f34..63cdd5767 100644
 --- a/apps/mobile/src/state/use-thread-selection.ts
 +++ b/apps/mobile/src/state/use-thread-selection.ts
 @@ -46,9 +46,12 @@ function firstRouteParam(value: string | string[] | undefined): string | null {
@@ -96,7 +97,7 @@ index 9df012f342..63cdd57674 100644
      }
    }
 diff --git a/apps/server/src/cli/config.ts b/apps/server/src/cli/config.ts
-index f9b8730b7d..9063b59723 100644
+index f9b8730b7..9063b5972 100644
 --- a/apps/server/src/cli/config.ts
 +++ b/apps/server/src/cli/config.ts
 @@ -100,6 +100,13 @@ const EnvServerConfig = Config.all({
@@ -122,7 +123,7 @@ index f9b8730b7d..9063b59723 100644
        traceMaxFiles: env.traceMaxFiles,
        otlpTracesUrl: traces?.url,
 diff --git a/apps/server/src/config.ts b/apps/server/src/config.ts
-index ef6f71a46a..8aa34b5f68 100644
+index ef6f71a46..8aa34b5f6 100644
 --- a/apps/server/src/config.ts
 +++ b/apps/server/src/config.ts
 @@ -71,6 +71,8 @@ export class ServerConfig extends Context.Service<
@@ -135,7 +136,7 @@ index ef6f71a46a..8aa34b5f68 100644
      readonly startupPresentation: StartupPresentation;
      readonly desktopBootstrapToken: string | undefined;
 diff --git a/apps/server/src/mcp/OrchestratorMcpService.activity.test.ts b/apps/server/src/mcp/OrchestratorMcpService.activity.test.ts
-index 12e7f7fd0d..c5fbed556e 100644
+index 12e7f7fd0..c5fbed556 100644
 --- a/apps/server/src/mcp/OrchestratorMcpService.activity.test.ts
 +++ b/apps/server/src/mcp/OrchestratorMcpService.activity.test.ts
 @@ -40,6 +40,7 @@ const parentThreadId = ThreadId.make("thread-mcp-orchestrator-parent");
@@ -172,7 +173,7 @@ index 12e7f7fd0d..c5fbed556e 100644
  });
  
 diff --git a/apps/server/src/mcp/OrchestratorMcpService.ts b/apps/server/src/mcp/OrchestratorMcpService.ts
-index 86c07ee03c..b9a88a82cc 100644
+index 86c07ee03..b9a88a82c 100644
 --- a/apps/server/src/mcp/OrchestratorMcpService.ts
 +++ b/apps/server/src/mcp/OrchestratorMcpService.ts
 @@ -59,7 +59,7 @@ import {
@@ -236,7 +237,7 @@ index 86c07ee03c..b9a88a82cc 100644
              .slice(0, input.runLimit ?? DEFAULT_THREAD_RUN_LIMIT)
              .map(threadRun),
 diff --git a/apps/server/src/mcp/toolkits/thread/handlers.ts b/apps/server/src/mcp/toolkits/thread/handlers.ts
-index e1bf858ca8..d5078c4957 100644
+index e1bf858ca..d5078c495 100644
 --- a/apps/server/src/mcp/toolkits/thread/handlers.ts
 +++ b/apps/server/src/mcp/toolkits/thread/handlers.ts
 @@ -9,6 +9,7 @@ import {
@@ -268,7 +269,7 @@ index e1bf858ca8..d5078c4957 100644
        const end = cursor + (input.limit ?? 20);
        return {
 diff --git a/apps/server/src/orchestration-v2/CommandPolicy.test.ts b/apps/server/src/orchestration-v2/CommandPolicy.test.ts
-index d3c9f38a49..5aeb72b776 100644
+index d3c9f38a4..5aeb72b77 100644
 --- a/apps/server/src/orchestration-v2/CommandPolicy.test.ts
 +++ b/apps/server/src/orchestration-v2/CommandPolicy.test.ts
 @@ -142,6 +142,19 @@ it("targets the latest active run for explicit steer and restart intent", () =>
@@ -292,7 +293,7 @@ index d3c9f38a49..5aeb72b776 100644
  
  it.each(["/compact", " /LOGOUT "])("queues a steer sent while %s runs", (text) => {
 diff --git a/apps/server/src/orchestration-v2/CommandPolicy.ts b/apps/server/src/orchestration-v2/CommandPolicy.ts
-index 751ce08f72..b93233e43e 100644
+index 751ce08f7..b93233e43 100644
 --- a/apps/server/src/orchestration-v2/CommandPolicy.ts
 +++ b/apps/server/src/orchestration-v2/CommandPolicy.ts
 @@ -159,6 +159,9 @@ function resolveDeliveryIntent(
@@ -306,7 +307,7 @@ index 751ce08f72..b93233e43e 100644
      return { type: "steer_active", targetRunId: activeRun.id };
    }
 diff --git a/apps/server/src/orchestration-v2/ContextHandoffService.ts b/apps/server/src/orchestration-v2/ContextHandoffService.ts
-index 137f617710..b4dc19c8df 100644
+index 137f61771..b4dc19c8d 100644
 --- a/apps/server/src/orchestration-v2/ContextHandoffService.ts
 +++ b/apps/server/src/orchestration-v2/ContextHandoffService.ts
 @@ -445,9 +445,14 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
@@ -326,7 +327,7 @@ index 137f617710..b4dc19c8df 100644
              ? []
 diff --git a/apps/server/src/orchestration-v2/IdleCompaction.ts b/apps/server/src/orchestration-v2/IdleCompaction.ts
 new file mode 100644
-index 0000000000..8c7981f6f9
+index 000000000..8c7981f6f
 --- /dev/null
 +++ b/apps/server/src/orchestration-v2/IdleCompaction.ts
 @@ -0,0 +1,153 @@
@@ -485,7 +486,7 @@ index 0000000000..8c7981f6f9
 +}
 diff --git a/apps/server/src/orchestration-v2/IdleCompactionService.test.ts b/apps/server/src/orchestration-v2/IdleCompactionService.test.ts
 new file mode 100644
-index 0000000000..639f3270e2
+index 000000000..639f3270e
 --- /dev/null
 +++ b/apps/server/src/orchestration-v2/IdleCompactionService.test.ts
 @@ -0,0 +1,602 @@
@@ -1093,7 +1094,7 @@ index 0000000000..639f3270e2
 +);
 diff --git a/apps/server/src/orchestration-v2/IdleCompactionService.ts b/apps/server/src/orchestration-v2/IdleCompactionService.ts
 new file mode 100644
-index 0000000000..41255b423d
+index 000000000..41255b423
 --- /dev/null
 +++ b/apps/server/src/orchestration-v2/IdleCompactionService.ts
 @@ -0,0 +1,146 @@
@@ -1244,7 +1245,7 @@ index 0000000000..41255b423d
 +  return { start, drain: worker.drain } satisfies IdleCompactionServiceV2["Service"];
 +});
 diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
-index 745e3f351f..7664c3b06c 100644
+index 745e3f351..7664c3b06 100644
 --- a/apps/server/src/orchestration-v2/Orchestrator.ts
 +++ b/apps/server/src/orchestration-v2/Orchestrator.ts
 @@ -4,6 +4,7 @@ import type {
@@ -1603,7 +1604,7 @@ index 745e3f351f..7664c3b06c 100644
          return yield* new OrchestratorDispatchError({
            commandId: command.commandId,
 diff --git a/apps/server/src/orchestration-v2/ProjectionSettlement.test.ts b/apps/server/src/orchestration-v2/ProjectionSettlement.test.ts
-index 0c31bcafc9..a8dd706243 100644
+index 0c31bcafc..a8dd70624 100644
 --- a/apps/server/src/orchestration-v2/ProjectionSettlement.test.ts
 +++ b/apps/server/src/orchestration-v2/ProjectionSettlement.test.ts
 @@ -23,7 +23,11 @@ import * as Statement from "effect/sql/Statement";
@@ -1676,7 +1677,7 @@ index 0c31bcafc9..a8dd706243 100644
    ["sql", layerSql],
    ["memory", ProjectionStore.layerMemory],
 diff --git a/apps/server/src/orchestration-v2/ProjectionStore.test.ts b/apps/server/src/orchestration-v2/ProjectionStore.test.ts
-index 6d605a963c..deb79acd14 100644
+index 6d605a963..deb79acd1 100644
 --- a/apps/server/src/orchestration-v2/ProjectionStore.test.ts
 +++ b/apps/server/src/orchestration-v2/ProjectionStore.test.ts
 @@ -3177,6 +3177,57 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
@@ -1778,7 +1779,7 @@ index 6d605a963c..deb79acd14 100644
          DELETE FROM orchestration_v2_projection_turn_items
          WHERE run_id IN (${sourceRun1Id}, ${sourceRun2Id})
 diff --git a/apps/server/src/orchestration-v2/ProjectionStore.ts b/apps/server/src/orchestration-v2/ProjectionStore.ts
-index a31dc773a5..7f50cb1e90 100644
+index a31dc773a..7f50cb1e9 100644
 --- a/apps/server/src/orchestration-v2/ProjectionStore.ts
 +++ b/apps/server/src/orchestration-v2/ProjectionStore.ts
 @@ -1,5 +1,10 @@
@@ -2177,7 +2178,7 @@ index a31dc773a5..7f50cb1e90 100644
          Effect.gen(function* () {
            const projections = (yield* Ref.get(replayState)).projections;
 diff --git a/apps/server/src/orchestration-v2/ProviderTurnControlService.test.ts b/apps/server/src/orchestration-v2/ProviderTurnControlService.test.ts
-index b60c421585..5cbb4a4c97 100644
+index b60c42158..5cbb4a4c9 100644
 --- a/apps/server/src/orchestration-v2/ProviderTurnControlService.test.ts
 +++ b/apps/server/src/orchestration-v2/ProviderTurnControlService.test.ts
 @@ -215,6 +215,7 @@ it.effect(
@@ -2189,7 +2190,7 @@ index b60c421585..5cbb4a4c97 100644
            getThreadWorktreePaths: () => Effect.die("unused getThreadWorktreePaths"),
            getThreadProjection: () => Effect.die("control effects must not load transcript"),
 diff --git a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
-index 36354f8c1f..ead6f3905b 100644
+index 5c1a27cb4..fa43cf489 100644
 --- a/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
 +++ b/apps/server/src/orchestration-v2/ProviderTurnStartService.ts
 @@ -1,4 +1,5 @@
@@ -2198,7 +2199,7 @@ index 36354f8c1f..ead6f3905b 100644
  import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
  import {
    CommandId,
-@@ -1046,6 +1047,7 @@ export const layer: Layer.Layer<
+@@ -1055,6 +1056,7 @@ export const layer: Layer.Layer<
        };
        const missedRuns = projection.runs.filter(
          (source) =>
@@ -2207,7 +2208,7 @@ index 36354f8c1f..ead6f3905b 100644
            source.providerThreadId === providerThread.id &&
            (source.status === "failed" || source.status === "interrupted") &&
 diff --git a/apps/server/src/orchestration-v2/RestartContinuation.ts b/apps/server/src/orchestration-v2/RestartContinuation.ts
-index 3339133c9a..01bb112477 100644
+index 3339133c9..01bb11247 100644
 --- a/apps/server/src/orchestration-v2/RestartContinuation.ts
 +++ b/apps/server/src/orchestration-v2/RestartContinuation.ts
 @@ -1,4 +1,4 @@
@@ -2241,7 +2242,7 @@ index 3339133c9a..01bb112477 100644
            run.status !== "queued" &&
            !cancelledBeforeStart(run) &&
 diff --git a/apps/server/src/orchestration-v2/RunExecutionService.test.ts b/apps/server/src/orchestration-v2/RunExecutionService.test.ts
-index df76234e96..af8ef83e14 100644
+index df76234e9..af8ef83e1 100644
 --- a/apps/server/src/orchestration-v2/RunExecutionService.test.ts
 +++ b/apps/server/src/orchestration-v2/RunExecutionService.test.ts
 @@ -3976,6 +3976,76 @@ it.effect("keeps completed runs completed when pull request refresh fails", () =
@@ -2375,7 +2376,7 @@ index df76234e96..af8ef83e14 100644
          modelSelection: { instanceId: providerInstanceId, model: "gpt-5.4" },
          runtimePolicy: {
 diff --git a/apps/server/src/orchestration-v2/RunExecutionService.ts b/apps/server/src/orchestration-v2/RunExecutionService.ts
-index 0ff4894457..82168ce3d9 100644
+index 0ff489445..82168ce3d 100644
 --- a/apps/server/src/orchestration-v2/RunExecutionService.ts
 +++ b/apps/server/src/orchestration-v2/RunExecutionService.ts
 @@ -587,6 +587,7 @@ export const layer: Layer.Layer<
@@ -2485,7 +2486,7 @@ index 0ff4894457..82168ce3d9 100644
                      isRootProviderThreadUpdate &&
                      rootTerminalAlreadySeen &&
 diff --git a/apps/server/src/orchestration-v2/SubagentProjection.test.ts b/apps/server/src/orchestration-v2/SubagentProjection.test.ts
-index 65f3b917fc..86fa4c179c 100644
+index 65f3b917f..86fa4c179 100644
 --- a/apps/server/src/orchestration-v2/SubagentProjection.test.ts
 +++ b/apps/server/src/orchestration-v2/SubagentProjection.test.ts
 @@ -190,6 +190,28 @@ it("reports the run that ended last, not the highest ordinal", () => {
@@ -2518,7 +2519,7 @@ index 65f3b917fc..86fa4c179c 100644
    const { projection, run } = taskFixture();
    assert.equal(
 diff --git a/apps/server/src/orchestration-v2/ThreadManagementService.test.ts b/apps/server/src/orchestration-v2/ThreadManagementService.test.ts
-index b46129e3c9..2f48bb5462 100644
+index b46129e3c..2f48bb546 100644
 --- a/apps/server/src/orchestration-v2/ThreadManagementService.test.ts
 +++ b/apps/server/src/orchestration-v2/ThreadManagementService.test.ts
 @@ -5,6 +5,7 @@ import {
@@ -2601,7 +2602,7 @@ index b46129e3c9..2f48bb5462 100644
    const sourceThreadId = ThreadId.make("thread:thread-management:source");
    const targetThreadId = ThreadId.make("thread:thread-management:target");
 diff --git a/apps/server/src/orchestration-v2/ThreadManagementService.ts b/apps/server/src/orchestration-v2/ThreadManagementService.ts
-index dda7c4bd0e..a8f68b42cc 100644
+index dda7c4bd0..a8f68b42c 100644
 --- a/apps/server/src/orchestration-v2/ThreadManagementService.ts
 +++ b/apps/server/src/orchestration-v2/ThreadManagementService.ts
 @@ -2,6 +2,7 @@ import type {
@@ -2663,7 +2664,7 @@ index dda7c4bd0e..a8f68b42cc 100644
          return yield* new ThreadManagementRunNotFoundError({
            threadId: input.threadId,
 diff --git a/apps/server/src/orchestration-v2/ThreadSearch.ts b/apps/server/src/orchestration-v2/ThreadSearch.ts
-index 0862c5160d..e3bf7e2983 100644
+index 0862c5160..e3bf7e298 100644
 --- a/apps/server/src/orchestration-v2/ThreadSearch.ts
 +++ b/apps/server/src/orchestration-v2/ThreadSearch.ts
 @@ -96,6 +96,12 @@ export const make = Effect.gen(function* () {
@@ -2680,7 +2681,7 @@ index 0862c5160d..e3bf7e2983 100644
        ranked AS (
          SELECT
 diff --git a/apps/server/src/orchestration-v2/ThreadTitleRegenerationService.ts b/apps/server/src/orchestration-v2/ThreadTitleRegenerationService.ts
-index bf242696c5..9df3b5889c 100644
+index bf242696c..9df3b5889 100644
 --- a/apps/server/src/orchestration-v2/ThreadTitleRegenerationService.ts
 +++ b/apps/server/src/orchestration-v2/ThreadTitleRegenerationService.ts
 @@ -1,3 +1,4 @@
@@ -2715,7 +2716,7 @@ index bf242696c5..9df3b5889c 100644
        }
        if (context.message.length === 0 && context.attachments.length === 0) {
 diff --git a/apps/server/src/orchestration-v2/runtimeLayer.test.ts b/apps/server/src/orchestration-v2/runtimeLayer.test.ts
-index b7e9142cef..a1d856227f 100644
+index b7e9142ce..a1d856227 100644
 --- a/apps/server/src/orchestration-v2/runtimeLayer.test.ts
 +++ b/apps/server/src/orchestration-v2/runtimeLayer.test.ts
 @@ -3990,13 +3990,20 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
@@ -2774,7 +2775,7 @@ index b7e9142cef..a1d856227f 100644
              type: "queue.resume",
              commandId: CommandId.make(`${threadId}:resume`),
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.test.ts b/apps/server/src/relay/AgentAwarenessRelay.test.ts
-index 055f9d52f7..95ca6e86eb 100644
+index 055f9d52f..95ca6e86e 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.test.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.test.ts
 @@ -6,6 +6,7 @@ import {
@@ -2899,7 +2900,7 @@ index 055f9d52f7..95ca6e86eb 100644
      Effect.gen(function* () {
        const direct: Array<boolean | undefined> = [];
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.ts b/apps/server/src/relay/AgentAwarenessRelay.ts
-index d79231fdb8..dc56717e8f 100644
+index d79231fdb..dc56717e8 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.ts
 @@ -533,6 +533,23 @@ export const make = Effect.gen(function* () {
@@ -2927,10 +2928,10 @@ index d79231fdb8..dc56717e8f 100644
        threadShell?.lineage.relationshipToParent === "subagent" &&
        !(yield* Ref.get(publishedStateByThreadRef)).has(threadId)
 diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
-index 638abcb3eb..db9c272854 100644
+index d082f6f3b..85f03ab8e 100644
 --- a/apps/server/src/server.ts
 +++ b/apps/server/src/server.ts
-@@ -171,6 +171,7 @@ import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
+@@ -172,6 +172,7 @@ import * as ProjectStore from "./orchestration-v2/ProjectStore.ts";
  import * as ThreadSearch from "./orchestration-v2/ThreadSearch.ts";
  import * as ResourceCleanupService from "./orchestration-v2/ResourceCleanupService.ts";
  import * as ThreadSettlementService from "./orchestration-v2/ThreadSettlementService.ts";
@@ -2938,7 +2939,7 @@ index 638abcb3eb..db9c272854 100644
  import * as ThreadPullRequestService from "./orchestration-v2/ThreadPullRequestService.ts";
  import * as RunFinalizationService from "./orchestration-v2/RunFinalizationService.ts";
  import * as EventStoreV2 from "./orchestration-v2/EventStore.ts";
-@@ -500,6 +501,10 @@ const layerThreadSettlementWorker = Layer.effectDiscard(
+@@ -507,6 +508,10 @@ const layerThreadSettlementWorker = Layer.effectDiscard(
    ThreadSettlementService.make.pipe(Effect.flatMap((service) => service.start())),
  ).pipe(Layer.provide(layerPullRequestService), Layer.provide(ProjectionStoreV2.layer));
  
@@ -2949,7 +2950,7 @@ index 638abcb3eb..db9c272854 100644
  const layerThreadPullRequestWorker = Layer.effectDiscard(
    ThreadPullRequestService.make.pipe(Effect.flatMap((service) => service.start())),
  ).pipe(Layer.provide(layerPullRequestService));
-@@ -540,6 +545,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
+@@ -547,6 +552,7 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
    AgentAwarenessRelay.layer,
    HeldHooksWaker.layer,
    layerThreadSettlementWorker,
@@ -2958,10 +2959,10 @@ index 638abcb3eb..db9c272854 100644
    DatabaseStorage.layer.pipe(
      Layer.provide(ProjectionMaintenance.layer),
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index 865227cafa..ab322c275c 100644
+index c7c62b598..03ca1debf 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -32,6 +32,7 @@ import { usePendingThreadRequests } from "./chat/usePendingThreadRequests";
+@@ -33,6 +33,7 @@ import { usePendingThreadRequests } from "./chat/usePendingThreadRequests";
  import { isScratchProject } from "@t3tools/client-runtime/state/projects";
  import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
  import {
@@ -2969,7 +2970,7 @@ index 865227cafa..ab322c275c 100644
    latestExecutedRun,
    latestRootProviderFailure,
  } from "@t3tools/shared/orchestrationV2ThreadError";
-@@ -1481,8 +1482,9 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1468,8 +1469,9 @@ export default function ChatView(props: ChatViewProps) {
    const activeRuntime = isServerThread ? serverRuntime : (activeThread?.runtime ?? null);
    const hasHeldQueuedRuns =
      isServerThread &&
@@ -2981,7 +2982,7 @@ index 865227cafa..ab322c275c 100644
    const resumableRunId = (() => {
      if (!isServerThread || serverProjection === null) return null;
      const run = latestExecutedRun(serverProjection.runs);
-@@ -2581,7 +2583,12 @@ export default function ChatView(props: ChatViewProps) {
+@@ -2469,7 +2471,12 @@ export default function ChatView(props: ChatViewProps) {
      activeThread,
      activeLatestRun,
      latestUserMessageId:
@@ -2995,7 +2996,7 @@ index 865227cafa..ab322c275c 100644
      phase,
      activePendingApproval: activePendingApproval?.requestId ?? null,
      activePendingUserInput: activePendingUserInput?.requestId ?? null,
-@@ -3450,7 +3457,10 @@ export default function ChatView(props: ChatViewProps) {
+@@ -3341,7 +3348,10 @@ export default function ChatView(props: ChatViewProps) {
        return;
      const result = await interruptThreadTurn({
        environmentId,
@@ -3008,7 +3009,7 @@ index 865227cafa..ab322c275c 100644
      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
        const error = squashAtomCommandFailure(result);
 diff --git a/apps/web/src/components/chat/V2LifecycleRow.tsx b/apps/web/src/components/chat/V2LifecycleRow.tsx
-index 015017527c..e9a4cc1a46 100644
+index 194c288d6..b97c9e1c6 100644
 --- a/apps/web/src/components/chat/V2LifecycleRow.tsx
 +++ b/apps/web/src/components/chat/V2LifecycleRow.tsx
 @@ -118,7 +118,9 @@ export function V2LifecycleRow(props: {
@@ -3023,10 +3024,10 @@ index 015017527c..e9a4cc1a46 100644
        <TimelineSystemDivider label={label} detail={item.summary ?? tokenDetail} icon={MinusIcon} />
      );
 diff --git a/apps/web/src/components/settings/SettingsPanels.tsx b/apps/web/src/components/settings/SettingsPanels.tsx
-index 897c902806..dddc8783d1 100644
+index 3789db8e3..47082be4f 100644
 --- a/apps/web/src/components/settings/SettingsPanels.tsx
 +++ b/apps/web/src/components/settings/SettingsPanels.tsx
-@@ -2302,6 +2302,35 @@ export function GeneralSettingsPanel() {
+@@ -2307,6 +2307,35 @@ export function GeneralSettingsPanel() {
            }
          />
  
@@ -3063,7 +3064,7 @@ index 897c902806..dddc8783d1 100644
            <>
              <SettingsRow
 diff --git a/apps/web/src/components/settings/settingsSearch.ts b/apps/web/src/components/settings/settingsSearch.ts
-index ed6f8cdd50..c1037ae2b6 100644
+index ed6f8cdd5..c1037ae2b 100644
 --- a/apps/web/src/components/settings/settingsSearch.ts
 +++ b/apps/web/src/components/settings/settingsSearch.ts
 @@ -330,6 +330,13 @@ export const SETTINGS_SEARCH_ITEMS = [
@@ -3081,7 +3082,7 @@ index ed6f8cdd50..c1037ae2b6 100644
      id: "auto-settle-merged-threads",
      title: "Auto-settle merged threads",
 diff --git a/docs/user/composer.md b/docs/user/composer.md
-index d27aa04dee..d411c5c4c7 100644
+index d27aa04de..d411c5c4c 100644
 --- a/docs/user/composer.md
 +++ b/docs/user/composer.md
 @@ -236,6 +236,12 @@ Provider commands must start the message to run. T3 Code commands such as
@@ -3098,7 +3099,7 @@ index d27aa04dee..d411c5c4c7 100644
  
  With Codex and Claude, send `/goal` followed by what "done" means, for example
 diff --git a/packages/client-runtime/src/handoff.ts b/packages/client-runtime/src/handoff.ts
-index 1ac4db202b..298ed03f1a 100644
+index 1ac4db202..298ed03f1 100644
 --- a/packages/client-runtime/src/handoff.ts
 +++ b/packages/client-runtime/src/handoff.ts
 @@ -6,6 +6,7 @@ import type {
@@ -3119,7 +3120,7 @@ index 1ac4db202b..298ed03f1a 100644
    if (from === undefined || selection == null) return null;
    const source = providers.find((provider) => provider.instanceId === from.instanceId);
 diff --git a/packages/client-runtime/src/operations/commands.test.ts b/packages/client-runtime/src/operations/commands.test.ts
-index a02554bb0f..7fb8935459 100644
+index a02554bb0..7fb893545 100644
 --- a/packages/client-runtime/src/operations/commands.test.ts
 +++ b/packages/client-runtime/src/operations/commands.test.ts
 @@ -503,6 +503,53 @@ describe("V2 environment commands", () => {
@@ -3177,7 +3178,7 @@ index a02554bb0f..7fb8935459 100644
      Effect.gen(function* () {
        const link = {
 diff --git a/packages/client-runtime/src/operations/commands.ts b/packages/client-runtime/src/operations/commands.ts
-index b16a2f5b48..c206eb252a 100644
+index b16a2f5b4..c206eb252 100644
 --- a/packages/client-runtime/src/operations/commands.ts
 +++ b/packages/client-runtime/src/operations/commands.ts
 @@ -29,6 +29,7 @@ import {
@@ -3243,7 +3244,7 @@ index b16a2f5b48..c206eb252a 100644
      if (checkpoint === undefined || checkpoint.status !== "ready") {
        const target =
 diff --git a/packages/client-runtime/src/state/threadCheckpoints.ts b/packages/client-runtime/src/state/threadCheckpoints.ts
-index 476a4d8b16..2c3875ba8a 100644
+index 4501007e2..a43fc3abd 100644
 --- a/packages/client-runtime/src/state/threadCheckpoints.ts
 +++ b/packages/client-runtime/src/state/threadCheckpoints.ts
 @@ -6,6 +6,7 @@ import type {
@@ -3254,9 +3255,12 @@ index 476a4d8b16..2c3875ba8a 100644
  import * as DateTime from "effect/DateTime";
  
  export interface ThreadCheckpointSummary {
-@@ -28,8 +29,13 @@ export interface ThreadCheckpointSummary {
+@@ -26,10 +27,15 @@ export interface ThreadCheckpointSummary {
+ }
+ 
  export function deriveThreadCheckpointSummaries(
-   projection: OrchestrationV2ThreadProjection,
+-  projection: Pick<OrchestrationV2ThreadProjection, "checkpoints" | "messages">,
++  projection: Pick<OrchestrationV2ThreadProjection, "checkpoints" | "messages" | "runs">,
  ): ReadonlyArray<ThreadCheckpointSummary> {
 +  // Idle compaction still captures a checkpoint, but it is never a review turn.
 +  const idleRunIds = new Set(
@@ -3268,8 +3272,40 @@ index 476a4d8b16..2c3875ba8a 100644
      const assistantMessageId =
        projection.messages.findLast(
          (message) => message.runId === checkpoint.runId && message.role === "assistant",
+diff --git a/packages/client-runtime/src/state/threadDetail.ts b/packages/client-runtime/src/state/threadDetail.ts
+index 89ec5cc74..06d71729d 100644
+--- a/packages/client-runtime/src/state/threadDetail.ts
++++ b/packages/client-runtime/src/state/threadDetail.ts
+@@ -129,7 +129,10 @@ export function createEnvironmentThreadDetailAtoms<E>(
+   });
+ 
+   const checkpointSummariesAtomFamily = Atom.family((key: string) => {
+-    let previous: Pick<OrchestrationV2ThreadProjection, "checkpoints" | "messages"> | null = null;
++    let previous: Pick<
++      OrchestrationV2ThreadProjection,
++      "checkpoints" | "messages" | "runs"
++    > | null = null;
+     let value = EMPTY_CHECKPOINT_SUMMARIES;
+     return Atom.make((get) => {
+       const projection = Option.getOrNull(get(threadStateValueAtomFamily(key)).data);
+@@ -138,10 +141,12 @@ export function createEnvironmentThreadDetailAtoms<E>(
+         value = EMPTY_CHECKPOINT_SUMMARIES;
+       } else if (
+         projection.checkpoints !== previous?.checkpoints ||
+-        projection.messages !== previous?.messages
++        projection.messages !== previous?.messages ||
++        // Idle compaction runs are filtered out of the summaries (patches-tt/0006).
++        projection.runs !== previous?.runs
+       ) {
+-        const { checkpoints, messages } = projection;
+-        previous = { checkpoints, messages };
++        const { checkpoints, messages, runs } = projection;
++        previous = { checkpoints, messages, runs };
+         value = deriveThreadCheckpointSummaries(previous);
+       }
+       return value;
 diff --git a/packages/client-runtime/src/state/threadExecution.test.ts b/packages/client-runtime/src/state/threadExecution.test.ts
-index 2d61f6d95f..bbc0c97754 100644
+index 2d61f6d95..bbc0c9775 100644
 --- a/packages/client-runtime/src/state/threadExecution.test.ts
 +++ b/packages/client-runtime/src/state/threadExecution.test.ts
 @@ -191,6 +191,27 @@ describe("thread execution presentation", () => {
@@ -3301,7 +3337,7 @@ index 2d61f6d95f..bbc0c97754 100644
      const interrupted = { ...run("run-interrupted", 1, "interrupted"), completedAt: now };
      const held = { ...run("run-held", 2, "queued"), queueHeld: true };
 diff --git a/packages/client-runtime/src/state/threadExecution.ts b/packages/client-runtime/src/state/threadExecution.ts
-index 75ae3404e4..738a50d69a 100644
+index 75ae3404e..738a50d69 100644
 --- a/packages/client-runtime/src/state/threadExecution.ts
 +++ b/packages/client-runtime/src/state/threadExecution.ts
 @@ -1,6 +1,8 @@
@@ -3353,7 +3389,7 @@ index 75ae3404e4..738a50d69a 100644
      updatedAt: DateTime.formatIso(projection.updatedAt),
    };
 diff --git a/packages/client-runtime/src/state/threadWorkflows.test.ts b/packages/client-runtime/src/state/threadWorkflows.test.ts
-index 23722260b8..12d60a147e 100644
+index 23722260b..12d60a147 100644
 --- a/packages/client-runtime/src/state/threadWorkflows.test.ts
 +++ b/packages/client-runtime/src/state/threadWorkflows.test.ts
 @@ -5,6 +5,7 @@ import {
@@ -3389,7 +3425,7 @@ index 23722260b8..12d60a147e 100644
      "does not merge older history while a newer run is %s",
      (status) => {
 diff --git a/packages/client-runtime/src/state/threadWorkflows.ts b/packages/client-runtime/src/state/threadWorkflows.ts
-index 69e691840b..edfaa268ed 100644
+index 69e691840..edfaa268e 100644
 --- a/packages/client-runtime/src/state/threadWorkflows.ts
 +++ b/packages/client-runtime/src/state/threadWorkflows.ts
 @@ -5,6 +5,7 @@ import type {
@@ -3456,7 +3492,7 @@ index 69e691840b..edfaa268ed 100644
      canPromoteToSteer:
        hasSteerableProviderTurn &&
 diff --git a/packages/client-runtime/src/work-log/presentation.ts b/packages/client-runtime/src/work-log/presentation.ts
-index 727f1b4ccd..faef4cb65c 100644
+index 727f1b4cc..faef4cb65 100644
 --- a/packages/client-runtime/src/work-log/presentation.ts
 +++ b/packages/client-runtime/src/work-log/presentation.ts
 @@ -51,14 +51,19 @@ export function toolItemForDisplay(item: OrchestrationV2TurnItem): Orchestration
@@ -3484,7 +3520,7 @@ index 727f1b4ccd..faef4cb65c 100644
  
  export interface WorkLogPresentationEntry {
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
-index 3e68e80fc1..4c270a4948 100644
+index 3e68e80fc..4c270a494 100644
 --- a/packages/contracts/src/orchestrationV2.ts
 +++ b/packages/contracts/src/orchestrationV2.ts
 @@ -554,6 +554,8 @@ export const OrchestrationV2Run = Schema.Struct({
@@ -3522,10 +3558,10 @@ index 3e68e80fc1..4c270a4948 100644
      deliveryIntent: Schema.optional(Schema.Literals(["auto", "steer", "restart"])),
      delegatedCompletion: Schema.optional(
 diff --git a/packages/contracts/src/settings.ts b/packages/contracts/src/settings.ts
-index 1b7b4099e8..9ec03a3bd5 100644
+index 976bb90cf..9f5042810 100644
 --- a/packages/contracts/src/settings.ts
 +++ b/packages/contracts/src/settings.ts
-@@ -1103,6 +1103,7 @@ export const ServerSettings = Schema.Struct({
+@@ -1107,6 +1107,7 @@ export const ServerSettings = Schema.Struct({
    sidebarAutoSettleAfterDays: Schema.NullOr(SidebarAutoSettleAfterDays).pipe(
      Schema.withDecodingDefault(Effect.succeed(DEFAULT_SIDEBAR_AUTO_SETTLE_AFTER_DAYS)),
    ),
@@ -3533,7 +3569,7 @@ index 1b7b4099e8..9ec03a3bd5 100644
    snoozeLimitedThreads: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
    autoResumeLimitedThreads: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
    sidebarAutoSettleKeepPullRequests: Schema.Boolean.pipe(
-@@ -1408,6 +1409,7 @@ export const ServerSettingsPatch = Schema.Struct({
+@@ -1412,6 +1413,7 @@ export const ServerSettingsPatch = Schema.Struct({
    deviceOnboardingCompleted: Schema.optionalKey(Schema.Boolean),
    deviceHosts: Schema.optionalKey(SshDeviceHostConfigs),
    sidebarAutoSettleAfterDays: Schema.optionalKey(Schema.NullOr(SidebarAutoSettleAfterDays)),
@@ -3542,7 +3578,7 @@ index 1b7b4099e8..9ec03a3bd5 100644
    sidebarAutoSettleOnMerge: Schema.optionalKey(Schema.Boolean),
    autoResumeLimitedThreads: Schema.optionalKey(Schema.Boolean),
 diff --git a/packages/provider-core/src/server/subagentProjection.ts b/packages/provider-core/src/server/subagentProjection.ts
-index 4ae4397251..29c4c3f320 100644
+index 4ae439725..29c4c3f32 100644
 --- a/packages/provider-core/src/server/subagentProjection.ts
 +++ b/packages/provider-core/src/server/subagentProjection.ts
 @@ -18,7 +18,7 @@ import type {
@@ -3564,7 +3600,7 @@ index 4ae4397251..29c4c3f320 100644
    const active = workRuns.some(
      (run) => !terminal(run.status) && !(run.status === "queued" && run.queueHeld === true),
 diff --git a/packages/provider-muse/src/server/adapter.ts b/packages/provider-muse/src/server/adapter.ts
-index bad108c6c3..34f4c45404 100644
+index bad108c6c..34f4c4540 100644
 --- a/packages/provider-muse/src/server/adapter.ts
 +++ b/packages/provider-muse/src/server/adapter.ts
 @@ -1882,6 +1882,7 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
@@ -3598,7 +3634,7 @@ index bad108c6c3..34f4c45404 100644
            if (compact) {
              const result = yield* request("session/compact", {}, true, nativeId).pipe(
 diff --git a/packages/provider-opencode/src/server/v2/adapter.ts b/packages/provider-opencode/src/server/v2/adapter.ts
-index a1ed0275f8..deaa6ce7bb 100644
+index a1ed0275f..deaa6ce7b 100644
 --- a/packages/provider-opencode/src/server/v2/adapter.ts
 +++ b/packages/provider-opencode/src/server/v2/adapter.ts
 @@ -3500,6 +3500,23 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
@@ -3626,7 +3662,7 @@ index a1ed0275f8..deaa6ce7bb 100644
                  yield* client.session.switchModel({ sessionID: Session.ID.make(sessionId), model });
                  state.model = model;
 diff --git a/packages/provider-pi/src/server/adapter.ts b/packages/provider-pi/src/server/adapter.ts
-index 25c3984246..b5aa75bb65 100644
+index 25c398424..b5aa75bb6 100644
 --- a/packages/provider-pi/src/server/adapter.ts
 +++ b/packages/provider-pi/src/server/adapter.ts
 @@ -2522,6 +2522,13 @@ export const makePiAdapterV2 = Effect.fn("makePiAdapterV2")(function* (
@@ -3644,7 +3680,7 @@ index 25c3984246..b5aa75bb65 100644
                state.providerThread = turnInput.providerThread;
                state.activeTurn = activeTurn;
 diff --git a/packages/shared/src/orchestrationV2PendingBackgroundWork.test.ts b/packages/shared/src/orchestrationV2PendingBackgroundWork.test.ts
-index db701d3f4d..119d53d195 100644
+index db701d3f4..119d53d19 100644
 --- a/packages/shared/src/orchestrationV2PendingBackgroundWork.test.ts
 +++ b/packages/shared/src/orchestrationV2PendingBackgroundWork.test.ts
 @@ -491,6 +491,30 @@ describe("derivePendingBackgroundWork", () => {
@@ -3679,7 +3715,7 @@ index db701d3f4d..119d53d195 100644
      const tasks = derivePendingBackgroundWork({
        latestRun: { id: "run-1" as never, ordinal: 1, status: "completed" },
 diff --git a/packages/shared/src/orchestrationV2PendingBackgroundWork.ts b/packages/shared/src/orchestrationV2PendingBackgroundWork.ts
-index 15453ae018..392f1d1335 100644
+index 15453ae01..392f1d133 100644
 --- a/packages/shared/src/orchestrationV2PendingBackgroundWork.ts
 +++ b/packages/shared/src/orchestrationV2PendingBackgroundWork.ts
 @@ -8,6 +8,7 @@ import type {
@@ -3714,7 +3750,7 @@ index 15453ae018..392f1d1335 100644
      false;
    if (hasActiveRun) {
 diff --git a/packages/shared/src/orchestrationV2ThreadError.ts b/packages/shared/src/orchestrationV2ThreadError.ts
-index c1e92cc133..60fc420f27 100644
+index c1e92cc13..60fc420f2 100644
 --- a/packages/shared/src/orchestrationV2ThreadError.ts
 +++ b/packages/shared/src/orchestrationV2ThreadError.ts
 @@ -5,6 +5,31 @@ import type {
@@ -3771,7 +3807,7 @@ index c1e92cc133..60fc420f27 100644
    }
    return latest;
 diff --git a/packages/shared/src/orchestrationV2Timeline.ts b/packages/shared/src/orchestrationV2Timeline.ts
-index d160b318a3..3aaf997126 100644
+index d160b318a..3aaf99712 100644
 --- a/packages/shared/src/orchestrationV2Timeline.ts
 +++ b/packages/shared/src/orchestrationV2Timeline.ts
 @@ -5,7 +5,7 @@ import type {

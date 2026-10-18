@@ -658,7 +658,22 @@ def checks(env, log, target):
     # someone once installed without it checked more strictly than the rest. Patch every time.
     if any((SOURCE / 'node_modules' / '.bin').glob('effect-tsgo*')):
         run(['effect-tsgo', 'patch'], cwd=SOURCE, env=env, log=log)
-    steps = [(['vp', 'test', 'run', *spec['tests']], 'The patch tests failed.')]
+    # Upstream runs *.browser.test.* files in its app's "browser" project (Playwright
+    # Chromium); from the root they land in the node pool and fail. Run them per app.
+    browser = [t for t in spec['tests'] if re.search(r'\.browser\.test\.[cm]?[jt]sx?$', t)]
+    unit = [t for t in spec['tests'] if t not in browser]
+    steps = [(['vp', 'test', 'run', *unit], 'The patch tests failed.')] if unit else []
+    by_app = {}
+    for t in browser:
+        app = '/'.join(t.split('/')[:2])
+        by_app.setdefault(app, []).append(t[len(app) + 1:])
+    for app, files in by_app.items():
+        steps.append((['vp', 'test', 'run', '--project', 'browser', *files], 'The patch browser tests failed.', app))
+    # The empty HOME below hides Playwright's browser cache; keep its own under the cache
+    # (an install also deletes browsers no installed Playwright uses from that folder).
+    browsers = CACHE / 'ms-playwright'
+    if by_app:
+        install_playwright_browser(env, browsers, SOURCE / next(iter(by_app)), log)
     steps += [(['tsc', '--noEmit', '-p', p + '/tsconfig.json'], f'Typecheck failed in {p}.') for p in spec['typecheck']]
     # Upstream's lint holds rules tests and typechecks miss, such as no-hermes-unsupported-apis
     # (Array#toSorted crashes the iOS app at render). Lint what the patches add or change.
@@ -673,10 +688,23 @@ def checks(env, log, target):
     tmp = CACHE / 'tmp'
     tmp.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='t3code-checks-home-', dir=tmp) as home:
-        check_env = dict(os.environ if env is None else env, HOME=home, TMPDIR=str(tmp))
-        for args, message in steps:
-            if run(args, cwd=SOURCE, env=check_env, log=log, check=False).returncode:
+        check_env = dict(os.environ if env is None else env, HOME=home, TMPDIR=str(tmp),
+                         PLAYWRIGHT_BROWSERS_PATH=str(browsers))
+        for args, message, *cwd in steps:
+            if run(args, cwd=SOURCE / cwd[0] if cwd else SOURCE, env=check_env, log=log, check=False).returncode:
                 raise NeedsFix(message + ' Command: ' + ' '.join(args))
+
+
+def install_playwright_browser(env, browsers, cwd, log):
+    """Install the headless Chromium the source's Playwright needs (a no-op once present).
+    Playwright refuses Linux releases newer than it knows (devbox1 runs Ubuntu 26.04);
+    then it takes the newest build it supports, as its own fallback does for older ones."""
+    install_env = dict(os.environ if env is None else env, PLAYWRIGHT_BROWSERS_PATH=str(browsers))
+    # pnpm links the CLI into the app that depends on Playwright, not the root.
+    install_env['PATH'] = os.pathsep.join([str(cwd / 'node_modules/.bin'), install_env.get('PATH', '')])
+    args = ['playwright', 'install', '--only-shell', 'chromium']
+    if run(args, cwd=cwd, env=install_env, log=log, check=False).returncode and sys.platform.startswith('linux'):
+        run(args, cwd=cwd, env=dict(install_env, PLAYWRIGHT_HOST_PLATFORM_OVERRIDE='ubuntu24.04-' + ('arm64' if host_arch() == 'arm64' else 'x64')), log=log)
 
 
 @contextlib.contextmanager
