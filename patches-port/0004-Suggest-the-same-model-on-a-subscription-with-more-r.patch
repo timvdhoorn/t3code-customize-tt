@@ -15,33 +15,35 @@ Model-scoped weeklies only count for their own model family. Clicking
 switches the thread through the usual model selection; the tooltip
 explains why and when a started thread cannot switch.
 ---
- apps/web/src/components/ChatView.tsx          |  18 ++
+ apps/web/src/components/ChatView.tsx          |  20 ++
  .../web/src/components/chat/ComposerStats.tsx |  69 ++++++
  .../chat/SubscriptionSwitch.logic.test.ts     | 226 ++++++++++++++++++
  .../chat/SubscriptionSwitch.logic.ts          | 225 +++++++++++++++++
- 4 files changed, 538 insertions(+)
+ 4 files changed, 540 insertions(+)
  create mode 100644 apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts
  create mode 100644 apps/web/src/components/chat/SubscriptionSwitch.logic.ts
 
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index c3893ed712..865227cafa 100644
+index 1cdef93ab..c7c62b598 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -326,6 +326,7 @@ import {
+@@ -321,6 +321,8 @@ import {
    type ComposerImageAttachment,
    type DraftThreadEnvMode,
    useComposerDraftStore,
-+  useEffectiveComposerModelState,
++  deriveEffectiveComposerModelState,
++  useComposerDraftModelState,
    DraftId,
  } from "../composerDraftStore";
  import {
-@@ -2623,6 +2624,16 @@ export default function ChatView(props: ChatViewProps) {
+@@ -2510,6 +2512,17 @@ export default function ChatView(props: ChatViewProps) {
      ),
    );
    const activeUsageLimits = activeProviderStatus?.usageLimits;
 +  // The model the composer shows, so the switch keeps it while changing subscription.
-+  const { selectedModel: subscriptionSwitchModel } = useEffectiveComposerModelState({
-+    threadRef: composerDraftTarget,
++  const subscriptionSwitchDraft = useComposerDraftModelState(composerDraftTarget);
++  const { selectedModel: subscriptionSwitchModel } = deriveEffectiveComposerModelState({
++    draft: subscriptionSwitchDraft,
 +    providers: providerStatuses,
 +    selectedProvider,
 +    selectedInstanceId: activeProviderInstanceId,
@@ -52,7 +54,7 @@ index c3893ed712..865227cafa 100644
    const activeProviderName =
      activeProviderStatus?.displayName?.trim() || activeProviderStatus?.instanceId || "";
    const composerStats = (() => {
-@@ -8596,6 +8607,13 @@ export default function ChatView(props: ChatViewProps) {
+@@ -8407,6 +8420,13 @@ export default function ChatView(props: ChatViewProps) {
                                    : compactDisabledReason
                            }
                            isCompacting={isCompacting}
@@ -67,7 +69,7 @@ index c3893ed712..865227cafa 100644
                        )}
                        <div
 diff --git a/apps/web/src/components/chat/ComposerStats.tsx b/apps/web/src/components/chat/ComposerStats.tsx
-index 53b81a83a1..4a4b72fcd4 100644
+index 53b81a83a..4a4b72fcd 100644
 --- a/apps/web/src/components/chat/ComposerStats.tsx
 +++ b/apps/web/src/components/chat/ComposerStats.tsx
 @@ -1,6 +1,8 @@
@@ -190,7 +192,7 @@ index 53b81a83a1..4a4b72fcd4 100644
            {stats.map(({ key, node }, index) => (
 diff --git a/apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts b/apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts
 new file mode 100644
-index 0000000000..da5f1aa6e4
+index 000000000..da5f1aa6e
 --- /dev/null
 +++ b/apps/web/src/components/chat/SubscriptionSwitch.logic.test.ts
 @@ -0,0 +1,226 @@
@@ -422,7 +424,7 @@ index 0000000000..da5f1aa6e4
 +});
 diff --git a/apps/web/src/components/chat/SubscriptionSwitch.logic.ts b/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
 new file mode 100644
-index 0000000000..af475f0b2a
+index 000000000..af475f0b2
 --- /dev/null
 +++ b/apps/web/src/components/chat/SubscriptionSwitch.logic.ts
 @@ -0,0 +1,225 @@
