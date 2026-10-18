@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import json
 import importlib.machinery
 import importlib.util
@@ -146,7 +147,8 @@ class OwedRestartTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.runtime = Path(tmp.name)
-        for name, value in (('OWED_RESTART', self.runtime / '.owed'), ('T3_RESTART_PENDING', self.runtime / '.rp')):
+        for name, value in (('OWED_RESTART', self.runtime / '.owed'), ('T3_RESTART_PENDING', self.runtime / '.rp'),
+                            ('RESTART_LOCK', self.runtime / 'restart-lock')):
             patcher = patch.object(customize, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -188,6 +190,257 @@ class OwedRestartTest(unittest.TestCase):
                 patch.object(customize, 'step'):
             customize.restart_server(self.runtime)
         self.assertFalse(customize.OWED_RESTART.exists())
+
+
+STAGE_SERVER_BUILD = customize.stage_server_build
+
+
+class ServerRunLockTest(unittest.TestCase):
+    """A server run holds the checkout lock only while it uses the checkout, and of two runs that
+    wait for idle threads at once only the newest staged build is swapped in."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.folder = self.root / 'versions/1.1-nightly'
+        (self.folder / 'client').mkdir(parents=True)
+        (self.folder / 'client/index.js').write_text('')
+        (self.folder / 't3').write_text('stock')
+        self.checkout_lock = self.root / 'lock'
+        self.runtime = ('1.1-nightly', self.folder)
+        self.installed = []
+        for name, value in (('CACHE', self.root / 'cache'), ('RESTART_LOCK', self.root / 'restart-lock'),
+                            ('OWED_RESTART', self.root / '.owed'), ('T3_RESTART_PENDING', self.root / '.rp'),
+                            ('MAC', False)):
+            patcher = patch.object(customize, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def checkout_lock_free(self):
+        return self.lock_free(self.checkout_lock)
+
+    def stage(self, folder, version):
+        (folder / 't3.customize-new').write_text('customized')
+        (folder / 'client.customize-new').mkdir(exist_ok=True)
+        return customize.mark_staged(folder, version)
+
+    def lock_free(self, path):
+        import fcntl
+        with path.open('a+') as other:
+            try:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            fcntl.flock(other, fcntl.LOCK_UN)
+            return True
+
+    def run_server(self, gate=lambda action: None, recipe='r', ported=False, restart=None):
+        """One cmd_server with a fresh build, holding the checkout lock as main() does. recipe=None
+        keeps the real recipe_hash."""
+        import fcntl
+        args = argparse.Namespace(no_restart=False, no_pull=True, resume=False, t3_update=False, force=False)
+        lock = self.checkout_lock.open('a+')
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        customize.CHECKOUT_LOCK = lock
+        self.addCleanup(setattr, customize, 'CHECKOUT_LOCK', None)
+        recipes = patch.object(customize, 'recipe_hash', return_value=recipe) if recipe else contextlib.nullcontext()
+        with patch.object(customize, 'inside_t3_service', return_value=False), \
+                patch.object(customize, 'server_runtime', side_effect=lambda: self.runtime), \
+                patch.object(customize, 'server_installing', return_value=False), recipes, \
+                patch.object(customize, 'public_config_from', return_value=dict(customize.PUBLIC_CONFIG)), \
+                patch.object(customize, 'ensure_node'), patch.object(customize, 'build_env', return_value={}), \
+                patch.object(customize, 'ensure_commit', return_value='abc'), \
+                patch.object(customize, 'apply_patches', return_value=ported), \
+                patch.object(customize, 'export_patches'), patch.object(customize, 'publish_port'), \
+                patch.object(customize, 'git', return_value='head'), \
+                patch.object(customize, 'build_rewrites_discarded', contextlib.nullcontext), \
+                patch.object(customize, 'build_server'), \
+                patch.object(customize, 'stage_server_build', side_effect=self.stage), \
+                patch.object(customize, 'wait_until_idle', side_effect=gate), \
+                patch.object(customize, 'install_server_build',
+                             side_effect=lambda folder, version, commit, recipe: self.installed.append(recipe)
+                             or (folder / customize.STAGED_MARK).unlink()), \
+                patch.object(customize, 'restart_server', side_effect=restart) as restart, \
+                patch.object(customize, 'say'), patch.object(customize, 'step'):
+            result = customize.cmd_server(args)
+        return result, restart
+
+    def test_a_port_can_take_the_checkout_lock_while_the_server_run_waits_for_idle(self):
+        free = []
+        result, restart = self.run_server(gate=lambda action: free.append(self.checkout_lock_free()))
+        self.assertEqual(free, [True])
+        self.assertTrue(result)
+        self.assertEqual(self.installed, ['r'])
+        restart.assert_called_once()
+
+    def test_the_restart_lock_is_free_while_the_server_run_waits_for_idle(self):
+        free = []
+        self.run_server(gate=lambda action: free.append(self.lock_free(customize.RESTART_LOCK)))
+        self.assertEqual(free, [True])
+
+    def test_the_recorded_recipe_is_the_one_built_even_if_a_port_changes_the_patches_meanwhile(self):
+        repo = self.root / 'repo'
+        for folder in ('patches', 'patches-tt'):
+            (repo / folder).mkdir(parents=True)
+        for name in ('checks.json', 'checks-tt.json', customize.NAME, 'platform_support.py'):
+            (repo / name).write_text(name)
+        (repo / 'patches-tt/0001-a.patch').write_text('ported')
+        with patch.object(customize, 'REPO', repo), patch.object(customize, 'WITH_IOS', False):
+            built = customize.recipe_hash()
+
+            def gate(action):
+                # A port that got the checkout lock during the wait commits newer patches.
+                (repo / 'patches-tt/0002-b.patch').write_text('newer port')
+
+            self.run_server(gate=gate, recipe=None, ported=True)
+            self.assertNotEqual(customize.recipe_hash(), built)
+        self.assertEqual(self.installed, [built])
+
+    def test_a_deferred_restart_in_the_swap_releases_the_restart_lock_and_leaves_the_owed_marker(self):
+        def deferred(folder, action):
+            customize.OWED_RESTART.write_text('x')
+            raise customize.Deferred('busy')
+
+        with self.assertRaises(customize.Deferred):
+            self.run_server(restart=deferred)
+        self.assertEqual(self.installed, ['r'])
+        self.assertTrue(self.lock_free(customize.RESTART_LOCK))
+        self.assertTrue(customize.OWED_RESTART.exists())
+
+    def real_stage(self, version='1.1-nightly', probe_ok=True, copy_fails=False):
+        """stage_server_build itself, from a fake build in a fake checkout."""
+        source = self.root / 'source'
+        (source / 'apps/server/dist-exe').mkdir(parents=True, exist_ok=True)
+        (source / 'apps/server/dist/client').mkdir(parents=True, exist_ok=True)
+        (source / 'apps/server/dist-exe/t3').write_text('newer build')
+        probe = argparse.Namespace(returncode=0 if probe_ok else 1, stdout=version if probe_ok else '', stderr='crash')
+
+        def copytree(*args, **kwargs):
+            raise OSError('disk full')
+
+        with patch.object(customize, 'SOURCE', source), patch.object(customize.subprocess, 'run', return_value=probe), \
+                patch.object(customize.shutil, 'copytree', copytree) if copy_fails else contextlib.nullcontext(), \
+                customize.restart_lock():
+            # The real one, also while run_server has patched it for the waiting run.
+            return STAGE_SERVER_BUILD(self.folder, version)
+
+    def test_a_waiter_does_not_install_files_a_newer_run_failed_to_stage(self):
+        result, restart = self.run_server(gate=lambda action: self.assertRaises(customize.Stop, self.real_stage,
+                                                                                 probe_ok=False))
+        self.assertFalse(result)
+        restart.assert_not_called()
+        self.assertEqual(self.installed, [])
+
+    def test_a_waiter_does_not_install_files_a_newer_run_copied_only_half(self):
+        result, restart = self.run_server(gate=lambda action: self.assertRaises(OSError, self.real_stage,
+                                                                                 copy_fails=True))
+        self.assertFalse(result)
+        restart.assert_not_called()
+        self.assertEqual(self.installed, [])
+        # The half-copied binary is there, but nothing marks it as anyone's to install.
+        self.assertEqual((self.folder / 't3.customize-new').read_text(), 'newer build')
+        self.assertFalse((self.folder / customize.STAGED_MARK).exists())
+
+    def test_a_staged_build_is_marked_only_once_its_probe_passed(self):
+        token = self.real_stage()
+        self.assertEqual(customize.load(self.folder / customize.STAGED_MARK, {}).get('token'), token)
+        with self.assertRaises(customize.Stop):
+            self.real_stage(probe_ok=False)
+        self.assertFalse((self.folder / customize.STAGED_MARK).exists())
+
+    def test_yield_messages_name_the_actual_cause(self):
+        cases = []
+        with patch.object(customize, 'say', cases.append):
+            token = self.stage(self.folder, '1.1-nightly')
+            with patch.object(customize, 'server_runtime', return_value=None):
+                self.assertFalse(customize.still_newest(self.folder, '1.1-nightly', token))
+            token = self.stage(self.folder, '1.1-nightly')
+            with patch.object(customize, 'server_runtime', return_value=self.runtime):
+                customize.discard_staged(self.folder)
+                self.assertFalse(customize.still_newest(self.folder, '1.1-nightly', token))
+                self.stage(self.folder, '1.1-nightly')
+                self.assertFalse(customize.still_newest(self.folder, '1.1-nightly', token))
+        self.assertIn('Could not read the service state', cases[0])
+        self.assertIn('server-off or a failed run', cases[1])
+        self.assertIn('A newer run staged', cases[2])
+
+    def test_the_checkout_lock_is_held_while_the_build_runs(self):
+        held = []
+        original = self.stage
+        # Staging copies the build out of the checkout, the last step that reads it.
+        self.stage = lambda folder, version: held.append(not self.checkout_lock_free()) or original(folder, version)
+        self.run_server()
+        self.assertEqual(held, [True])
+
+    def test_of_two_waiters_only_the_newest_staged_build_is_swapped_in(self):
+        newer = []
+
+        def gate(action):
+            # While the older run waits for idle, a newer one builds, stages, waits and swaps.
+            if not newer:
+                newer.append(self.run_server(recipe='newer'))
+
+        result, restart = self.run_server(gate=gate, recipe='older')
+        self.assertFalse(result)
+        restart.assert_not_called()
+        self.assertTrue(newer[0][0])
+        self.assertEqual(self.installed, ['newer'])
+
+    def test_an_older_waiter_yields_to_a_build_staged_over_it(self):
+        def gate(action):
+            customize.mark_staged(self.folder, '1.1-nightly')
+
+        result, restart = self.run_server(gate=gate)
+        self.assertFalse(result)
+        restart.assert_not_called()
+        self.assertEqual(self.installed, [])
+
+    def test_a_waiter_yields_and_cleans_up_when_t3_moved_to_another_version(self):
+        other = self.root / 'versions/1.2-nightly'
+        other.mkdir(parents=True)
+
+        def gate(action):
+            self.runtime = ('1.2-nightly', other)
+
+        result, restart = self.run_server(gate=gate)
+        self.assertFalse(result)
+        restart.assert_not_called()
+        self.assertEqual(self.installed, [])
+        self.assertFalse((self.folder / 't3.customize-new').exists())
+        self.assertFalse((self.folder / customize.STAGED_MARK).exists())
+
+    def test_server_off_drops_a_staged_build_so_a_waiter_cannot_swap_it_in(self):
+        self.stage(self.folder, '1.1-nightly')
+        token = customize.mark_staged(self.folder, '1.1-nightly')
+        args = argparse.Namespace(no_restart=True)
+        with patch.object(customize, 'server_runtime', return_value=self.runtime), \
+                patch.object(customize, 'restore_server_stock'), patch.object(customize, 'say'):
+            customize.cmd_server_off(args)
+            self.assertFalse(customize.still_newest(self.folder, '1.1-nightly', token))
+        self.assertFalse((self.folder / 't3.customize-new').exists())
+
+    def test_the_owed_restart_waits_for_idle_without_the_checkout_lock(self):
+        import fcntl
+        customize.OWED_RESTART.write_text('x')
+        lock = self.checkout_lock.open('a+')
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        customize.CHECKOUT_LOCK = lock
+        self.addCleanup(setattr, customize, 'CHECKOUT_LOCK', None)
+        free = []
+        args = argparse.Namespace(no_restart=False, no_pull=True, resume=False, t3_update=False, force=False)
+        with patch.object(customize, 'inside_t3_service', return_value=False), \
+                patch.object(customize, 'server_runtime', return_value=self.runtime), \
+                patch.object(customize, 'server_installing', return_value=False), \
+                patch.object(customize, 'recipe_hash', return_value='r'), \
+                patch.object(customize, 'load', return_value={'version': '1.1-nightly', 'recipe': 'r'}), \
+                patch.object(customize, 'wait_until_idle', side_effect=lambda a: free.append(self.checkout_lock_free())), \
+                patch.object(customize, 'restart_server') as restart, patch.object(customize, 'say'):
+            customize.cmd_server(args)
+        self.assertEqual(free, [True])
+        restart.assert_called_once()
 
 
 class AcquireLockTest(unittest.TestCase):
