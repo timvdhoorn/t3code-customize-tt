@@ -644,6 +644,17 @@ def install_dependencies(env, log):
     run([*pnpm(env), 'install', *PNPM_INSTALL], cwd=SOURCE, env=env, log=log)
 
 
+def typechecker(log=None):
+    """Upstream typechecks with tsc-rs, which has the Effect diagnostics built in and checks the
+    packages about 3x faster in half the memory of tsc; nightlies from before it switched only have tsc."""
+    if any((SOURCE / 'node_modules' / '.bin').glob('tsc-rs*')):
+        return 'tsc-rs'
+    if log:
+        log.write('tsc-rs is not installed in this checkout; typechecking with tsc.\n')
+        log.flush()
+    return 'tsc'
+
+
 def checks(env, log, target):
     spec = json.loads((REPO / 'checks.json').read_text())
     for path in own_checks():
@@ -659,7 +670,8 @@ def checks(env, log, target):
     if any((SOURCE / 'node_modules' / '.bin').glob('effect-tsgo*')):
         run(['effect-tsgo', 'patch'], cwd=SOURCE, env=env, log=log)
     steps = [(['vp', 'test', 'run', *spec['tests']], 'The patch tests failed.')]
-    steps += [(['tsc', '--noEmit', '-p', p + '/tsconfig.json'], f'Typecheck failed in {p}.') for p in spec['typecheck']]
+    tsc = typechecker(log)
+    steps += [([tsc, '--noEmit', '-p', p + '/tsconfig.json'], f'Typecheck failed in {p}.') for p in spec['typecheck']]
     # Upstream's lint holds rules tests and typechecks miss, such as no-hermes-unsupported-apis
     # (Array#toSorted crashes the iOS app at render). Lint what the patches add or change.
     changed = [f for f in git('diff', '--name-only', '--diff-filter=AM', target + '..HEAD').split()
