@@ -2482,9 +2482,13 @@ def build_server(env, version, config, log):
 
 
 def stage_server_build(folder, version):
-    """Copy the customized binary and web client next to the runtime's as *.customize-new and check
-    that the binary runs. Slow, so it happens before waiting for the server to be idle."""
+    """Copy the customized binary and web client next to the runtime's as *.customize-new, check
+    that the binary runs and return the token that marks them as this run's (under restart_lock).
+    Slow, so it happens before waiting for the server to be idle."""
     new_binary, new_client = folder / 't3.customize-new', folder / 'client.customize-new'
+    # First, so a run waiting on what was staged before never installs these files, even when this
+    # run fails or is killed half-way; the mark comes back only once the probe passed.
+    (folder / STAGED_MARK).unlink(missing_ok=True)
     shutil.rmtree(new_client, ignore_errors=True)
     shutil.copy2(SOURCE / 'apps/server/dist-exe/t3', new_binary)
     shutil.copytree(SOURCE / 'apps/server/dist/client', new_client, ignore=shutil.ignore_patterns('*.map'))
@@ -2493,6 +2497,7 @@ def stage_server_build(folder, version):
         new_binary.unlink(missing_ok=True)
         shutil.rmtree(new_client, ignore_errors=True)
         raise Stop(f'The customized server does not run: {(probe.stdout + probe.stderr).strip()[:300]}')
+    return mark_staged(folder, version)
 
 
 # Serialises staging, swapping and restarting the T3 server between server runs. Held only for
@@ -2537,12 +2542,20 @@ def still_newest(folder, version, token):
     """True when the service still runs version from folder and the staged build there is this
     run's. Checked under the restart lock right before the swap: while this run waited for idle, a
     newer run may have staged over it or T3 may have moved on, and then that run installs."""
-    if server_runtime() != (version, folder):
-        if load(folder / STAGED_MARK, {}).get('token') == token:
+    runtime = server_runtime()
+    staged = load(folder / STAGED_MARK, {}).get('token')
+    if runtime != (version, folder):
+        if staged == token:
             discard_staged(folder)
-        say(f'T3 moved past {version} while this run waited; the run for the new version installs that.')
+        if runtime is None:
+            say('Could not read the service state (service-state.json) after the wait; nothing was installed.')
+        else:
+            say(f'T3 moved past {version} while this run waited; the run for the new version installs that.')
         return False
-    if load(folder / STAGED_MARK, {}).get('token') != token:
+    if staged is None:
+        say('The staged build was removed while this run waited (server-off or a failed run); nothing was installed.')
+        return False
+    if staged != token:
         say('A newer run staged its build while this one waited; that run installs it.')
         return False
     return True
@@ -2692,9 +2705,10 @@ def cmd_server(args):
             export_patches(target)
             # Before the idle wait, so a deferred or failed restart never loses the port.
             publish_port(args, version)
+        # What this build is made of, read now: once the lock is released a port may change the patches.
+        built_recipe = recipe_hash() if ported else recipe
         with restart_lock():
-            stage_server_build(folder, version)
-            token = mark_staged(folder, version)
+            token = stage_server_build(folder, version)
         # Only renames and the restart follow, none of them in the source checkout: a port need
         # not wait hours for this run's idle wait (which its own waiting threads would prolong).
         release_checkout_lock()
@@ -2705,7 +2719,7 @@ def cmd_server(args):
             if not still_newest(folder, version, token):
                 return False
             step('Installing the customized server...')
-            install_server_build(folder, version, target, recipe_hash() if ported else recipe)
+            install_server_build(folder, version, target, built_recipe)
             if not args.no_restart:
                 restart_server(folder, 'restart the T3 server on the customized build')
     if args.no_restart:

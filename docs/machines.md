@@ -24,7 +24,8 @@ run the same patches.
   (`T3CODE_CUSTOMIZE_IDLE_WAIT_MINUTES`). Staging, the swap and the restart take a short restart
   lock (`~/.cache/t3code-customize/restart-lock`, after the checkout lock, never during an idle
   wait); under it the run swaps only when the service still runs its version and the staged build
-  is still its own (`t3.customize-new.json`), else it yields to the newer run. It swaps the files in
+  is still its own (`t3.customize-new.json`, removed at the start of every staging and written only
+  once the probe passed), else it yields: while a run waits, a newer run may rebuild and stage over it. It swaps the files in
   by renaming, runs `daemon-reload` (the unit `t3 update` rewrote) and checks once more right before
   `systemctl restart`. `server-off` and the owed restart below also wait for idle without the checkout lock. Still busy: it
   stops with `deferred: threads busy` (exit 4, fleet says the same) and restarts nothing; the next run
