@@ -38,9 +38,61 @@ class OperationalCodeTest(unittest.TestCase):
     def test_no_build_function_is_denied(self):
         for name in ('apply_patches', 'build_server', 'build_bundles', 'build_web_and_server', 'checks',
                      'recipe_hash', 'build_source', 'overlay', 'assemble_mac', 'cmd_build', 'cmd_server',
-                     'cmd_ios', 'build_ios', 'main', 'run_test_step', 'check_spec'):
+                     'cmd_ios', 'build_ios', 'main', 'run_test_step', 'check_spec', 'repo_run', 'cmd_checks',
+                     'follow_marker', 'recipe_for', 'extract_recipe', 'uncommitted_patches', 'server_runtime',
+                     'server_installing'):
             self.assertIn(name, top_level_names(SCRIPT.read_text()))
             self.assertNotIn(name, customize.OPERATIONAL_CODE)
+
+
+# Where the build starts. main is left out: it dispatches to every command.
+BUILD_ROOTS = ('cmd_build', 'cmd_server', 'cmd_ios', 'cmd_update', 'apply_patches', 'cmd_verify', 'checks')
+
+# Operational code the build entry points call, reviewed as unable to change what is built. A denied
+# function that becomes reachable from the build and is not listed here fails the test: review it,
+# then list it with its reason or take it out of OPERATIONAL_CODE.
+REVIEWED_REACHED = {
+    'PortHandedOff': 'exception that ends a run on the current build',
+    'say': 'prints',
+    'step': 'prints',
+    'notify': 'sends a notification',
+    'inside_t3_agent': 'decides where a server run executes, not what it builds',
+    'release_checkout_lock': 'lock handling around a wait',
+    'restart_lock': 'serialises swap and restart',
+    'mark_staged': 'token that marks staged files as this run\'s',
+    'still_newest': 'checks before the swap that this run\'s staged build is still the newest',
+    'restart_owed': 'whether a restart is still pending',
+    'restart_server': 'restarts the service after the files are swapped',
+    'wait_until_idle': 'waits for idle threads before a restart',
+    'stage_t3_update': 'fetches the newest T3 nightly; the build reads the version afterwards',
+    'app_settled': 'waits for the app to be quiet before an update',
+    'stuck_message': 'text of a stop message',
+    'agent_prompt': 'prompt for the agent session; its result is patches, which are hashed',
+    'choose_agent': 'picks which agent fixes a port; its result is patches, which are hashed',
+    'hand_off_port': 'hands a port to the porter instead of building',
+    'handed_off_already': 'skips a repeated hand-off',
+    'port_failed': 'records a failed port',
+    'port_pending': 'finds a published port for a nightly',
+    'porter_machine': 'which machine ports',
+    'publish_port': 'commits and opens the port PR',
+}
+
+
+class BuildReachTest(unittest.TestCase):
+    def test_operational_code_reached_from_the_build_is_reviewed(self):
+        defs = {node.name: node for node in ast.parse(SCRIPT.read_text()).body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+        seen, stack, reached = set(), list(BUILD_ROOTS), set()
+        while stack:
+            name = stack.pop()
+            if name in seen or name not in defs:
+                continue
+            seen.add(name)
+            if name in customize.OPERATIONAL_CODE:
+                reached.add(name)
+                continue  # not followed: its callees are only reached through it
+            stack.extend(n.id for n in ast.walk(defs[name]) if isinstance(n, ast.Name) and n.id in defs)
+        self.assertEqual(reached, set(REVIEWED_REACHED))
 
 
 class BuildSourceTest(unittest.TestCase):
