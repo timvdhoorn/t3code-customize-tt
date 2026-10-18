@@ -5,10 +5,12 @@ Subject: [PATCH 3/7] feat(mobile): show stats for nerds in the composer
 
 ---
  .../settings/SettingsThreadsRouteScreen.tsx   |  26 +
- .../src/features/threads/ComposerStats.tsx    | 565 +++++++++++++++
+ .../src/features/threads/ComposerStats.tsx    | 599 ++++++++++++++++
  .../src/features/threads/ThreadComposer.tsx   |   3 +
  .../features/threads/ThreadDetailScreen.tsx   |  40 +-
  .../features/threads/ThreadRouteScreen.tsx    |   1 +
+ .../features/threads/composerStatsRow.test.ts | 140 ++++
+ .../src/features/threads/composerStatsRow.ts  | 137 ++++
  apps/mobile/src/lib/storage.test.ts           |  10 +
  .../src/persistence/mobile-preferences.ts     |   6 +
  apps/mobile/src/state/use-composer-stats.ts   |  42 ++
@@ -25,8 +27,10 @@ Subject: [PATCH 3/7] feat(mobile): show stats for nerds in the composer
  .../client-runtime/src/state/composerStats.ts | 427 +++++++++++
  .../src/state/contextWindow.test.ts           | 158 +++++
  .../client-runtime/src/state/contextWindow.ts | 177 +++++
- 21 files changed, 2206 insertions(+), 576 deletions(-)
+ 23 files changed, 2517 insertions(+), 576 deletions(-)
  create mode 100644 apps/mobile/src/features/threads/ComposerStats.tsx
+ create mode 100644 apps/mobile/src/features/threads/composerStatsRow.test.ts
+ create mode 100644 apps/mobile/src/features/threads/composerStatsRow.ts
  create mode 100644 apps/mobile/src/state/use-composer-stats.ts
  create mode 100644 packages/client-runtime/src/state/composerStats.test.ts
  create mode 100644 packages/client-runtime/src/state/composerStats.ts
@@ -79,17 +83,15 @@ index dea74b2cd5..f5839abdde 100644
    const preferences = useAtomValue(mobilePreferencesAtom);
 diff --git a/apps/mobile/src/features/threads/ComposerStats.tsx b/apps/mobile/src/features/threads/ComposerStats.tsx
 new file mode 100644
-index 0000000000..31689075a8
+index 0000000000..7b243c42b9
 --- /dev/null
 +++ b/apps/mobile/src/features/threads/ComposerStats.tsx
-@@ -0,0 +1,565 @@
+@@ -0,0 +1,599 @@
 +import {
 +  COMPOSER_STATS_CLOCK_MS,
 +  composerLimitDisplay,
 +  composerLimitsFreshness,
-+  composerLimitSourceLabel,
 +  deriveContextCompaction,
-+  deriveResponseRate,
 +  deriveTurnCachePercentage,
 +  deriveTurnElapsedMs,
 +  formatCachePercentage,
@@ -116,6 +118,11 @@ index 0000000000..31689075a8
 +import { ListSection } from "../../components/ui/ListSection";
 +import { RowPressable } from "../../components/ui/RowPressable";
 +import { cn } from "../../lib/cn";
++import {
++  chooseComposerStatsRowLayout,
++  deriveComposerStatsRow,
++  type ComposerStatsRow,
++} from "./composerStatsRow";
 +
 +/** Height the stats row adds under the composer surface. */
 +export const COMPOSER_STATS_ROW_HEIGHT = 22;
@@ -177,12 +184,18 @@ index 0000000000..31689075a8
 +  readonly displayPercent: number | null;
 +  readonly percentText: string;
 +  readonly dimmed: boolean;
++  readonly compact: boolean;
 +}) {
 +  const tone = toneOf(props.percent);
 +  return (
 +    <View className={cn("flex-row items-center gap-1.5", props.dimmed && "opacity-50")}>
 +      <StatText>{props.label}</StatText>
-+      <View className="h-[3px] w-7 overflow-hidden rounded-full bg-foreground/10">
++      <View
++        className={cn(
++          "h-[3px] overflow-hidden rounded-full bg-foreground/10",
++          props.compact ? "w-4" : "w-7",
++        )}
++      >
 +        <View
 +          className={cn("h-full", props.dimmed ? "bg-foreground-muted" : TONE_FILL[tone])}
 +          style={{
@@ -535,7 +548,86 @@ index 0000000000..31689075a8
 +  );
 +}
 +
-+/** Touch version of web's "Stats for nerds" line under the composer. */
++function StatsRowContent(props: {
++  readonly row: ComposerStatsRow;
++  readonly onOpen: (sheet: SheetKind) => void;
++}) {
++  const { row, onOpen } = props;
++  return (
++    <>
++      {row.limits.length > 0 ? (
++        <Chip label="Usage limit details" onPress={() => onOpen("limits")}>
++          <View className={cn("flex-row items-center", row.compact ? "gap-x-3" : "gap-x-4")}>
++            {row.limits.map((limit) => (
++              <Meter
++                key={limit.id}
++                label={limit.label}
++                percent={limit.percent}
++                displayPercent={limit.displayPercent}
++                percentText={limit.percentText}
++                dimmed={limit.dimmed}
++                compact={row.compact}
++              />
++            ))}
++          </View>
++        </Chip>
++      ) : null}
++      <View className="ml-auto flex-row items-center gap-x-2.5">
++        {row.context ? (
++          <Chip label="Context usage details" onPress={() => onOpen("context")}>
++            <StatText
++              className={row.context.tone ? TONE_TEXT[row.context.tone] : "text-foreground"}
++            >
++              {row.context.value}
++            </StatText>
++            <StatText>{row.context.label}</StatText>
++          </Chip>
++        ) : null}
++        {row.cache ? (
++          <Chip label="Cache and turn details" onPress={() => onOpen("turn")}>
++            <StatText className="text-foreground">{row.cache.value}</StatText>
++            <StatText>{row.cache.label}</StatText>
++          </Chip>
++        ) : null}
++        {row.turn ? (
++          <Chip label="Turn token details" onPress={() => onOpen("turn")}>
++            <StatText>{row.turn.label}</StatText>
++          </Chip>
++        ) : null}
++      </View>
++    </>
++  );
++}
++
++/** Renders a row form off screen at its natural width and reports that width. */
++function MeasureRow(props: {
++  readonly row: ComposerStatsRow;
++  readonly onWidth: (width: number) => void;
++}) {
++  return (
++    <View
++      pointerEvents="none"
++      accessibilityElementsHidden
++      importantForAccessibility="no-hide-descendants"
++      className="absolute left-0 top-0 flex-row opacity-0"
++      style={{ width: 10_000 }}
++    >
++      <View
++        className="shrink-0 flex-row items-center gap-x-4 px-1 pt-1"
++        onLayout={(event) => props.onWidth(event.nativeEvent.layout.width)}
++      >
++        <StatsRowContent row={props.row} onOpen={() => {}} />
++      </View>
++    </View>
++  );
++}
++
++/**
++ * Touch version of web's "Stats for nerds" line under the composer, on one line:
++ * limits, context and cache (`deriveComposerStatsRow`); the sheets hold the rest. Both
++ * row forms are measured off screen, so the row shortens only when the full one would
++ * not fit (`chooseComposerStatsRowLayout`), whatever the screen width or text size.
++ */
 +export function ComposerStats(props: {
 +  readonly stats: ComposerStatsData;
 +  readonly onCompact: () => void;
@@ -546,88 +638,34 @@ index 0000000000..31689075a8
 +  const { stats } = props;
 +  const { context, turn, compactions, usageLimits } = stats;
 +  const [sheet, setSheet] = useState<SheetKind | null>(null);
++  const [available, setAvailable] = useState<number | null>(null);
++  const [fullWidth, setFullWidth] = useState<number | null>(null);
++  const [compactWidth, setCompactWidth] = useState<number | null>(null);
 +  const now = useStatsClock(turn?.status === "running");
-+  const compaction = deriveContextCompaction(
-+    context,
-+    stats.contextDriver,
-+    stats.configuredClaudeThreshold,
-+  );
-+  const responseRate = deriveResponseRate(turn);
-+  const rateText = formatResponseRateText(turn, responseRate);
-+  const usage = turn?.turnTokenUsage;
-+  const available = usage?.usageStatus !== "unavailable" ? usage : undefined;
-+  const cache = deriveTurnCachePercentage(available);
-+  const hasElapsed =
-+    turn !== null &&
-+    turn.startedAt !== null &&
-+    (turn.status === "running" || deriveTurnElapsedMs(turn, 0) !== null);
-+  const hasTokens = available?.inputTokens !== undefined || available?.outputTokens !== undefined;
-+  const limitChips = selectComposerLimitWindows(usageLimits?.limits);
 +  const showContext =
 +    context !== null || compactions.length > 0 || !props.compactDisabled || props.isCompacting;
-+  const showTurn = turn !== null && (hasElapsed || hasTokens || rateText !== null);
-+  if (!showContext && !showTurn && cache === null && limitChips.length === 0) return null;
++  const fullRow = deriveComposerStatsRow(stats, { showContext, nowMs: now, compact: false });
++  const compactRow = deriveComposerStatsRow(stats, { showContext, nowMs: now, compact: true });
++  if (!fullRow.context && !fullRow.cache && !fullRow.turn && fullRow.limits.length === 0) {
++    return null;
++  }
++  const layout = chooseComposerStatsRowLayout({ available, fullWidth, compactWidth });
++  const row = layout === "full" ? fullRow : compactRow;
 +
 +  return (
 +    <>
 +      <View
 +        accessibilityLabel="Stats for nerds"
-+        className="flex-row flex-wrap items-center gap-x-4 px-1 pt-1"
++        className={cn(
++          "flex-row items-center gap-x-4 overflow-hidden px-1 pt-1",
++          layout === "wrap" && "flex-wrap",
++        )}
 +        style={{ minHeight: COMPOSER_STATS_ROW_HEIGHT }}
++        onLayout={(event) => setAvailable(event.nativeEvent.layout.width)}
 +      >
-+        {usageLimits && limitChips.length > 0 ? (
-+          <Chip label="Usage limit details" onPress={() => setSheet("limits")}>
-+            <View className="flex-row items-center gap-x-4">
-+              {limitChips.map(({ window, shortLabel }) => {
-+                const display = composerLimitDisplay(window, usageLimits.limits.checkedAt, now);
-+                return (
-+                  <Meter
-+                    key={window.id}
-+                    label={shortLabel}
-+                    percent={window.usedPercent}
-+                    displayPercent={display.displayPercent}
-+                    percentText={display.percentText}
-+                    dimmed={display.dimmed}
-+                  />
-+                );
-+              })}
-+            </View>
-+          </Chip>
-+        ) : null}
-+        <View className="ml-auto flex-row flex-wrap items-center gap-x-2.5">
-+          {showContext ? (
-+            <Chip label="Context usage details" onPress={() => setSheet("context")}>
-+              {context?.usedPercentage != null ? (
-+                <StatText className={TONE_TEXT[toneOf(compaction.pressurePercentage)]}>
-+                  {Math.round(context.usedPercentage)}%
-+                </StatText>
-+              ) : (
-+                <StatText className="text-foreground">
-+                  {context ? formatContextWindowTokens(context.usedTokens) : "—"}
-+                </StatText>
-+              )}
-+              <StatText>context</StatText>
-+            </Chip>
-+          ) : null}
-+          {showTurn ? (
-+            <Chip label="Turn token details" onPress={() => setSheet("turn")}>
-+              {rateText !== null ? (
-+                <>
-+                  <StatText className="text-foreground">{rateText}</StatText>
-+                  <StatText>tok/s{turn?.responseThroughput?.partial ? " partial" : ""}</StatText>
-+                </>
-+              ) : (
-+                <StatText>Tokens</StatText>
-+              )}
-+            </Chip>
-+          ) : null}
-+          {cache !== null ? (
-+            <Chip label="Cache details" onPress={() => setSheet("turn")}>
-+              <StatText className="text-foreground">{formatCachePercentage(cache)}</StatText>
-+              <StatText>cached</StatText>
-+            </Chip>
-+          ) : null}
-+        </View>
++        <StatsRowContent row={row} onOpen={setSheet} />
++        <MeasureRow row={fullRow} onWidth={setFullWidth} />
++        <MeasureRow row={compactRow} onWidth={setCompactWidth} />
 +      </View>
 +      {sheet === "limits" && usageLimits ? (
 +        <LimitsSheet limits={usageLimits} now={now} onClose={() => setSheet(null)} />
@@ -753,6 +791,295 @@ index 690973578f..7e9aadc5aa 100644
            onReconnectEnvironment={handleReconnectEnvironment}
            canSwitchThreadProvider={composer.canSwitchThreadProvider}
            onUpdateThreadModelSelection={composer.onUpdateModelSelection}
+diff --git a/apps/mobile/src/features/threads/composerStatsRow.test.ts b/apps/mobile/src/features/threads/composerStatsRow.test.ts
+new file mode 100644
+index 0000000000..3ba25ca668
+--- /dev/null
++++ b/apps/mobile/src/features/threads/composerStatsRow.test.ts
+@@ -0,0 +1,140 @@
++import { NodeId, ProviderThreadId, ProviderTurnId } from "@t3tools/contracts";
++import type { ComposerStatsData } from "@t3tools/client-runtime/state/composer-stats";
++import * as DateTime from "effect/DateTime";
++import { describe, expect, it } from "vite-plus/test";
++
++import {
++  chooseComposerStatsRowLayout,
++  composerStatsRowText,
++  deriveComposerStatsRow,
++} from "./composerStatsRow";
++
++const checkedAt = "2026-10-17T18:00:00.000Z";
++const nowMs = Date.parse(checkedAt);
++
++const stats = {
++  turn: {
++    id: ProviderTurnId.make("turn-1"),
++    providerThreadId: ProviderThreadId.make("active"),
++    nodeId: NodeId.make("main"),
++    runAttemptId: null,
++    nativeTurnRef: null,
++    ordinal: 1,
++    status: "completed",
++    startedAt: DateTime.makeUnsafe("2026-10-17T17:59:00Z"),
++    completedAt: DateTime.makeUnsafe("2026-10-17T17:59:48Z"),
++    responseThroughput: { outputTokens: 400, elapsedMs: 4000, responseCount: 2, partial: false },
++    turnTokenUsage: {
++      usageStatus: "complete",
++      usageScope: "main_agent",
++      inputTokens: 10_000,
++      cachedInputTokens: 9_604,
++      outputTokens: 400,
++      hasSubagents: false,
++    },
++  },
++  compactions: [],
++  context: {
++    usedTokens: 45_000,
++    maxTokens: 300_000,
++    remainingTokens: 255_000,
++    usedPercentage: 15,
++    remainingPercentage: 85,
++    updatedAt: checkedAt,
++  },
++  usageLimits: {
++    providerName: "Claude",
++    limits: {
++      checkedAt,
++      windows: [
++        { id: "five_hour", kind: "session", label: "5h", usedPercent: 12, windowDurationMins: 300 },
++        {
++          id: "seven_day",
++          kind: "weekly",
++          label: "7d",
++          usedPercent: 3,
++          windowDurationMins: 10_080,
++        },
++      ],
++    },
++  },
++  contextDriver: "claudeAgent",
++  configuredClaudeThreshold: undefined,
++} as unknown as ComposerStatsData;
++
++const row = (compact = false) =>
++  deriveComposerStatsRow(stats, { showContext: true, nowMs, compact });
++
++describe("mobile composer stats row", () => {
++  it("shows limits, context and cache, never the output rate", () => {
++    const text = composerStatsRowText(row());
++    expect(text).toBe("5h 12% Week 3% 15% context 96% cached");
++    expect(text).not.toMatch(/tok\/s|Tokens/);
++  });
++
++  it("shortens the context label in the compact form and keeps the cache rate", () => {
++    expect(row(true).compact).toBe(true);
++    expect(composerStatsRowText(row(true))).toBe("5h 12% Week 3% 15% ctx 96% cached");
++  });
++
++  it("uses the full row while it fits, then the compact one, then wraps", () => {
++    const pick = (
++      available: number | null,
++      fullWidth: number | null,
++      compactWidth: number | null,
++    ) => chooseComposerStatsRowLayout({ available, fullWidth, compactWidth });
++    // Before the first layout, render the full row.
++    expect(pick(null, null, null)).toBe("full");
++    expect(pick(370, null, null)).toBe("full");
++    expect(pick(370, 365, 310)).toBe("full");
++    expect(pick(370, 370.4, 310)).toBe("full");
++    // Both limits at 100% widen the full row past the screen.
++    expect(pick(370, 402, 345)).toBe("compact");
++    expect(pick(370, 402, null)).toBe("compact");
++    // Very large text: even the compact row is too wide, so it wraps instead of clipping.
++    expect(pick(370, 560, 470)).toBe("wrap");
++  });
++
++  it("truncates the cache rate to whole percents", () => {
++    const cached = (cachedInputTokens: number) =>
++      deriveComposerStatsRow(
++        {
++          ...stats,
++          turn: {
++            ...stats.turn!,
++            turnTokenUsage: { ...stats.turn!.turnTokenUsage!, cachedInputTokens },
++          },
++        },
++        { showContext: true, nowMs, compact: false },
++      ).cache?.value;
++    expect(cached(9_999)).toBe("99%");
++    expect(cached(10_000)).toBe("100%");
++    expect(cached(0)).toBe("0%");
++  });
++
++  it("keeps the turn sheet reachable through a tokens chip when the turn has no cache figure", () => {
++    const noCache = deriveComposerStatsRow(
++      {
++        ...stats,
++        turn: {
++          ...stats.turn!,
++          turnTokenUsage: { ...stats.turn!.turnTokenUsage!, usageStatus: "unavailable" },
++        },
++      },
++      { showContext: true, nowMs, compact: false },
++    );
++    expect(noCache.cache).toBeNull();
++    expect(noCache.turn).toEqual({ label: "tokens" });
++    expect(composerStatsRowText(noCache)).toBe("5h 12% Week 3% 15% context tokens");
++    // With a cache figure the cache chip opens the turn sheet; no second chip.
++    expect(row().turn).toBeNull();
++  });
++
++  it("leaves out what the thread has not reported", () => {
++    const empty = deriveComposerStatsRow(
++      { ...stats, turn: null, usageLimits: null },
++      { showContext: false, nowMs, compact: false },
++    );
++    expect(composerStatsRowText(empty)).toBe("");
++  });
++});
+diff --git a/apps/mobile/src/features/threads/composerStatsRow.ts b/apps/mobile/src/features/threads/composerStatsRow.ts
+new file mode 100644
+index 0000000000..b2f98ea1c7
+--- /dev/null
++++ b/apps/mobile/src/features/threads/composerStatsRow.ts
+@@ -0,0 +1,137 @@
++import {
++  composerLimitDisplay,
++  deriveContextCompaction,
++  deriveResponseRate,
++  deriveTurnCachePercentage,
++  deriveTurnElapsedMs,
++  selectComposerLimitWindows,
++  toneOf,
++  type ComposerStatsData,
++  type ComposerStatsTone,
++} from "@t3tools/client-runtime/state/composer-stats";
++import { formatContextWindowTokens } from "@t3tools/client-runtime/state/context-window";
++
++/**
++ * How the row fits its width: the full row when it fits, else shorter meters and labels,
++ * else (very large text) the short row wrapped onto a second line rather than clipped.
++ */
++export type ComposerStatsRowLayout = "full" | "compact" | "wrap";
++
++/** Picks the layout from the row's width and the measured natural widths of both forms. */
++export function chooseComposerStatsRowLayout(input: {
++  /** Measured row width in points; null before the first layout. */
++  readonly available: number | null;
++  readonly fullWidth: number | null;
++  readonly compactWidth: number | null;
++}): ComposerStatsRowLayout {
++  const { available, fullWidth, compactWidth } = input;
++  if (available === null || fullWidth === null) return "full";
++  // Half a point of slack for sub-pixel layout rounding.
++  if (fullWidth <= available + 0.5) return "full";
++  if (compactWidth === null || compactWidth <= available + 0.5) return "compact";
++  return "wrap";
++}
++
++export interface ComposerStatsRowLimit {
++  readonly id: string;
++  readonly label: string;
++  readonly percent: number;
++  readonly displayPercent: number | null;
++  readonly percentText: string;
++  readonly dimmed: boolean;
++}
++
++/**
++ * The stats line under the mobile composer: the 5h and weekly limits, context and the
++ * cache hit rate, on one line. Unlike the desktop it leaves out the output rate (tok/s);
++ * the turn sheet, opened from the cache chip (or the "tokens" chip when the turn has no
++ * cache figure), still shows it.
++ */
++export interface ComposerStatsRow {
++  readonly limits: ReadonlyArray<ComposerStatsRowLimit>;
++  readonly context: {
++    readonly value: string;
++    readonly label: string;
++    readonly tone: ComposerStatsTone | null;
++  } | null;
++  readonly cache: { readonly value: string; readonly label: string } | null;
++  /**
++   * When the turn has no cache figure but does have details (time, tokens or rate), a
++   * plain "tokens" chip in the cache chip's place, so the turn sheet stays reachable.
++   */
++  readonly turn: { readonly label: string } | null;
++  /** Shorter meters and labels, so the row fits a narrow screen or large text. */
++  readonly compact: boolean;
++}
++
++/** Whole percent, truncated, so 100% means every input token was cached. */
++function formatRowCachePercentage(percentage: number): string {
++  return `${Math.max(0, Math.min(100, Math.floor(percentage + 1e-9)))}%`;
++}
++
++export function deriveComposerStatsRow(
++  stats: ComposerStatsData,
++  input: {
++    readonly showContext: boolean;
++    readonly nowMs: number;
++    readonly compact: boolean;
++  },
++): ComposerStatsRow {
++  const { context, turn, usageLimits } = stats;
++  const { compact } = input;
++  const limits = usageLimits
++    ? selectComposerLimitWindows(usageLimits.limits).map(({ window, shortLabel }) => {
++        const display = composerLimitDisplay(window, usageLimits.limits.checkedAt, input.nowMs);
++        return {
++          id: window.id,
++          label: shortLabel,
++          percent: window.usedPercent,
++          displayPercent: display.displayPercent,
++          percentText: display.percentText,
++          dimmed: display.dimmed,
++        };
++      })
++    : [];
++  const usage = turn?.turnTokenUsage;
++  const available = usage?.usageStatus !== "unavailable" ? usage : undefined;
++  const cache = deriveTurnCachePercentage(available);
++  const hasTurnDetails =
++    turn !== null &&
++    ((turn.startedAt !== null &&
++      (turn.status === "running" || deriveTurnElapsedMs(turn, 0) !== null)) ||
++      available?.inputTokens !== undefined ||
++      available?.outputTokens !== undefined ||
++      deriveResponseRate(turn) !== null);
++  return {
++    limits,
++    context: input.showContext
++      ? context?.usedPercentage != null
++        ? {
++            value: `${Math.round(context.usedPercentage)}%`,
++            label: compact ? "ctx" : "context",
++            tone: toneOf(
++              deriveContextCompaction(context, stats.contextDriver, stats.configuredClaudeThreshold)
++                .pressurePercentage,
++            ),
++          }
++        : {
++            value: context ? formatContextWindowTokens(context.usedTokens) : "—",
++            label: compact ? "ctx" : "context",
++            tone: null,
++          }
++      : null,
++    cache: cache === null ? null : { value: formatRowCachePercentage(cache), label: "cached" },
++    turn: cache === null && hasTurnDetails ? { label: "tokens" } : null,
++    compact,
++  };
++}
++
++/** The row's visible text, left to right. */
++export function composerStatsRowText(row: ComposerStatsRow): string {
++  return [
++    ...row.limits.map((limit) => `${limit.label} ${limit.percentText}`),
++    ...(row.context ? [`${row.context.value} ${row.context.label}`] : []),
++    ...(row.cache ? [`${row.cache.value} ${row.cache.label}`] : []),
++    ...(row.turn ? [row.turn.label] : []),
++  ].join(" ");
++}
 diff --git a/apps/mobile/src/lib/storage.test.ts b/apps/mobile/src/lib/storage.test.ts
 index b9f7a17b4d..8aa03e2296 100644
 --- a/apps/mobile/src/lib/storage.test.ts
