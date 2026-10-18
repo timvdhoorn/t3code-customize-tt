@@ -5,15 +5,16 @@ Subject: [PATCH 3/7] feat(mobile): show stats for nerds in the composer
 
 ---
  .../settings/SettingsThreadsRouteScreen.tsx   |  26 +
- .../src/features/threads/ComposerStats.tsx    | 598 ++++++++++++++++
+ .../src/features/threads/ComposerStats.tsx    | 608 ++++++++++++++++
  .../src/features/threads/ThreadComposer.tsx   |   3 +
  .../features/threads/ThreadDetailScreen.tsx   |  40 +-
  .../features/threads/ThreadRouteScreen.tsx    |   1 +
- .../features/threads/composerStatsRow.test.ts | 160 ++++++++++++++++
- .../src/features/threads/composerStatsRow.ts  | 140 ++++++++++++++++
+ .../features/threads/composerStatsRow.test.ts | 189 ++++++++++++++++
+ .../src/features/threads/composerStatsRow.ts  | 143 ++++++++++++++++
  apps/mobile/src/lib/storage.test.ts           |  10 +
  .../src/persistence/mobile-preferences.ts     |   6 +
- apps/mobile/src/state/use-composer-stats.ts   |  42 ++
+ .../src/state/composer-cache-usage.ts           | 43 +++++++++
+ apps/mobile/src/state/use-composer-stats.ts   |  59 +++++++++++
  .../src/state/use-thread-composer-state.ts    |  40 ++
  apps/web/src/components/ChatView.tsx          |  59 +-
  apps/web/src/components/chat/ChatComposer.tsx |   2 +-
@@ -27,10 +28,11 @@ Subject: [PATCH 3/7] feat(mobile): show stats for nerds in the composer
  .../client-runtime/src/state/composerStats.ts | 427 +++++++++++
  .../src/state/contextWindow.test.ts           | 158 +++++
  .../client-runtime/src/state/contextWindow.ts | 177 +++++
- 23 files changed, 2535 insertions(+), 575 deletions(-)
+ 24 files changed, 2637 insertions(+), 575 deletions(-)
  create mode 100644 apps/mobile/src/features/threads/ComposerStats.tsx
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.test.ts
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.ts
+ create mode 100644 apps/mobile/src/state/composer-cache-usage.ts
  create mode 100644 apps/mobile/src/state/use-composer-stats.ts
  create mode 100644 packages/client-runtime/src/state/composerStats.test.ts
  create mode 100644 packages/client-runtime/src/state/composerStats.ts
@@ -83,10 +85,10 @@ index dea74b2cd..f5839abdd 100644
    const preferences = useAtomValue(mobilePreferencesAtom);
 diff --git a/apps/mobile/src/features/threads/ComposerStats.tsx b/apps/mobile/src/features/threads/ComposerStats.tsx
 new file mode 100644
-index 000000000..936722658
+index 000000000..9bc64e202
 --- /dev/null
 +++ b/apps/mobile/src/features/threads/ComposerStats.tsx
-@@ -0,0 +1,598 @@
+@@ -0,0 +1,608 @@
 +import {
 +  COMPOSER_STATS_CLOCK_MS,
 +  composerLimitDisplay,
@@ -123,6 +125,7 @@ index 000000000..936722658
 +  deriveComposerStatsRow,
 +  type ComposerStatsRow,
 +} from "./composerStatsRow";
++import type { MobileComposerStats } from "../../state/composer-cache-usage";
 +
 +/** Height the stats row adds under the composer surface. */
 +export const COMPOSER_STATS_ROW_HEIGHT = 22;
@@ -591,9 +594,18 @@ index 000000000..936722658
 +          onPress={row.cache.openable ? () => onOpen("turn") : undefined}
 +          dimmed={!row.cache.openable}
 +        >
-+          <StatText className={row.cache.openable ? "text-foreground" : undefined}>
-+            {row.cache.value}
-+          </StatText>
++          {/* Invisible "100%" in the flow reserves the widest value at the current text
++              size (tabular figures), so "—%" and "NN%" never shift the label. */}
++          <View>
++            <View accessibilityElementsHidden importantForAccessibility="no-hide-descendants">
++              <StatText className="opacity-0">100%</StatText>
++            </View>
++            <View className="absolute inset-y-0 right-0 justify-center">
++              <StatText className={row.cache.openable ? "text-foreground" : undefined}>
++                {row.cache.value}
++              </StatText>
++            </View>
++          </View>
 +          <StatText>{row.cache.label}</StatText>
 +        </Chip>
 +      </View>
@@ -631,7 +643,7 @@ index 000000000..936722658
 + * not fit (`chooseComposerStatsRowLayout`), whatever the screen width or text size.
 + */
 +export function ComposerStats(props: {
-+  readonly stats: ComposerStatsData;
++  readonly stats: MobileComposerStats;
 +  readonly onCompact: () => void;
 +  readonly compactDisabled: boolean;
 +  readonly compactDisabledReason: string | null;
@@ -792,10 +804,10 @@ index 690973578..7e9aadc5a 100644
            onUpdateThreadModelSelection={composer.onUpdateModelSelection}
 diff --git a/apps/mobile/src/features/threads/composerStatsRow.test.ts b/apps/mobile/src/features/threads/composerStatsRow.test.ts
 new file mode 100644
-index 000000000..d062bf0f2
+index 000000000..f08f75426
 --- /dev/null
 +++ b/apps/mobile/src/features/threads/composerStatsRow.test.ts
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,189 @@
 +import { NodeId, ProviderThreadId, ProviderTurnId } from "@t3tools/contracts";
 +import type { ComposerStatsData } from "@t3tools/client-runtime/state/composer-stats";
 +import * as DateTime from "effect/DateTime";
@@ -806,6 +818,7 @@ index 000000000..d062bf0f2
 +  composerStatsRowText,
 +  deriveComposerStatsRow,
 +} from "./composerStatsRow";
++import { rememberCacheUsage, selectLastCacheUsage } from "../../state/composer-cache-usage";
 +
 +const checkedAt = "2026-10-17T18:00:00.000Z";
 +const nowMs = Date.parse(checkedAt);
@@ -955,13 +968,41 @@ index 000000000..d062bf0f2
 +    // Only the cache placeholder stays, so the row keeps its shape.
 +    expect(composerStatsRowText(empty)).toBe("—% cached");
 +  });
++
++  describe("remembering the cache figure when a thread is re-entered", () => {
++    const usage = stats.turn!.turnTokenUsage!;
++    const newerTurnWithoutUsage = { ...stats.turn!, turnTokenUsage: undefined };
++
++    it("takes the figure from the latest turn that has one", () => {
++      expect(selectLastCacheUsage([stats.turn!, newerTurnWithoutUsage])).toBe(usage);
++      expect(selectLastCacheUsage([newerTurnWithoutUsage])).toBeUndefined();
++    });
++
++    it("keeps showing the last figure while the latest turn has none", () => {
++      const reentered = deriveComposerStatsRow(
++        { ...stats, turn: newerTurnWithoutUsage, lastCacheUsage: usage } as ComposerStatsData,
++        { showContext: true, nowMs, compact: false },
++      );
++      expect(reentered.cache.value).toBe("96%");
++      expect(composerStatsRowText(reentered)).toBe("5h 12% Week 3% 15% context 96% cached");
++    });
++
++    it("remembers per thread, in memory", () => {
++      const memory = new Map();
++      expect(rememberCacheUsage(memory, "thread-a", undefined)).toBeUndefined();
++      expect(rememberCacheUsage(memory, "thread-a", usage)).toBe(usage);
++      // Back in the thread with a snapshot that carries no figure.
++      expect(rememberCacheUsage(memory, "thread-a", undefined)).toBe(usage);
++      expect(rememberCacheUsage(memory, "thread-b", undefined)).toBeUndefined();
++    });
++  });
 +});
 diff --git a/apps/mobile/src/features/threads/composerStatsRow.ts b/apps/mobile/src/features/threads/composerStatsRow.ts
 new file mode 100644
-index 000000000..f713151f9
+index 000000000..c94489711
 --- /dev/null
 +++ b/apps/mobile/src/features/threads/composerStatsRow.ts
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,143 @@
 +import {
 +  composerLimitDisplay,
 +  deriveContextCompaction,
@@ -970,9 +1011,9 @@ index 000000000..f713151f9
 +  deriveTurnElapsedMs,
 +  selectComposerLimitWindows,
 +  toneOf,
-+  type ComposerStatsData,
 +  type ComposerStatsTone,
 +} from "@t3tools/client-runtime/state/composer-stats";
++import type { MobileComposerStats } from "../../state/composer-cache-usage";
 +import { formatContextWindowTokens } from "@t3tools/client-runtime/state/context-window";
 +
 +/**
@@ -1035,7 +1076,7 @@ index 000000000..f713151f9
 +}
 +
 +export function deriveComposerStatsRow(
-+  stats: ComposerStatsData,
++  stats: MobileComposerStats,
 +  input: {
 +    readonly showContext: boolean;
 +    readonly nowMs: number;
@@ -1059,7 +1100,10 @@ index 000000000..f713151f9
 +    : [];
 +  const usage = turn?.turnTokenUsage;
 +  const available = usage?.usageStatus !== "unavailable" ? usage : undefined;
-+  const cache = deriveTurnCachePercentage(available);
++  const latestCache = deriveTurnCachePercentage(available);
++  const cache =
++    latestCache ??
++    (stats.lastCacheUsage === undefined ? null : deriveTurnCachePercentage(stats.lastCacheUsage));
 +  const hasTurnDetails =
 +    turn !== null &&
 +    ((turn.startedAt !== null &&
@@ -1154,23 +1198,82 @@ index 4ec0f9ea8..bc7f04d89 100644
    if (Array.isArray(parsed.modelFavorites)) {
      preferences.modelFavorites = parsed.modelFavorites.filter(
        (favorite) =>
+diff --git a/apps/mobile/src/state/composer-cache-usage.ts b/apps/mobile/src/state/composer-cache-usage.ts
+new file mode 100644
+index 000000000..d5ec12c77
+--- /dev/null
++++ b/apps/mobile/src/state/composer-cache-usage.ts
+@@ -0,0 +1,43 @@
++import {
++  deriveTurnCachePercentage,
++  type ComposerStatsData,
++} from "@t3tools/client-runtime/state/composer-stats";
++import type { OrchestrationV2ProviderTurn, TurnTokenUsage } from "@t3tools/contracts";
++
++/**
++ * Stats plus the last cache-bearing usage of the thread: the latest turn can lack a cache
++ * figure (a turn that just started, or a thread snapshot loaded without it) while an
++ * earlier turn had one, and the cache chip keeps showing that figure.
++ */
++export type MobileComposerStats = ComposerStatsData & {
++  readonly lastCacheUsage?: TurnTokenUsage | undefined;
++};
++
++function usableUsage(turn: Pick<OrchestrationV2ProviderTurn, "turnTokenUsage">) {
++  const usage = turn.turnTokenUsage;
++  return usage?.usageStatus !== "unavailable" ? usage : undefined;
++}
++
++/** Usage of the latest turn (turns in ordinal order) that has a cache figure. */
++export function selectLastCacheUsage(
++  turns: ReadonlyArray<Pick<OrchestrationV2ProviderTurn, "turnTokenUsage">>,
++): TurnTokenUsage | undefined {
++  return turns.findLast((turn) => deriveTurnCachePercentage(usableUsage(turn)) !== null)
++    ?.turnTokenUsage;
++}
++
++/**
++ * Remembers the last known cache usage per thread in memory, so leaving a thread and
++ * coming back (its snapshot reloaded without a usable figure) keeps the figure.
++ */
++export function rememberCacheUsage(
++  memory: Map<string, TurnTokenUsage>,
++  threadKey: string,
++  derived: TurnTokenUsage | undefined,
++): TurnTokenUsage | undefined {
++  if (derived !== undefined) {
++    memory.set(threadKey, derived);
++    return derived;
++  }
++  return memory.get(threadKey);
++}
 diff --git a/apps/mobile/src/state/use-composer-stats.ts b/apps/mobile/src/state/use-composer-stats.ts
 new file mode 100644
-index 000000000..c8207d610
+index 000000000..3af6ecc17
 --- /dev/null
 +++ b/apps/mobile/src/state/use-composer-stats.ts
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,59 @@
 +import { useAtomValue } from "@effect/atom-react";
 +import { useMemo } from "react";
 +import { AsyncResult } from "effect/reactivity";
 +import type { ServerConfig as T3ServerConfig } from "@t3tools/contracts";
++import type { TurnTokenUsage } from "@t3tools/contracts";
 +import {
 +  deriveComposerStats,
-+  type ComposerStatsData,
++  selectComposerStatsTurns,
 +} from "@t3tools/client-runtime/state/composer-stats";
++
++import {
++  rememberCacheUsage,
++  selectLastCacheUsage,
++  type MobileComposerStats,
++} from "./composer-cache-usage";
 +
 +import { mobilePreferencesAtom } from "./preferences";
 +import { useSelectedThreadProjection } from "./use-thread-detail";
++
++/** Last known cache usage per thread, for a thread re-entered with a reloaded snapshot. */
++const lastCacheUsageByThread = new Map<string, TurnTokenUsage>();
 +
 +/**
 + * The stats line's data for the selected thread, or null while "Stats for nerds"
@@ -1179,7 +1282,7 @@ index 000000000..c8207d610
 +export function useComposerStats(input: {
 +  readonly serverConfig: T3ServerConfig | null;
 +  readonly instanceId: string;
-+}): ComposerStatsData | null {
++}): MobileComposerStats | null {
 +  const preferences = useAtomValue(mobilePreferencesAtom);
 +  const enabled =
 +    AsyncResult.isSuccess(preferences) && preferences.value.statsForNerdsEnabled === true;
@@ -1195,11 +1298,18 @@ index 000000000..c8207d610
 +          providerName: provider.displayName?.trim() || provider.instanceId,
 +        }
 +      : null;
-+    return deriveComposerStats(
++    const stats = deriveComposerStats(
 +      projection,
 +      serverConfig?.settings.providerInstances ?? {},
 +      usageLimits,
 +    );
++    if (!projection) return stats;
++    const lastCacheUsage = rememberCacheUsage(
++      lastCacheUsageByThread,
++      projection.thread.id,
++      selectLastCacheUsage(selectComposerStatsTurns(projection)),
++    );
++    return { ...stats, lastCacheUsage };
 +  }, [enabled, projection, serverConfig, instanceId]);
 +}
 diff --git a/apps/mobile/src/state/use-thread-composer-state.ts b/apps/mobile/src/state/use-thread-composer-state.ts
