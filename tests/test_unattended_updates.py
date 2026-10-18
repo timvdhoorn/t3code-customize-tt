@@ -419,9 +419,10 @@ class FleetCommandTest(unittest.TestCase):
 
     def test_autoupdate_uses_each_machines_own_settings(self):
         machines = {m['name']: m for m in customize.load(customize.MACHINES)['machines']}
-        # Only the MacBook Pro has git and gh to publish a port; devbox1's repo is a Syncthing copy.
-        self.assertEqual(customize.autoupdate_command(machines['devbox1']), ['autoupdate', 'on'])
-        self.assertEqual(customize.autoupdate_command(machines['mbp']), ['autoupdate', 'on', '--fix', 'claude', '--ios'])
+        # devbox1 is the porter (16 cores, idle); the MacBook Pro builds iOS and hands ports over.
+        self.assertEqual(customize.autoupdate_command(machines['devbox1']), ['autoupdate', 'on', '--fix', 'claude'])
+        self.assertEqual(customize.autoupdate_command(machines['mbp']), ['autoupdate', 'on', '--ios'])
+        self.assertEqual(customize.porter_machine(list(machines.values()))['name'], 'devbox1')
         self.assertEqual(customize.autoupdate_command(machines['mba']), ['autoupdate', 'on'])
 
 

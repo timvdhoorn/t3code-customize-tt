@@ -13,6 +13,7 @@ import argparse
 import contextlib
 import copy
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ import plistlib
 import re
 import shlex
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -70,7 +72,7 @@ SERVER_MARK = '.t3code-customize.json'
 SERVER_PORT = int(os.environ.get('T3CODE_CUSTOMIZE_PORT', '3773'))
 SYSTEMD_USER = Path(os.environ.get('XDG_CONFIG_HOME') or HOME / '.config') / 'systemd/user'
 SERVER_UNITS = {name: SYSTEMD_USER / (NAME + '-server' + name) for name in ('.service', '.path', '.timer')}
-# Every machine `fleet` updates; see "Machines" in README.md.
+# Every machine `fleet` updates; see "Machines" in README.md and docs/machines.md.
 MACHINES = REPO / 'machines.json'
 AGENTS = {
     'claude': ['claude', '-p', '--dangerously-skip-permissions'],
@@ -150,6 +152,9 @@ def save(path, value):
 
 # The fork's own port of the shared patches. It is used while it targets a newer nightly
 # than upstream's patches/, and ignored once upstream catches up; see choose_shared.
+# The folder holding the patch set a run applies: this repo, or an older version of its patch
+# folders from git history for a nightly older than the current patches (use_recipe).
+RECIPE = REPO
 PORT = REPO / 'patches-port'
 SHARED = REPO / 'patches'
 
@@ -165,10 +170,10 @@ def shared_base():
 def choose_shared(log):
     """Use patches-port/ when it is a port to a newer nightly than upstream's patches/."""
     global SHARED
-    SHARED = REPO / 'patches'
+    SHARED = RECIPE / 'patches'
     if not (PORT / 'base.txt').exists():
         return
-    upstream_base = (REPO / 'patches/base.txt').read_text().strip()
+    upstream_base = (RECIPE / 'patches/base.txt').read_text().strip()
     port_base = (PORT / 'base.txt').read_text().strip()
     ensure_commit(upstream_base, None, log)
     ensure_commit(port_base, None, log)
@@ -193,6 +198,15 @@ IOS_CHECKS = REPO / 'checks-ios.json'
 WITH_IOS = False
 
 
+def use_recipe(root):
+    """Apply the patch set in root (this repo, or an extracted older one) from now on."""
+    global RECIPE, PORT, SHARED, OWN_PATCHES, OWN_CHECKS, IOS_PATCHES, IOS_CHECKS
+    RECIPE = Path(root)
+    PORT, SHARED = RECIPE / 'patches-port', RECIPE / 'patches'
+    OWN_PATCHES, OWN_CHECKS = RECIPE / 'patches-tt', RECIPE / 'checks-tt.json'
+    IOS_PATCHES, IOS_CHECKS = RECIPE / 'patches-ios', RECIPE / 'checks-ios.json'
+
+
 def own_layers():
     """The own patch folders this build applies, in order."""
     return [OWN_PATCHES] + ([IOS_PATCHES] if WITH_IOS else [])
@@ -213,8 +227,13 @@ def own_checks():
 def recipe_hash():
     digest = hashlib.sha256()
     # Only real files: sync tools leave hidden temporary files beside the patches.
-    shared = [p for p in sorted((REPO / 'patches').glob('*')) + sorted(PORT.glob('*')) if not p.name.startswith('.')]
-    for path in (shared + own_patches() + [REPO / 'checks.json'] + [c for c in own_checks() if c.exists()]
+    # Always this repo's files, also while a run applies an older patch set (use_recipe).
+    shared = [p for p in sorted((REPO / 'patches').glob('*')) + sorted((REPO / 'patches-port').glob('*'))
+              if not p.name.startswith('.')]
+    folders = ['patches-tt'] + (['patches-ios'] if WITH_IOS else [])
+    lists = [REPO / 'checks-tt.json'] + ([REPO / 'checks-ios.json'] if WITH_IOS else [])
+    own = [p for folder in folders for p in sorted((REPO / folder).glob('*.patch'))]
+    for path in (shared + own + [REPO / 'checks.json'] + [c for c in lists if c.exists()]
                  + [REPO / NAME, REPO / 'platform_support.py'] + sorted((REPO / 'macos').glob('*'))):
         digest.update(path.name.encode() + path.read_bytes())
     return digest.hexdigest()[:12]
@@ -530,9 +549,112 @@ def pnpm(env):
 
 # --- Source checkout ----------------------------------------------------------------
 
+def git_dir():
+    """The checkout's own git dir (a worktree has one of its own)."""
+    return Path(git('rev-parse', '--absolute-git-dir').strip())
+
+
 def rebase_in_progress():
-    gitdir = Path(git('rev-parse', '--absolute-git-dir').strip())
+    gitdir = git_dir()
     return (gitdir / 'rebase-merge').exists() or (gitdir / 'rebase-apply').exists()
+
+
+def am_in_progress():
+    return (git_dir() / 'rebase-apply' / 'applying').exists()
+
+
+# What the run that last applied the patches in this checkout started from: the nightly commit, the
+# layers and the patch set. `continue` and `checks` read it; an unattended run reads it to tell a
+# rebase or git am it stopped itself from one a person or agent works on.
+RUN_MARK = 't3code-customize-run.json'
+
+
+def run_marker():
+    return load(git_dir() / RUN_MARK, {})
+
+
+def write_run_marker(target, version, unattended):
+    save(git_dir() / RUN_MARK, {'target': target, 'version': version, 'ios': WITH_IOS, 'recipe': str(RECIPE),
+                                'unattended': bool(unattended), 'pid': os.getpid(),
+                                'command': ' '.join(sys.argv[1:]), 'started': time.strftime('%Y-%m-%dT%H:%M:%S')})
+
+
+def abort_stopped(log):
+    """Abort a stopped git am or rebase and drop uncommitted edits, leaving the checkout clean."""
+    if am_in_progress():
+        git('am', '--abort', check=False, capture=False, log=log)
+    if rebase_in_progress():
+        git('rebase', '--abort', check=False, capture=False, log=log)
+    git('reset', '--quiet', '--hard', check=False, capture=False, log=log)
+
+
+def checkout_fingerprint():
+    """HEAD, the stopped rebase or am, and every staged and unstaged edit: any change by someone else alters it."""
+    digest = hashlib.sha256()
+    for args in (('rev-parse', 'HEAD'), ('status', '--porcelain', '--untracked-files=no'), ('diff',), ('diff', '--cached')):
+        digest.update(git(*args, check=False).encode())
+    digest.update(str(rebase_in_progress()).encode())
+    return digest.hexdigest()
+
+
+def update_run_marker(**values):
+    marker = run_marker()
+    if marker:
+        save(git_dir() / RUN_MARK, dict(marker, **values))
+
+
+def mark_unattended_stop():
+    """An unattended run leaves the checkout stopped: record exactly how, so a later unattended run can
+    tell its own untouched stop from one someone has worked on since."""
+    update_run_marker(stopped=checkout_fingerprint())
+
+
+def claim_checkout():
+    """A person or an agent works on this checkout (continue, checks, --resume outside a run that holds
+    the lock): no unattended run may clean it up from now on."""
+    if not os.environ.get('T3CODE_CUSTOMIZE_LOCK_HELD') and run_marker().get('unattended'):
+        update_run_marker(unattended=False, claimed=' '.join(sys.argv[1:]))
+
+
+def process_ticks(pid):
+    """The start time of pid in clock ticks since boot (Linux), else None: a pid reused after a reboot or
+    by another process has another start time."""
+    try:
+        return int(Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def process_alive(pid, ticks=None):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return ticks is None or process_ticks(pid) in (None, ticks)
+
+
+def killed_agent_session(marker):
+    """True when the marker names an agent session whose run is gone (reboot, OOM, unit stopped)
+    before it could record how it left the checkout."""
+    session = marker.get('agent') or {}
+    return bool(session.get('pid')) and not process_alive(session['pid'], session.get('ticks'))
+
+
+def stopped_by_unattended_run():
+    """True when the checkout holds a stopped rebase or git am, or uncommitted edits, exactly as an
+    unattended run left them: started by an unattended run, never claimed by continue, checks or
+    --resume, and not touched since (same fingerprint). This run holds the lock, so that run has ended."""
+    stopped = rebase_in_progress() or bool(git('status', '--porcelain', '--untracked-files=no').strip())
+    marker = run_marker()
+    if not stopped or marker.get('unattended') is not True:
+        return False
+    if marker.get('stopped') and marker['stopped'] == checkout_fingerprint():
+        return True
+    # Killed during its agent session, so it never recorded the fingerprint. Nobody claimed the
+    # checkout since (continue, checks, --resume), and this run holds the lock.
+    return killed_agent_session(marker) and not marker.get('stopped')
 
 
 def has_commit(ref):
@@ -590,10 +712,13 @@ def build_rewrites_discarded():
                 git('checkout', '--quiet', '--', *changed)
 
 
-def prepare(target, log, resume=False):
+def prepare(target, log, resume=False, unattended=False, version=None):
     """Leave SOURCE with the patches as commits on top of target."""
     base = shared_base()
     if not resume:
+        if unattended and stopped_by_unattended_run():
+            say('    Aborting the rebase or git am an earlier unattended run left stopped here.')
+            abort_stopped(log)
         restore_generated()
         # A fresh build starts over from the repo's patches, which throws away a stopped rebase or
         # git am and uncommitted edits. Those may be a port someone is still working on: stop.
@@ -602,6 +727,7 @@ def prepare(target, log, resume=False):
                        ' throw them away. If it is a port in progress, finish it and run again with --resume.'
                        ' Otherwise clear it yourself (git rebase --abort, git am --abort, git checkout .)'
                        ' and run again.')
+        write_run_marker(target, version, unattended)
         git('checkout', '--quiet', '--force', '--detach', base, capture=False, log=log)
         # Keep node_modules so dependency installs stay fast between builds.
         git('clean', '-ffdxq', '-e', 'node_modules', capture=False, log=log)
@@ -612,7 +738,9 @@ def prepare(target, log, resume=False):
             git('rebase', '--quiet', '--onto', target, base, check=False, capture=False, log=log)
     if rebase_in_progress():
         conflicted = git('diff', '--name-only', '--diff-filter=U').split()
-        raise NeedsFix('The patches conflict with this nightly in:\n' + '\n'.join('  ' + f for f in conflicted))
+        stage = (f'Your own patches in {own_stage()}/' if am_in_progress() else 'The shared patches')
+        raise NeedsFix(f'{stage} conflict with this nightly in:\n' + '\n'.join('  ' + f for f in conflicted)
+                       + f'\nResolve each file, git add it, then run {NAME} continue (see docs/porting.md).')
     if git('status', '--porcelain', '--untracked-files=no').strip():
         raise NeedsFix('The source checkout has uncommitted changes in ' + str(SOURCE) + '.')
     if git('merge-base', '--is-ancestor', target, 'HEAD', check=False, capture=False).returncode:
@@ -629,12 +757,24 @@ def prepare(target, log, resume=False):
                 conflicted = git('diff', '--name-only', '--diff-filter=U').split()
                 raise NeedsFix(f'Your own patches in {folder.name}/ conflict with this nightly'
                                + (' in:\n' + '\n'.join('  ' + f for f in conflicted) if conflicted else '.')
-                               + '\nResolve, git add, then git am --continue (see "Fork changes" in AGENTS.md).')
+                               + f'\nResolve each file, git add it, then run {NAME} continue (see docs/porting.md).')
             applied += len(layer)
         expected += len(layer)
     if applied != expected:
         raise NeedsFix(f'Expected one commit per patch on top of the nightly ({len(patches())} shared,'
                        f' {len(own_patches())} own), found {applied}.')
+
+
+def own_stage():
+    """The own patch folder a stopped git am applies, by the number of commits already on the nightly."""
+    target = run_marker().get('target')
+    applied = int(git('rev-list', '--count', target + '..HEAD').strip()) if target else 0
+    done = len(patches())
+    for folder in own_layers():
+        done += len(layer_patches(folder))
+        if applied < done:
+            return folder.name
+    return own_layers()[-1].name
 
 
 def install_dependencies(env, log):
@@ -644,11 +784,114 @@ def install_dependencies(env, log):
     run([*pnpm(env), 'install', *PNPM_INSTALL], cwd=SOURCE, env=env, log=log)
 
 
-def checks(env, log, target):
-    spec = json.loads((REPO / 'checks.json').read_text())
+def typechecker(log=None):
+    """Upstream typechecks with tsc-rs, which has the Effect diagnostics built in and checks the
+    packages about 3x faster in half the memory of tsc; nightlies from before it switched only have tsc."""
+    if any((SOURCE / 'node_modules' / '.bin').glob('tsc-rs*')):
+        return 'tsc-rs'
+    if log:
+        log.write('tsc-rs is not installed in this checkout; typechecking with tsc.\n')
+        log.flush()
+    return 'tsc'
+
+
+def check_spec():
+    """The tests and typechecks of checks.json plus the own check lists this run applies."""
+    spec = json.loads((RECIPE / 'checks.json').read_text())
     for path in own_checks():
         own = load(path, {})
         spec = {key: list(dict.fromkeys(spec.get(key, []) + own.get(key, []))) for key in ('tests', 'typecheck')}
+    return spec
+
+
+def check_lists_hash():
+    digest = hashlib.sha256()
+    for path in [RECIPE / 'checks.json'] + own_checks():
+        digest.update(path.name.encode() + (path.read_bytes() if path.exists() else b''))
+    return digest.hexdigest()[:12]
+
+
+# Written into the checkout's git dir when every check passed, so a run that comes back to the
+# same commit (the tool after an agent ran `checks`) does not run them all again.
+CHECKS_STAMP = 't3code-customize-checks.json'
+
+
+def checks_stamp(target):
+    """What a pass covers: this commit on this nightly, with these check lists and this recipe (script and patches)."""
+    return {'head': git('rev-parse', 'HEAD').strip(), 'target': target, 'lists': check_lists_hash(),
+            'recipe': recipe_hash()}
+
+
+def checks_stamped(target):
+    stamp = load(git_dir() / CHECKS_STAMP, {})
+    return all(stamp.get(key) == value for key, value in checks_stamp(target).items())
+
+
+# A test that only times out is often the machine, not the patch (the MacBook Pro under swap timed out
+# 28 tests in one night). Such a file runs once more on its own before it counts as failed.
+TIMED_OUT = re.compile(r'\b(Test|Hook) timed out in \d+ ?ms')
+# vitest exits non-zero on an error outside any test without failing a file in its report.
+UNHANDLED = re.compile(r'Unhandled (Error|Rejection)')
+# file(line,col): error (tsc) or file:line:col - error (tsc-rs).
+TYPE_ERROR = re.compile(r'^(\S+?\.[cm]?[jt]sx?)(?:\(\d+,\d+\)|:\d+:\d+)\s*[:-]\s*error', re.M)
+
+
+def failed_test_files(report, root):
+    """{file relative to SOURCE: True when it failed only by timeouts} from a vitest JSON report."""
+    failed = {}
+    for result in report.get('testResults', []):
+        if result.get('status') != 'failed':
+            continue
+        name = os.path.relpath(result.get('name', ''), str(SOURCE)) if os.path.isabs(result.get('name', '')) \
+            else str(Path(root) / result.get('name', ''))
+        messages = [m for a in result.get('assertionResults', []) if a.get('status') == 'failed'
+                    for m in a.get('failureMessages', []) or ['']]
+        failed[name] = (bool(messages) and not result.get('message')
+                        and all(TIMED_OUT.search(m or '') for m in messages))
+    return failed
+
+
+def run_test_step(args, cwd, env, log, report_dir):
+    """Run a vitest step; (passed, failing files). A file that failed only by timeout is rerun alone."""
+    report = Path(tempfile.mkstemp(prefix='vitest-', suffix='.json', dir=str(report_dir))[1])
+    try:
+        code, output = run_bounded([*args, '--reporter=default', '--reporter=json', f'--outputFile.json={report}'],
+                              env, log, STEP_TIMEOUT, cwd=cwd, merge=True)
+        try:
+            failed = failed_test_files(json.loads(report.read_text() or '{}'), Path(cwd).relative_to(SOURCE))
+        except ValueError:
+            failed = {}
+    finally:
+        report.unlink(missing_ok=True)
+    if code and not failed:
+        return False, [f'(vitest exited {code} without a failing file; see the log)']
+    failing = []
+    prefix = Path(cwd).relative_to(SOURCE)
+    for name, timeout_only in sorted(failed.items()):
+        if not timeout_only:
+            failing.append(name)
+            continue
+        log.write(f'\n{name} failed only by timeout; running it once more on its own.\n')
+        own = str(Path(name).relative_to(prefix)) if prefix != Path('.') else name
+        rerun, _ = run_bounded([*[a for a in args if not a.endswith(('.ts', '.tsx', '.js', '.mts'))], own],
+                               env, log, STEP_TIMEOUT, cwd=cwd, merge=True)
+        log.write(f'{name} {"passed" if not rerun else "failed again"} on its own.\n')
+        say(f'          {name}: timed out, ' + ('passed on its own' if not rerun else 'failed again on its own'))
+        if rerun:
+            failing.append(name + ' (timeout)')
+    if code and not failing and UNHANDLED.search(output):
+        # The reruns explain the failed files, not an unhandled error next to them.
+        failing.append(f'(vitest exited {code} with an unhandled error; see the log)')
+    return not failing, failing
+
+
+def checks(env, log, target, force=False):
+    """Run every test, typecheck and lint step, print each one's result and the failing files, and
+    raise NeedsFix when any failed. Skipped when they already passed on this commit."""
+    if not force and checks_stamped(target):
+        step('The checks already passed on this commit; skipping them.')
+        return
+    spec = check_spec()
     missing = [t for t in spec['tests'] if not (SOURCE / t).exists()]
     if missing:
         raise NeedsFix('Test files listed in checks.json no longer exist (moved upstream?):\n' + '\n'.join('  ' + t for t in missing))
@@ -662,37 +905,151 @@ def checks(env, log, target):
     # Chromium); from the root they land in the node pool and fail. Run them per app.
     browser = [t for t in spec['tests'] if re.search(r'\.browser\.test\.[cm]?[jt]sx?$', t)]
     unit = [t for t in spec['tests'] if t not in browser]
-    steps = [(['vp', 'test', 'run', *unit], 'The patch tests failed.')] if unit else []
+    steps = [('tests', ['vp', 'test', 'run', *unit], SOURCE)] if unit else []
     by_app = {}
     for t in browser:
         app = '/'.join(t.split('/')[:2])
         by_app.setdefault(app, []).append(t[len(app) + 1:])
     for app, files in by_app.items():
-        steps.append((['vp', 'test', 'run', '--project', 'browser', *files], 'The patch browser tests failed.', app))
+        steps.append((f'browser tests in {app}', ['vp', 'test', 'run', '--project', 'browser', *files], SOURCE / app))
     # The empty HOME below hides Playwright's browser cache; keep its own under the cache
     # (an install also deletes browsers no installed Playwright uses from that folder).
     browsers = CACHE / 'ms-playwright'
     if by_app:
         install_playwright_browser(env, browsers, SOURCE / next(iter(by_app)), log)
-    steps += [(['tsc', '--noEmit', '-p', p + '/tsconfig.json'], f'Typecheck failed in {p}.') for p in spec['typecheck']]
+    tsc = typechecker(log)
+    steps += [(f'typecheck {p}', [tsc, '--noEmit', '-p', p + '/tsconfig.json'], SOURCE) for p in spec['typecheck']]
     # Upstream's lint holds rules tests and typechecks miss, such as no-hermes-unsupported-apis
     # (Array#toSorted crashes the iOS app at render). Lint what the patches add or change.
     changed = [f for f in git('diff', '--name-only', '--diff-filter=AM', target + '..HEAD').split()
                if f.endswith(('.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs'))]
-    if changed:
-        steps.append((['vp', 'lint', *changed], 'Lint failed on files the patches change.'))
     # Run against an empty home, as upstream's CI does: the server tests read the user's
     # real ~/.claude/skills, and a large set of skills races their TestClock steps.
     # Temporary files go to disk under the cache, as in the build: a tmpfs /tmp with a user
     # quota (devbox1) fills up halfway through the test transforms (EDQUOT).
     tmp = CACHE / 'tmp'
     tmp.mkdir(parents=True, exist_ok=True)
+    failures = []
+
+    def report(name, passed, failing, started):
+        say(f'    {"pass" if passed else "FAIL"}  {name} ({time.time() - started:.0f}s)')
+        for line in failing[:20]:
+            say('          ' + line)
+        if not passed:
+            failures.append(f'{name}: ' + (', '.join(failing[:10]) or 'failed'))
+
     with tempfile.TemporaryDirectory(prefix='t3code-checks-home-', dir=tmp) as home:
         check_env = dict(os.environ if env is None else env, HOME=home, TMPDIR=str(tmp),
                          PLAYWRIGHT_BROWSERS_PATH=str(browsers))
-        for args, message, *cwd in steps:
-            if run(args, cwd=SOURCE / cwd[0] if cwd else SOURCE, env=check_env, log=log, check=False).returncode:
-                raise NeedsFix(message + ' Command: ' + ' '.join(args))
+        for name, args, cwd in steps:
+            started = time.time()
+            log.write(f'\n--- {name}: {" ".join(args)}\n')
+            if args[1:3] == ['test', 'run']:
+                passed, failing = run_test_step(args, cwd, check_env, log, tmp)
+            else:
+                code, output = run_bounded(args, check_env, log, STEP_TIMEOUT, cwd=cwd, merge=True)
+                passed, failing = not code, sorted(set(TYPE_ERROR.findall(output)))
+            report(name, passed, failing, started)
+        if changed:
+            started = time.time()
+            try:
+                lint_changed(changed, check_env, log)
+                report('lint of the changed files', True, [], started)
+            except NeedsFix as error:
+                report('lint of the changed files', False, str(error).splitlines()[1:] or [str(error)], started)
+    if failures:
+        raise NeedsFix(f'The checks failed (log: {log.name}):\n' + '\n'.join('  ' + f for f in failures))
+    save(git_dir() / CHECKS_STAMP, dict(checks_stamp(target), at=time.strftime('%Y-%m-%dT%H:%M:%S')))
+
+
+# A lint of every changed file takes 10 to 30 seconds. One hung for 35 minutes in an unattended
+# port (oxlint idle at 0% CPU), which blocks every update, so the step has a hard limit.
+LINT_TIMEOUT = int(os.environ.get('T3CODE_CUSTOMIZE_LINT_TIMEOUT_SECONDS', '600'))
+# Any other check step: generous, so only a real hang ends it (tsc took 61 min on a swapping Mac).
+STEP_TIMEOUT = int(os.environ.get('T3CODE_CUSTOMIZE_STEP_TIMEOUT_SECONDS', '10800'))
+
+
+def run_bounded(args, env, log, timeout, cwd=None, merge=False):
+    """Run args in cwd (SOURCE) and return (exit code, stdout). stderr goes to the log, or with merge
+    into stdout, which then goes to the log too. After timeout seconds the whole process tree is
+    killed (vp runs oxlint and vitest, which run node workers) and NeedsFix raised."""
+    windows = os.name == 'nt'
+    log.flush()
+    process = subprocess.Popen(command_args(args, env), cwd=cwd or SOURCE, env=env, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge else log,
+                               start_new_session=not windows,
+                               creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if windows else 0)
+    try:
+        stdout, _ = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if windows:
+            subprocess.run(['taskkill', '/T', '/F', '/PID', str(process.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        variable = 'T3CODE_CUSTOMIZE_LINT_TIMEOUT_SECONDS' if timeout == LINT_TIMEOUT else 'T3CODE_CUSTOMIZE_STEP_TIMEOUT_SECONDS'
+        raise NeedsFix(f'{" ".join(map(str, args[:3]))} did not finish within {timeout} seconds and was stopped'
+                       f' ({variable}). Command: {" ".join(map(str, args))}')
+    output = stdout.decode('utf-8', 'replace')
+    if merge:
+        log.write(output)
+        log.flush()
+    return process.returncode, output
+
+
+def lint_report(output):
+    """The JSON report of `vp lint -f json`; vp may print a note before it."""
+    start = output.find('{')
+    try:
+        report = json.loads(output[start:]) if start >= 0 else None
+    except ValueError:
+        report = None
+    if not isinstance(report, dict) or not isinstance(report.get('number_of_files'), int):
+        raise NeedsFix('Lint printed no report, so it is unknown what it checked:\n' + output[-2000:])
+    return report
+
+
+def lint_changed(changed, env, log, timeout=None):
+    """Lint the files the patches change, and prove it did: lint first lists the files it would
+    check (its ignorePatterns drop generated ones such as apps/mobile/uniwind-types.d.ts), then
+    lints exactly those and must report the same number of files."""
+    timeout = LINT_TIMEOUT if timeout is None else timeout
+    flags = ['--no-error-on-unmatched-pattern']
+    code, listed = run_bounded(['vp', 'lint', '--debug=files', *flags, *changed], env, log, timeout)
+    if code:
+        raise NeedsFix('Lint could not list the files to check. Command: vp lint --debug=files')
+    lines = [line.strip() for line in listed.splitlines() if line.strip()]
+    listed = {os.path.normpath(os.path.relpath(line, str(SOURCE)) if os.path.isabs(line) else line) for line in lines}
+    lintable = [f for f in changed if os.path.normpath(f) in listed]
+    if lines and not lintable:
+        # It listed something, yet none of the changed files: a format change would lint nothing.
+        raise NeedsFix('Lint listed files, but none of the changed ones; its --debug=files output is not'
+                       ' understood:\n' + '\n'.join(lines[:10]))
+    ignored = [f for f in changed if f not in lintable]
+    if ignored:
+        log.write('Lint ignores (ignorePatterns): ' + ', '.join(ignored) + '\n')
+    if not lintable:
+        return
+    started = time.monotonic()
+    code, output = run_bounded(['vp', 'lint', '-f', 'json', *flags, *lintable], env, log, timeout)
+    report = lint_report(output)
+    errors = []
+    for diagnostic in report.get('diagnostics', []):
+        span = (diagnostic.get('labels') or [{}])[0].get('span', {})
+        line = (f"{diagnostic.get('filename')}:{span.get('line', 0)}:{span.get('column', 0)}:"
+                f" {diagnostic.get('severity')} {diagnostic.get('code')}: {diagnostic.get('message')}")
+        log.write(line + '\n')
+        if diagnostic.get('severity') == 'error':
+            errors.append(line)
+    log.write(f"Lint checked {report['number_of_files']} of {len(changed)} changed files"
+              f' in {time.monotonic() - started:.0f}s.\n')
+    log.flush()
+    if code or errors:
+        raise NeedsFix('Lint failed on files the patches change:\n' + '\n'.join('  ' + e for e in errors[:20]))
+    if report['number_of_files'] != len(lintable):
+        raise NeedsFix(f"Lint checked {report['number_of_files']} files, expected {len(lintable)}.")
 
 
 def install_playwright_browser(env, browsers, cwd, log):
@@ -781,16 +1138,43 @@ def choose_agent(requested):
     return name if answer in ('', 'y', 'yes') else None
 
 
+def source_option():
+    """The --source option the agent's commands need when this run uses another checkout."""
+    return '' if SOURCE == CACHE / 't3code' else ' --source ' + shlex.quote(str(SOURCE))
+
+
+def agent_prompt(problem, target, version):
+    tool = shlex.quote(str(REPO / NAME))
+    return (f'Port the T3 Code customization patches onto a new nightly. Read {REPO}/docs/porting.md first;'
+            f' {REPO}/docs/fork-changes.md says what each own patch must keep doing.\n\n'
+            f'Source checkout: {SOURCE}\nNightly: {version} at commit {target}\nPatch repo: {REPO}\n\n'
+            f'The run stopped with:\n\n{problem}\n\n'
+            f'Work in one loop, in this session:\n'
+            f'1. Resolve the conflicted files, git add them, then run `{tool} continue{source_option()}`. It applies the'
+            f' next stage and prints the next conflict, or "All patches applied." Repeat until it says that.\n'
+            f'2. Run `{tool} checks{source_option()}`. Fix what fails (git commit --fixup, then rebase --autosquash onto'
+            f' {target[:12]}, as docs/porting.md says) and run it again until it passes.\n'
+            f'3. Stop. Do not export, commit to the repo, push or build; {NAME} does that after you.\n')
+
+
 def agent_fix(agent, problem, target, version, log):
-    prompt = (f'Follow {REPO}/AGENTS.md, including "Fork changes", to port the T3 Code customization patches.\n\n'
-              f'Source checkout: {SOURCE}\nNightly: {version} at commit {target}\n'
-              f'Patch repo: {REPO}\n\nThe build stopped with:\n\n{problem}\n\n'
-              f'When the checks pass, stop. Do not run the build yourself; {NAME} continues it.\n')
+    """One agent session that takes the port through every stage and the checks."""
+    prompt = agent_prompt(problem, target, version)
     step(f'{AGENT_NAMES[agent]} is porting the patches. Transcript: {log.name}')
     log.write('\n--- agent prompt ---\n' + prompt + '\n')
     log.flush()
-    result = subprocess.run(command_args(AGENTS[agent]), cwd=SOURCE, input=prompt,
-                            text=True, encoding='utf-8', stdout=log, stderr=log)
+    # The agent's continue and checks run inside this run, which holds the checkout lock.
+    env = dict(os.environ, T3CODE_CUSTOMIZE_LOCK_HELD=str(os.getpid()))
+    # A run killed during the session leaves this behind, so a later unattended run can tell (see
+    # stopped_by_unattended_run); the fingerprint is recorded again once the session ends.
+    update_run_marker(stopped=None, agent={'pid': os.getpid(), 'ticks': process_ticks(os.getpid()),
+                                           'unit': os.environ.get('INVOCATION_ID'), 'agentName': agent,
+                                           'started': time.strftime('%Y-%m-%dT%H:%M:%S')})
+    try:
+        result = subprocess.run(command_args(AGENTS[agent]), cwd=SOURCE, input=prompt, env=env,
+                                text=True, encoding='utf-8', stdout=log, stderr=log)
+    finally:
+        update_run_marker(agent=None, stopped=checkout_fingerprint())
     if result.returncode:
         say(f'{AGENT_NAMES[agent]} exited with {result.returncode}; checking what it left.')
 
@@ -800,7 +1184,101 @@ def older_than_patches(target):
     return target != base and git('merge-base', '--is-ancestor', target, base, check=False, capture=False).returncode == 0
 
 
+class Waiting(Stop):
+    """Nothing to do until the installed app updates; a clean exit (0)."""
+
+
+RECIPE_FILES = ('patches', 'patches-port', 'patches-tt', 'patches-ios', 'checks.json', 'checks-tt.json', 'checks-ios.json')
+
+
+def effective_base(read, newer=None):
+    """The nightly a patch set targets, through read(path) -> text or None, chosen as choose_shared does:
+    patches-port/ only while it is a port to a newer nightly than patches/ (newer(old, new) says so)."""
+    upstream = (read('patches/base.txt') or '').strip()
+    port = (read('patches-port/base.txt') or '').strip()
+    if port and port != upstream and (newer is None or newer(upstream, port)):
+        return port
+    return upstream
+
+
+def descends(older, newer):
+    """True when newer has older in its history; also when the source lacks either commit, since a
+    patches-port/ was written as a port to a newer nightly."""
+    if not (has_commit(older) and has_commit(newer)):
+        return True
+    return git('merge-base', '--is-ancestor', older, newer, check=False, capture=False).returncode == 0
+
+
+def recipe_for(target, log=None):
+    """The newest commit of this repo whose patch set targets exactly target and carries every layer this
+    run applies (patches-ios/ for ios and port), or None."""
+    if not (REPO / '.git').exists():
+        return None
+    commits = repo_run('git', 'log', '--format=%H', 'HEAD', '--', *RECIPE_FILES, check=False).split()
+    needed = [folder.name for folder in own_layers() if any(folder.glob('*.patch'))]
+
+    def reader(commit):
+        def read(path):
+            result = subprocess.run(['git', 'show', f'{commit}:{path}'], cwd=REPO, capture_output=True, text=True)
+            return result.stdout if result.returncode == 0 else None
+
+        def listing(folder):
+            names = repo_run('git', 'ls-tree', '--name-only', commit, folder + '/', check=False).split()
+            return [n for n in names if n.endswith('.patch')]
+        return read, listing
+
+    for commit in commits:
+        read, listing = reader(commit)
+        if effective_base(read, descends) == target and all(listing(folder) for folder in needed):
+            return commit
+    return None
+
+
+def extract_recipe(commit):
+    """The patch folders and check lists of commit, in a folder of their own under the cache."""
+    folder = CACHE / 'recipes' / commit[:12]
+    if not (folder / '.complete').exists():
+        shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir(parents=True)
+        names = repo_run('git', 'ls-tree', '--name-only', commit, check=False).split()
+        paths = [p for p in RECIPE_FILES if p in names]
+        archive = subprocess.run(['git', 'archive', '--format=tar', commit, *paths], cwd=REPO,
+                                 capture_output=True, check=True).stdout
+        with tarfile.open(fileobj=io.BytesIO(archive)) as bundle:
+            if hasattr(tarfile, 'data_filter'):
+                bundle.extractall(folder, filter='data')
+            else:
+                bundle.extractall(folder)
+        (folder / '.complete').touch()
+    return folder
+
+
+def use_older_recipe(target, log):
+    """For a nightly older than the patches: switch to the patch set from git history made for exactly
+    that nightly, or raise Waiting, before anything touches the checkout."""
+    commit = recipe_for(target, log)
+    if not commit:
+        raise Waiting(f'This T3 Code ({target[:12]}) is older than the patches ({shared_base()[:12]}) and no'
+                      ' earlier patch set in this repo targets it: waiting for the app update.'
+                      ' Your current T3 Code is untouched.')
+    use_recipe(extract_recipe(commit))
+    choose_shared(log)
+    say(f'    This nightly is older than the patches; using the patch set from {commit[:12]}, made for it.')
+
+
+# The command this run is, when the advice differs from build's (port).
+COMMAND = None
+
+
 def stuck_message(problem, target):
+    if COMMAND == 'port':
+        version = run_marker().get('version')
+        where = source_option()
+        return (f'{problem}\n\nThe port stopped. Resolve each file, git add it, then run {NAME} continue{where}'
+                f' until it says "All patches applied.", then {NAME} checks{where} (see {REPO}/docs/porting.md),'
+                f' and finish with {NAME} port{where} --resume' + (f' --version {version}' if version else '') + '.\n'
+                f'Or let an agent port it: {NAME} port{where}' + (f' --version {version}' if version else '')
+                + ' --fix claude  (or --fix codex)')
     if older_than_patches(target):
         return (f'{problem}\n\nYour T3 Code is older than these patches. Update T3 Code, then run {NAME} again.\n'
                 'Your current T3 Code is untouched.')
@@ -809,13 +1287,13 @@ def stuck_message(problem, target):
     return (f'{problem}\n\nThis nightly changed code the patches touch. Any of these works:\n'
             f'  - wait for the repo to catch up (usually within a day), then run {command} again\n'
             f'  - let an agent port them now: {command} --fix claude  (or --fix codex)\n'
-            f'  - or ask your coding agent to follow {REPO}/AGENTS.md'
+            f'  - or ask your coding agent to follow {REPO}/docs/porting.md'
             + (f', then finish with {command} --resume' if WITH_IOS else '') + '\n'
             'Your current T3 Code is untouched and still opens normally.')
 
 
 # --- Publishing an unattended port ---------------------------------------------------
-# Tim's standing grant (AGENTS.md, "Unattended ports"): a port an agent made under --fix is
+# Tim's standing grant (docs/machines.md, "Unattended ports"): a port an agent made under --fix is
 # merged and rolled out without him when its checks passed and every patch keeps exactly the
 # same code lines as before, so only context, comments and line numbers moved. Anything else
 # waits in a PR for him.
@@ -962,6 +1440,10 @@ class MergedButStuck(Stop):
     """The port is merged, but this copy of the repo did not follow."""
 
 
+# The ports this machine published, by nightly version, so a port handed over twice opens one PR.
+PORTS = DATA / 'ports.json'
+
+
 def publish_port(args, version):
     """Commit a port to a branch and open a PR; merge it and run fleet when the standing grant covers it."""
     if not getattr(args, 'agent_ported', False):
@@ -976,6 +1458,10 @@ def publish_port(args, version):
         notify(LAUNCHER_NAME, f'An agent ported the patches, but opening the PR failed: {error}'
                f' The port is in {REPO}; commit it by hand.')
         return
+    ports = load(PORTS, {})
+    ports[version] = {'url': url, 'merged': merged, 'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                      'layers': ['shared'] + [folder.name for folder in own_layers()]}
+    save(PORTS, ports)
     if merged:
         notify(LAUNCHER_NAME, f'An agent ported the patches to {version}; only context moved, so {url} is merged'
                ' and fleet is updating every machine.')
@@ -1018,7 +1504,7 @@ def _publish_port(version, checked):
         shutil.rmtree(worktree, ignore_errors=True)
     if safe:
         verdict = ('Checks passed and every patch keeps the same code lines (only context, comments and line'
-                   ' numbers moved), so it merges under the standing grant in AGENTS.md.')
+                   ' numbers moved), so it merges under the standing grant in docs/machines.md.')
     else:
         reasons = ([] if checked else ['checks were skipped']) + ([] if on_main else ['this copy is not on main'])
         reasons += ['also changed: ' + ', '.join(other)] if other else []
@@ -1052,13 +1538,22 @@ def _publish_port(version, checked):
 def spawn_detached(argv, name):
     """Start argv so it outlives this run, also when this run is a systemd unit or a LaunchAgent."""
     (CACHE / 'logs').mkdir(parents=True, exist_ok=True)
-    if os.environ.get('INVOCATION_ID') and shutil.which('systemd-run'):
-        # systemd ends every process of a oneshot unit with it; a unit of its own survives.
-        subprocess.run(['systemd-run', '--user', '--collect', '--unit', f'{NAME}-{name}-{os.getpid()}',
-                        '--setenv=PATH=' + os.environ.get('PATH', ''), *argv], check=True, capture_output=True)
-        return
     with (CACHE / f'logs/{name}.log').open('a') as log:
-        subprocess.Popen(argv, cwd=REPO, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        if os.environ.get('INVOCATION_ID') and shutil.which('systemd-run'):
+            # systemd ends every process of a oneshot unit with it; a unit of its own survives.
+            started = subprocess.run(['systemd-run', '--user', '--collect', '--unit', f'{NAME}-{name}-{os.getpid()}',
+                                      '--setenv=PATH=' + os.environ.get('PATH', ''), *argv],
+                                     capture_output=True, text=True)
+            if started.returncode == 0:
+                return 'systemd-run'
+            # Without a user bus (or with another failure) a new session is the next best thing.
+            log.write(f'systemd-run failed ({started.returncode}): {started.stderr.strip()}; starting it with setsid\n')
+            log.flush()
+        try:
+            subprocess.Popen(argv, cwd=REPO, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        except OSError as error:
+            raise Stop(f'Could not start {name}: {error}')
+        return 'setsid'
 
 
 # --- Commands -----------------------------------------------------------------------
@@ -1199,31 +1694,211 @@ def current_executable(state):
     return CURRENT / 'AppRun' if SYSTEM == 'linux' else DATA / 'missing-build'
 
 
-def apply_patches(args, target, version, env, log):
-    """Put the patches on target and pass their checks, letting an agent port them if allowed.
+def apply_patches(args, target, version, env, log, handoff=True):
+    """Put the patches on target and pass their checks. An unattended run hands a port to the porter
+    (`port`, all three layers, one agent session); otherwise one agent session ports here if allowed.
     True if the patches were ported (export and commit them)."""
     choose_shared(log)
+    unattended = bool(getattr(args, 'background', False))
+    if args.resume:
+        claim_checkout()
+    history = False
+    if not args.resume and older_than_patches(target):
+        use_older_recipe(target, log)
+        history = True
+    delegate = unattended and handoff and porter_machine() is not None
+    if delegate and not history:
+        handed_off_already(target, version)
     step('Applying the patches...')
-    attempts = 2
     resume = ported = args.resume
     agent = None
     while True:
         try:
-            prepare(target, log, resume=resume)
+            prepare(target, log, resume=resume, unattended=unattended, version=version)
             install_dependencies(env, log)
             if not args.skip_checks:
                 checks(env, log, target)
             return ported
         except NeedsFix as problem:
+            say(str(problem))
+            if unattended:
+                mark_unattended_stop()
+            if history:
+                # A patch set from history on the very nightly it was made for: nothing to port.
+                abort_stopped(log)
+                (git_dir() / RUN_MARK).unlink(missing_ok=True)
+                raise NeedsFix(f'{problem}\n\nThe patch set made for this nightly fails here; see the log.'
+                               ' The checkout is clean again.')
             if older_than_patches(target):
                 raise Stop(stuck_message(problem, target))
-            say(str(problem))
-            agent = agent or choose_agent(args.fix)
-            if not agent or attempts == 0:
+            if ported and agent:
+                # One agent session per port: it had every stage and the checks.
+                if unattended:
+                    port_failed(version, problem, log)
                 raise NeedsFix(stuck_message(problem, target))
-            attempts -= 1
+            pending = port_pending(version) if unattended else None
+            if pending:
+                # Ported already: its PR waits for review or merge. Leave nothing stopped behind.
+                abort_stopped(log)
+                (git_dir() / RUN_MARK).unlink(missing_ok=True)
+                raise PortHandedOff(f'{problem}\n\nThe port to {version} waits for review: {pending}.')
+            if delegate:
+                hand_off_port(target, version, problem, log)
+            agent = choose_agent(args.fix)
+            if not agent:
+                raise NeedsFix(stuck_message(problem, target))
             agent_fix(agent, str(problem), target, version, log)
             resume = ported = args.agent_ported = True
+
+
+def port_failed(version, problem, log):
+    """The one agent session did not finish: put this checkout back as it was, say so, and record it."""
+    abort_stopped(log)
+    (git_dir() / RUN_MARK).unlink(missing_ok=True)
+    ports = load(PORTS, {})
+    ports[version] = dict(ports.get(version, {}), failed=log.name, failedAt=time.strftime('%Y-%m-%dT%H:%M:%S'),
+                          failedEpoch=time.time(), failedRecipe=recipe_hash(), reported=False)
+    save(PORTS, ports)
+    notify(LAUNCHER_NAME, f'The port to {version} failed: the agent session left it unfinished. The checkout'
+           f' is clean again; transcript {log.name}.')
+
+
+def recent_failure(version, clock=time.time):
+    """The ports.json record of a port to version that failed within the quiet window with the patches
+    as they are now, else None: porting it again would fail the same way."""
+    record = load(PORTS, {}).get(version or '', {})
+    if (record.get('failedEpoch') and clock() - record['failedEpoch'] < HANDOFF_QUIET
+            and record.get('failedRecipe') == recipe_hash()):
+        return record
+    return None
+
+
+def port_pending(version):
+    """The URL of a port to version that is published already (ports.json) or waits in an open
+    port/nightly-<version> PR, else None."""
+    record = load(PORTS, {}).get(version, {})
+    if record.get('url') and 'patches-ios' in record.get('layers', []):
+        return record['url']
+    repo = fork_repo()
+    if not repo or not shutil.which('gh'):
+        return None
+    try:
+        listed = subprocess.run(['gh', 'pr', 'list', '--repo', repo, '--state', 'open', '--json', 'url,headRefName'],
+                                capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+        prs = json.loads(listed.stdout) if listed.returncode == 0 else []
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    branch = f'port/nightly-{version}'
+    return next((pr['url'] for pr in prs if pr['headRefName'] == branch or
+                 pr['headRefName'].startswith(branch + '-')), None)
+
+
+# --- Handing a port to the porter -------------------------------------------------------
+# One machine in machines.json ports (the one with "fix"). Another machine that hits a conflict or a
+# failing check in an unattended run starts the port there and stays as it is; once the port is merged,
+# its next run gets it through pull_latest.
+
+HANDOFFS = DATA / 'handoffs.json'
+# A port handed over for a nightly is not handed over again for this long (the porter dedupes too).
+HANDOFF_QUIET = 12 * 3600
+
+
+class PortHandedOff(NeedsFix):
+    """The port runs on the porter; this machine stays on its current build."""
+
+
+def porter_machine(machines=None):
+    machines = load(MACHINES, {}).get('machines', []) if machines is None else machines
+    return next((m for m in machines if m.get('fix')), None)
+
+
+def port_command(machine, target, version):
+    """The port run the porter starts for target, as argv for this tool."""
+    return ['port', '--commit', target, '--version', version, '--fix', machine['fix'], '--background',
+            '--wait-lock', str(PORT_FLEET_WAIT)]
+
+
+def repo_path():
+    """This repo's path for the porter: relative to HOME when it lives there, else absolute."""
+    try:
+        return str(REPO.relative_to(HOME))
+    except ValueError:
+        return str(REPO)
+
+
+def remote_port_line(machine, target, version, path):
+    """A shell line for the porter that starts the port detached: a systemd unit named by the nightly
+    (a second start while it runs fails with "already", a no-op), else, also when systemd-run fails
+    otherwise, nohup."""
+    where = shlex.quote(path) if path.startswith('/') else '"$HOME"/' + shlex.quote(path)
+    tool = f'python3 {where}/{NAME} ' + shlex.join(port_command(machine, target, version))
+    unit = f'{NAME}-port-{target[:12]}'
+    logs = f'"$HOME"/.cache/{NAME}/logs'
+    fallback = f'mkdir -p {logs}; nohup {tool} >>{logs}/port.log 2>&1 </dev/null & echo started with nohup'
+    return (f'if command -v systemd-run >/dev/null 2>&1; then'
+            f' out=$(systemd-run --user --collect --unit={unit} --setenv=PATH="$PATH" {tool} 2>&1); rc=$?;'
+            f' if [ $rc -eq 0 ]; then echo "$out"; elif echo "$out" | grep -q already; then echo "already running: $out";'
+            f' else echo "systemd-run failed: $out"; {fallback}; fi;'
+            f' else {fallback}; fi')
+
+
+def handed_off_already(target, version, clock=time.time):
+    """Raise PortHandedOff before touching the checkout when this nightly was handed to the porter within
+    the quiet window and the patches here did not change since (the porter runs or ran that port)."""
+    earlier = load(HANDOFFS, {}).get(target, {})
+    if (earlier and not earlier.get('unreachable') and clock() - earlier.get('at', 0) < HANDOFF_QUIET
+            and recipe_hash() in earlier.get('recipes', [])):
+        raise PortHandedOff(f'The port to {version} was handed to {earlier.get("porter")} at'
+                            f' {time.strftime("%H:%M", time.localtime(earlier["at"]))}; waiting for its PR.')
+
+
+def hand_off_port(target, version, problem, log, clock=time.time):
+    """Clean this checkout, start the port on the porter and raise PortHandedOff."""
+    porter = porter_machine()
+    if not porter:
+        return
+    abort_stopped(log)
+    (git_dir() / RUN_MARK).unlink(missing_ok=True)
+    handed = load(HANDOFFS, {})
+    earlier = handed.get(target, {})
+    name = porter['name']
+    recent = bool(earlier) and clock() - earlier.get('at', 0) < HANDOFF_QUIET
+    if recent and not earlier.get('unreachable'):
+        earlier['recipes'] = sorted(set(earlier.get('recipes', [])) | {recipe_hash()})
+        save(HANDOFFS, handed)
+        raise PortHandedOff(f'{problem}\n\nThe port to {version} was handed to {name} already'
+                            f' ({time.strftime("%H:%M", time.localtime(earlier["at"]))}); waiting for its PR.')
+    me = this_machine(load(MACHINES, {}).get('machines', []))
+    if me and me.get('name') == name:
+        try:
+            spawn_detached([sys.executable, str(REPO / NAME), *port_command(porter, target, version)], 'port')
+        except Stop as error:
+            if not recent:
+                handed[target] = {'version': version, 'porter': name, 'at': clock(), 'unreachable': True,
+                                  'error': str(error)}
+                save(HANDOFFS, handed)
+                notify(LAUNCHER_NAME, f'The patches do not fit {version} yet and the port could not start: {error}')
+            raise NeedsFix(f'{problem}\n\n{error}; nobody ports this nightly yet.')
+    else:
+        alias = ssh_target(porter)
+        if not alias:
+            if not recent:
+                # Once per quiet window; the next runs retry quietly.
+                handed[target] = {'version': version, 'porter': name, 'at': clock(), 'unreachable': True}
+                save(HANDOFFS, handed)
+                notify(LAUNCHER_NAME, f'The patches do not fit {version} yet and the porter {name} is unreachable'
+                       ' over SSH; nobody ports this nightly yet.')
+            raise NeedsFix(f'{problem}\n\nThe porter {name} is unreachable over SSH; nobody ports this nightly yet.')
+        path = porter.get('repo') or repo_path()
+        started = remote(alias, remote_port_line(porter, target, version, path), capture_output=True, text=True)
+        log.write(f'\n--- port handed to {name}: {started.returncode}\n{started.stdout}{started.stderr}\n')
+        if started.returncode:
+            raise NeedsFix(f'{problem}\n\nStarting the port on {name} failed: {(started.stderr or started.stdout).strip()[:200]}')
+    handed[target] = {'version': version, 'porter': name, 'at': clock(), 'recipes': [recipe_hash()]}
+    save(HANDOFFS, handed)
+    notify(LAUNCHER_NAME, f'The patches do not fit {version} yet: port running on {name}.'
+           ' T3 Code stays as it is until the port is merged.')
+    raise PortHandedOff(f'{problem}\n\nPort running on {name}; this machine picks it up once it is merged.')
 
 
 def cmd_build(args):
@@ -1323,7 +1998,7 @@ def cmd_build(args):
     return True
 
 
-def export_patches(target):
+def export_patches(target, root=None):
     """Keep a port that an agent or you finished, so the next build starts from it.
 
     The shared patches go to patches-port/ (upstream's patches/ is never changed); the
@@ -1336,15 +2011,17 @@ def export_patches(target):
     layers = own_layers()
     sizes = [len(layer_patches(folder)) for folder in layers]
     sizes[-1] = len(commits) - shared - sum(sizes[:-1])
-    for path in sorted(PORT.glob('*.patch')) + own_patches():
+    # A dry run writes the folders under root instead of this repo.
+    out = Path(root) / PORT.name if root else PORT
+    layers_out = [Path(root) / folder.name for folder in layers] if root else layers
+    for path in sorted(out.glob('*.patch')) + [p for folder in layers_out for p in sorted(folder.glob('*.patch'))]:
         path.unlink()
-    out = PORT
-    out.mkdir(exist_ok=True)
+    out.mkdir(parents=True, exist_ok=True)
     git('format-patch', '--quiet', '--no-signature', '--zero-commit', '-o', str(out), target + '..' + split, capture=False)
     start = shared
-    for folder, size in zip(layers, sizes):
+    for folder, size in zip(layers_out, sizes):
         if size > 0:
-            folder.mkdir(exist_ok=True)
+            folder.mkdir(parents=True, exist_ok=True)
             git('format-patch', '--quiet', '--no-signature', '--zero-commit', '-o', str(folder),
                 f'{commits[start - 1] if start else target}..{commits[start + size - 1]}', capture=False)
         start += size
@@ -1376,6 +2053,149 @@ def cmd_verify(args):
         install_dependencies(env, log)
         checks(env, log, target)
     say('Patches apply and pass their checks on ' + base[:12] + '.')
+
+
+def set_source(path):
+    """Work in another checkout of the T3 source (your own detached worktree) instead of the shared one."""
+    global SOURCE
+    if path:
+        SOURCE = Path(path).expanduser().resolve()
+        if not (SOURCE / '.git').exists():
+            raise Stop(f'{SOURCE} is not a git checkout of the T3 source.')
+
+
+def lock_path():
+    """The checkout lock: the shared one for the shared checkout, one per path for another."""
+    if SOURCE == CACHE / 't3code':
+        return CACHE / 'lock'
+    return CACHE / ('lock-' + hashlib.sha256(str(SOURCE).encode()).hexdigest()[:10])
+
+
+def follow_marker(args):
+    """Target, layers and patch set of the run that applied the patches in this checkout."""
+    global WITH_IOS
+    marker = run_marker()
+    target = getattr(args, 'target', None) or marker.get('target')
+    if not target:
+        raise Stop(f'No run applied the patches in {SOURCE} yet, so the nightly commit is unknown; pass --target.')
+    WITH_IOS = bool(marker.get('ios', WITH_IOS)) or getattr(args, 'ios', False)
+    if marker.get('recipe') and Path(marker['recipe']) != REPO and Path(marker['recipe']).exists():
+        use_recipe(marker['recipe'])
+    return git('rev-parse', target + '^{commit}').strip(), marker.get('version') or target[:12]
+
+
+def tool_log(name):
+    logs = CACHE / 'logs'
+    logs.mkdir(parents=True, exist_ok=True)
+    log = (logs / (name + '-' + time.strftime('%Y%m%d-%H%M%S') + '.log')).open('w', encoding='utf-8')
+    say('Log: ' + log.name)
+    return log
+
+
+def cmd_continue(args):
+    """After resolving a conflict: finish the stopped stage, apply the next one, print the next conflict."""
+    target, _ = follow_marker(args)
+    claim_checkout()
+    with tool_log('continue') as log:
+        with contextlib.redirect_stdout(io.StringIO()):
+            choose_shared(log)
+        unresolved = git('diff', '--name-only', '--diff-filter=U').split()
+        if unresolved:
+            raise NeedsFix('Still conflicted; resolve and git add:\n' + '\n'.join('  ' + f for f in unresolved))
+        if rebase_in_progress():
+            action = ['am', '--continue'] if am_in_progress() else ['-c', 'core.editor=true', 'rebase', '--continue']
+            result = git(*action, check=False, capture=False, log=log)
+            if result.returncode and not rebase_in_progress():
+                raise NeedsFix(f'git {" ".join(action)} failed; see {log.name}.')
+        prepare(target, log, resume=True)
+    say(f'All patches applied. Next: {NAME} checks' + source_option())
+
+
+def cmd_checks(args):
+    """Run the tests, typechecks and lint of every patch layer this checkout carries."""
+    target, _ = follow_marker(args)
+    claim_checkout()
+    if rebase_in_progress():
+        raise NeedsFix(f'A rebase or git am is stopped in {SOURCE}; finish it with {NAME} continue first.')
+    with tool_log('checks') as log:
+        with contextlib.redirect_stdout(io.StringIO()):
+            choose_shared(log)
+        started = time.time()
+        env = build_env(ensure_node(log))
+        install_dependencies(env, log)
+        checks(env, log, target, force=True)
+    say(f'All checks passed in {max(1, round((time.time() - started) / 60))} min.')
+
+
+def newest_nightly():
+    """(version, tag) of the newest T3 Code nightly release."""
+    listed = subprocess.run(['gh', 'release', 'list', '--repo', 'pingdotgg/t3code', '--limit', '20',
+                             '--json', 'tagName'], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if listed.returncode:
+        raise Stop('Could not list the T3 Code releases (gh): ' + listed.stderr.strip()[:200])
+    tag = next((r['tagName'] for r in json.loads(listed.stdout) if '-nightly.' in r['tagName']), None)
+    if not tag:
+        raise Stop('No nightly among the latest T3 Code releases.')
+    return tag[1:], tag
+
+
+def cmd_port(args):
+    """Port every patch layer (shared, patches-tt, patches-ios) onto one nightly, on any platform: one agent
+    session for every stage and the checks, then export and publish (the porter's job)."""
+    global WITH_IOS
+    WITH_IOS = True
+    if not args.no_pull and not args.resume:
+        pull_latest()
+    version = args.version
+    if not version and not args.commit:
+        version, _ = newest_nightly()
+    global COMMAND
+    COMMAND = 'port'
+    pending = port_pending(version) if version and not args.force and not args.dry_run else None
+    if pending:
+        say(f'The port to {version} is published already or waits for review: {pending}. Nothing to do.')
+        return False
+    failed = recent_failure(version) if not args.force else None
+    if failed:
+        message = (f'The port to {version} failed at {failed.get("failedAt")} with these patches (transcript'
+                   f' {failed.get("failed")}); not trying again until the patches change or {HANDOFF_QUIET // 3600} h'
+                   ' have passed. Run port --force to try now.')
+        say(message)
+        if not failed.get('reported'):
+            ports = load(PORTS, {})
+            ports[version]['reported'] = True
+            save(PORTS, ports)
+            notify(LAUNCHER_NAME, message)
+        return False
+    with tool_log('port') as log:
+        env = build_env(ensure_node(log))
+        target = ensure_commit(args.commit or 'v' + version, version, log)
+        version = version or target[:12]
+        say(f'Porting the patches to nightly {version} ({target[:12]}).')
+        with contextlib.redirect_stdout(io.StringIO()):
+            choose_shared(log)  # apply_patches says which shared set it uses
+        if older_than_patches(target):
+            say(f'This nightly is older than the patches ({shared_base()[:12]}); nothing to port.')
+            return False
+        ported = apply_patches(args, target, version, env, log, handoff=False)
+        if not ported:
+            say(f'The patches apply to {version} and pass their checks; nothing to port.')
+            return False
+        if args.dry_run:
+            out = CACHE / 'port-dry-run' / version
+            shutil.rmtree(out, ignore_errors=True)
+            export_patches(target, root=out)
+
+            def read(folder):
+                return {p.name: p.read_text() for p in sorted((out / folder).glob('*.patch'))}
+
+            same = code_unchanged(patch_sets(committed_folder), patch_sets(read))
+            say(f'Dry run: the port is in {out}, not published. Every patch keeps the same code lines: '
+                + ('yes, the standing grant would merge it.' if same else 'no, its PR would wait for review.'))
+            return True
+        export_patches(target)
+        publish_port(args, version)
+    return True
 
 
 def stock_target(app):
@@ -1921,6 +2741,11 @@ def cmd_update(args):
                    + (' The patches were ported; ask an agent to commit them and run fleet.' if ported else ''))
         if MAC and args.background and args.ios:
             update_ios(args)
+    except Waiting as waiting:
+        say(str(waiting))
+        return
+    except PortHandedOff:
+        raise
     except NeedsFix:
         if args.background:
             notify(LAUNCHER_NAME, 'This nightly changed code the patches touch, so T3 Code stays stock for now.'
@@ -1949,10 +2774,12 @@ def update_ios(args):
     if load(IOS_ATTEMPT, {}).get('version') == version:
         return
     ios_args = argparse.Namespace(app=args.app, fix=args.fix, resume=False, skip_checks=False, force=False,
-                                  no_pull=True, attempt=IOS_ATTEMPT)
+                                  no_pull=True, attempt=IOS_ATTEMPT, background=getattr(args, 'background', False))
     try:
         if cmd_ios(ios_args):
             notify(LAUNCHER_NAME, f"The iOS app for {load(IOS_STATE, {}).get('version')} is on TestFlight.")
+    except (Waiting, PortHandedOff):
+        return
     except (Stop, PlatformError) as stop:
         notify(LAUNCHER_NAME, f'iOS build failed: {str(stop).strip().splitlines()[0]} Run {NAME} ios in a terminal.')
 
@@ -2082,7 +2909,43 @@ def _report_ported_prs():
         else:
             hint = 'open, ported head is current: keep the patch'
         say(f'{label}: {hint}')
-    say('    See "Checking that an update did not break a fork change" in AGENTS.md.')
+    say('    See "Checking an update" in docs/fork-changes.md.')
+
+
+def fork_repo():
+    """owner/name of this repo on GitHub, from its origin remote."""
+    if not (REPO / '.git').exists():
+        return None
+    url = repo_run('git', 'remote', 'get-url', 'origin', check=False)
+    match = re.search(r'github\.com[:/]([^/]+/[^/]+?)(?:\.git)?/?$', url)
+    return match.group(1) if match else None
+
+
+def report_open_prs(run=subprocess.run):
+    """One line per open PR of this repo, so a port or feature waiting for review is not missed. Never raises."""
+    try:
+        repo = fork_repo()
+        if not repo:
+            return
+        say()
+        if not shutil.which('gh'):
+            say('Open PRs: skipped, gh is not installed.')
+            return
+        try:
+            result = run(['gh', 'pr', 'list', '--repo', repo, '--state', 'open', '--limit', '30',
+                          '--json', 'number,title,headRefName,isDraft'],
+                         capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+        if result is None or result.returncode:
+            say('Open PRs: skipped, gh could not reach GitHub (offline or not signed in).')
+            return
+        prs = json.loads(result.stdout)
+        say(f'Open PRs ({repo}): ' + ('none' if not prs else str(len(prs))))
+        for pr in prs:
+            say(f"    #{pr['number']} {pr['title']} ({pr['headRefName']}{', draft' if pr.get('isDraft') else ''})")
+    except Exception as error:
+        say(f'Open PRs: skipped ({error.__class__.__name__}: {error}).')
 
 
 def cmd_on(args):
@@ -2189,7 +3052,7 @@ def sync_repo(alias, path, wanted, say_as):
         raise Stop('could not bring the repo over: ' + (unpack.stderr.strip() or 'files still differ'))
 
 
-FLEET_STATUS = {0: 'ok', 3: 'needs a port (see AGENTS.md)', 4: 'deferred: threads busy'}
+FLEET_STATUS = {0: 'ok', 3: 'needs a port (see docs/porting.md)', 4: 'deferred: threads busy'}
 
 
 def fleet_command(machine, args):
@@ -2262,7 +3125,7 @@ def cmd_fleet(args):
 
             code, last = follow(start(command))
             status = FLEET_STATUS.get(code, f'failed ({code})')
-            # Every machine keeps itself current from now on (see "Machines" in AGENTS.md).
+            # Every machine keeps itself current from now on (see docs/machines.md).
             auto_code, auto_last = follow(start(autoupdate_command(machine)))
             if auto_code:
                 status, last = f'{status}, autoupdate failed ({auto_code})', auto_last
@@ -2577,6 +3440,19 @@ def main():
                        help='how long each machine waits for a run that holds its checkout (default 30)')
     ios = sub.add_parser('ios', help='macOS: build the patched iOS app and upload it to TestFlight (see ios.json)')
     build_options(ios)
+    port = sub.add_parser('port', help='port every patch layer onto a nightly with one agent session (the porter runs it)')
+    build_options(port)
+    port.add_argument('--version', help='nightly version, such as 0.1.1-nightly.20261018.3302 (default: the newest)')
+    port.add_argument('--commit', help='its upstream commit (default: the tag v<version>)')
+    port.add_argument('--source', help='use this checkout of the T3 source (your own detached worktree)')
+    port.add_argument('--dry-run', action='store_true', help='export the port under the cache; do not commit or publish it')
+    port.add_argument('--background', action='store_true', help=argparse.SUPPRESS)
+    for name, text in (('continue', 'after resolving a conflict: finish that stage and apply the next'),
+                       ('checks', 'run the tests, typechecks and lint of the applied patches')):
+        command = sub.add_parser(name, help=text)
+        command.add_argument('--source', help='the checkout of the T3 source (default: the shared one)')
+        command.add_argument('--target', help='the nightly commit the patches sit on (default: from the last run)')
+        command.add_argument('--ios', action='store_true', help='include patches-ios/ (default: as the last run)')
     sub.add_parser('identity')
     argv = sys.argv[1:]
     if not argv or argv[0].startswith('-') and argv[0] not in ('-h', '--help'):
@@ -2586,14 +3462,19 @@ def main():
         parser.print_help()
         return
     handler = globals()['cmd_' + args.command.replace('-', '_')]
+    set_source(getattr(args, 'source', None))
     if args.command == 'status':
         try:
             return handler(args)
         finally:
             report_ported_prs()
+            report_open_prs()
     if args.command in ('launch', 'on', 'off', 'autoupdate', 'fleet', 'identity'):
         return handler(args)
     CACHE.mkdir(parents=True, exist_ok=True)
+    if args.command in ('continue', 'checks') and os.environ.get('T3CODE_CUSTOMIZE_LOCK_HELD'):
+        # An agent inside a run that holds the lock (agent_fix).
+        return handler(args)
     if SYSTEM == 'win32':
         with build_lock(LOCK):
             if args.command not in ('build', 'update', 'server'):
@@ -2603,7 +3484,7 @@ def main():
             finally:
                 report_ported_prs()
     # The lock file names its holder, so a second run (or an agent) can see who uses the checkout.
-    with (CACHE / 'lock').open('a+') as lock:
+    with lock_path().open('a+') as lock:
         if not acquire_lock(lock, getattr(args, 'wait_lock', 0) * 60):
             if getattr(args, 'background', False):
                 return
@@ -2612,7 +3493,7 @@ def main():
         lock.truncate(0)
         lock.write(f'pid {os.getpid()}, {NAME} {" ".join(argv)}, since {time.strftime("%H:%M:%S")}\n')
         lock.flush()
-        if args.command not in ('build', 'update', 'server'):
+        if args.command not in ('build', 'update', 'server', 'port'):
             return handler(args)
         try:
             return handler(args)
@@ -2626,7 +3507,8 @@ if __name__ == '__main__':
         main()
     except (Stop, PlatformError, OSError) as stop:
         print(f'\n{stop}', file=sys.stderr)
-        sys.exit(3 if isinstance(stop, NeedsFix) else 4 if isinstance(stop, Deferred) else 1)
+        sys.exit(0 if isinstance(stop, Waiting) else 3 if isinstance(stop, NeedsFix)
+                 else 4 if isinstance(stop, Deferred) else 1)
     except KeyboardInterrupt:
         print('\nStopped. Your T3 Code is untouched.', file=sys.stderr)
         sys.exit(130)
