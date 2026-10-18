@@ -16,8 +16,8 @@ Subject: [PATCH 4/7] feat(mobile): nest child threads under their opener in
  apps/mobile/src/lib/storage.test.ts           |  20 +
  .../src/persistence/mobile-preferences.ts     |  18 +
  apps/mobile/src/state/entities.ts             |   5 +
+ .../src/components/Sidebar.childThreads.tsx   |  24 +-
  apps/web/src/components/Sidebar.families.ts   | 456 +------------
- apps/web/src/components/Sidebar.tsx           |  24 +-
  packages/client-runtime/package.json          |   4 +
  .../src/state/threadFamilies.test.ts          | 575 ++++++++++++++++
  .../src/state/threadFamilies.ts               | 488 ++++++++++++++
@@ -2170,6 +2170,78 @@ index 144325fb2d..c1602e1e08 100644
  export function useProject(ref: ScopedProjectRef | null): EnvironmentProject | null {
    return useAtomValue(ref === null ? EMPTY_PROJECT_ATOM : environmentProjects.projectAtom(ref));
  }
+diff --git a/apps/web/src/components/Sidebar.childThreads.tsx b/apps/web/src/components/Sidebar.childThreads.tsx
+index d086ba7d48..55dc7707cf 100644
+--- a/apps/web/src/components/Sidebar.childThreads.tsx
++++ b/apps/web/src/components/Sidebar.childThreads.tsx
+@@ -1,7 +1,7 @@
+ // Child threads in the sidebar (patches-tt/0003): a thread an agent opened
+ // renders under its opener when both sit in the same section, with a
+ // disclosure row that folds the family. The family rules live in
+-// Sidebar.families.ts; this module holds the sidebar's state and rendering so
++// threadFamilies.ts; this module holds the sidebar's state and rendering so
+ // Sidebar.tsx only calls into it.
+ import type { EnvironmentServerConfig } from "@t3tools/client-runtime/connection";
+ import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
+@@ -37,11 +37,13 @@ import {
+   placeChildThreadSections,
+   pruneChildThreadFolds,
+   settledEntryOf,
++  threadDelegatorKeyOf,
++  threadOpenerKeyOf,
+   toggleChildThreadFamily,
+   type ChildThreadFoldPlace,
+   type ChildThreadFolds,
+   type SidebarThreadFamily,
+-} from "./Sidebar.families";
++} from "@t3tools/client-runtime/state/thread-families";
+ import {
+   hasUnseenCompletion,
+   resolveSidebarThreadStatus,
+@@ -50,7 +52,7 @@ import {
+ } from "./Sidebar.logic";
+ import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
+ 
+-// Folded families (ChildThreadFolds in Sidebar.families.ts): heads the user
++// Folded families (ChildThreadFolds in threadFamilies.ts): heads the user
+ // collapsed outside Settled, and `<head key>@<settled entry>` for families the
+ // user expanded during their current stay in Settled, where they start
+ // collapsed.
+@@ -81,22 +83,14 @@ const threadShellKey = (thread: Pick<EnvironmentThreadShell, "environmentId" | "
+ const isFoldedSettledChild = (thread: EnvironmentThreadShell) =>
+   thread.settledOverride === "settled" && !childThreadStillRuns(resolveSidebarThreadStatus(thread));
+ 
+-const openerKeyOf = (thread: EnvironmentThreadShell) => {
+-  const openerId = thread.openedByThreadId ?? thread.delegatedByThreadId;
+-  return openerId === undefined
+-    ? null
+-    : scopedThreadKey(scopeThreadRef(thread.environmentId, openerId));
+-};
+-// Only called for delegated children; without a delegator a thread names
+-// itself, which ends the walk and keeps it hidden.
+-const delegatorKeyOf = (thread: EnvironmentThreadShell) =>
+-  scopedThreadKey(scopeThreadRef(thread.environmentId, thread.delegatedByThreadId ?? thread.id));
++const openerKeyOf = threadOpenerKeyOf;
++const delegatorKeyOf = threadDelegatorKeyOf;
+ 
+ /**
+  * Delegated tasks render under the thread that delegated them, in its
+  * section; other subagents stay out of the roster. A settled child stays with
+  * an opener that is not settled, folded away in its family, and reaches
+- * Settled with the opener (Sidebar.families.ts). The lists change in place.
++ * Settled with the opener (threadFamilies.ts). The lists change in place.
+  */
+ export function placeSidebarChildThreads(input: {
+   readonly live: readonly EnvironmentThreadShell[][];
+@@ -259,7 +253,7 @@ export function useSidebarChildThreads(input: {
+   const [shownSettledChildThreadKeys, setShownSettledChildThreadKeys] = useState<
+     ReadonlySet<string>
+   >(() => new Set());
+-  // Drops folds of families that left Settled or are gone (Sidebar.families.ts),
++  // Drops folds of families that left Settled or are gone (threadFamilies.ts),
+   // so a family that comes back to Settled starts collapsed again.
+   useEffect(() => {
+     const stateOf = childThreadFoldHeadStateOf(threads, threadShellKey, (thread) => {
 diff --git a/apps/web/src/components/Sidebar.families.ts b/apps/web/src/components/Sidebar.families.ts
 index c9b9bed009..c36543a6f6 100644
 --- a/apps/web/src/components/Sidebar.families.ts
@@ -2631,80 +2703,6 @@ index c9b9bed009..c36543a6f6 100644
 +// Child-thread family rules now live in client-runtime so the web sidebar and
 +// the mobile thread list nest threads the same way.
 +export * from "@t3tools/client-runtime/state/thread-families";
-diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
-index ac60c77588..0926337ae8 100644
---- a/apps/web/src/components/Sidebar.tsx
-+++ b/apps/web/src/components/Sidebar.tsx
-@@ -243,11 +243,13 @@ import {
-   placeChildThreadSections,
-   pruneChildThreadFolds,
-   settledEntryOf,
-+  threadDelegatorKeyOf,
-+  threadOpenerKeyOf,
-   toggleChildThreadFamily,
-   type ChildThreadFoldPlace,
-   type ChildThreadFolds,
-   type SidebarThreadFamily,
--} from "./Sidebar.families";
-+} from "@t3tools/client-runtime/state/thread-families";
- import { resolveLocalCheckoutBranchMismatch } from "./BranchToolbar.logic";
- import {
-   createSidebarCollisionDetection,
-@@ -317,7 +319,7 @@ const SETTLED_TAIL_PAGE_COUNT = 25;
- const SETTLED_SHELF_EXPANDED_KEY = "t3code:sidebar:settled-expanded";
- const SNOOZED_SHELF_EXPANDED_KEY = "t3code:sidebar:snoozed-expanded";
- const WORKING_SHELF_EXPANDED_KEY = "t3code:sidebar:working-expanded";
--// Folded families (ChildThreadFolds in Sidebar.families.ts): heads the user
-+// Folded families (ChildThreadFolds in threadFamilies.ts): heads the user
- // collapsed outside Settled, and `<head key>@<settled entry>` for families the
- // user expanded during their current stay in Settled, where they start
- // collapsed.
-@@ -344,16 +346,8 @@ interface RenderedChildThreadFamily extends SidebarThreadFamily<EnvironmentThrea
- const isFoldedSettledChild = (thread: EnvironmentThreadShell) =>
-   thread.settledOverride === "settled" && !childThreadStillRuns(resolveSidebarThreadStatus(thread));
- 
--const openerKeyOf = (thread: EnvironmentThreadShell) => {
--  const openerId = thread.openedByThreadId ?? thread.delegatedByThreadId;
--  return openerId === undefined
--    ? null
--    : scopedThreadKey(scopeThreadRef(thread.environmentId, openerId));
--};
--// Only called for delegated children; without a delegator a thread names
--// itself, which ends the walk and keeps it hidden.
--const delegatorKeyOf = (thread: EnvironmentThreadShell) =>
--  scopedThreadKey(scopeThreadRef(thread.environmentId, thread.delegatedByThreadId ?? thread.id));
-+const openerKeyOf = threadOpenerKeyOf;
-+const delegatorKeyOf = threadDelegatorKeyOf;
- 
- const inboxReturns = createInboxReturnTracker();
- 
-@@ -520,7 +514,7 @@ function useSidebarThreads(input: {
-     ? workingThreads
-     : routeThreadOnly(workingThreads, routeThreadKey);
- 
--  // Child threads (Sidebar.families.ts): a thread an agent opened renders
-+  // Child threads (threadFamilies.ts): a thread an agent opened renders
-   // under its opener when both sit in the same section. A collapsed family
-   // keeps only children that need the user, plus the open thread.
-   // Families start expanded, except in Settled, where each settle starts
-@@ -543,7 +537,7 @@ function useSidebarThreads(input: {
-     collapsed: collapsedChildThreadKeys,
-     expandedInSettled: expandedSettledChildThreadKeys,
-   };
--  // Drops folds of families that left Settled or are gone (Sidebar.families.ts),
-+  // Drops folds of families that left Settled or are gone (threadFamilies.ts),
-   // so a family that comes back to Settled starts collapsed again.
-   const foldNow = partition.snoozeNow;
-   useEffect(() => {
-@@ -769,7 +763,7 @@ function partitionSidebarThreads(input: SidebarThreadPartitionInput) {
-   // Delegated tasks render under the thread that delegated them, in its
-   // section; other subagents stay out of the roster. A settled child stays
-   // with an opener that is not settled, folded away in its family, and
--  // reaches Settled with the opener (Sidebar.families.ts).
-+  // reaches Settled with the opener (threadFamilies.ts).
-   placeChildThreadSections({
-     live: [pinned, active, working, snoozed],
-     settled,
 diff --git a/packages/client-runtime/package.json b/packages/client-runtime/package.json
 index 2fd34df6e8..4f406895a7 100644
 --- a/packages/client-runtime/package.json
@@ -3796,10 +3794,10 @@ index 0000000000..4757f5f791
 +export const threadFamilyKeyOf = (thread: EnvironmentThreadShell): string =>
 +  scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
 diff --git a/packages/client-runtime/src/state/threadShell.test.ts b/packages/client-runtime/src/state/threadShell.test.ts
-index 2fe2056af9..028df5f843 100644
+index cc4f2f900c..2c04098b39 100644
 --- a/packages/client-runtime/src/state/threadShell.test.ts
 +++ b/packages/client-runtime/src/state/threadShell.test.ts
-@@ -106,6 +106,43 @@ describe("v2 thread shell lists", () => {
+@@ -108,6 +108,43 @@ describe("v2 thread shell lists", () => {
      registry.dispose();
    });
  
@@ -3844,10 +3842,10 @@ index 2fe2056af9..028df5f843 100644
      const { registry, threads, snapshotAtom } = makeHarness();
      const root = v2ThreadShell;
 diff --git a/packages/client-runtime/src/state/threadShell.ts b/packages/client-runtime/src/state/threadShell.ts
-index beec64abe6..7c23cd8e92 100644
+index 315f5a93e4..6156c3b3b1 100644
 --- a/packages/client-runtime/src/state/threadShell.ts
 +++ b/packages/client-runtime/src/state/threadShell.ts
-@@ -361,6 +361,29 @@ export function createEnvironmentThreadShellAtoms(input: {
+@@ -411,6 +411,29 @@ export function createEnvironmentThreadShellAtoms(input: {
      return next;
    }).pipe(Atom.withLabel("environment-navigation-thread-shells"));
  
@@ -3877,7 +3875,7 @@ index beec64abe6..7c23cd8e92 100644
    return {
      environmentThreadsAtom,
      environmentThreadIndexAtom,
-@@ -369,6 +392,7 @@ export function createEnvironmentThreadShellAtoms(input: {
+@@ -419,6 +442,7 @@ export function createEnvironmentThreadShellAtoms(input: {
      threadRefsAtom,
      threadShellsAtom,
      navigationThreadShellsAtom,
