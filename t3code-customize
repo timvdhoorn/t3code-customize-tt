@@ -588,10 +588,42 @@ def abort_stopped(log):
     git('reset', '--quiet', '--hard', check=False, capture=False, log=log)
 
 
+def checkout_fingerprint():
+    """HEAD, the stopped rebase or am, and every staged and unstaged edit: any change by someone else alters it."""
+    digest = hashlib.sha256()
+    for args in (('rev-parse', 'HEAD'), ('status', '--porcelain', '--untracked-files=no'), ('diff',), ('diff', '--cached')):
+        digest.update(git(*args, check=False).encode())
+    digest.update(str(rebase_in_progress()).encode())
+    return digest.hexdigest()
+
+
+def update_run_marker(**values):
+    marker = run_marker()
+    if marker:
+        save(git_dir() / RUN_MARK, dict(marker, **values))
+
+
+def mark_unattended_stop():
+    """An unattended run leaves the checkout stopped: record exactly how, so a later unattended run can
+    tell its own untouched stop from one someone has worked on since."""
+    update_run_marker(stopped=checkout_fingerprint())
+
+
+def claim_checkout():
+    """A person or an agent works on this checkout (continue, checks, --resume outside a run that holds
+    the lock): no unattended run may clean it up from now on."""
+    if not os.environ.get('T3CODE_CUSTOMIZE_LOCK_HELD') and run_marker().get('unattended'):
+        update_run_marker(unattended=False, claimed=' '.join(sys.argv[1:]))
+
+
 def stopped_by_unattended_run():
-    """True when the checkout holds a stopped rebase or git am that an unattended run started (and
-    left for an agent that did not finish). This run holds the lock, so that run has ended."""
-    return rebase_in_progress() and run_marker().get('unattended') is True
+    """True when the checkout holds a stopped rebase or git am, or uncommitted edits, exactly as an
+    unattended run left them: started by an unattended run, never claimed by continue, checks or
+    --resume, and not touched since (same fingerprint). This run holds the lock, so that run has ended."""
+    stopped = rebase_in_progress() or bool(git('status', '--porcelain', '--untracked-files=no').strip())
+    marker = run_marker()
+    return (stopped and marker.get('unattended') is True and bool(marker.get('stopped'))
+            and marker['stopped'] == checkout_fingerprint())
 
 
 def has_commit(ref):
@@ -753,14 +785,22 @@ def check_lists_hash():
 CHECKS_STAMP = 't3code-customize-checks.json'
 
 
-def checks_stamped():
+def checks_stamp(target):
+    """What a pass covers: this commit on this nightly, with these check lists and this recipe (script and patches)."""
+    return {'head': git('rev-parse', 'HEAD').strip(), 'target': target, 'lists': check_lists_hash(),
+            'recipe': recipe_hash()}
+
+
+def checks_stamped(target):
     stamp = load(git_dir() / CHECKS_STAMP, {})
-    return stamp.get('head') == git('rev-parse', 'HEAD').strip() and stamp.get('lists') == check_lists_hash()
+    return all(stamp.get(key) == value for key, value in checks_stamp(target).items())
 
 
 # A test that only times out is often the machine, not the patch (the MacBook Pro under swap timed out
 # 28 tests in one night). Such a file runs once more on its own before it counts as failed.
 TIMED_OUT = re.compile(r'\b(Test|Hook) timed out in \d+ ?ms')
+# vitest exits non-zero on an error outside any test without failing a file in its report.
+UNHANDLED = re.compile(r'Unhandled (Error|Rejection)')
 # file(line,col): error (tsc) or file:line:col - error (tsc-rs).
 TYPE_ERROR = re.compile(r'^(\S+?\.[cm]?[jt]sx?)(?:\(\d+,\d+\)|:\d+:\d+)\s*[:-]\s*error', re.M)
 
@@ -784,7 +824,7 @@ def run_test_step(args, cwd, env, log, report_dir):
     """Run a vitest step; (passed, failing files). A file that failed only by timeout is rerun alone."""
     report = Path(tempfile.mkstemp(prefix='vitest-', suffix='.json', dir=str(report_dir))[1])
     try:
-        code, _ = run_bounded([*args, '--reporter=default', '--reporter=json', f'--outputFile.json={report}'],
+        code, output = run_bounded([*args, '--reporter=default', '--reporter=json', f'--outputFile.json={report}'],
                               env, log, STEP_TIMEOUT, cwd=cwd, merge=True)
         try:
             failed = failed_test_files(json.loads(report.read_text() or '{}'), Path(cwd).relative_to(SOURCE))
@@ -808,13 +848,16 @@ def run_test_step(args, cwd, env, log, report_dir):
         say(f'          {name}: timed out, ' + ('passed on its own' if not rerun else 'failed again on its own'))
         if rerun:
             failing.append(name + ' (timeout)')
+    if code and not failing and UNHANDLED.search(output):
+        # The reruns explain the failed files, not an unhandled error next to them.
+        failing.append(f'(vitest exited {code} with an unhandled error; see the log)')
     return not failing, failing
 
 
 def checks(env, log, target, force=False):
     """Run every test, typecheck and lint step, print each one's result and the failing files, and
     raise NeedsFix when any failed. Skipped when they already passed on this commit."""
-    if not force and checks_stamped():
+    if not force and checks_stamped(target):
         step('The checks already passed on this commit; skipping them.')
         return
     spec = check_spec()
@@ -885,8 +928,7 @@ def checks(env, log, target, force=False):
                 report('lint of the changed files', False, str(error).splitlines()[1:] or [str(error)], started)
     if failures:
         raise NeedsFix(f'The checks failed (log: {log.name}):\n' + '\n'.join('  ' + f for f in failures))
-    save(git_dir() / CHECKS_STAMP, {'head': git('rev-parse', 'HEAD').strip(), 'lists': check_lists_hash(),
-                                    'at': time.strftime('%Y-%m-%dT%H:%M:%S')})
+    save(git_dir() / CHECKS_STAMP, dict(checks_stamp(target), at=time.strftime('%Y-%m-%dT%H:%M:%S')))
 
 
 # A lint of every changed file takes 10 to 30 seconds. One hung for 35 minutes in an unattended
@@ -947,8 +989,13 @@ def lint_changed(changed, env, log, timeout=None):
     code, listed = run_bounded(['vp', 'lint', '--debug=files', *flags, *changed], env, log, timeout)
     if code:
         raise NeedsFix('Lint could not list the files to check. Command: vp lint --debug=files')
-    listed = {os.path.normpath(line.strip()) for line in listed.splitlines() if line.strip()}
+    lines = [line.strip() for line in listed.splitlines() if line.strip()]
+    listed = {os.path.normpath(os.path.relpath(line, str(SOURCE)) if os.path.isabs(line) else line) for line in lines}
     lintable = [f for f in changed if os.path.normpath(f) in listed]
+    if lines and not lintable:
+        # It listed something, yet none of the changed files: a format change would lint nothing.
+        raise NeedsFix('Lint listed files, but none of the changed ones; its --debug=files output is not'
+                       ' understood:\n' + '\n'.join(lines[:10]))
     ignored = [f for f in changed if f not in lintable]
     if ignored:
         log.write('Lint ignores (ignorePatterns): ' + ', '.join(ignored) + '\n')
@@ -1105,24 +1152,47 @@ class Waiting(Stop):
 RECIPE_FILES = ('patches', 'patches-port', 'patches-tt', 'patches-ios', 'checks.json', 'checks-tt.json', 'checks-ios.json')
 
 
-def effective_base(read):
-    """The nightly a patch set targets, through read(path) -> text or None: patches-port/ when it is there."""
-    return (read('patches-port/base.txt') or read('patches/base.txt') or '').strip()
+def effective_base(read, newer=None):
+    """The nightly a patch set targets, through read(path) -> text or None, chosen as choose_shared does:
+    patches-port/ only while it is a port to a newer nightly than patches/ (newer(old, new) says so)."""
+    upstream = (read('patches/base.txt') or '').strip()
+    port = (read('patches-port/base.txt') or '').strip()
+    if port and port != upstream and (newer is None or newer(upstream, port)):
+        return port
+    return upstream
+
+
+def descends(older, newer):
+    """True when newer has older in its history; also when the source lacks either commit, since a
+    patches-port/ was written as a port to a newer nightly."""
+    if not (has_commit(older) and has_commit(newer)):
+        return True
+    return git('merge-base', '--is-ancestor', older, newer, check=False, capture=False).returncode == 0
 
 
 def recipe_for(target, log=None):
-    """The newest commit of this repo whose patch set targets exactly target, or None."""
+    """The newest commit of this repo whose patch set targets exactly target and carries every layer this
+    run applies (patches-ios/ for ios and port), or None."""
     if not (REPO / '.git').exists():
         return None
     commits = repo_run('git', 'log', '--format=%H', 'HEAD', '--', *RECIPE_FILES, check=False).split()
+    needed = [folder.name for folder in own_layers() if any(folder.glob('*.patch'))]
 
     def reader(commit):
         def read(path):
             result = subprocess.run(['git', 'show', f'{commit}:{path}'], cwd=REPO, capture_output=True, text=True)
             return result.stdout if result.returncode == 0 else None
-        return read
 
-    return next((c for c in commits if effective_base(reader(c)) == target), None)
+        def listing(folder):
+            names = repo_run('git', 'ls-tree', '--name-only', commit, folder + '/', check=False).split()
+            return [n for n in names if n.endswith('.patch')]
+        return read, listing
+
+    for commit in commits:
+        read, listing = reader(commit)
+        if effective_base(read, descends) == target and all(listing(folder) for folder in needed):
+            return commit
+    return None
 
 
 def extract_recipe(commit):
@@ -1338,7 +1408,8 @@ def publish_port(args, version):
                f' The port is in {REPO}; commit it by hand.')
         return
     ports = load(PORTS, {})
-    ports[version] = {'url': url, 'merged': merged, 'at': time.strftime('%Y-%m-%dT%H:%M:%S')}
+    ports[version] = {'url': url, 'merged': merged, 'at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                      'layers': ['shared'] + [folder.name for folder in own_layers()]}
     save(PORTS, ports)
     if merged:
         notify(LAUNCHER_NAME, f'An agent ported the patches to {version}; only context moved, so {url} is merged'
@@ -1564,15 +1635,20 @@ def current_executable(state):
 
 
 def apply_patches(args, target, version, env, log, handoff=True):
-    """Put the patches on target and pass their checks, letting one agent session port them if allowed,
-    or else (unattended, without an agent) handing the port to the porter. True if the patches were
-    ported (export and commit them)."""
+    """Put the patches on target and pass their checks. An unattended run hands a port to the porter
+    (`port`, all three layers, one agent session); otherwise one agent session ports here if allowed.
+    True if the patches were ported (export and commit them)."""
     choose_shared(log)
     unattended = bool(getattr(args, 'background', False))
+    if args.resume:
+        claim_checkout()
     history = False
     if not args.resume and older_than_patches(target):
         use_older_recipe(target, log)
         history = True
+    delegate = unattended and handoff and porter_machine() is not None
+    if delegate and not history:
+        handed_off_already(target, version)
     step('Applying the patches...')
     resume = ported = args.resume
     agent = None
@@ -1585,21 +1661,65 @@ def apply_patches(args, target, version, env, log, handoff=True):
             return ported
         except NeedsFix as problem:
             say(str(problem))
+            if unattended:
+                mark_unattended_stop()
             if history:
                 # A patch set from history on the very nightly it was made for: nothing to port.
-                raise NeedsFix(f'{problem}\n\nThe patch set made for this nightly fails here; see the log.')
+                abort_stopped(log)
+                (git_dir() / RUN_MARK).unlink(missing_ok=True)
+                raise NeedsFix(f'{problem}\n\nThe patch set made for this nightly fails here; see the log.'
+                               ' The checkout is clean again.')
             if older_than_patches(target):
                 raise Stop(stuck_message(problem, target))
             if ported and agent:
                 # One agent session per port: it had every stage and the checks.
+                if unattended:
+                    port_failed(version, problem, log)
                 raise NeedsFix(stuck_message(problem, target))
+            pending = port_pending(version) if unattended else None
+            if pending:
+                # Ported already: its PR waits for review or merge. Leave nothing stopped behind.
+                abort_stopped(log)
+                (git_dir() / RUN_MARK).unlink(missing_ok=True)
+                raise PortHandedOff(f'{problem}\n\nThe port to {version} waits for review: {pending}.')
+            if delegate:
+                hand_off_port(target, version, problem, log)
             agent = choose_agent(args.fix)
             if not agent:
-                if unattended and handoff:
-                    hand_off_port(target, version, problem, log)
                 raise NeedsFix(stuck_message(problem, target))
             agent_fix(agent, str(problem), target, version, log)
             resume = ported = args.agent_ported = True
+
+
+def port_failed(version, problem, log):
+    """The one agent session did not finish: put this checkout back as it was, say so, and record it."""
+    abort_stopped(log)
+    (git_dir() / RUN_MARK).unlink(missing_ok=True)
+    ports = load(PORTS, {})
+    ports[version] = dict(ports.get(version, {}), failed=log.name, failedAt=time.strftime('%Y-%m-%dT%H:%M:%S'))
+    save(PORTS, ports)
+    notify(LAUNCHER_NAME, f'The port to {version} failed: the agent session left it unfinished. The checkout'
+           f' is clean again; transcript {log.name}.')
+
+
+def port_pending(version):
+    """The URL of a port to version that is published already (ports.json) or waits in an open
+    port/nightly-<version> PR, else None."""
+    record = load(PORTS, {}).get(version, {})
+    if record.get('url') and 'patches-ios' in record.get('layers', []):
+        return record['url']
+    repo = fork_repo()
+    if not repo or not shutil.which('gh'):
+        return None
+    try:
+        listed = subprocess.run(['gh', 'pr', 'list', '--repo', repo, '--state', 'open', '--json', 'url,headRefName'],
+                                capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+        prs = json.loads(listed.stdout) if listed.returncode == 0 else []
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    branch = f'port/nightly-{version}'
+    return next((pr['url'] for pr in prs if pr['headRefName'] == branch or
+                 pr['headRefName'].startswith(branch + '-')), None)
 
 
 # --- Handing a port to the porter -------------------------------------------------------
@@ -1627,15 +1747,38 @@ def port_command(machine, target, version):
             '--wait-lock', str(PORT_FLEET_WAIT)]
 
 
+def repo_path():
+    """This repo's path for the porter: relative to HOME when it lives there, else absolute."""
+    try:
+        return str(REPO.relative_to(HOME))
+    except ValueError:
+        return str(REPO)
+
+
 def remote_port_line(machine, target, version, path):
     """A shell line for the porter that starts the port detached: a systemd unit named by the nightly
-    (a second start while it runs fails, and is a no-op), else nohup."""
-    tool = f'python3 "$HOME"/{shlex.quote(path)}/{NAME} ' + shlex.join(port_command(machine, target, version))
+    (a second start while it runs fails with "already", a no-op), else, also when systemd-run fails
+    otherwise, nohup."""
+    where = shlex.quote(path) if path.startswith('/') else '"$HOME"/' + shlex.quote(path)
+    tool = f'python3 {where}/{NAME} ' + shlex.join(port_command(machine, target, version))
     unit = f'{NAME}-port-{target[:12]}'
-    log = f'"$HOME"/.cache/{NAME}/logs/port.log'
-    return (f'if command -v systemd-run >/dev/null 2>&1; then systemd-run --user --collect --unit={unit}'
-            f' --setenv=PATH="$PATH" {tool}; else mkdir -p "$HOME"/.cache/{NAME}/logs;'
-            f' nohup {tool} >>{log} 2>&1 </dev/null & fi')
+    logs = f'"$HOME"/.cache/{NAME}/logs'
+    fallback = f'mkdir -p {logs}; nohup {tool} >>{logs}/port.log 2>&1 </dev/null & echo started with nohup'
+    return (f'if command -v systemd-run >/dev/null 2>&1; then'
+            f' out=$(systemd-run --user --collect --unit={unit} --setenv=PATH="$PATH" {tool} 2>&1); rc=$?;'
+            f' if [ $rc -eq 0 ]; then echo "$out"; elif echo "$out" | grep -q already; then echo "already running: $out";'
+            f' else echo "systemd-run failed: $out"; {fallback}; fi;'
+            f' else {fallback}; fi')
+
+
+def handed_off_already(target, version, clock=time.time):
+    """Raise PortHandedOff before touching the checkout when this nightly was handed to the porter within
+    the quiet window and the patches here did not change since (the porter runs or ran that port)."""
+    earlier = load(HANDOFFS, {}).get(target, {})
+    if (earlier and not earlier.get('unreachable') and clock() - earlier.get('at', 0) < HANDOFF_QUIET
+            and recipe_hash() in earlier.get('recipes', [])):
+        raise PortHandedOff(f'The port to {version} was handed to {earlier.get("porter")} at'
+                            f' {time.strftime("%H:%M", time.localtime(earlier["at"]))}; waiting for its PR.')
 
 
 def hand_off_port(target, version, problem, log, clock=time.time):
@@ -1648,7 +1791,10 @@ def hand_off_port(target, version, problem, log, clock=time.time):
     handed = load(HANDOFFS, {})
     earlier = handed.get(target, {})
     name = porter['name']
-    if earlier and clock() - earlier.get('at', 0) < HANDOFF_QUIET:
+    recent = bool(earlier) and clock() - earlier.get('at', 0) < HANDOFF_QUIET
+    if recent and not earlier.get('unreachable'):
+        earlier['recipes'] = sorted(set(earlier.get('recipes', [])) | {recipe_hash()})
+        save(HANDOFFS, handed)
         raise PortHandedOff(f'{problem}\n\nThe port to {version} was handed to {name} already'
                             f' ({time.strftime("%H:%M", time.localtime(earlier["at"]))}); waiting for its PR.')
     me = this_machine(load(MACHINES, {}).get('machines', []))
@@ -1657,13 +1803,19 @@ def hand_off_port(target, version, problem, log, clock=time.time):
     else:
         alias = ssh_target(porter)
         if not alias:
+            if not recent:
+                # Once per quiet window; the next runs retry quietly.
+                handed[target] = {'version': version, 'porter': name, 'at': clock(), 'unreachable': True}
+                save(HANDOFFS, handed)
+                notify(LAUNCHER_NAME, f'The patches do not fit {version} yet and the porter {name} is unreachable'
+                       ' over SSH; nobody ports this nightly yet.')
             raise NeedsFix(f'{problem}\n\nThe porter {name} is unreachable over SSH; nobody ports this nightly yet.')
-        path = porter.get('repo') or str(REPO.relative_to(HOME))
+        path = porter.get('repo') or repo_path()
         started = remote(alias, remote_port_line(porter, target, version, path), capture_output=True, text=True)
         log.write(f'\n--- port handed to {name}: {started.returncode}\n{started.stdout}{started.stderr}\n')
-        if started.returncode and 'already' not in (started.stderr + started.stdout):
-            raise NeedsFix(f'{problem}\n\nStarting the port on {name} failed: {started.stderr.strip()[:200]}')
-    handed[target] = {'version': version, 'porter': name, 'at': clock()}
+        if started.returncode:
+            raise NeedsFix(f'{problem}\n\nStarting the port on {name} failed: {(started.stderr or started.stdout).strip()[:200]}')
+    handed[target] = {'version': version, 'porter': name, 'at': clock(), 'recipes': [recipe_hash()]}
     save(HANDOFFS, handed)
     notify(LAUNCHER_NAME, f'The patches do not fit {version} yet: port running on {name}.'
            ' T3 Code stays as it is until the port is merged.')
@@ -1864,6 +2016,7 @@ def tool_log(name):
 def cmd_continue(args):
     """After resolving a conflict: finish the stopped stage, apply the next one, print the next conflict."""
     target, _ = follow_marker(args)
+    claim_checkout()
     with tool_log('continue') as log:
         with contextlib.redirect_stdout(io.StringIO()):
             choose_shared(log)
@@ -1882,6 +2035,7 @@ def cmd_continue(args):
 def cmd_checks(args):
     """Run the tests, typechecks and lint of every patch layer this checkout carries."""
     target, _ = follow_marker(args)
+    claim_checkout()
     if rebase_in_progress():
         raise NeedsFix(f'A rebase or git am is stopped in {SOURCE}; finish it with {NAME} continue first.')
     with tool_log('checks') as log:
@@ -1916,9 +2070,9 @@ def cmd_port(args):
     version = args.version
     if not version and not args.commit:
         version, _ = newest_nightly()
-    published = load(PORTS, {}).get(version) if version else None
-    if published and not args.force and not args.dry_run:
-        say(f'The port to {version} is published already: {published["url"]}. Nothing to do.')
+    pending = port_pending(version) if version and not args.force and not args.dry_run else None
+    if pending:
+        say(f'The port to {version} is published already or waits for review: {pending}. Nothing to do.')
         return False
     with tool_log('port') as log:
         env = build_env(ensure_node(log))

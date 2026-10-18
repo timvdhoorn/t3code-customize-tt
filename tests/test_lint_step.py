@@ -32,7 +32,12 @@ if mode == 'hang':
     open(os.environ['FAKE_CHILD'], 'w').write(str(child.pid))
     time.sleep(60)
 if '--debug=files' in args:
-    print('\\n'.join(f for f in files if f != {ignored!r}))
+    if mode == 'foreign':
+        print('apps/web/src/somewhere-else.ts')
+    elif mode == 'absolute':
+        print('\\n'.join(os.path.join(os.getcwd(), f) for f in files if f != {ignored!r}))
+    else:
+        print('\\n'.join(f for f in files if f != {ignored!r}))
     sys.exit(0)
 if mode == 'none':
     print('No files found to lint. Please check your paths and ignore patterns.')
@@ -108,6 +113,18 @@ class LintStepTest(unittest.TestCase):
         with self.assertRaises(customize.NeedsFix) as stop:
             self.lint('none', ['a.ts'])
         self.assertIn('No files found to lint', str(stop.exception))
+
+    def test_a_listing_that_names_none_of_the_changed_files_fails(self):
+        # A changed --debug=files format must not turn into linting nothing.
+        with self.assertRaises(customize.NeedsFix) as stop:
+            self.lint('foreign', ['a.ts', 'b.ts'])
+        self.assertIn('none of the changed ones', str(stop.exception))
+        self.assertEqual(self.lint_calls(), [])
+
+    def test_absolute_paths_in_the_listing_match_the_changed_files(self):
+        self.lint('absolute', ['a.ts', 'b.tsx'])
+        files = [a for a in self.lint_calls()[0] if not a.startswith('-') and a != 'json']
+        self.assertEqual(files, ['a.ts', 'b.tsx'])
 
     def test_hang_is_stopped_with_its_whole_process_tree(self):
         started = time.monotonic()

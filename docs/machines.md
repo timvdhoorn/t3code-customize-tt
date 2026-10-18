@@ -51,13 +51,18 @@ run the same patches.
   (detached, in the systemd unit `t3code-customize-port-<commit>`; a second start while it runs is a
   no-op, and the porter's lock serialises it with its own runs), notifies "port running on devbox1",
   and leaves its checkout clean and its app untouched. It does not hand the same nightly over again
-  for 12 hours. `port` applies all three layers, runs one agent session through every stage and the
+  for 12 hours, and while the patches stay the same its hourly runs stop before they touch the
+  checkout; an unreachable porter is notified once per 12 hours. The porter's own unattended runs
+  (`server --fix claude` at 04:30) hand their port to `port` too, so every port carries all three
+  layers. A port that waits for review (`ports.json`, or an open `port/nightly-<version>` PR) is not
+  ported again by any run. When the one agent session leaves a port unfinished, its run cleans the
+  checkout, records `failed` in `ports.json` and notifies. `port` applies all three layers, runs one agent session through every stage and the
   checks (`docs/porting.md`), then publishes as below. The Mac's next hourly run picks the merged port
   up through `pull_latest`.
 - **A nightly older than the patches** (the Mac still on the nightly before a port merged) builds
   with the patch set from git history made for exactly that nightly, or waits for the app update
   and exits 0. It never leaves a stopped rebase or `git am`; an unattended run that finds one an
-  unattended run left aborts it.
+  unattended run left, untouched since, aborts it (`continue`, `checks` or `--resume` claim it).
 - **Asked to update** ("update", "zijn er updates", "update alles"): follow
   [`.agents/playbooks/update.md`](../.agents/playbooks/update.md).
 - **A new machine:** follow "A new machine" in [README.md](../README.md). A new Linux box is first set up
@@ -74,7 +79,9 @@ Tim's standing grant (retro of 2026-10-16): when `--fix <agent>` ported the patc
 against `main`. It merges that PR (squash) and starts `fleet`, without asking, only when both hold:
 
 1. every test, typecheck and lint in `checks.json` and `checks-*.json` that the run applies passed
-   (the port did not run with `--skip-checks`), and
+   (the port did not run with `--skip-checks`, which blocks the grant). The tool trusts the stamp
+   `checks` writes (`t3code-customize-checks.json` in the checkout's git dir: HEAD, nightly, check
+   lists and `recipe_hash()`); a run that finds it current skips the checks, and
 2. each patch keeps exactly the same code: per patch (shared set, `patches-tt/`, `patches-ios/`,
    matched by number) the files it changes, in order by their `diff --git` path, each with its
    added and removed lines in order, without blank and comment-only lines, are identical to the

@@ -51,6 +51,8 @@ Otherwise run the same Python entry with `build --resume`. It reruns the checks 
 left it, builds, installs the result and writes the ported commits back to
 `patches/`. Leave the checkout clean with no rebase in progress.
 
+Fork: the porting loop (`continue`, `checks`, `port`) is in [docs/porting.md](docs/porting.md); `build --resume` claims the stopped checkout, so no unattended run cleans it up.
+
 End with a short report: what changed upstream, what you changed and in which files,
 and whether the final build succeeded. Separate fixture tests, native process
 checks and real desktop startup evidence.

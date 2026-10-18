@@ -34,8 +34,10 @@ Run every command from the repo (`./t3code-customize`, or the path the prompt gi
 3. **`./t3code-customize checks`** installs dependencies if needed and runs every test, typecheck
    and lint in `checks.json`, `checks-tt.json` and (with `patches-ios/`) `checks-ios.json`. It
    prints `pass` or `FAIL` per step with the failing files; the full output is in the log it names.
-   A test file that failed only by a timeout runs once more on its own before it counts. When
-   everything passes it stamps the commit, so the tool's own run afterwards skips the checks.
+   A test file that failed only by a timeout runs once more on its own before it counts; a
+   non-zero exit with an unhandled error fails the step too. When everything passes it stamps the
+   commit (with the nightly, the check lists and the recipe), so the tool's own run afterwards skips
+   the checks.
 4. **Fix** a failing check in the commit of the patch that causes it: `git commit --fixup=<sha>`,
    then `git -c sequence.editor=true rebase -i --autosquash <nightly commit>`. Run `checks` again.
    If a test file moved upstream, its path in the check list moves with it (say so in your report).
@@ -56,7 +58,8 @@ push or build.
 ## By hand, outside a tool run
 
 The shared checkout belongs to whichever run holds `~/.cache/t3code-customize/lock` (the file names
-the holder). Work in your own detached worktree:
+the holder). `continue`, `checks` and `build --resume` claim a stop there, so no unattended run
+cleans it up while you work on it. Work in your own detached worktree:
 
 ```sh
 git -C ~/.cache/t3code-customize/t3code worktree add --detach <dir> HEAD

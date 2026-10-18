@@ -57,8 +57,13 @@ class Sandbox(unittest.TestCase):
         self.nightly = commit(self.source, {'a.txt': 'x\n', 'b.txt': 'y\n'}, 'nightly')
         (self.recipe / 'patches' / 'base.txt').write_text(self.base + '\n')
         (self.recipe / 'checks.json').write_text('{"tests": [], "typecheck": []}\n')
+        (root / 'machines.json').write_text('{"machines": []}\n')
+        self.notes = []
         for name, value in (('SOURCE', self.source), ('CACHE', self.cache), ('WITH_IOS', True),
-                            ('DATA', root / 'data')):
+                            ('DATA', root / 'data'), ('PORTS', root / 'data/ports.json'),
+                            ('HANDOFFS', root / 'data/handoffs.json'), ('MACHINES', root / 'machines.json'),
+                            ('notify', lambda title, message: self.notes.append(message)),
+                            ('fork_repo', lambda: None)):
             patcher = patch.object(customize, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -66,6 +71,13 @@ class Sandbox(unittest.TestCase):
         customize.use_recipe(self.recipe)
         self.log = (root / 'log').open('w+')
         self.addCleanup(self.log.close)
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop('T3CODE_CUSTOMIZE_LOCK_HELD', None)
+
+    def clean(self):
+        return not customize.rebase_in_progress() and not git(self.source, 'status', '--porcelain', '--untracked-files=no')
 
     def quiet(self, function, *args, **kwargs):
         with contextlib.redirect_stdout(io.StringIO()) as out:
@@ -118,31 +130,88 @@ class StageLoopTest(Sandbox):
 
 
 class StoppedCheckoutTest(Sandbox):
-    def test_an_unattended_run_aborts_the_stop_an_unattended_run_left(self):
+    def unattended_stop(self):
         with self.assertRaises(customize.NeedsFix):
             self.prepare(unattended=True)
+        customize.mark_unattended_stop()
         self.assertTrue(customize.rebase_in_progress())
+
+    def assert_protected(self):
+        with self.assertRaises(customize.Stop) as stop:
+            self.quiet(self.prepare, unattended=True)
+        self.assertNotIsInstance(stop.exception, customize.NeedsFix)
+        self.assertIn('stopped rebase or git am', str(stop.exception))
+        self.assertTrue(customize.rebase_in_progress())
+
+    def test_an_unattended_run_aborts_the_stop_an_unattended_run_left(self):
+        self.unattended_stop()
         with self.assertRaises(customize.NeedsFix) as stop:
             self.quiet(self.prepare, unattended=True)
         # It started over: the stop it reports is a fresh one, not the guard.
         self.assertIn('The shared patches conflict', str(stop.exception))
 
+    def test_continue_claims_the_stop_before_the_next_unattended_run(self):
+        self.unattended_stop()
+        self.resolve('a.txt', '2\n')
+        with self.assertRaises(customize.NeedsFix):
+            self.cont()  # on to patches-tt/, which conflicts too
+        self.assertFalse(customize.run_marker()['unattended'])
+        self.assert_protected()
+        self.assertEqual(git(self.source, 'rev-list', '--count', self.nightly + '..HEAD'), '1')
+
+    def test_checks_and_resume_claim_the_stop(self):
+        self.unattended_stop()
+        with self.assertRaises(customize.NeedsFix):
+            self.quiet(customize.cmd_checks, argparse.Namespace(target=None, ios=False, force=False))
+        self.assertFalse(customize.run_marker()['unattended'])
+        self.assert_protected()
+        customize.update_run_marker(unattended=True)
+        args = argparse.Namespace(resume=True, skip_checks=True, fix=None, background=False)
+        with self.assertRaises(customize.NeedsFix):
+            self.quiet(customize.apply_patches, args, self.nightly, 'n2', {}, self.log)
+        self.assertFalse(customize.run_marker()['unattended'])
+        self.assert_protected()
+
+    def test_work_without_continue_after_the_stop_stays_protected(self):
+        # The other order: someone resolves files (staged or not) but has not run continue yet.
+        self.unattended_stop()
+        self.resolve('a.txt', '2\n')
+        self.assertTrue(customize.run_marker()['unattended'])
+        self.assert_protected()
+        self.assertEqual(git(self.source, 'diff', '--cached', '--name-only'), 'a.txt')
+
+    def test_the_run_holding_the_lock_does_not_claim_its_own_stop(self):
+        self.unattended_stop()
+        os.environ['T3CODE_CUSTOMIZE_LOCK_HELD'] = '1'
+        customize.claim_checkout()
+        self.assertTrue(customize.run_marker()['unattended'])
+
+    def test_edits_an_unattended_run_left_without_a_rebase_are_cleaned_too(self):
+        self.unattended_stop()
+        self.resolve('a.txt', '2\n')
+        with self.assertRaises(customize.NeedsFix):
+            self.quiet(customize.cmd_continue, argparse.Namespace(target=None, ios=False))
+        # Pretend an agent session (holding the lock) left uncommitted edits and no rebase.
+        self.resolve('b.txt', '2\n')
+        self.cont()
+        (self.source / 'a.txt').write_text('half done\n')
+        customize.update_run_marker(unattended=True)
+        customize.mark_unattended_stop()
+        self.assertFalse(customize.rebase_in_progress())
+        with self.assertRaises(customize.NeedsFix) as stop:
+            self.quiet(self.prepare, unattended=True)
+        self.assertIn('The shared patches conflict', str(stop.exception))
+
     def test_a_stop_a_person_or_agent_started_stays_protected(self):
         with self.assertRaises(customize.NeedsFix):
             self.prepare(unattended=False)
-        with self.assertRaises(customize.Stop) as stop:
-            self.prepare(unattended=True)
-        self.assertNotIsInstance(stop.exception, customize.NeedsFix)
-        self.assertIn('stopped rebase or git am', str(stop.exception))
-        self.assertTrue(customize.rebase_in_progress())
+        customize.mark_unattended_stop()
+        self.assert_protected()
 
     def test_a_stop_without_a_marker_stays_protected(self):
-        with self.assertRaises(customize.NeedsFix):
-            self.prepare(unattended=True)
+        self.unattended_stop()
         (customize.git_dir() / customize.RUN_MARK).unlink()
-        with self.assertRaises(customize.Stop) as stop:
-            self.prepare(unattended=True)
-        self.assertIn('stopped rebase or git am', str(stop.exception))
+        self.assert_protected()
 
 
 class ChecksStampTest(Sandbox):
@@ -151,21 +220,24 @@ class ChecksStampTest(Sandbox):
         git(self.source, 'checkout', '-q', '--detach', self.base)
 
     def test_checks_that_passed_on_this_commit_are_skipped(self):
-        customize.save(customize.git_dir() / customize.CHECKS_STAMP,
-                       {'head': git(self.source, 'rev-parse', 'HEAD'), 'lists': customize.check_lists_hash()})
+        customize.save(customize.git_dir() / customize.CHECKS_STAMP, customize.checks_stamp(self.base))
         with patch.object(customize, 'run_bounded', side_effect=AssertionError('ran a check')):
             _, out = self.quiet(customize.checks, {}, self.log, self.base)
         self.assertIn('already passed on this commit', out)
 
-    def test_a_new_commit_or_changed_check_list_runs_them_again(self):
+    def test_a_new_commit_nightly_check_list_or_recipe_runs_them_again(self):
         stamp = customize.git_dir() / customize.CHECKS_STAMP
-        customize.save(stamp, {'head': self.base, 'lists': customize.check_lists_hash()})
+        customize.save(stamp, customize.checks_stamp(self.base))
+        self.assertTrue(customize.checks_stamped(self.base))
+        self.assertFalse(customize.checks_stamped(self.nightly))
         (self.recipe / 'checks.json').write_text('{"tests": [], "typecheck": ["x"]}\n')
-        self.assertFalse(customize.checks_stamped())
+        self.assertFalse(customize.checks_stamped(self.base))
         (self.recipe / 'checks.json').write_text('{"tests": [], "typecheck": []}\n')
-        self.assertTrue(customize.checks_stamped())
-        customize.save(stamp, {'head': self.nightly, 'lists': customize.check_lists_hash()})
-        self.assertFalse(customize.checks_stamped())
+        self.assertTrue(customize.checks_stamped(self.base))
+        with patch.object(customize, 'recipe_hash', return_value='another script'):
+            self.assertFalse(customize.checks_stamped(self.base))
+        git(self.source, 'checkout', '-q', '--detach', self.nightly)
+        self.assertFalse(customize.checks_stamped(self.base))
 
     def test_passing_checks_write_the_stamp_and_force_ignores_it(self):
         calls = []
@@ -176,7 +248,8 @@ class ChecksStampTest(Sandbox):
         (self.recipe / 'checks.json').write_text('{"tests": [], "typecheck": ["packages/x"]}\n')
         with patch.object(customize, 'run_bounded', fake):
             self.quiet(customize.checks, {}, self.log, self.base)
-            self.assertTrue(customize.checks_stamped())
+            self.assertTrue(customize.checks_stamped(self.base))
+            self.assertEqual(customize.load(customize.git_dir() / customize.CHECKS_STAMP)['target'], self.base)
             self.quiet(customize.checks, {}, self.log, self.base, force=True)
         self.assertEqual(len(calls), 2)
 
@@ -202,6 +275,10 @@ for name in files:
         results.append(dict(name=os.path.join(os.getcwd(), name), status='passed', message='', assertionResults=[]))
 if out:
     json.dump(dict(testResults=results), open(out, 'w'))
+if os.environ.get('FAKE_UNHANDLED') and len(files) > 1:
+    print('Vitest caught 1 unhandled error during the test run.')
+    print('⎯⎯ Unhandled Rejection ⎯⎯')
+    sys.exit(1)
 sys.exit(1 if any(r['status'] == 'failed' for r in results) else 0)
 '''
 
@@ -238,6 +315,16 @@ class TimeoutRerunTest(unittest.TestCase):
         self.assertIn('slow.test.ts failed only by timeout', log)
         self.assertIn('slow.test.ts passed on its own', log)
 
+    def test_an_unhandled_error_still_fails_after_the_timeouts_passed_alone(self):
+        self.env['FAKE_UNHANDLED'] = '1'
+        passed, failing = self.step(['ok.test.ts', 'slow.test.ts'], 'pass')
+        self.assertFalse(passed)
+        self.assertIn('unhandled error', failing[0])
+
+    def test_an_unhandled_error_without_a_failed_file_fails(self):
+        self.env['FAKE_UNHANDLED'] = '1'
+        self.assertFalse(self.step(['ok.test.ts', 'ok2.test.ts'], 'pass')[0])
+
     def test_a_timeout_that_repeats_alone_counts_as_failed(self):
         self.assertEqual(self.step(['ok.test.ts', 'slow.test.ts'], 'fail'), (False, ['slow.test.ts (timeout)']))
 
@@ -270,7 +357,8 @@ class OlderNightlyTest(unittest.TestCase):
                          'port to n1')
         self.feature = commit(self.repo, {'patches-tt/0001-x.patch': 'v3\n'}, 'feature on n1')
         commit(self.repo, {'patches-port/base.txt': 'c' * 40 + '\n', 'patches-tt/0001-x.patch': 'v4\n'}, 'port to n2')
-        for name, value in (('REPO', self.repo), ('CACHE', self.cache)):
+        # SOURCE is this repo too: the fake nightlies are unknown there, as they would be anywhere.
+        for name, value in (('REPO', self.repo), ('CACHE', self.cache), ('SOURCE', self.repo)):
             patcher = patch.object(customize, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -281,6 +369,21 @@ class OlderNightlyTest(unittest.TestCase):
         folder = customize.extract_recipe(self.feature)
         self.assertEqual((folder / 'patches-tt/0001-x.patch').read_text(), 'v3\n')
         self.assertEqual((folder / 'patches-port/base.txt').read_text().strip(), 'b' * 40)
+
+    def test_a_patch_set_without_a_layer_this_run_applies_is_skipped(self):
+        (self.repo / 'patches-ios').mkdir()
+        (self.repo / 'patches-ios' / '0001-y.patch').write_text('ios\n')
+        with patch.object(customize, 'WITH_IOS', True), patch.object(customize, 'IOS_PATCHES', self.repo / 'patches-ios'):
+            self.assertIsNone(customize.recipe_for('b' * 40))
+            with_ios = commit(self.repo, {'patches-port/base.txt': 'b' * 40 + '\n'}, 'ios layer on n1')
+            self.assertEqual(customize.recipe_for('b' * 40), with_ios)
+
+    def test_the_base_follows_choose_shared(self):
+        files = {'patches/base.txt': 'a' * 40, 'patches-port/base.txt': 'b' * 40}
+        self.assertEqual(customize.effective_base(files.get, lambda old, new: True), 'b' * 40)
+        # Upstream caught up past the port: patches-port/ is unused, so patches/ decides.
+        self.assertEqual(customize.effective_base(files.get, lambda old, new: False), 'a' * 40)
+        self.assertEqual(customize.effective_base({'patches/base.txt': 'a' * 40, 'patches-port/base.txt': 'a' * 40}.get), 'a' * 40)
 
     def test_no_patch_set_for_that_nightly_waits_for_the_app_update(self):
         self.assertIsNone(customize.recipe_for('d' * 40))
@@ -341,6 +444,34 @@ class HandOffTest(Sandbox):
         self.assertIn('python3 "$HOME"/Devops/Personal/t3code-customize-tt/t3code-customize port --commit', line)
         self.assertIn('nohup', line)
 
+    def run_line(self, systemd):
+        """Run the remote line with a fake systemd-run and a fake tool that records that it started."""
+        root = Path(self.tmp.name)
+        (root / 'bin').mkdir(exist_ok=True)
+        (root / 'repo').mkdir(exist_ok=True)
+        started = root / 'started'
+        (root / 'repo' / 't3code-customize').write_text(f'open({str(started)!r}, "a").write("tool\\n")\n')
+        fake = root / 'bin' / 'systemd-run'
+        fake.write_text('#!/bin/sh\n' + systemd + '\n')
+        fake.chmod(0o755)
+        line = customize.remote_port_line(customize.porter_machine(), 'f' * 40, 'n2', str(root / 'repo'))
+        env = dict(os.environ, HOME=str(root), PATH=f'{root / "bin"}:{os.environ["PATH"]}')
+        out = subprocess.run(['sh', '-c', line + '; wait'], env=env, capture_output=True, text=True, timeout=30)
+        return out.stdout, started.exists()
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX shell')
+    def test_systemd_run_failing_otherwise_falls_back_to_nohup(self):
+        out, started = self.run_line('echo "Failed to connect to bus: No medium found" >&2; exit 1')
+        self.assertIn('systemd-run failed', out)
+        self.assertIn('started with nohup', out)
+        self.assertTrue(started)
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX shell')
+    def test_a_port_unit_that_runs_already_is_left_alone(self):
+        out, started = self.run_line('echo "Failed to start transient service unit: Unit t.service was already loaded" >&2; exit 1')
+        self.assertIn('already running', out)
+        self.assertFalse(started)
+
     def test_a_machine_without_fix_hands_the_port_over_and_stays_clean(self):
         args = argparse.Namespace(resume=False, skip_checks=True, fix=None, background=True)
         with patch.object(customize, 'interactive', lambda: False):
@@ -352,13 +483,56 @@ class HandOffTest(Sandbox):
         self.assertEqual([s[0] for s in self.started], ['devbox1', 'notify'])
         self.assertIn('port --commit ' + self.nightly, self.started[0][1])
         self.assertIn('port running on devbox1', self.started[1][1])
-        # The next hourly run hands nothing over again, and stays clean too.
-        with patch.object(customize, 'interactive', lambda: False):
+        # The next hourly run stops before it touches the checkout or runs a check.
+        with patch.object(customize, 'prepare', side_effect=AssertionError('applied the patches again')):
             with self.assertRaises(customize.PortHandedOff) as again:
                 self.quiet(customize.apply_patches, args, self.nightly, 'n2', {}, self.log)
-        self.assertIn('handed to devbox1 already', str(again.exception))
+        self.assertIn('was handed to devbox1 at', str(again.exception))
         self.assertEqual(len(self.started), 2)
-        self.assertFalse(customize.rebase_in_progress())
+
+    def test_changed_patches_after_a_hand_off_are_applied_again(self):
+        customize.save(customize.HANDOFFS, {self.nightly: {'porter': 'devbox1', 'at': 1e12, 'recipes': ['old']}})
+        with patch.object(customize.time, 'time', lambda: 1e12 + 60):
+            customize.handed_off_already(self.nightly, 'n2', clock=lambda: 1e12 + 60)  # no raise
+            customize.save(customize.HANDOFFS, {self.nightly: {'porter': 'devbox1', 'at': 1e12,
+                                                               'recipes': [customize.recipe_hash()]}})
+            with self.assertRaises(customize.PortHandedOff):
+                customize.handed_off_already(self.nightly, 'n2', clock=lambda: 1e12 + 60)
+        # After the quiet window it tries again.
+        customize.handed_off_already(self.nightly, 'n2', clock=lambda: 1e12 + customize.HANDOFF_QUIET + 1)
+
+    def test_the_porter_itself_hands_its_server_run_to_port(self):
+        spawned = []
+        args = argparse.Namespace(resume=False, skip_checks=True, fix='claude', background=True)
+        with patch.object(customize, 'this_machine', lambda machines: machines[1]), \
+                patch.object(customize, 'spawn_detached', lambda argv, name: spawned.append(argv)), \
+                patch.object(customize, 'agent_fix', side_effect=AssertionError('ported inline')):
+            with self.assertRaises(customize.PortHandedOff):
+                self.quiet(customize.apply_patches, args, self.nightly, 'n2', {}, self.log)
+        self.assertEqual(spawned[0][2:], customize.port_command(customize.porter_machine(), self.nightly, 'n2'))
+        self.assertTrue(self.clean())
+        self.assertEqual([s[0] for s in self.started], ['notify'])
+
+    def test_an_unreachable_porter_is_reported_once_per_window(self):
+        args = argparse.Namespace(resume=False, skip_checks=True, fix=None, background=True)
+        with patch.object(customize, 'ssh_target', lambda machine: None):
+            for _ in range(2):
+                with self.assertRaises(customize.NeedsFix) as stop:
+                    self.quiet(customize.apply_patches, args, self.nightly, 'n2', {}, self.log)
+                self.assertNotIsInstance(stop.exception, customize.PortHandedOff)
+                self.assertIn('unreachable', str(stop.exception))
+                self.assertTrue(self.clean())
+        notes = [s for s in self.started if s[0] == 'notify']
+        self.assertEqual(len(notes), 1)
+        self.assertIn('unreachable', notes[0][1])
+        self.assertTrue(customize.load(customize.HANDOFFS)[self.nightly]['unreachable'])
+
+    def test_a_repo_outside_home_is_passed_as_an_absolute_path(self):
+        with patch.object(customize, 'REPO', Path('/srv/t3code-customize-tt')):
+            self.assertEqual(customize.repo_path(), '/srv/t3code-customize-tt')
+            line = customize.remote_port_line(customize.porter_machine(), 'f' * 40, 'n2', customize.repo_path())
+        self.assertIn('python3 /srv/t3code-customize-tt/t3code-customize port', line)
+        self.assertNotIn('$HOME"//srv', line)
 
     def test_a_run_someone_watches_does_not_hand_over(self):
         args = argparse.Namespace(resume=False, skip_checks=True, fix=None, background=False)
@@ -383,19 +557,53 @@ class OneAgentSessionTest(Sandbox):
         args = argparse.Namespace(resume=False, skip_checks=True, fix='claude', background=True)
         with patch.object(customize, 'agent_fix', agent), patch.object(customize, 'choose_agent', lambda r: r), \
                 patch.object(customize, 'install_dependencies', lambda env, log: None):
-            ported, _ = self.quiet(customize.apply_patches, args, self.nightly, 'n2', {}, self.log)
+            ported, _ = self.quiet(customize.apply_patches, args, self.nightly, 'n2', {}, self.log, handoff=False)
         self.assertTrue(ported)
         self.assertEqual(len(sessions), 1)
         self.assertEqual(git(self.source, 'rev-list', '--count', self.nightly + '..HEAD'), '3')
 
     def test_an_unfinished_session_is_not_followed_by_a_second(self):
         sessions = []
-        args = argparse.Namespace(resume=False, skip_checks=True, fix='claude', background=True)
+        args = argparse.Namespace(resume=False, skip_checks=True, fix='claude', background=False)
         with patch.object(customize, 'agent_fix', lambda *a: sessions.append(a)), \
                 patch.object(customize, 'choose_agent', lambda r: r):
             with self.assertRaises(customize.NeedsFix):
                 self.quiet(customize.apply_patches, args, self.nightly, 'n2', {}, self.log)
         self.assertEqual(len(sessions), 1)
+        # Someone watches this run: the stop stays for them.
+        self.assertTrue(customize.rebase_in_progress())
+
+    def test_an_unattended_session_that_gives_up_leaves_the_checkout_clean_and_says_so(self):
+        def agent(name, problem, target, version, log):
+            # Mid-fix: resolved the rebase, then left a half edit and no rebase behind.
+            self.resolve('a.txt', '2\n')
+            with self.assertRaises(customize.NeedsFix):
+                self.cont()
+            self.resolve('b.txt', '2\n')
+            self.cont()
+            (self.source / 'a.txt').write_text('half done\n')
+        args = argparse.Namespace(resume=False, skip_checks=True, fix='claude', background=True)
+        with patch.object(customize, 'agent_fix', agent), patch.object(customize, 'choose_agent', lambda r: r):
+            with self.assertRaises(customize.NeedsFix):
+                self.quiet(customize.apply_patches, args, self.nightly, 'n2', {}, self.log, handoff=False)
+        self.assertTrue(self.clean())
+        self.assertEqual(customize.run_marker(), {})
+        self.assertIn('failed', customize.load(customize.PORTS)['n2'])
+        self.assertIn('The port to n2 failed', self.notes[0])
+        # The next unattended run starts over instead of stopping at the guard.
+        with self.assertRaises(customize.NeedsFix) as stop:
+            self.quiet(self.prepare, unattended=True)
+        self.assertIn('The shared patches conflict', str(stop.exception))
+
+    def test_a_port_waiting_for_review_is_not_ported_again(self):
+        customize.save(customize.PORTS, {'n2': {'url': 'https://example.test/pr/9', 'layers': ['shared', 'patches-tt', 'patches-ios']}})
+        args = argparse.Namespace(resume=False, skip_checks=True, fix='claude', background=True)
+        with patch.object(customize, 'agent_fix', side_effect=AssertionError('ported again')), \
+                patch.object(customize, 'choose_agent', lambda r: r):
+            with self.assertRaises(customize.PortHandedOff) as stop:
+                self.quiet(customize.apply_patches, args, self.nightly, 'n2', {}, self.log)
+        self.assertIn('waits for review: https://example.test/pr/9', str(stop.exception))
+        self.assertTrue(self.clean())
 
     def test_the_prompt_points_at_the_porting_docs_and_the_loop(self):
         prompt = customize.agent_prompt('conflict', self.nightly, 'n2')
@@ -404,6 +612,35 @@ class OneAgentSessionTest(Sandbox):
         self.assertIn('t3code-customize continue --source', prompt)
         self.assertIn('t3code-customize checks --source', prompt)
         self.assertNotIn('AGENTS.md', prompt)
+
+
+class PortPendingTest(Sandbox):
+    def test_a_published_port_counts_only_with_the_ios_layer(self):
+        customize.save(customize.PORTS, {'n2': {'url': 'u', 'layers': ['shared', 'patches-tt']}})
+        self.assertIsNone(customize.port_pending('n2'))
+        customize.save(customize.PORTS, {'n2': {'url': 'u', 'layers': ['shared', 'patches-tt', 'patches-ios']}})
+        self.assertEqual(customize.port_pending('n2'), 'u')
+
+    def test_an_open_port_branch_pr_counts(self):
+        prs = [{'url': 'https://x/pull/3', 'headRefName': 'port/nightly-n2-2'},
+               {'url': 'https://x/pull/4', 'headRefName': 'port/nightly-n3'}]
+        with patch.object(customize, 'fork_repo', lambda: 'o/r'), \
+                patch.object(customize.shutil, 'which', lambda n: n), \
+                patch.object(customize.subprocess, 'run', lambda *a, **k: subprocess.CompletedProcess([], 0, json.dumps(prs), '')):
+            self.assertEqual(customize.port_pending('n2'), 'https://x/pull/3')
+            self.assertIsNone(customize.port_pending('n1'))
+
+
+class HistoryRecipeTest(Sandbox):
+    def test_a_failing_patch_set_from_history_leaves_no_stop_behind(self):
+        args = argparse.Namespace(resume=False, skip_checks=True, fix='claude', background=True)
+        with patch.object(customize, 'older_than_patches', lambda target: True), \
+                patch.object(customize, 'use_older_recipe', lambda target, log: None):
+            with self.assertRaises(customize.NeedsFix) as stop:
+                self.quiet(customize.apply_patches, args, self.nightly, 'n2', {}, self.log)
+        self.assertIn('made for this nightly fails here', str(stop.exception))
+        self.assertTrue(self.clean())
+        self.assertEqual(customize.run_marker(), {})
 
 
 class OpenPrsTest(unittest.TestCase):
