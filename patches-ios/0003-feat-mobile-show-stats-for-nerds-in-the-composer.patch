@@ -40,10 +40,10 @@ Subject: [PATCH 3/7] feat(mobile): show stats for nerds in the composer
  create mode 100644 packages/client-runtime/src/state/contextWindow.ts
 
 diff --git a/apps/mobile/src/features/settings/SettingsThreadsRouteScreen.tsx b/apps/mobile/src/features/settings/SettingsThreadsRouteScreen.tsx
-index dea74b2cd5..f5839abdde 100644
+index d023e5c57e..787b8c89f5 100644
 --- a/apps/mobile/src/features/settings/SettingsThreadsRouteScreen.tsx
 +++ b/apps/mobile/src/features/settings/SettingsThreadsRouteScreen.tsx
-@@ -47,6 +47,7 @@ export function SettingsThreadsRouteScreen() {
+@@ -46,6 +46,7 @@ export function SettingsThreadsRouteScreen() {
            contentContainerStyle={{ paddingBottom: Math.max(insets.bottom, 18) + 18 }}
          >
            <AutoSettleSettingsRows />
@@ -51,7 +51,7 @@ index dea74b2cd5..f5839abdde 100644
            <BetaSettingsSection />
            <LegacySettingsSection />
          </ScrollView>
-@@ -257,6 +258,31 @@ function AutoSettleSettingsRows() {
+@@ -245,6 +246,31 @@ function AutoSettleSettingsRows() {
    );
  }
  
@@ -713,7 +713,7 @@ index 0000000000..decc32e1cf
 +  );
 +}
 diff --git a/apps/mobile/src/features/threads/ThreadComposer.tsx b/apps/mobile/src/features/threads/ThreadComposer.tsx
-index 2a95b63258..500c7520f9 100644
+index 8aecb5b07e..30223f131a 100644
 --- a/apps/mobile/src/features/threads/ThreadComposer.tsx
 +++ b/apps/mobile/src/features/threads/ThreadComposer.tsx
 @@ -139,6 +139,8 @@ export interface ThreadComposerProps {
@@ -725,7 +725,7 @@ index 2a95b63258..500c7520f9 100644
    readonly serverConfig: T3ServerConfig | null;
    readonly queueCount: number;
    readonly activeThreadBusy: boolean;
-@@ -1069,6 +1071,7 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
+@@ -1095,6 +1097,7 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
              This connection cannot control this task. You can still edit your draft.
            </Text>
          ) : null}
@@ -734,10 +734,10 @@ index 2a95b63258..500c7520f9 100644
  
        <VideoPreviewModal source={previewVideo} onRequestClose={closePreview} />
 diff --git a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
-index 681bd85293..8d1d837d32 100644
+index a456387a31..4f1ec336c1 100644
 --- a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
 +++ b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
-@@ -142,6 +142,9 @@ import {
+@@ -146,6 +146,9 @@ import {
    ThreadComposer,
  } from "./ThreadComposer";
  import { ComposerPopoverHost } from "./ComposerPopoverHost";
@@ -747,16 +747,16 @@ index 681bd85293..8d1d837d32 100644
  import { ThreadFeed, type ThreadFeedHistoryControls } from "./ThreadFeed";
  import { useThreadTurnSubagents } from "./ThreadAgentsSheet";
  import { ComposerQueuedEditBanner } from "./ComposerQueuedEdit";
-@@ -218,6 +221,8 @@ export interface ThreadDetailScreenProps {
-   readonly onRemoveDraftImage: (imageId: string) => void;
-   readonly onStopThread: () => void;
+@@ -224,6 +227,8 @@ export interface ThreadDetailScreenProps {
+   /** Present while the thread's queue is held. */
+   readonly onResumeQueue: (() => Promise<void>) | null;
    readonly onSendMessage: (followUp?: ActiveTurnComposerAction) => Promise<MessageId | null>;
 +  /** Sends "/compact" without touching the draft. */
 +  readonly onCompactContext: () => void;
    readonly onReconnectEnvironment: () => void;
    readonly canSwitchThreadProvider: boolean;
    readonly onUpdateThreadModelSelection: (modelSelection: ModelSelection) => void;
-@@ -536,7 +541,14 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
+@@ -606,7 +611,14 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
      ) ||
      (props.historyControls?.hasMoreHistory === true &&
        props.selectedThread.latestUserMessageAt !== null);
@@ -772,7 +772,7 @@ index 681bd85293..8d1d837d32 100644
    const composerOverlapHeight = composerChrome + composerBottomInset;
    const [collapsedUserInputRequestId, setCollapsedUserInputRequestId] =
      useState<RuntimeRequestId | null>(null);
-@@ -1308,6 +1320,32 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
+@@ -1335,6 +1347,32 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
                          hasCompactableConversation={
                            hasCompactableConversation && !props.isCompacting
                          }
@@ -806,12 +806,12 @@ index 681bd85293..8d1d837d32 100644
                          queueCount={props.selectedThreadQueueCount}
                          activeThreadBusy={props.activeThreadBusy}
 diff --git a/apps/mobile/src/features/threads/ThreadRouteScreen.tsx b/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
-index 2b109ca9e2..91ebee4376 100644
+index 3908d7ad92..3327cd9190 100644
 --- a/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
 +++ b/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
-@@ -956,6 +956,7 @@ function ThreadRouteContent(
-           serverConfig={serverConfig}
+@@ -967,6 +967,7 @@ function ThreadRouteContent(
            onStopThread={awaitingBootstrapTurn ? handleCancelWorktreeSetup : handleStopThread}
+           onResumeQueue={composer.queueHeld ? handleResumeQueue : null}
            onSendMessage={composer.onSendMessage}
 +          onCompactContext={composer.onCompactContext}
            onReconnectEnvironment={handleReconnectEnvironment}
@@ -1381,10 +1381,10 @@ index 0000000000..3cc2cb612f
 +  }, [enabled, projection, environmentId, serverConfig, instanceId]);
 +}
 diff --git a/apps/mobile/src/state/use-thread-composer-state.ts b/apps/mobile/src/state/use-thread-composer-state.ts
-index 4129527668..2e72a8c5ea 100644
+index bb2be14282..f81405f234 100644
 --- a/apps/mobile/src/state/use-thread-composer-state.ts
 +++ b/apps/mobile/src/state/use-thread-composer-state.ts
-@@ -682,6 +682,45 @@ export function useThreadComposerState() {
+@@ -696,6 +696,45 @@ export function useThreadComposerState() {
      return messageId;
    };
  
@@ -1430,7 +1430,7 @@ index 4129527668..2e72a8c5ea 100644
    const onChangeDraftMessage = (value: string) => {
      if (!selectedThreadShell) {
        return;
-@@ -985,6 +1024,7 @@ export function useThreadComposerState() {
+@@ -1000,6 +1039,7 @@ export function useThreadComposerState() {
      onNativePasteText,
      onRemoveDraftImage,
      onSendMessage,
@@ -1439,10 +1439,10 @@ index 4129527668..2e72a8c5ea 100644
      onUpdateRuntimeMode,
      onUpdateInteractionMode,
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index 3451a74a9f..0b245140eb 100644
+index 95335a927b..239e0c2d43 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -459,7 +459,7 @@ import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
+@@ -463,7 +463,7 @@ import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
  import { ThreadStatusLine } from "./chat/ThreadStatusLine";
  import { formatRelativeTimeLabel, formatRelativeTimeUntilLabel } from "../timestampFormat";
  import { ComposerStats } from "./chat/ComposerStats";
@@ -1451,7 +1451,7 @@ index 3451a74a9f..0b245140eb 100644
  import { ComposerSurface } from "./chat/ComposerSurface";
  import { resolveThreadSyncPhase } from "../threadSync";
  import {
-@@ -2568,45 +2568,11 @@ export default function ChatView(props: ChatViewProps) {
+@@ -2583,45 +2583,11 @@ export default function ChatView(props: ChatViewProps) {
      activeProviderStatus?.displayName?.trim() || activeProviderStatus?.instanceId || "";
    const composerStats = (() => {
      if (!settings.statsForNerdsEnabled) return null;
@@ -1501,7 +1501,7 @@ index 3451a74a9f..0b245140eb 100644
    })();
    const pendingBackgroundTasks = (() => {
      if (serverProjection === null || serverProjection === undefined) {
-@@ -8475,15 +8441,12 @@ export default function ChatView(props: ChatViewProps) {
+@@ -8503,15 +8469,12 @@ export default function ChatView(props: ChatViewProps) {
                            {...composerStats}
                            onCompact={() => composerRef.current?.compactContext()}
                            compactDisabled={compactDisabled}
@@ -1524,7 +1524,7 @@ index 3451a74a9f..0b245140eb 100644
                            subscriptionSwitch={{
                              providers: providerStatuses,
 diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
-index 4370d0da4a..6f4a03270f 100644
+index 146393fcc8..424b03fd99 100644
 --- a/apps/web/src/components/chat/ChatComposer.tsx
 +++ b/apps/web/src/components/chat/ChatComposer.tsx
 @@ -1091,7 +1091,7 @@ import {
