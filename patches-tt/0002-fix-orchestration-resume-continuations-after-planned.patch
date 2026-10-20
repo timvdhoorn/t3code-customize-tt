@@ -28,7 +28,7 @@ closes ingestion.
  15 files changed, 1049 insertions(+), 407 deletions(-)
 
 diff --git a/apps/server/src/mcp/WorktreeMcpService.test.ts b/apps/server/src/mcp/WorktreeMcpService.test.ts
-index eea8d4bbd8..c01f6672d1 100644
+index 7cc31272c0..dda45a90f0 100644
 --- a/apps/server/src/mcp/WorktreeMcpService.test.ts
 +++ b/apps/server/src/mcp/WorktreeMcpService.test.ts
 @@ -3,7 +3,10 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -50,7 +50,7 @@ index eea8d4bbd8..c01f6672d1 100644
  import * as Deferred from "effect/Deferred";
  import * as Effect from "effect/Effect";
  import * as Exit from "effect/Exit";
-@@ -23,6 +27,7 @@ import * as GitWorkflowService from "../git/GitWorkflowService.ts";
+@@ -26,6 +30,7 @@ import * as ServerConfig from "../config.ts";
  import {
    OrchestratorDispatchError,
    OrchestratorProjectionError,
@@ -58,7 +58,7 @@ index eea8d4bbd8..c01f6672d1 100644
  } from "../orchestration-v2/Orchestrator.ts";
  import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
  import * as ProjectService from "../project/ProjectService.ts";
-@@ -99,7 +104,7 @@ interface HarnessOptions {
+@@ -103,7 +108,7 @@ interface HarnessOptions {
    readonly threadAttachedOnRecheck?: boolean;
    readonly threadArchivedOnRecheck?: boolean;
    readonly threadReadFailsOnRecheck?: boolean;
@@ -67,7 +67,7 @@ index eea8d4bbd8..c01f6672d1 100644
    readonly projectMissing?: boolean;
    readonly projectReadFails?: boolean;
    readonly existingBranchWorktreePath?: string | null;
-@@ -114,7 +119,7 @@ interface HarnessOptions {
+@@ -118,7 +123,7 @@ interface HarnessOptions {
  const makeHarness = (options: HarnessOptions = {}) => {
    const thread = options.thread === undefined ? {} : options.thread;
    const scope = makeScope(options.capabilities ?? new Set(["preview", "worktree"]));
@@ -76,7 +76,7 @@ index eea8d4bbd8..c01f6672d1 100644
      (options.dispatchGate ?? Effect.void).pipe(
        Effect.andThen(
          options.dispatchInterrupts
-@@ -123,7 +128,45 @@ const makeHarness = (options: HarnessOptions = {}) => {
+@@ -127,7 +132,45 @@ const makeHarness = (options: HarnessOptions = {}) => {
              ? Effect.die(new Error("dispatch defect"))
              : options.dispatchFails
                ? (Effect.fail("simulated dispatch failure") as never)
@@ -123,7 +123,7 @@ index eea8d4bbd8..c01f6672d1 100644
        ),
      ),
    );
-@@ -171,22 +214,9 @@ const makeHarness = (options: HarnessOptions = {}) => {
+@@ -175,22 +218,9 @@ const makeHarness = (options: HarnessOptions = {}) => {
        ? Effect.succeed(makeProjection(thread))
        : Effect.fail(new OrchestratorProjectionError({ threadId: id }));
    });
@@ -149,7 +149,7 @@ index eea8d4bbd8..c01f6672d1 100644
    const getById = vi.fn((id: ProjectId) =>
      options.projectReadFails
        ? (Effect.fail("simulated project read failure") as never)
-@@ -432,46 +462,57 @@ describe("t3_worktree_handoff", () => {
+@@ -434,46 +464,57 @@ describe("t3_worktree_handoff", () => {
        });
  
        expect(result.continuation).toEqual({ status: "scheduled", delivery: "queued" });
@@ -230,7 +230,7 @@ index eea8d4bbd8..c01f6672d1 100644
  
    it.effect("does not queue a continuation when the thread update fails", () => {
      const harness = makeHarness({ dispatchFails: true });
-@@ -765,6 +806,7 @@ describe("t3_worktree_handoff", () => {
+@@ -791,6 +832,7 @@ describe("t3_worktree_handoff", () => {
        const gate = yield* Deferred.make<void>();
        const harness = makeHarness({ dispatchGate: Deferred.await(gate) });
  
@@ -238,7 +238,7 @@ index eea8d4bbd8..c01f6672d1 100644
        const fiber = yield* Effect.forkChild(
          runHandoff(harness, {
            branch: "feature/interrupted",
-@@ -779,7 +821,12 @@ describe("t3_worktree_handoff", () => {
+@@ -805,7 +847,12 @@ describe("t3_worktree_handoff", () => {
        yield* Fiber.join(interruption);
  
        expect(harness.dispatch).toHaveBeenCalledTimes(1);
@@ -253,7 +253,7 @@ index eea8d4bbd8..c01f6672d1 100644
      }),
    );
 diff --git a/apps/server/src/mcp/WorktreeMcpService.ts b/apps/server/src/mcp/WorktreeMcpService.ts
-index b738aaac12..9665e6b177 100644
+index 461b7044ba..01d6c4cfd2 100644
 --- a/apps/server/src/mcp/WorktreeMcpService.ts
 +++ b/apps/server/src/mcp/WorktreeMcpService.ts
 @@ -132,7 +132,6 @@ const make = Effect.gen(function* () {
@@ -264,7 +264,7 @@ index b738aaac12..9665e6b177 100644
            continuationMessageId: MessageId.make(part("message", "worktree-continuation")),
          };
        }),
-@@ -288,7 +287,7 @@ const make = Effect.gen(function* () {
+@@ -287,7 +286,7 @@ const make = Effect.gen(function* () {
                `Thread '${scope.thread.threadId}' was archived while the worktree was being created; the handoff was rolled back.`,
              );
            }
@@ -273,7 +273,7 @@ index b738aaac12..9665e6b177 100644
              .dispatch({
                type: "thread.metadata.update",
                commandId: ids.commandId,
-@@ -296,6 +295,14 @@ const make = Effect.gen(function* () {
+@@ -295,6 +294,14 @@ const make = Effect.gen(function* () {
                branch: worktree.worktree.refName,
                worktreePath,
                expectedWorktreePath: null,
@@ -288,7 +288,7 @@ index b738aaac12..9665e6b177 100644
              })
              .pipe(
                Effect.catchCause((cause) =>
-@@ -318,36 +325,14 @@ const make = Effect.gen(function* () {
+@@ -317,36 +324,14 @@ const make = Effect.gen(function* () {
            ),
          );
  
@@ -358,10 +358,10 @@ index a44b60c249..b7be299dd0 100644
                    ? {}
                    : { revokeMcpCredential: effect.request.revokeMcpCredential }),
 diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
-index 96b6bab3c0..c67c6add35 100644
+index 08048e1328..5e230e343b 100644
 --- a/apps/server/src/orchestration-v2/Orchestrator.ts
 +++ b/apps/server/src/orchestration-v2/Orchestrator.ts
-@@ -2557,6 +2557,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -2572,6 +2572,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
          cause: `Thread ${command.threadId} branch changed before the metadata update could be applied.`,
        });
      }
@@ -388,7 +388,7 @@ index 96b6bab3c0..c67c6add35 100644
      if (command.type === "thread.metadata.update" && command.expectedEmpty === true) {
        const records = yield* projectionStore
          .getThreadRecords(command.threadId, ["runs"])
-@@ -3530,6 +3550,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -3565,6 +3585,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                  // Terminal detaches revoke the thread's MCP credentials; other
                  // detach reasons keep them so a re-attaching provider process
                  // stays authorized.
@@ -398,7 +398,7 @@ index 96b6bab3c0..c67c6add35 100644
                  ...(command.type === "thread.archive" ? { revokeMcpCredential: true } : {}),
                },
              } satisfies PendingOrchestrationEffectV2;
-@@ -11074,7 +11097,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -11141,7 +11164,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
        case "thread.pin.reorder":
        case "thread.active.reorder":
        case "thread.mark-unread":
@@ -406,7 +406,7 @@ index 96b6bab3c0..c67c6add35 100644
        case "thread.pull-request.link":
        case "thread.pull-request.unlink":
        case "thread.pull-request-link.sync":
-@@ -11087,6 +11109,25 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -11154,6 +11176,25 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
        case "provider.switch":
          yield* dispatchThreadMutation(command, events, effects);
          break;
@@ -2085,10 +2085,10 @@ index 66be9fe435..dc2ba0ab3e 100644
  the oldest queued message as a steer. This leaves the current draft intact and
  requires an active turn that supports steering. If that shortcut sends the opposite
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
-index d113e70da4..c56283c22f 100644
+index c94e0d1c16..9f642a4fbb 100644
 --- a/packages/contracts/src/orchestrationV2.ts
 +++ b/packages/contracts/src/orchestrationV2.ts
-@@ -2685,6 +2685,10 @@ export const OrchestrationV2Command = Schema.Union([
+@@ -2693,6 +2693,10 @@ export const OrchestrationV2Command = Schema.Union([
      worktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
      expectedWorktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
      expectedBranch: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
