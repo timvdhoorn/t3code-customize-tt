@@ -32,6 +32,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+from urllib.parse import unquote, urlparse
 import zipfile
 
 from platform_support import (PlatformError, InstalledApp, storage_paths, find_app,
@@ -197,6 +198,12 @@ OWN_CHECKS = REPO / 'checks-tt.json'
 IOS_PATCHES = REPO / 'patches-ios'
 IOS_CHECKS = REPO / 'checks-ios.json'
 WITH_IOS = False
+# Install scripts of apps/mobile's dependencies, which --ignore-scripts skips. The iOS build runs
+# the first set (react-native-enriched-markdown downloads its RaTeX and grammar assets, without
+# which its podspec fails pod install); the second set it does not need. `checks` fails with the
+# ios layer on any other dependency that has one, so a new one is sorted before an iOS build.
+IOS_INSTALL_SCRIPTS = ('react-native-enriched-markdown',)
+IOS_SKIPPED_INSTALL_SCRIPTS = ('typescript',)
 
 
 def use_recipe(root):
@@ -240,7 +247,7 @@ OPERATIONAL_CODE = frozenset({
     'restart_service', 'stage_t3_update', 'restart_lock', 'mark_staged', 'discard_staged',
     'still_newest', 'restore_server_stock', 'systemctl', 'server_healthy', 'restart_server',
     'cmd_server_off', 'server_autoupdate', 'cmd_on', 'cmd_off', 'cmd_uninstall', 'cmd_autoupdate',
-    'start_background_update', 'app_settled', 'cmd_status',
+    'start_background_update', 'app_settled', 'cmd_status', 'staged_app_update',
     'report_ported_prs', '_report_ported_prs', 'fork_repo', 'report_open_prs', 'stuck_message',
     'port_failed', 'recent_failure', 'port_pending', 'porter_machine', 'port_command', 'repo_path',
     'remote_port_line', 'handed_off_already', 'hand_off_port', 'spawn_detached', 'publish_port',
@@ -861,6 +868,16 @@ def check_spec():
     return spec
 
 
+def mobile_install_scripts():
+    """The direct dependencies of apps/mobile that have a preinstall, install or postinstall script."""
+    mobile = SOURCE / 'apps/mobile'
+    manifest = load(mobile / 'package.json', {})
+    names = sorted({**manifest.get('dependencies', {}), **manifest.get('devDependencies', {})})
+    return [name for name in names
+            if set(load(mobile / 'node_modules' / name / 'package.json', {}).get('scripts', {}))
+            & {'preinstall', 'install', 'postinstall'}]
+
+
 def check_lists_hash():
     digest = hashlib.sha256()
     for path in [RECIPE / 'checks.json'] + own_checks():
@@ -952,6 +969,12 @@ def checks(env, log, target, force=False):
     missing = [t for t in spec['tests'] if not (SOURCE / t).exists()]
     if missing:
         raise NeedsFix('Test files listed in checks.json no longer exist (moved upstream?):\n' + '\n'.join('  ' + t for t in missing))
+    unsorted = [name for name in mobile_install_scripts()
+                if name not in IOS_INSTALL_SCRIPTS + IOS_SKIPPED_INSTALL_SCRIPTS] if WITH_IOS else []
+    if unsorted:
+        raise NeedsFix('These apps/mobile dependencies have an install script that --ignore-scripts skips:\n'
+                       + '\n'.join('  ' + n for n in unsorted) + f'\nAdd each to IOS_INSTALL_SCRIPTS in {NAME} if the'
+                       ' iOS build needs it (pod install or the archive fails without it), else to IOS_SKIPPED_INSTALL_SCRIPTS.')
     step('Testing the patches...')
     # Upstream's `prepare` patches tsc with the Effect diagnostics (globalDateInEffect and
     # friends) and its CI typechecks with them; --ignore-scripts skips that, so a checkout
@@ -2867,6 +2890,20 @@ def bundle_version(app):
     return plistlib.loads((app / 'Contents/Info.plist').read_bytes()).get('CFBundleShortVersionString', '')
 
 
+def staged_app_update(app):
+    """The version T3's updater (Squirrel's ShipIt) has staged to install on quit, or None."""
+    bundle_id = plistlib.loads((app / 'Contents/Info.plist').read_bytes()).get('CFBundleIdentifier', '')
+    try:
+        state = load(Path.home() / 'Library/Caches' / f'{bundle_id}.ShipIt' / 'ShipItState.plist', {})
+    except ValueError:
+        return None  # ShipIt writes JSON under a .plist name; anything else is not ours to read.
+    staged = Path(unquote(urlparse(state.get('updateBundleURL', '')).path))
+    if not state or not (staged / 'Contents/Info.plist').exists():
+        return None
+    version = bundle_version(staged)
+    return version if version and version != bundle_version(app) else None
+
+
 def start_background_update():
     """Start the rebuild now (the LaunchAgent if autoupdate is on, else a detached run). Returns
     what to tell the user, or None if it could not start."""
@@ -3031,12 +3068,17 @@ def cmd_status(args):
     if MAC:
         say('Launcher:           ' + (str(MAC_LAUNCHER) if MAC_LAUNCHER.exists() else 'not installed'))
         say('Background updates: ' + ('on' if AUTOUPDATE_PLIST.exists() else f'off ({NAME} autoupdate on)'))
+        staged = staged_app_update(app.path)
+        if staged:
+            say(f'App update:         {staged} staged; installs when T3 Code quits')
         ios_state = load(IOS_STATE)
         if ios_state:
             behind = (ios_state.get('recipe') != ios_recipe_hash()
                       or ios_state.get('version') != bundle_version(app.path))
+            # A build now would be for the nightly the quit replaces; the rebuild after it builds iOS.
+            hint = 'quit T3 Code first, its update then builds it' if staged else f'run {NAME} ios'
             say(f"iOS app:            build {ios_state['buildNumber']} for {ios_state['version']}"
-                + (f' (behind; run {NAME} ios)' if behind else ''))
+                + (f' (behind; {hint})' if behind else ''))
 
 
 # --- Ported upstream PRs ------------------------------------------------------------
@@ -3468,11 +3510,13 @@ def build_ios(env, config, public, build_number, job, log):
                APP_VARIANT='production', EXPO_NO_GIT_STATUS='1', CI='1',
                T3CODE_IOS_BUNDLE_ID=config['bundleId'], T3CODE_IOS_TEAM_ID=config['teamId'],
                T3CODE_IOS_APP_NAME=config['appName'])
+    run([*pnpm(env), 'rebuild', *IOS_INSTALL_SCRIPTS], cwd=mobile, env=env, log=log)
     step('Generating the iOS project...')
     run([*pnpm(env), 'exec', 'expo', 'prebuild', '--clean', '--platform', 'ios'], cwd=mobile, env=env, log=log)
     workspace = next((mobile / 'ios').glob('*.xcworkspace'), None)
     if not workspace:
-        raise Stop('expo prebuild produced no Xcode workspace in apps/mobile/ios.')
+        # Expo exits 0 when pod install fails; the cause is only in its output.
+        raise Stop('expo prebuild produced no Xcode workspace in apps/mobile/ios.' + pod_install_error(log))
     # Prebuild writes a literal CFBundleVersion of 1 into the app and widget plists (EAS
     # numbers builds remotely); every target must carry this build's number.
     for info in (mobile / 'ios').glob('*/Info.plist'):
@@ -3498,6 +3542,21 @@ def build_ios(env, config, public, build_number, job, log):
     if not ipa:
         raise Stop('xcodebuild exported no .ipa.')
     return ipa
+
+
+def pod_install_error(log):
+    """pod install's first error from this run's log, for a prebuild that left no workspace."""
+    try:
+        text = Path(log).read_text(errors='replace')
+    except OSError:
+        return ''
+    start = text.rfind('> pod install')  # Expo prints this line before it runs pod install.
+    if start < 0:
+        return ''
+    text = re.sub(r'\x1b\[[0-9;]*m', '', text[start:])
+    lines = [line.strip() for line in text.splitlines()
+             if line.strip().startswith('[!]') and line.strip() not in ('[!] Invalid `Podfile` file:',)]
+    return f'\npod install failed: {lines[0]}' if lines else ''
 
 
 def ios_recipe_hash():

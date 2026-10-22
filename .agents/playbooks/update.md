@@ -37,7 +37,8 @@ standing grant in "Unattended ports"); this is the order.
    its own unit that waits for your turn to end: do not wait on that unit in the same turn; end the
    turn and read `journalctl --user -u t3code-customize-server-run` in a later one.
    `deferred: threads busy` is a valid result: report which threads, do not interrupt them.
-7. iOS: on the MacBook Pro run `./t3code-customize ios` when `status` says the iOS app is behind
-   (its `autoupdate --ios` also does this after each rebuild).
+7. iOS: on the MacBook Pro run `./t3code-customize ios` when `status` says the iOS app is behind.
+   When `status` shows an `App update: ... staged` line, the build waits for that update: it
+   installs when Tim quits T3 Code, and `autoupdate --ios` then rebuilds the app and the iOS build.
 8. Report per machine (mbp, mba, devbox1, TestFlight): nightly before and after, customized yes or
    no, `deferred` with the busy threads, any PR left open, and what still waits for Tim's quit.
