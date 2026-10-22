@@ -70,5 +70,36 @@ class RestoreGeneratedTest(unittest.TestCase):
         self.assertEqual((self.source / 'other.ts').read_text(), 'code\n')
 
 
+class UncommittedChangesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.origin = Path(self.tmp.name) / 'origin'
+        self.origin.mkdir()
+        run = lambda *a: subprocess.run(['git', *a], cwd=self.origin, check=True, capture_output=True)
+        run('init', '-q')
+        (self.origin / 'code.ts').write_text('code\n')
+        run('add', '.')
+        run('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'base')
+
+    def use(self, source):
+        patcher = patch.object(customize, 'SOURCE', source)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_fresh_no_checkout_clone_is_clean(self):
+        source = Path(self.tmp.name) / 'clone'
+        subprocess.run(['git', 'clone', '-q', '--no-checkout', str(self.origin), str(source)],
+                       check=True, capture_output=True)
+        self.use(source)
+        self.assertFalse(customize.uncommitted_changes())
+
+    def test_an_edit_is_an_uncommitted_change(self):
+        self.use(self.origin)
+        self.assertFalse(customize.uncommitted_changes())
+        (self.origin / 'code.ts').write_text('a port in progress\n')
+        self.assertTrue(customize.uncommitted_changes())
+
+
 if __name__ == '__main__':
     unittest.main()

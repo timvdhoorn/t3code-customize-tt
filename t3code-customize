@@ -695,7 +695,7 @@ def stopped_by_unattended_run():
     """True when the checkout holds a stopped rebase or git am, or uncommitted edits, exactly as an
     unattended run left them: started by an unattended run, never claimed by continue, checks or
     --resume, and not touched since (same fingerprint). This run holds the lock, so that run has ended."""
-    stopped = rebase_in_progress() or bool(git('status', '--porcelain', '--untracked-files=no').strip())
+    stopped = rebase_in_progress() or uncommitted_changes()
     marker = run_marker()
     if not stopped or marker.get('unattended') is not True:
         return False
@@ -730,6 +730,14 @@ def ensure_commit(commit, version, log):
 # strips, Expo prebuild the uniwind types). A build undoes its own rewrites when it ends
 # (discard_build_rewrites); this list covers a run that was killed before it could.
 GENERATED = ('apps/web/src/routeTree.gen.ts', 'apps/mobile/uniwind-types.d.ts')
+
+
+def uncommitted_changes():
+    """True when tracked files differ from HEAD. A fresh --no-checkout clone has no index yet, so
+    git status lists every file as deleted; there is nothing to lose there."""
+    if not (SOURCE / git('rev-parse', '--git-path', 'index').strip()).exists():
+        return False
+    return bool(git('status', '--porcelain', '--untracked-files=no').strip())
 
 
 def modified_files():
@@ -771,7 +779,7 @@ def prepare(target, log, resume=False, unattended=False, version=None):
         restore_generated()
         # A fresh build starts over from the repo's patches, which throws away a stopped rebase or
         # git am and uncommitted edits. Those may be a port someone is still working on: stop.
-        if rebase_in_progress() or git('status', '--porcelain', '--untracked-files=no').strip():
+        if rebase_in_progress() or uncommitted_changes():
             raise Stop(f'{SOURCE} has a stopped rebase or git am, or uncommitted changes; a fresh build would'
                        ' throw them away. If it is a port in progress, finish it and run again with --resume.'
                        ' Otherwise clear it yourself (git rebase --abort, git am --abort, git checkout .)'
