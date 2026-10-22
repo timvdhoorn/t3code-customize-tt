@@ -43,7 +43,7 @@ run the same patches.
   `journalctl --user -u t3code-customize-server-run` later.
 - **How each machine gets a new nightly:**
   - Mac: T3's own updater. In the customized build it downloads a new nightly as soon as it finds
-    one and installs it when Tim quits the app (`patches-tt/0007`); nothing restarts the app for
+    one and installs it when Tim quits the app (`patches-tt/0006`); nothing restarts the app for
     it. The install changes the app's `Info.plist`, the `autoupdate` LaunchAgent rebuilds the
     overlay, and the next launcher start loads it (opened before that, it opens stock and starts the
     rebuild). On the MacBook Pro (`"ios": true`) the same run then builds the iOS app for the new

@@ -6,8 +6,9 @@ Subject: [PATCH 3/7] feat(mobile): show stats for nerds in the composer
 ---
  .../settings/SettingsThreadsRouteScreen.tsx   |  26 +
  .../src/features/threads/ComposerStats.tsx    | 623 ++++++++++++++++
+ .../features/threads/NewTaskDraftScreen.tsx   |   1 +
  .../src/features/threads/ThreadComposer.tsx   |   3 +
- .../features/threads/ThreadDetailScreen.tsx   |  40 +-
+ .../features/threads/ThreadDetailScreen.tsx   |  42 +-
  .../features/threads/ThreadRouteScreen.tsx    |   1 +
  .../features/threads/composerStatsRow.test.ts | 223 ++++++
  .../src/features/threads/composerStatsRow.ts  | 143 ++++
@@ -19,16 +20,16 @@ Subject: [PATCH 3/7] feat(mobile): show stats for nerds in the composer
  apps/web/src/components/ChatView.tsx          |  59 +-
  apps/web/src/components/chat/ChatComposer.tsx |   2 +-
  .../chat/ComposerPrimaryActions.tsx           |   2 +-
- .../components/chat/ComposerStats.logic.ts    | 303 +-------
+ .../components/chat/ComposerStats.logic.ts    | 307 +-------
  .../web/src/components/chat/ComposerStats.tsx |  57 +-
  .../components/chat/ContextWindowMeter.tsx    |   5 +-
- apps/web/src/lib/contextWindow.ts             | 178 +----
+ apps/web/src/lib/contextWindow.ts             | 196 +----
  packages/client-runtime/package.json          |   8 +
  .../src/state/composerStats.test.ts           | 668 ++++++++++++++++++
- .../client-runtime/src/state/composerStats.ts | 427 +++++++++++
+ .../client-runtime/src/state/composerStats.ts | 433 ++++++++++++
  .../src/state/contextWindow.test.ts           | 158 +++++
- .../client-runtime/src/state/contextWindow.ts | 177 +++++
- 24 files changed, 2705 insertions(+), 575 deletions(-)
+ .../client-runtime/src/state/contextWindow.ts | 195 +++++
+ 25 files changed, 2732 insertions(+), 597 deletions(-)
  create mode 100644 apps/mobile/src/features/threads/ComposerStats.tsx
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.test.ts
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.ts
@@ -712,11 +713,23 @@ index 0000000000..decc32e1cf
 +    </>
 +  );
 +}
+diff --git a/apps/mobile/src/features/threads/NewTaskDraftScreen.tsx b/apps/mobile/src/features/threads/NewTaskDraftScreen.tsx
+index 12a451d72d..d8078b6989 100644
+--- a/apps/mobile/src/features/threads/NewTaskDraftScreen.tsx
++++ b/apps/mobile/src/features/threads/NewTaskDraftScreen.tsx
+@@ -1251,6 +1251,7 @@ export function NewTaskDraftScreen(props: {
+         onNativePasteText={handleNativePasteText}
+         onRemoveDraftImage={flow.removeAttachment}
+         onStopThread={() => {}}
++        onCompactContext={() => {}}
+         onResumeQueue={null}
+         onSendMessage={handleStart}
+         onReconnectEnvironment={() => onReconnectEnvironment(selectedProject.environmentId)}
 diff --git a/apps/mobile/src/features/threads/ThreadComposer.tsx b/apps/mobile/src/features/threads/ThreadComposer.tsx
-index 041855e4bb..9d79525a10 100644
+index 08ae70f300..b9ab33603f 100644
 --- a/apps/mobile/src/features/threads/ThreadComposer.tsx
 +++ b/apps/mobile/src/features/threads/ThreadComposer.tsx
-@@ -140,6 +140,8 @@ export interface ThreadComposerProps {
+@@ -239,6 +239,8 @@ export interface ThreadComposerProps {
    readonly selectedThread: EnvironmentThreadShell;
    readonly reportedModelSelection?: ModelSelection | null;
    readonly hasCompactableConversation: boolean;
@@ -725,7 +738,7 @@ index 041855e4bb..9d79525a10 100644
    readonly serverConfig: T3ServerConfig | null;
    readonly queueCount: number;
    readonly activeThreadBusy: boolean;
-@@ -1099,6 +1101,7 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
+@@ -1278,6 +1280,7 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
              This connection cannot control this task. You can still edit your draft.
            </Text>
          ) : null}
@@ -734,10 +747,10 @@ index 041855e4bb..9d79525a10 100644
  
        <VideoPreviewModal source={previewVideo} onRequestClose={closePreview} />
 diff --git a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
-index 500abb7575..5ba0d7512e 100644
+index e8f99bf4e6..3244f4837c 100644
 --- a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
 +++ b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
-@@ -147,6 +147,9 @@ import {
+@@ -166,6 +166,9 @@ import {
    ThreadComposer,
  } from "./ThreadComposer";
  import { ComposerPopoverHost } from "./ComposerPopoverHost";
@@ -747,32 +760,35 @@ index 500abb7575..5ba0d7512e 100644
  import { ThreadFeed, type ThreadFeedHistoryControls } from "./ThreadFeed";
  import { useThreadTurnSubagents } from "./ThreadAgentsSheet";
  import { ComposerQueuedEditBanner } from "./ComposerQueuedEdit";
-@@ -225,6 +228,8 @@ export interface ThreadDetailScreenProps {
-   /** Present while the thread's queue is held. */
-   readonly onResumeQueue: (() => Promise<void>) | null;
-   readonly onSendMessage: (followUp?: ActiveTurnComposerAction) => Promise<MessageId | null>;
+@@ -260,6 +263,8 @@ export interface ThreadDetailScreenProps {
+     followUp?: ActiveTurnComposerAction,
+     beforeDispatch?: () => Promise<boolean>,
+   ) => Promise<MessageId | null>;
 +  /** Sends "/compact" without touching the draft. */
 +  readonly onCompactContext: () => void;
    readonly onReconnectEnvironment: () => void;
    readonly canSwitchThreadProvider: boolean;
    readonly onUpdateThreadModelSelection: (modelSelection: ModelSelection) => void;
-@@ -607,7 +612,14 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
+@@ -807,8 +812,17 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
      ) ||
      (props.historyControls?.hasMoreHistory === true &&
        props.selectedThread.latestUserMessageAt !== null);
--  const composerChrome = composerExpanded ? COMPOSER_EXPANDED_CHROME : COMPOSER_COLLAPSED_CHROME;
 +  const composerStatsData = useComposerStats({
 +    serverConfig: props.serverConfig,
 +    instanceId: props.selectedThread.modelSelection.instanceId,
 +  });
 +  const composerStatsVisible = composerStatsData !== null && !isProviderSubagent;
-+  const composerChrome =
-+    (composerExpanded ? COMPOSER_EXPANDED_CHROME : COMPOSER_COLLAPSED_CHROME) +
-+    (composerStatsVisible ? COMPOSER_STATS_ROW_HEIGHT : 0);
-   const composerOverlapHeight = composerChrome + composerBottomInset;
+   const composerOverlapHeight =
+-    composerHeight ?? COMPOSER_COLLAPSED_CHROME + (hasSidebarTabBar ? 14 : 0) + composerBottomInset;
++    composerHeight ??
++    COMPOSER_COLLAPSED_CHROME +
++      (hasSidebarTabBar ? 14 : 0) +
++      (composerStatsVisible ? COMPOSER_STATS_ROW_HEIGHT : 0) +
++      composerBottomInset;
    const [collapsedUserInputRequestId, setCollapsedUserInputRequestId] =
      useState<RuntimeRequestId | null>(null);
-@@ -1351,6 +1363,32 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
+   const activeUserInputRequestId = props.activePendingUserInput?.requestId ?? null;
+@@ -1652,6 +1666,32 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
                          hasCompactableConversation={
                            hasCompactableConversation && !props.isCompacting
                          }
@@ -806,10 +822,10 @@ index 500abb7575..5ba0d7512e 100644
                          queueCount={props.selectedThreadQueueCount}
                          activeThreadBusy={props.activeThreadBusy}
 diff --git a/apps/mobile/src/features/threads/ThreadRouteScreen.tsx b/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
-index 39f412684f..ca05c8ed98 100644
+index eedfa6e1d8..4273d9e7d0 100644
 --- a/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
 +++ b/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
-@@ -968,6 +968,7 @@ function ThreadRouteContent(
+@@ -1001,6 +1001,7 @@ function ThreadRouteContent(
            onStopThread={awaitingBootstrapTurn ? handleCancelWorktreeSetup : handleStopThread}
            onResumeQueue={composer.queueHeld ? handleResumeQueue : null}
            onSendMessage={composer.onSendMessage}
@@ -1196,11 +1212,11 @@ index 0000000000..db084616b0
 +  ].join(" ");
 +}
 diff --git a/apps/mobile/src/lib/storage.test.ts b/apps/mobile/src/lib/storage.test.ts
-index e9973a8362..ec0ca6bbda 100644
+index e5dc872abe..649011e5e3 100644
 --- a/apps/mobile/src/lib/storage.test.ts
 +++ b/apps/mobile/src/lib/storage.test.ts
-@@ -266,6 +266,16 @@ describe("mobile connection storage", () => {
-     });
+@@ -149,6 +149,16 @@ describe("mobile connection storage", () => {
+     expect(fallback.updatedAt).toEqual(expect.any(Number));
    });
  
 +  it("persists the stats for nerds preference and drops a non-boolean value", async () => {
@@ -1209,13 +1225,13 @@ index e9973a8362..ec0ca6bbda 100644
 +    });
 +    await expect(loadPreferences()).resolves.toEqual({ statsForNerdsEnabled: true });
 +
-+    mocks.setPreferencesJson(JSON.stringify({ statsForNerdsEnabled: "yes" }), Date.now() + 60_000);
++    mocks.setPreferencesJson(JSON.stringify({ statsForNerdsEnabled: "yes" }), 20);
 +    await expect(loadPreferences()).resolves.toEqual({});
 +  });
 +
-   it("drops legacy and invalid thread list shelf expansion preferences", async () => {
-     mocks.setPreferencesJson(
-       JSON.stringify({
+   it("reconciles fallback preferences after SQLite recovers", async () => {
+     mocks.setPreferencesJson(JSON.stringify({ baseFontSize: 15 }), 10);
+     await mocks.setItemAsync(
 diff --git a/apps/mobile/src/persistence/mobile-preferences.ts b/apps/mobile/src/persistence/mobile-preferences.ts
 index 7acdd47e4e..78096db53e 100644
 --- a/apps/mobile/src/persistence/mobile-preferences.ts
@@ -1381,10 +1397,10 @@ index 0000000000..3cc2cb612f
 +  }, [enabled, projection, environmentId, serverConfig, instanceId]);
 +}
 diff --git a/apps/mobile/src/state/use-thread-composer-state.ts b/apps/mobile/src/state/use-thread-composer-state.ts
-index bb2be14282..f81405f234 100644
+index afd952d43a..9c1a907023 100644
 --- a/apps/mobile/src/state/use-thread-composer-state.ts
 +++ b/apps/mobile/src/state/use-thread-composer-state.ts
-@@ -696,6 +696,45 @@ export function useThreadComposerState() {
+@@ -728,6 +728,45 @@ export function useThreadComposerState() {
      return messageId;
    };
  
@@ -1430,7 +1446,7 @@ index bb2be14282..f81405f234 100644
    const onChangeDraftMessage = (value: string) => {
      if (!selectedThreadShell) {
        return;
-@@ -1000,6 +1039,7 @@ export function useThreadComposerState() {
+@@ -912,6 +951,7 @@ export function useThreadComposerState() {
      onNativePasteText,
      onRemoveDraftImage,
      onSendMessage,
@@ -1439,19 +1455,19 @@ index bb2be14282..f81405f234 100644
      onUpdateRuntimeMode,
      onUpdateInteractionMode,
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index 7c3160bd56..9d80952501 100644
+index cf446360d5..d98e9853f7 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -463,7 +463,7 @@ import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
- import { ThreadStatusLine } from "./chat/ThreadStatusLine";
- import { formatRelativeTimeLabel, formatRelativeTimeUntilLabel } from "../timestampFormat";
+@@ -303,7 +303,7 @@ import { useRightPanelSurfaceClose } from "../hooks/useRightPanelSurfaceClose";
+ import { useAgentOpenedPreviews } from "./preview/useAgentOpenedPreviews";
+ import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
  import { ComposerStats } from "./chat/ComposerStats";
 -import { selectComposerStatsTurns, selectRecordedCompactions } from "./chat/ComposerStats.logic";
 +import { composerCompactDisabledReason, deriveComposerStats } from "./chat/ComposerStats.logic";
  import { ComposerSurface } from "./chat/ComposerSurface";
  import { resolveThreadSyncPhase } from "../threadSync";
  import {
-@@ -2567,45 +2567,11 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1435,45 +1435,11 @@ export default function ChatView(props: ChatViewProps) {
      activeProviderStatus?.displayName?.trim() || activeProviderStatus?.instanceId || "";
    const composerStats = (() => {
      if (!settings.statsForNerdsEnabled) return null;
@@ -1499,9 +1515,9 @@ index 7c3160bd56..9d80952501 100644
 -      ),
 -    };
    })();
-   const pendingBackgroundTasks = (() => {
-     if (serverProjection === null || serverProjection === undefined) {
-@@ -8520,15 +8486,12 @@ export default function ChatView(props: ChatViewProps) {
+   const pendingBackgroundTasks = deriveThreadPendingBackgroundTasks(serverProjection);
+   const activeWorkStartedAt =
+@@ -3782,15 +3748,12 @@ export default function ChatView(props: ChatViewProps) {
                            {...composerStats}
                            onCompact={() => composerRef.current?.compactContext()}
                            compactDisabled={compactDisabled}
@@ -1524,20 +1540,20 @@ index 7c3160bd56..9d80952501 100644
                            subscriptionSwitch={{
                              providers: providerStatuses,
 diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
-index 65656ba4f2..d5753b335f 100644
+index b74e691ddd..5fba9b44a1 100644
 --- a/apps/web/src/components/chat/ChatComposer.tsx
 +++ b/apps/web/src/components/chat/ChatComposer.tsx
-@@ -1096,7 +1096,7 @@ import {
+@@ -269,7 +269,7 @@ import {
    resolveComposerDispatchMode,
    type ComposerDispatchMode,
  } from "@t3tools/client-runtime/state/composer-dispatch";
 -import type { ContextWindowSnapshot } from "../../lib/contextWindow";
 +import type { ContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
  import {
-   getProviderSlashCommandsForSlashMenu,
-   getProviderSkillsForSlashMenu,
+   resolveProviderSkillsForCwd,
+   resolveProviderSlashCommandsForCwd,
 diff --git a/apps/web/src/components/chat/ComposerPrimaryActions.tsx b/apps/web/src/components/chat/ComposerPrimaryActions.tsx
-index c4d91be940..4cf87f31b0 100644
+index 03d7403994..acd1064b84 100644
 --- a/apps/web/src/components/chat/ComposerPrimaryActions.tsx
 +++ b/apps/web/src/components/chat/ComposerPrimaryActions.tsx
 @@ -3,7 +3,7 @@ import { CheckIcon, ChevronDownIcon, ChevronLeftIcon, Minimize2Icon, PlayIcon }
@@ -1550,10 +1566,10 @@ index c4d91be940..4cf87f31b0 100644
  import { useShortcutModifierState } from "../../shortcutModifierState";
  import { StageBackdropButtonArt, useSidebarStageBackdropVariant } from "../SidebarStageBackdrop";
 diff --git a/apps/web/src/components/chat/ComposerStats.logic.ts b/apps/web/src/components/chat/ComposerStats.logic.ts
-index 6e7ed5e4cd..f9196990b5 100644
+index ba83c879d3..f9196990b5 100644
 --- a/apps/web/src/components/chat/ComposerStats.logic.ts
 +++ b/apps/web/src/components/chat/ComposerStats.logic.ts
-@@ -1,302 +1 @@
+@@ -1,306 +1 @@
 -import type {
 -  OrchestrationV2ProviderTurn,
 -  OrchestrationV2ThreadProjection,
@@ -1630,7 +1646,11 @@ index 6e7ed5e4cd..f9196990b5 100644
 -
 -/** These are observed completed events, not a lifetime count for a provider. */
 -export function selectRecordedCompactions(
--  items: ReadonlyArray<OrchestrationV2TurnItem>,
+-  // Structure-only items (no streamed text) carry every field a compaction needs.
+-  items: ReadonlyArray<
+-    | { readonly type: Exclude<OrchestrationV2TurnItem["type"], "compaction"> }
+-    | Extract<OrchestrationV2TurnItem, { type: "compaction" }>
+-  >,
 -  turns: ReadonlyArray<OrchestrationV2ProviderTurn>,
 -): ReadonlyArray<Extract<OrchestrationV2TurnItem, { type: "compaction" }>> {
 -  const nodes = new Set(turns.map((turn) => turn.nodeId));
@@ -1639,10 +1659,10 @@ index 6e7ed5e4cd..f9196990b5 100644
 -  const nativeAcpTurns = new Set(
 -    items
 -      .filter(
--        (item) =>
+-        (item): item is Extract<OrchestrationV2TurnItem, { type: "compaction" }> =>
 -          item.type === "compaction" &&
 -          item.status === "completed" &&
--          item.nativeItemRef?.nativeId?.startsWith("acp-compaction:"),
+-          item.nativeItemRef?.nativeId?.startsWith("acp-compaction:") === true,
 -      )
 -      .map((item) => item.providerTurnId),
 -  );
@@ -1971,15 +1991,15 @@ index e7f4042f53..bba073eb57 100644
  import {
    formatContextWindowCompactionMessage,
 diff --git a/apps/web/src/lib/contextWindow.ts b/apps/web/src/lib/contextWindow.ts
-index 5bad05664c..b4e8bb5647 100644
+index 93054e57a5..b4e8bb5647 100644
 --- a/apps/web/src/lib/contextWindow.ts
 +++ b/apps/web/src/lib/contextWindow.ts
-@@ -1,177 +1 @@
+@@ -1,195 +1 @@
+-import type { ThreadStructure, ThreadStructureTurnItem } from "@t3tools/client-runtime/state/shell";
 -import type {
 -  OrchestrationV2ProviderTurn,
 -  OrchestrationV2ProviderTurnTokenUsage,
 -  OrchestrationV2ProviderThread,
--  OrchestrationV2TurnItem,
 -  ThreadTokenUsageSnapshot,
 -} from "@t3tools/contracts";
 -import * as DateTime from "effect/DateTime";
@@ -2005,6 +2025,8 @@ index 5bad05664c..b4e8bb5647 100644
 -    by provider thread, not time, so pick by timestamp. */
 -export function latestProviderTurnTokenUsage(
 -  turns: ReadonlyArray<Pick<OrchestrationV2ProviderTurn, "tokenUsage">>,
+-  projection?: Pick<ThreadStructure, "thread" | "contextTransfers"> | null,
+-  providerThread?: Pick<OrchestrationV2ProviderThread, "contextUsage"> | null,
 -): OrchestrationV2ProviderTurnTokenUsage | null {
 -  let latest: OrchestrationV2ProviderTurnTokenUsage | null = null;
 -  for (const { tokenUsage } of turns) {
@@ -2014,12 +2036,25 @@ index 5bad05664c..b4e8bb5647 100644
 -      latest = tokenUsage;
 -    }
 -  }
--  return latest;
+-  if (latest !== null || projection == null || providerThread?.contextUsage != null) return latest;
+-  const forkedFrom = projection.thread.forkedFrom;
+-  if (forkedFrom?.type !== "run") return null;
+-  return (
+-    projection.contextTransfers.find(
+-      (transfer) =>
+-        transfer.type === "fork" &&
+-        transfer.targetThreadId === projection.thread.id &&
+-        transfer.sourceThreadId === forkedFrom.threadId &&
+-        transfer.sourcePoint.runId === forkedFrom.runId &&
+-        transfer.sourceProviderInstanceId === projection.thread.modelSelection.instanceId &&
+-        (transfer.status === "pending" || transfer.resolution?.strategy === "native_fork"),
+-    )?.sourceTokenUsage ?? null
+-  );
 -}
 -
 -export function deriveLatestContextWindowSnapshot(
 -  entries: ReadonlyArray<{
--    readonly item: OrchestrationV2TurnItem;
+-    readonly item: ThreadStructureTurnItem;
 -  }>,
 -  liveUsage?: OrchestrationV2ProviderTurnTokenUsage | null,
 -  providerThread?: Pick<OrchestrationV2ProviderThread, "contextUsage" | "updatedAt"> | null,
@@ -2051,7 +2086,10 @@ index 5bad05664c..b4e8bb5647 100644
 -      toolUses: null,
 -      durationMs: null,
 -      compactsAutomatically: providerThread?.contextUsage?.compactsAutomatically ?? null,
--      autoCompactThreshold: providerThread?.contextUsage?.autoCompactThreshold ?? null,
+-      autoCompactThreshold:
+-        liveUsage.autoCompactThreshold ??
+-        providerThread?.contextUsage?.autoCompactThreshold ??
+-        null,
 -      cost: null,
 -      updatedAt: liveUsage.updatedAt,
 -    };
@@ -2154,10 +2192,10 @@ index 5bad05664c..b4e8bb5647 100644
 -}
 +export * from "@t3tools/client-runtime/state/context-window";
 diff --git a/packages/client-runtime/package.json b/packages/client-runtime/package.json
-index 9eed1acbb8..7fc92452ab 100644
+index 7bec2b2c08..45a658da4a 100644
 --- a/packages/client-runtime/package.json
 +++ b/packages/client-runtime/package.json
-@@ -123,6 +123,14 @@
+@@ -127,6 +127,14 @@
        "types": "./src/relay/index.ts",
        "default": "./src/relay/index.ts"
      },
@@ -2848,10 +2886,10 @@ index 0000000000..81ebba342f
 +});
 diff --git a/packages/client-runtime/src/state/composerStats.ts b/packages/client-runtime/src/state/composerStats.ts
 new file mode 100644
-index 0000000000..836da770e6
+index 0000000000..5733e22796
 --- /dev/null
 +++ b/packages/client-runtime/src/state/composerStats.ts
-@@ -0,0 +1,427 @@
+@@ -0,0 +1,433 @@
 +import type {
 +  OrchestrationV2ProviderTurn,
 +  OrchestrationV2ThreadProjection,
@@ -2931,7 +2969,11 @@ index 0000000000..836da770e6
 +
 +/** These are observed completed events, not a lifetime count for a provider. */
 +export function selectRecordedCompactions(
-+  items: ReadonlyArray<OrchestrationV2TurnItem>,
++  // Structure-only items (no streamed text) carry every field a compaction needs.
++  items: ReadonlyArray<
++    | { readonly type: Exclude<OrchestrationV2TurnItem["type"], "compaction"> }
++    | Extract<OrchestrationV2TurnItem, { type: "compaction" }>
++  >,
 +  turns: ReadonlyArray<OrchestrationV2ProviderTurn>,
 +): ReadonlyArray<Extract<OrchestrationV2TurnItem, { type: "compaction" }>> {
 +  const nodes = new Set(turns.map((turn) => turn.nodeId));
@@ -2940,10 +2982,10 @@ index 0000000000..836da770e6
 +  const nativeAcpTurns = new Set(
 +    items
 +      .filter(
-+        (item) =>
++        (item): item is Extract<OrchestrationV2TurnItem, { type: "compaction" }> =>
 +          item.type === "compaction" &&
 +          item.status === "completed" &&
-+          item.nativeItemRef?.nativeId?.startsWith("acp-compaction:"),
++          item.nativeItemRef?.nativeId?.startsWith("acp-compaction:") === true,
 +      )
 +      .map((item) => item.providerTurnId),
 +  );
@@ -3236,7 +3278,9 @@ index 0000000000..836da770e6
 +export function deriveComposerStats(
 +  projection:
 +    | (Parameters<typeof selectComposerStatsTurns>[0] &
-+        Pick<OrchestrationV2ThreadProjection, "providerThreads" | "turnItems">)
++        Pick<OrchestrationV2ThreadProjection, "providerThreads"> & {
++          readonly turnItems: Parameters<typeof selectRecordedCompactions>[0];
++        })
 +    | null
 +    | undefined,
 +  providerInstances: Readonly<Record<string, { readonly config?: unknown } | undefined>>,
@@ -3445,15 +3489,15 @@ index 0000000000..45a882ab47
 +});
 diff --git a/packages/client-runtime/src/state/contextWindow.ts b/packages/client-runtime/src/state/contextWindow.ts
 new file mode 100644
-index 0000000000..5bad05664c
+index 0000000000..61b7dd2f32
 --- /dev/null
 +++ b/packages/client-runtime/src/state/contextWindow.ts
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,195 @@
++import type { ThreadStructure, ThreadStructureTurnItem } from "./shell.ts";
 +import type {
 +  OrchestrationV2ProviderTurn,
 +  OrchestrationV2ProviderTurnTokenUsage,
 +  OrchestrationV2ProviderThread,
-+  OrchestrationV2TurnItem,
 +  ThreadTokenUsageSnapshot,
 +} from "@t3tools/contracts";
 +import * as DateTime from "effect/DateTime";
@@ -3479,6 +3523,8 @@ index 0000000000..5bad05664c
 +    by provider thread, not time, so pick by timestamp. */
 +export function latestProviderTurnTokenUsage(
 +  turns: ReadonlyArray<Pick<OrchestrationV2ProviderTurn, "tokenUsage">>,
++  projection?: Pick<ThreadStructure, "thread" | "contextTransfers"> | null,
++  providerThread?: Pick<OrchestrationV2ProviderThread, "contextUsage"> | null,
 +): OrchestrationV2ProviderTurnTokenUsage | null {
 +  let latest: OrchestrationV2ProviderTurnTokenUsage | null = null;
 +  for (const { tokenUsage } of turns) {
@@ -3488,12 +3534,25 @@ index 0000000000..5bad05664c
 +      latest = tokenUsage;
 +    }
 +  }
-+  return latest;
++  if (latest !== null || projection == null || providerThread?.contextUsage != null) return latest;
++  const forkedFrom = projection.thread.forkedFrom;
++  if (forkedFrom?.type !== "run") return null;
++  return (
++    projection.contextTransfers.find(
++      (transfer) =>
++        transfer.type === "fork" &&
++        transfer.targetThreadId === projection.thread.id &&
++        transfer.sourceThreadId === forkedFrom.threadId &&
++        transfer.sourcePoint.runId === forkedFrom.runId &&
++        transfer.sourceProviderInstanceId === projection.thread.modelSelection.instanceId &&
++        (transfer.status === "pending" || transfer.resolution?.strategy === "native_fork"),
++    )?.sourceTokenUsage ?? null
++  );
 +}
 +
 +export function deriveLatestContextWindowSnapshot(
 +  entries: ReadonlyArray<{
-+    readonly item: OrchestrationV2TurnItem;
++    readonly item: ThreadStructureTurnItem;
 +  }>,
 +  liveUsage?: OrchestrationV2ProviderTurnTokenUsage | null,
 +  providerThread?: Pick<OrchestrationV2ProviderThread, "contextUsage" | "updatedAt"> | null,
@@ -3525,7 +3584,10 @@ index 0000000000..5bad05664c
 +      toolUses: null,
 +      durationMs: null,
 +      compactsAutomatically: providerThread?.contextUsage?.compactsAutomatically ?? null,
-+      autoCompactThreshold: providerThread?.contextUsage?.autoCompactThreshold ?? null,
++      autoCompactThreshold:
++        liveUsage.autoCompactThreshold ??
++        providerThread?.contextUsage?.autoCompactThreshold ??
++        null,
 +      cost: null,
 +      updatedAt: liveUsage.updatedAt,
 +    };

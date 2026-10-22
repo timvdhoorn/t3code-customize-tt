@@ -5,26 +5,29 @@ Subject: [PATCH 1/8] fix(server): measure Claude context against
  autoCompactWindow
 
 ---
- .../Adapters/ClaudeAdapterV2.test.ts          | 19 +++++++
- .../Adapters/ClaudeAdapterV2.ts               | 45 ++++++++++++++--
- .../src/provider/Drivers/ClaudeSkills.test.ts | 51 ++++++++++++++++++-
+ .../Adapters/ClaudeAdapterV2.test.ts          | 21 ++++++++
+ .../Adapters/ClaudeAdapterV2.ts               | 54 ++++++++++++++++---
+ .../src/provider/Drivers/ClaudeSkills.test.ts | 47 +++++++++++++++-
  .../src/provider/Drivers/ClaudeSkills.ts      | 48 +++++++++++++++++
  .../components/chat/ComposerStats.logic.ts    |  2 +-
- 5 files changed, 160 insertions(+), 5 deletions(-)
+ 5 files changed, 163 insertions(+), 9 deletions(-)
 
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-index e0905c0678..b3c22404ca 100644
+index fb17b6d36a..c1a54812cb 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-@@ -942,6 +942,25 @@ describe("ClaudeAdapterV2 context usage", () => {
-     });
+@@ -587,6 +587,27 @@ describe("ClaudeAdapterV2 context usage", () => {
+     );
+     assert.strictEqual(usage.promptCacheExpiresAt, "2026-08-29T00:05:00.000Z");
    });
- 
++
 +  it("measures context against autoCompactWindow, as Claude Code does", () => {
 +    const usage = ClaudeAdapterV2.claudeProviderTurnTokenUsage(
 +      { input_tokens: 129_000, output_tokens: 1_000 },
 +      CLAUDE_TEST_MODEL_SELECTION,
 +      "2026-08-29T00:00:00.000Z",
++      "",
++      undefined,
 +      ClaudeAdapterV2.claudeEffectiveContextWindow(1_000_000, "", 300_000),
 +    );
 +    assert.strictEqual(usage.maxTokens, 300_000);
@@ -38,18 +41,17 @@ index e0905c0678..b3c22404ca 100644
 +    assert.strictEqual(effective(200_000, "", 300_000), 200_000);
 +    assert.strictEqual(effective(null, "", 300_000), 300_000);
 +  });
-+
-   it("reports the prompt cache TTL the response wrote", () => {
-     const ttlFor = (cache_creation: {
-       ephemeral_1h_input_tokens: number;
+ });
+ 
+ describe("ClaudeAdapterV2 approval presentation", () => {
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-index dfa4d3665a..1793f0033e 100644
+index 0f50e8de6b..5e6fc442b4 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-@@ -119,7 +119,10 @@ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
- import { resolveAttachmentPath } from "../../attachmentStore.ts";
- import { resolveClaudeSdkExecutablePath } from "../../provider/Drivers/ClaudeExecutable.ts";
- import { planClaudeSkillDispatch } from "../../provider/Drivers/ClaudeSkillDispatch.ts";
+@@ -130,7 +130,10 @@ import {
+   planClaudeSkillDispatch,
+   type ClaudeSkillTarget,
+ } from "../../provider/Drivers/ClaudeSkillDispatch.ts";
 -import { discoverClaudeSkills } from "../../provider/Drivers/ClaudeSkills.ts";
 +import {
 +  discoverClaudeSkills,
@@ -58,7 +60,7 @@ index dfa4d3665a..1793f0033e 100644
  import {
    compileClaudeModelSelection,
    type CompiledClaudeModelSelection,
-@@ -193,6 +196,23 @@ function claudeContextWindow(modelSelection: ModelSelection): number | null {
+@@ -205,6 +208,23 @@ function claudeContextWindow(modelSelection: ModelSelection): number | null {
    );
  }
  
@@ -82,32 +84,47 @@ index dfa4d3665a..1793f0033e 100644
  interface ClaudeCacheCreation {
    readonly ephemeral_1h_input_tokens: number;
    readonly ephemeral_5m_input_tokens: number;
-@@ -229,13 +249,14 @@ export function claudeProviderTurnTokenUsage(
-   },
-   modelSelection: ModelSelection,
+@@ -251,11 +271,13 @@ export function claudeProviderTurnTokenUsage(
    updatedAt: string,
+   autoCompactWindow = "",
+   requestedAt?: DateTime.Utc,
 +  contextWindow: number | null = claudeContextWindow(modelSelection),
  ) {
    const inputTokens = claudeMessageInputTokens(usage);
    const outputTokens = usage.output_tokens;
    const promptCacheTtlMs = claudePromptCacheTtlMs(usage.cache_creation);
+-  const maxTokens = claudeContextWindow(modelSelection);
++  // The threshold is relative to the model's window, not the capped context window.
++  const modelWindow = claudeContextWindow(modelSelection);
+   // The cache lifetime starts with the request, not when its response ends.
+   const promptCacheExpiresAt =
+     promptCacheTtlMs === undefined || requestedAt === undefined
+@@ -263,13 +285,13 @@ export function claudeProviderTurnTokenUsage(
+       : DateTime.formatIso(DateTime.add(requestedAt, { milliseconds: promptCacheTtlMs }));
    return {
      usedTokens: inputTokens + outputTokens,
--    maxTokens: claudeContextWindow(modelSelection),
+-    maxTokens,
 +    maxTokens: contextWindow,
      inputTokens,
      cachedInputTokens: usage.cache_read_input_tokens ?? 0,
      outputTokens,
-@@ -3098,6 +3119,8 @@ function formatClaudeUsageLimitWait(waitMs: number): string {
- 
+     reasoningOutputTokens: 0,
+     ...(promptCacheTtlMs === undefined ? {} : { promptCacheTtlMs }),
+-    ...claudeAutoCompactThreshold(autoCompactWindow, maxTokens),
++    ...claudeAutoCompactThreshold(autoCompactWindow, modelWindow),
+     ...(promptCacheExpiresAt === undefined ? {} : { promptCacheExpiresAt }),
+     updatedAt,
+   };
+@@ -3394,6 +3416,8 @@ function formatClaudeUsageLimitWait(waitMs: number): string {
  interface ActiveClaudeTurnContext {
+   readonly queryPolicy: ClaudeRuntimeQueryPolicy;
    readonly responseThroughput: ClaudeResponseThroughput;
 +  /** See `claudeEffectiveContextWindow`; resolved once per turn. */
 +  readonly contextWindow: number | null;
    readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
    readonly nativeThreadId: string;
    readonly nativeTurnId: string;
-@@ -3621,6 +3644,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -4016,6 +4040,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
            model: input.modelSelection.model,
            now,
          });
@@ -124,25 +141,38 @@ index dfa4d3665a..1793f0033e 100644
          const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
          const activeTurn = yield* Ref.make<ActiveClaudeTurnContext | null>(null);
          // Foreground Bash calls whose output file is being tailed, by tool_use_id.
-@@ -3911,6 +3944,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
-             usage,
-             context.input.modelSelection,
+@@ -4339,6 +4373,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
              DateTime.formatIso(now),
+             adapterOptions.settings.autoCompactWindow,
+             context.streamUsage?.requestedAt,
 +            context.contextWindow,
            );
            if (tokenUsage.inputTokens <= 0) return;
            yield* emitProviderEvent({
-@@ -7410,7 +7444,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -7837,7 +7872,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+                 ? Math.round(postTokens)
+                 : undefined;
+             if (afterTokenCount !== undefined) {
+-              const maxTokens = claudeContextWindow(context.input.modelSelection);
++              const modelWindow = claudeContextWindow(context.input.modelSelection);
+               yield* emitProviderEvent({
+                 type: "provider_turn.updated",
+                 driver: CLAUDE_PROVIDER,
+@@ -7858,10 +7893,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                    completedAt: null,
                    tokenUsage: {
                      usedTokens: afterTokenCount,
--                    maxTokens: claudeContextWindow(context.input.modelSelection),
+-                    maxTokens,
 +                    maxTokens: context.contextWindow,
+                     ...claudeAutoCompactThreshold(
+                       adapterOptions.settings.autoCompactWindow,
+-                      maxTokens,
++                      modelWindow,
+                     ),
                      updatedAt: DateTime.formatIso(now),
                    },
-                 },
-@@ -8980,6 +9014,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
-             }
+@@ -9512,6 +9547,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+             const querySession = yield* openQuery(turnInput, nativeThreadId);
              const context: ActiveClaudeTurnContext = {
                responseThroughput: new ClaudeResponseThroughput(),
 +              contextWindow: claudeEffectiveContextWindow(
@@ -151,26 +181,22 @@ index dfa4d3665a..1793f0033e 100644
 +                fileAutoCompactWindow,
 +              ),
                input: turnInput,
+               queryPolicy: querySession.queryPolicy,
                nativeThreadId,
-               nativeTurnId,
 diff --git a/apps/server/src/provider/Drivers/ClaudeSkills.test.ts b/apps/server/src/provider/Drivers/ClaudeSkills.test.ts
-index 6529fdd412..79110fe50c 100644
+index 62c322cabf..3ce1f95206 100644
 --- a/apps/server/src/provider/Drivers/ClaudeSkills.test.ts
 +++ b/apps/server/src/provider/Drivers/ClaudeSkills.test.ts
-@@ -5,7 +5,11 @@ import * as Effect from "effect/Effect";
+@@ -4,7 +4,7 @@ import * as Effect from "effect/Effect";
  import * as FileSystem from "effect/FileSystem";
  import * as Path from "effect/Path";
  
--import { discoverClaudeSkills, skillOverrideSettingsPaths } from "./ClaudeSkills.ts";
-+import {
-+  discoverClaudeSkills,
-+  readClaudeAutoCompactWindow,
-+  skillOverrideSettingsPaths,
-+} from "./ClaudeSkills.ts";
+-import { discoverClaudeSkills } from "./ClaudeSkills.ts";
++import { discoverClaudeSkills, readClaudeAutoCompactWindow } from "./ClaudeSkills.ts";
  import { planClaudeSkillDispatch } from "./ClaudeSkillDispatch.ts";
  
  const writeSkill = Effect.fn(function* (
-@@ -788,3 +792,48 @@ it.layer(NodeServices.layer)("discoverClaudeSkills", (it) => {
+@@ -875,3 +875,48 @@ it.layer(NodeServices.layer)("discoverClaudeSkills", (it) => {
      }),
    );
  });
@@ -220,10 +246,10 @@ index 6529fdd412..79110fe50c 100644
 +  );
 +});
 diff --git a/apps/server/src/provider/Drivers/ClaudeSkills.ts b/apps/server/src/provider/Drivers/ClaudeSkills.ts
-index 9828dafe45..3dd53bda98 100644
+index ff26287611..eb7b8488cd 100644
 --- a/apps/server/src/provider/Drivers/ClaudeSkills.ts
 +++ b/apps/server/src/provider/Drivers/ClaudeSkills.ts
-@@ -262,6 +262,54 @@ const resolveClaudeConfigDirPath = Effect.fn("resolveClaudeConfigDirPath")(funct
+@@ -436,6 +436,54 @@ const resolveClaudeConfigDirPath = Effect.fn("resolveClaudeConfigDirPath")(funct
    return path.join(home, ".claude");
  });
  
@@ -279,10 +305,10 @@ index 9828dafe45..3dd53bda98 100644
   * Roots are listed highest precedence first and the first hit for a name wins,
   * matching Claude Code: verified against the CLI with the same skill name in
 diff --git a/apps/web/src/components/chat/ComposerStats.logic.ts b/apps/web/src/components/chat/ComposerStats.logic.ts
-index 8c8236a639..6e7ed5e4cd 100644
+index 96f52e05f5..ba83c879d3 100644
 --- a/apps/web/src/components/chat/ComposerStats.logic.ts
 +++ b/apps/web/src/components/chat/ComposerStats.logic.ts
-@@ -292,7 +292,7 @@ export function deriveContextCompaction(
+@@ -296,7 +296,7 @@ export function deriveContextCompaction(
            ? "Provider reported"
            : "Claude setting"
          : driver === "claudeAgent"

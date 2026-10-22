@@ -18,7 +18,7 @@ standing grant in "Unattended ports"); this is the order.
    lists the repo's open PRs: report each one, a port or feature waiting there has not shipped.
 2. Nothing newer and nothing behind: report that per machine and stop.
 3. A Mac whose app is older than the newest nightly gets it from T3's own updater: the customized
-   build downloads it itself and installs on quit (`patches-tt/0007`). Do not quit or relaunch the
+   build downloads it itself and installs on quit (`patches-tt/0006`). Do not quit or relaunch the
    app; tell Tim it installs the next time he quits T3 Code, unless he asks you to wait for it.
 4. Port when the patches no longer apply: a `build`, `update` or `server` reports a conflict or
    failing check. The porter is devbox1 (`"fix"` in `machines.json`): an unattended Mac run hands the
