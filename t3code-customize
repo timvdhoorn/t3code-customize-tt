@@ -2520,21 +2520,32 @@ def contains(folder, marker):
                if path.suffix in ('.js', '.mjs', '.cjs') and path.is_file())
 
 
+def sea_node_version(source):
+    """The exact Node the server executable embeds: SEA_NODE_VERSION in older nightlies, the root
+    package.json's engines.node since upstream #23165 pinned that instead."""
+    pinned = re.search(r'SEA_NODE_VERSION\s*=\s*"([\d.]+)"', (source / 'apps/server/vite.config.ts').read_text())
+    if pinned:
+        return pinned.group(1)
+    engine = json.loads((source / 'package.json').read_text()).get('engines', {}).get('node', '')
+    return engine if re.fullmatch(r'\d+\.\d+\.\d+', engine) else None
+
+
 def build_server(env, version, config, log):
     step('Building the T3 server...')
     env = dict(env, APP_VERSION=version, TMPDIR=str(CACHE / 'tmp'),
                T3CODE_CUSTOMIZED_BUILD=customized_build_stamp(), **config)
     Path(env['TMPDIR']).mkdir(parents=True, exist_ok=True)
-    pinned = re.search(r'SEA_NODE_VERSION\s*=\s*"([\d.]+)"', (SOURCE / 'apps/server/vite.config.ts').read_text())
-    if not pinned:
-        raise Stop('apps/server/vite.config.ts no longer pins SEA_NODE_VERSION; upstream changed how the'
-                   ' server executable is built. Update build_server in ' + NAME + '.')
+    sea_version = sea_node_version(SOURCE)
+    if not sea_version:
+        raise Stop('Neither apps/server/vite.config.ts (SEA_NODE_VERSION) nor package.json (engines.node) pins'
+                   ' an exact Node; upstream changed how the server executable is built. Update build_server in '
+                   + NAME + '.')
     with pinned_versions(version, ('web', 'server')):
         build_web_and_server(env, version, log)
         # Like upstream's release workflow: the repo builds on its own Node, the executable with
         # the Node it embeds (25.7+ for --build-sea).
-        sea_bin = exact_node(pinned.group(1), log)
-        exe_env = dict(env, PATH=os.pathsep.join([str(sea_bin), env['PATH']]), VP_NODE_VERSION=pinned.group(1))
+        sea_bin = exact_node(sea_version, log)
+        exe_env = dict(env, PATH=os.pathsep.join([str(sea_bin), env['PATH']]), VP_NODE_VERSION=sea_version)
         run([str(sea_bin / 'node'), 'scripts/cli.ts', 'build-exe'], cwd=SOURCE / 'apps/server', env=exe_env, log=log)
     for folder, marker in (('apps/server/dist/client', b'statsForNerds'), ('apps/server/dist-exe', b'claude_observed')):
         if not contains(SOURCE / folder, marker):
