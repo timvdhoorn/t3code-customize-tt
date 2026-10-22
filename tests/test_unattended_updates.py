@@ -38,6 +38,28 @@ def state_db(path, runs, provider_threads=()):
     db.close()
 
 
+class SeaNodeVersionTest(unittest.TestCase):
+    def source(self, vite_config, package):
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__('shutil').rmtree(folder, ignore_errors=True))
+        (folder / 'apps/server').mkdir(parents=True)
+        (folder / 'apps/server/vite.config.ts').write_text(vite_config)
+        (folder / 'package.json').write_text(json.dumps(package))
+        return folder
+
+    def test_reads_the_vite_pin_of_older_nightlies(self):
+        source = self.source('const SEA_NODE_VERSION = "26.8.2";\n', {'engines': {'node': '24.13.1'}})
+        self.assertEqual(customize.sea_node_version(source), '26.8.2')
+
+    def test_falls_back_to_the_exact_engines_node(self):
+        source = self.source('const cliNodeVersion = rootPackageJson.engines.node;\n', {'engines': {'node': '26.12.1'}})
+        self.assertEqual(customize.sea_node_version(source), '26.12.1')
+
+    def test_a_range_is_no_pin(self):
+        source = self.source('', {'engines': {'node': '>=24'}})
+        self.assertIsNone(customize.sea_node_version(source))
+
+
 class BusyThreadsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
