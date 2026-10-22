@@ -1,0 +1,359 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: timvdhoorn <timvdhoorn@gmail.com>
+Date: Thu, 22 Oct 2026 19:11:45 +0000
+Subject: [PATCH 8/8] feat(server): keep idle compactions silent
+
+Upstream's idle compaction (#21682) sends /compact as a visible turn, which can push an alert or Live Activity and mark a read thread unread. The relay and direct push now skip a thread whose latest run is an idle compaction (settling and archiving still publish), and a finished compaction moves the read mark only when the thread was already read.
+---
+ .../src/orchestration-v2/IdleCompaction.ts    | 60 +++++++++++++-
+ .../IdleCompactionReadState.test.ts           | 79 +++++++++++++++++++
+ .../orchestration-v2/IdleCompactionService.ts | 35 +++++++-
+ .../src/relay/AgentAwarenessRelay.test.ts     | 48 ++++++++++-
+ apps/server/src/relay/AgentAwarenessRelay.ts  | 17 ++++
+ 5 files changed, 233 insertions(+), 6 deletions(-)
+ create mode 100644 apps/server/src/orchestration-v2/IdleCompactionReadState.test.ts
+
+diff --git a/apps/server/src/orchestration-v2/IdleCompaction.ts b/apps/server/src/orchestration-v2/IdleCompaction.ts
+index b142dd4efb..1a0842d5cb 100644
+--- a/apps/server/src/orchestration-v2/IdleCompaction.ts
++++ b/apps/server/src/orchestration-v2/IdleCompaction.ts
+@@ -1,4 +1,10 @@
+-import type { OrchestrationV2ThreadProjection } from "@t3tools/contracts";
++import {
++  MessageId,
++  type OrchestrationV2Run,
++  type OrchestrationV2ThreadProjection,
++  type RunId,
++  type ThreadId,
++} from "@t3tools/contracts";
+ import { COMPACTION_SUGGESTION_MIN_TOKENS } from "@t3tools/shared/claudeCompaction";
+ import { derivePendingBackgroundWork } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+ import * as DateTime from "effect/DateTime";
+@@ -101,3 +107,55 @@ export function idleCompactionWindow(
+   if (!Number.isFinite(endMs) || nowMs >= endMs) return null;
+   return { runId: latestRun.id, startMs: endMs - LEAD_MS, endMs };
+ }
++
++const IDLE_COMPACTION_MESSAGE_PREFIX = "idle-compact:";
++
++/** The message an idle compaction sends for the completed run `runId`. */
++export function idleCompactionMessageId(threadId: ThreadId, runId: RunId): MessageId {
++  return MessageId.make(`${IDLE_COMPACTION_MESSAGE_PREFIX}${threadId}:${runId}`);
++}
++
++/** Whether a run was started by an idle compaction rather than by someone. */
++export function isIdleCompactionRun(run: Pick<OrchestrationV2Run, "userMessageId">): boolean {
++  return run.userMessageId.startsWith(IDLE_COMPACTION_MESSAGE_PREFIX);
++}
++
++/**
++ * When a finished idle compaction should move the thread's read mark to its
++ * end, or null. Housekeeping must not make a thread the person had already
++ * read look unread; a thread that was still unread stays unread.
++ */
++export function idleCompactionVisitedAt(
++  {
++    thread,
++    runs,
++  }: {
++    readonly thread: Pick<OrchestrationV2ThreadProjection["thread"], "lastVisitedAt">;
++    readonly runs: ReadonlyArray<
++      Pick<OrchestrationV2Run, "id" | "ordinal" | "status" | "completedAt" | "userMessageId">
++    >;
++  },
++  compactionRunId: RunId,
++): DateTime.Utc | null {
++  const compaction = runs.find((run) => run.id === compactionRunId);
++  if (
++    compaction === undefined ||
++    !isIdleCompactionRun(compaction) ||
++    compaction.status !== "completed" ||
++    compaction.completedAt === null ||
++    thread.lastVisitedAt === null
++  )
++    return null;
++  const previous = runs
++    .filter((run) => run.ordinal < compaction.ordinal && !isIdleCompactionRun(run))
++    .reduce<(typeof runs)[number] | null>(
++      (latest, run) => (latest === null || run.ordinal > latest.ordinal ? run : latest),
++      null,
++    );
++  if (
++    previous?.completedAt == null ||
++    DateTime.toEpochMillis(thread.lastVisitedAt) < DateTime.toEpochMillis(previous.completedAt)
++  )
++    return null;
++  return compaction.completedAt;
++}
+diff --git a/apps/server/src/orchestration-v2/IdleCompactionReadState.test.ts b/apps/server/src/orchestration-v2/IdleCompactionReadState.test.ts
+new file mode 100644
+index 0000000000..3ad294ad35
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/IdleCompactionReadState.test.ts
+@@ -0,0 +1,79 @@
++import { describe, expect, it } from "@effect/vitest";
++import { MessageId, RunId, ThreadId } from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++
++import {
++  idleCompactionMessageId,
++  idleCompactionVisitedAt,
++  isIdleCompactionRun,
++} from "./IdleCompaction.ts";
++
++const NOW_MS = Date.parse("2026-10-22T12:00:00.000Z");
++const at = (offsetMs: number) => DateTime.makeUnsafe(NOW_MS + offsetMs);
++const threadId = ThreadId.make("idle-thread");
++const userRunId = RunId.make("run-user");
++const compactionRunId = RunId.make("run-compaction");
++
++const userRun = {
++  id: userRunId,
++  ordinal: 1,
++  status: "completed" as const,
++  completedAt: at(0),
++  userMessageId: MessageId.make("message-user"),
++};
++const compactionRun = {
++  id: compactionRunId,
++  ordinal: 2,
++  status: "completed" as const,
++  completedAt: at(60 * 60_000),
++  userMessageId: idleCompactionMessageId(threadId, userRunId),
++};
++
++describe("idle compaction read state", () => {
++  it("recognises only the runs an idle compaction started", () => {
++    expect(isIdleCompactionRun(compactionRun)).toBe(true);
++    expect(isIdleCompactionRun(userRun)).toBe(false);
++  });
++
++  it("keeps a thread read after its compaction when it was read before", () => {
++    expect(
++      idleCompactionVisitedAt(
++        { thread: { lastVisitedAt: at(1_000) }, runs: [userRun, compactionRun] },
++        compactionRunId,
++      ),
++    ).toEqual(compactionRun.completedAt);
++  });
++
++  it("leaves a thread that was still unread, or never opened, as it was", () => {
++    expect(
++      idleCompactionVisitedAt(
++        { thread: { lastVisitedAt: at(-1_000) }, runs: [userRun, compactionRun] },
++        compactionRunId,
++      ),
++    ).toBeNull();
++    expect(
++      idleCompactionVisitedAt(
++        { thread: { lastVisitedAt: null }, runs: [userRun, compactionRun] },
++        compactionRunId,
++      ),
++    ).toBeNull();
++  });
++
++  it("does not touch the read mark for a person's own run or a failed compaction", () => {
++    expect(
++      idleCompactionVisitedAt(
++        { thread: { lastVisitedAt: at(1_000) }, runs: [userRun, compactionRun] },
++        userRunId,
++      ),
++    ).toBeNull();
++    expect(
++      idleCompactionVisitedAt(
++        {
++          thread: { lastVisitedAt: at(1_000) },
++          runs: [userRun, { ...compactionRun, status: "failed" as const }],
++        },
++        compactionRunId,
++      ),
++    ).toBeNull();
++  });
++});
+diff --git a/apps/server/src/orchestration-v2/IdleCompactionService.ts b/apps/server/src/orchestration-v2/IdleCompactionService.ts
+index 30c81ba703..f4f0b348d4 100644
+--- a/apps/server/src/orchestration-v2/IdleCompactionService.ts
++++ b/apps/server/src/orchestration-v2/IdleCompactionService.ts
+@@ -1,6 +1,5 @@
+ import {
+   CommandId,
+-  MessageId,
+   resolveIdleCompaction,
+   resolveProjectProviderInstanceEnabled,
+   type RunId,
+@@ -14,7 +13,12 @@ import * as Stream from "effect/Stream";
+ 
+ import { forkParked } from "../serverActivation.ts";
+ import * as ServerSettings from "../serverSettings.ts";
+-import { idleCompactionWindow } from "./IdleCompaction.ts";
++import {
++  idleCompactionMessageId,
++  idleCompactionVisitedAt,
++  idleCompactionWindow,
++  isIdleCompactionRun,
++} from "./IdleCompaction.ts";
+ import * as Orchestrator from "./Orchestrator.ts";
+ import * as ProjectionStore from "./ProjectionStore.ts";
+ 
+@@ -68,7 +72,7 @@ export const make = Effect.gen(function* () {
+           type: "message.dispatch",
+           // One compaction per completed run, even across duplicate events.
+           commandId: CommandId.make(`server:idle-compact:${threadId}:${runId}`),
+-          messageId: MessageId.make(`idle-compact:${threadId}:${runId}`),
++          messageId: idleCompactionMessageId(threadId, runId),
+           threadId,
+           text: "/compact",
+           attachments: [],
+@@ -85,13 +89,36 @@ export const make = Effect.gen(function* () {
+       ),
+   );
+ 
++  // Fork: a finished compaction leaves an already-read thread read.
++  const keepReadState = Effect.fn("IdleCompactionService.keepReadState")(
++    function* (threadId: ThreadId, runId: RunId) {
++      const records = yield* projections.getThreadRecords(threadId, ["runs"]);
++      const visitedAt = idleCompactionVisitedAt(records, runId);
++      if (visitedAt === null) return;
++      yield* orchestrator.dispatch({
++        type: "thread.visit",
++        commandId: CommandId.make(`server:idle-compact-visit:${threadId}:${runId}`),
++        threadId,
++        visitedAt: DateTime.formatIso(visitedAt),
++      });
++    },
++    (effect, threadId) =>
++      effect.pipe(
++        Effect.catch((cause) =>
++          Effect.logWarning("idle compaction read state skipped", { threadId, cause }),
++        ),
++      ),
++  );
++
+   const start = Effect.fn("IdleCompactionService.start")(function* () {
+     // Keyed by thread: a newer completed run replaces the waiting timer.
+     const timers = yield* FiberMap.make<ThreadId>();
+     yield* forkParked(
+       Stream.runForEach(orchestrator.streamDomainEvents, (event) =>
+         event.type === "run.updated" && event.payload.status === "completed"
+-          ? FiberMap.run(timers, event.threadId, compactWhenDue(event.threadId, event.payload.id))
++          ? isIdleCompactionRun(event.payload)
++            ? keepReadState(event.threadId, event.payload.id)
++            : FiberMap.run(timers, event.threadId, compactWhenDue(event.threadId, event.payload.id))
+           : Effect.void,
+       ),
+     );
+diff --git a/apps/server/src/relay/AgentAwarenessRelay.test.ts b/apps/server/src/relay/AgentAwarenessRelay.test.ts
+index 9dacdf11b6..ec3e071d34 100644
+--- a/apps/server/src/relay/AgentAwarenessRelay.test.ts
++++ b/apps/server/src/relay/AgentAwarenessRelay.test.ts
+@@ -6,6 +6,7 @@ import {
+   MessageId,
+   NodeId,
+   type OrchestrationV2DomainEvent,
++  type OrchestrationV2Run,
+   type OrchestrationV2ThreadShell,
+   type OrchestrationV2TurnItem,
+   ProjectId,
+@@ -142,6 +143,10 @@ const makeTestRelay = Effect.fnUntraced(function* (
+     readonly failSecretRead?: (name: string) => boolean;
+     readonly linked?: boolean;
+     readonly readShell?: (threadId: ThreadId) => Effect.Effect<OrchestrationV2ThreadShell | null>;
++    readonly readRuns?: (
++      threadId: ThreadId,
++      runIds?: ReadonlyArray<RunId>,
++    ) => ReadonlyArray<OrchestrationV2Run>;
+     readonly domainEvents?: Stream.Stream<OrchestrationV2DomainEvent>;
+     readonly directPush?: DirectPush.DirectPush["Service"];
+   } = {},
+@@ -198,7 +203,13 @@ const makeTestRelay = Effect.fnUntraced(function* (
+     getTimelinePage: () => Effect.die("Unused timeline read"),
+     getMessageCount: () => Effect.die("unused message count"),
+     getTurnItem: () => Effect.die("unused turn item read"),
+-    getThreadRecords: () => Effect.die("unused record read"),
++    getThreadRecords: (threadId, fields, filter) =>
++      fields.some((field) => field === "runs")
++        ? Effect.succeed({
++            thread: shell({ id: threadId }),
++            runs: options.readRuns?.(threadId, filter?.runIds) ?? [],
++          } as never)
++        : Effect.die("unused record read"),
+     getThreadProjection: unused,
+     getCheckpointContext: unused,
+     getThreadSnapshot: unused,
+@@ -361,6 +372,41 @@ describe("AgentAwarenessRelay", () => {
+     }),
+   );
+ 
++  it.effect("keeps an idle compaction off the card and the alerts", () =>
++    Effect.gen(function* () {
++      const direct: Array<RelayAgentActivityState | null> = [];
++      const compactionRunId = RunId.make("relay-idle-compaction-run");
++      const userRunId = RunId.make("relay-user-run");
++      const run = (id: RunId, userMessageId: string) =>
++        ({ id, userMessageId: MessageId.make(userMessageId) }) as OrchestrationV2Run;
++      let latestRunId = compactionRunId;
++      const { relay } = yield* makeTestRelay({
++        linked: false,
++        readShell: () =>
++          Effect.succeed(shell({ activeRunId: latestRunId, latestRunId })),
++        readRuns: (_threadId, runIds) =>
++          [
++            run(compactionRunId, `idle-compact:${THREAD_ID}:${userRunId}`),
++            run(userRunId, "relay-user-message"),
++          ].filter((candidate) => runIds?.includes(candidate.id) ?? true),
++        directPush: {
++          isEnabled: Effect.succeed(true),
++          registerDevice: () => Effect.die("unused"),
++          registerLiveActivity: () => Effect.die("unused"),
++          snapshot: Effect.die("unused"),
++          publish: ({ state }) => Effect.sync(() => void direct.push(state)),
++        },
++      });
++      yield* relay.publishThread(THREAD_ID);
++      assert.equal(direct.length, 0);
++
++      latestRunId = userRunId;
++      yield* relay.publishThread(THREAD_ID);
++      assert.equal(direct.length, 1);
++      assert.equal(direct[0]?.phase, "running");
++    }),
++  );
++
+   it.effect("tells direct push which threads an agent opened", () =>
+     Effect.gen(function* () {
+       const direct: Array<boolean | undefined> = [];
+diff --git a/apps/server/src/relay/AgentAwarenessRelay.ts b/apps/server/src/relay/AgentAwarenessRelay.ts
+index 4ae6b652af..92ce49be10 100644
+--- a/apps/server/src/relay/AgentAwarenessRelay.ts
++++ b/apps/server/src/relay/AgentAwarenessRelay.ts
+@@ -48,6 +48,7 @@ import {
+ import { getOrCreateEnvironmentKeyPairFromSecretStore } from "../cloud/environmentKeys.ts";
+ import * as DirectPush from "../directPush/DirectPush.ts";
+ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
++import { isIdleCompactionRun } from "../orchestration-v2/IdleCompaction.ts";
+ import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
+ import * as ProjectService from "../project/ProjectService.ts";
+ import { forkParked } from "../serverActivation.ts";
+@@ -533,6 +534,22 @@ export const make = Effect.gen(function* () {
+     // domain event, so materializing the full shell here would make the cost
+     // of one thread's activity proportional to how many threads exist.
+     const threadShell = yield* threads.getThreadShell(threadId);
++    // Fork: an idle compaction is housekeeping, so it neither starts nor ends
++    // a card or alert; the last published state stands. Archiving and
++    // settling still publish, so the card can clear.
++    const shellRunId = threadShell?.activeRunId ?? threadShell?.latestRunId ?? null;
++    if (
++      threadShell !== null &&
++      shellRunId !== null &&
++      threadShell.archivedAt === null &&
++      threadShell.settledAt === null &&
++      threadShell.settledOverride !== "settled"
++    ) {
++      const { runs } = yield* threads.getThreadRecords(threadId, ["runs"], {
++        runIds: [shellRunId],
++      });
++      if (runs.some((run) => run.id === shellRunId && isIdleCompactionRun(run))) return;
++    }
+     if (
+       threadShell?.lineage.relationshipToParent === "subagent" &&
+       !(yield* Ref.get(publishedStateByThreadRef)).has(threadId)

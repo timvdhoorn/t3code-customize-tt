@@ -13,15 +13,15 @@ darkened to keep white button text at 4.5:1.
  .../mobile/generated-uniwind-theme-names.json |   4 +-
  apps/mobile/generated-uniwind-themes.css      | 322 ++++++++++++++++++
  .../scripts/generate-uniwind-themes.mts       |   8 +-
- .../scripts/generate-uniwind-themes.test.ts   |   2 +
+ .../scripts/generate-uniwind-themes.test.ts   |   8 +
  apps/mobile/src/lib/claudeTheme.test.ts       |  65 ++++
  apps/mobile/src/lib/mobileTheme.test.ts       |   3 +-
  apps/mobile/src/lib/mobileTheme.ts            |  10 +-
- .../mobile/src/lib/mobileThemeRuntime.test.ts |   9 +-
+ .../mobile/src/lib/mobileThemeRuntime.test.ts |  16 +
  apps/mobile/src/lib/mobileThemeRuntime.ts     |   6 +-
  apps/mobile/uniwind-types.d.ts                |   2 +-
  packages/shared/src/themePalettes.ts          | 153 ++++++++-
- 11 files changed, 565 insertions(+), 19 deletions(-)
+ 11 files changed, 582 insertions(+), 15 deletions(-)
  create mode 100644 apps/mobile/src/lib/claudeTheme.test.ts
 
 diff --git a/apps/mobile/generated-uniwind-theme-names.json b/apps/mobile/generated-uniwind-theme-names.json
@@ -410,18 +410,22 @@ index d930766e5f..26e6719ce0 100644
          renderVariant(`${themeId}-${appearance}`, variablesFor(themeId, appearance)),
        ),
 diff --git a/apps/mobile/scripts/generate-uniwind-themes.test.ts b/apps/mobile/scripts/generate-uniwind-themes.test.ts
-index a225b7087c..96d4facd6b 100644
+index 25ed7dd41d..3aa0c6c050 100644
 --- a/apps/mobile/scripts/generate-uniwind-themes.test.ts
 +++ b/apps/mobile/scripts/generate-uniwind-themes.test.ts
-@@ -37,6 +37,8 @@ describe("generate mobile Uniwind themes", () => {
-       "ember-dark",
-       "iris-light",
-       "iris-dark",
-+      "claude-light",
-+      "claude-dark",
-     ]);
- 
-     const stylesheet = renderUniwindThemesCSS();
+@@ -37,4 +37,12 @@ describe("generate mobile Uniwind themes", () => {
+       });
+     }
+   });
++
++  it("registers the Claude palette for both appearances", () => {
++    expect(customThemeNames).toEqual(expect.arrayContaining(["claude-light", "claude-dark"]));
++    const stylesheet = renderUniwindThemesCSS();
++    for (const themeName of ["claude-light", "claude-dark"]) {
++      expect(stylesheet.match(new RegExp(`@variant ${themeName} \\{`, "gu"))).toHaveLength(1);
++    }
++  });
+ });
 diff --git a/apps/mobile/src/lib/claudeTheme.test.ts b/apps/mobile/src/lib/claudeTheme.test.ts
 new file mode 100644
 index 0000000000..c94ff9ae79
@@ -494,7 +498,7 @@ index 0000000000..c94ff9ae79
 +  });
 +});
 diff --git a/apps/mobile/src/lib/mobileTheme.test.ts b/apps/mobile/src/lib/mobileTheme.test.ts
-index d201a1e5ae..b3f6a36851 100644
+index 31fc6f83f1..c6051813da 100644
 --- a/apps/mobile/src/lib/mobileTheme.test.ts
 +++ b/apps/mobile/src/lib/mobileTheme.test.ts
 @@ -5,6 +5,7 @@ import {
@@ -505,7 +509,7 @@ index d201a1e5ae..b3f6a36851 100644
    MOBILE_THEME_IDS,
    getThemeColorsForAppearance,
  } from "@t3tools/shared/themePalettes";
-@@ -81,7 +82,7 @@ describe("mobile themes", () => {
+@@ -69,7 +70,7 @@ describe("mobile themes", () => {
  
    it.each(MOBILE_THEME_IDS)("uses the web color roles for %s in both appearances", (themeId) => {
      for (const appearance of ["light", "dark"] as const) {
@@ -555,42 +559,37 @@ index 52b8ff3b4f..42c368e827 100644
    return {
      canvas: themeColorToNativeColor(colors.canvas),
 diff --git a/apps/mobile/src/lib/mobileThemeRuntime.test.ts b/apps/mobile/src/lib/mobileThemeRuntime.test.ts
-index ad678d1f88..aebdc2a425 100644
+index b65a5e9391..6ede95f77f 100644
 --- a/apps/mobile/src/lib/mobileThemeRuntime.test.ts
 +++ b/apps/mobile/src/lib/mobileThemeRuntime.test.ts
-@@ -20,6 +20,7 @@ describe("mobileThemeRuntime", () => {
+@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
  
-   it("maps custom palettes and appearances to registered themes", () => {
-     expect(getMobileUniwindThemeName("t3-chat", "dark")).toBe("t3-chat-dark");
-+    expect(getMobileUniwindThemeName("claude", "light")).toBe("claude-light");
+ import {
+   createMobileThemeRuntimeOperations,
++  getMobileUniwindThemeName,
+   type MobileThemeRuntimeState,
+ } from "./mobileThemeRuntime";
+ 
+@@ -20,4 +21,19 @@ describe("mobileThemeRuntime", () => {
+ 
+     expect(operations).toEqual([]);
    });
- 
-   it("hydrates text variables and clears the native appearance override", () => {
-@@ -28,8 +29,8 @@ describe("mobileThemeRuntime", () => {
-       (operation) => operation.kind === "update-text-variables",
-     );
- 
--    expect(variableOperations).toHaveLength(12);
--    expect(variableOperations.at(-1)?.themeName).toBe("iris-dark");
++
++  it("maps the Claude palette to its registered themes", () => {
++    expect(getMobileUniwindThemeName("claude", "light")).toBe("claude-light");
++    expect(getMobileUniwindThemeName("claude", "dark")).toBe("claude-dark");
++  });
++
++  it("hydrates text variables for every palette, the Claude themes last", () => {
++    const operations = createMobileThemeRuntimeOperations(null, initialState);
++    const variableOperations = operations.filter(
++      (operation) => operation.kind === "update-text-variables",
++    );
++
 +    expect(variableOperations).toHaveLength(14);
 +    expect(variableOperations.at(-1)?.themeName).toBe("claude-dark");
-     expect(operations.at(-1)).toEqual({
-       kind: "set-appearance-mode",
-       appearance: "light",
-@@ -68,11 +69,11 @@ describe("mobileThemeRuntime", () => {
-       baseFontSize: 18,
-     });
- 
--    expect(operations).toHaveLength(12);
-+    expect(operations).toHaveLength(14);
-     expect(operations.every((operation) => operation.kind === "update-text-variables")).toBe(true);
-     expect(operations.at(-1)).toMatchObject({
-       kind: "update-text-variables",
--      themeName: "iris-dark",
-+      themeName: "claude-dark",
-     });
-   });
- 
++  });
+ });
 diff --git a/apps/mobile/src/lib/mobileThemeRuntime.ts b/apps/mobile/src/lib/mobileThemeRuntime.ts
 index ec2858cb9f..04be3d7295 100644
 --- a/apps/mobile/src/lib/mobileThemeRuntime.ts
