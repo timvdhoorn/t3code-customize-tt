@@ -32,11 +32,13 @@ guide line, context-menu collapse and a summary stub.
  .../src/components/threadActionMenu.logic.ts  |  13 +
  apps/web/src/contextMenuFallback.ts           |   7 +
  packages/client-runtime/src/state/models.ts   |  18 +
+ .../src/state/shell-sync.test.ts              |  12 +-
+ packages/client-runtime/src/state/shell.ts    |   4 +-
  .../src/state/threadCommands.test.ts          |   6 +-
  .../src/state/threadCommands.ts               |  14 +-
  .../src/state/threadShell.test.ts             |  37 ++
  packages/contracts/src/orchestrationV2.ts     |  25 +
- 27 files changed, 2486 insertions(+), 39 deletions(-)
+ 29 files changed, 2494 insertions(+), 47 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.childThreads.browser.test.tsx
  create mode 100644 apps/web/src/components/Sidebar.childThreads.test.ts
  create mode 100644 apps/web/src/components/Sidebar.childThreads.tsx
@@ -3051,6 +3053,45 @@ index d772989f23..daa57f1e3c 100644
      limitRecovery: thread.limitRecovery ?? null,
      pinnedAt: nullableIso(thread.pinnedAt ?? null),
      autoSettleDisabledAt: nullableIso(thread.autoSettleDisabledAt ?? null),
+diff --git a/packages/client-runtime/src/state/shell-sync.test.ts b/packages/client-runtime/src/state/shell-sync.test.ts
+index 2941e81278..6901ae1bca 100644
+--- a/packages/client-runtime/src/state/shell-sync.test.ts
++++ b/packages/client-runtime/src/state/shell-sync.test.ts
+@@ -685,14 +685,12 @@ describe("environment shell synchronization", () => {
+       const stateWhere = (predicate: (state: EnvironmentShellState) => boolean) =>
+         SubscriptionRef.changes(shellState).pipe(Stream.filter(predicate), Stream.runHead);
+ 
+-      // Both transports must omit, or omitted children would come back through the socket.
+-      expect(yield* Deferred.await(subscribeInput)).toMatchObject({
+-        afterSequence: 1,
+-        omitIdleSubagents: true,
+-        omitOlderSettled: true,
+-      });
++      // Both transports must agree. Idle subagents stay: the lists nest finished workers.
++      const subscribed = yield* Deferred.await(subscribeInput);
++      expect(subscribed).toMatchObject({ afterSequence: 1, omitOlderSettled: true });
++      expect(subscribed).not.toHaveProperty("omitIdleSubagents");
+       expect(yield* Ref.get(loadOptions)).toEqual([
+-        { omitIdleSubagents: true, omitOlderSettled: true },
++        { omitIdleSubagents: false, omitOlderSettled: true },
+       ]);
+       const loaded = Option.getOrThrow(yield* stateWhere((state) => state.generation > 0));
+       expect(loaded.removedAt.size).toBe(0);
+diff --git a/packages/client-runtime/src/state/shell.ts b/packages/client-runtime/src/state/shell.ts
+index ba9bb3d489..11f92bf1b9 100644
+--- a/packages/client-runtime/src/state/shell.ts
++++ b/packages/client-runtime/src/state/shell.ts
+@@ -367,7 +367,9 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
+           yield* session.initialConfig.pipe(
+             Effect.map((config) => ({
+               supportsCompletionMarker: config.shellResumeCompletionMarker === true,
+-              omitIdleSubagents: config.shellThreadFamilies === true,
++              // The sidebar and mobile list nest finished `delegate_task` workers under their opener, and
++              // only the open thread mounts its family, so idle subagent rows stay in the shell.
++              omitIdleSubagents: false,
+               omitOlderSettled:
+                 config.shellOlderSettled === true && config.shellThreadFamilies === true,
+             })),
 diff --git a/packages/client-runtime/src/state/threadCommands.test.ts b/packages/client-runtime/src/state/threadCommands.test.ts
 index d61213c243..43d4273d34 100644
 --- a/packages/client-runtime/src/state/threadCommands.test.ts
