@@ -246,7 +246,7 @@ OPERATIONAL_CODE = frozenset({
     'remote_port_line', 'handed_off_already', 'hand_off_port', 'spawn_detached', 'publish_port',
     '_publish_port', 'port_branch', 'port_changes', 'committed_folder', 'working_folder',
     'is_port_file', 'newest_nightly', 'cmd_port', 'cmd_continue',
-    'available_agents', 'choose_agent', 'agent_prompt',
+    'find_agent', 'available_agents', 'choose_agent', 'agent_prompt',
 })
 
 
@@ -1174,14 +1174,26 @@ def build_bundles(env, version, resources, config, log):
 
 # --- Porting help -------------------------------------------------------------------
 
+def find_agent(name):
+    """Whether the agent is installed. A login shell over SSH and the systemd units it writes may lack the
+    user install folders (zsh -lc reads no .zshrc), so those are searched too and added to PATH."""
+    if shutil.which(name):
+        return True
+    for folder in (HOME / '.local/bin', HOME / '.claude/local', HOME / 'bin'):
+        if shutil.which(name, path=str(folder)):
+            os.environ['PATH'] = str(folder) + os.pathsep + os.environ.get('PATH', '')
+            return True
+    return False
+
+
 def available_agents():
-    return [name for name in AGENTS if shutil.which(name)]
+    return [name for name in AGENTS if find_agent(name)]
 
 
 def choose_agent(requested):
     """The agent to port the patches with, asking first when run by a person."""
     if requested:
-        if not shutil.which(requested):
+        if not find_agent(requested):
             raise Stop(f'{requested} is not installed.')
         return requested
     agents = available_agents()
