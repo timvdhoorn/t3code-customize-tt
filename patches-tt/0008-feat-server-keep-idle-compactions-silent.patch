@@ -171,17 +171,18 @@ index 0000000000..3ad294ad35
 +  });
 +});
 diff --git a/apps/server/src/orchestration-v2/IdleCompactionService.ts b/apps/server/src/orchestration-v2/IdleCompactionService.ts
-index 30c81ba703..f4f0b348d4 100644
+index 2b16cb8c1d..34a14511a9 100644
 --- a/apps/server/src/orchestration-v2/IdleCompactionService.ts
 +++ b/apps/server/src/orchestration-v2/IdleCompactionService.ts
-@@ -1,6 +1,5 @@
+@@ -1,7 +1,6 @@
  import {
    CommandId,
+   IDLE_COMPACTION_TEXT,
 -  MessageId,
    resolveIdleCompaction,
    resolveProjectProviderInstanceEnabled,
    type RunId,
-@@ -14,7 +13,12 @@ import * as Stream from "effect/Stream";
+@@ -15,7 +14,12 @@ import * as Stream from "effect/Stream";
  
  import { forkParked } from "../serverActivation.ts";
  import * as ServerSettings from "../serverSettings.ts";
@@ -195,16 +196,16 @@ index 30c81ba703..f4f0b348d4 100644
  import * as Orchestrator from "./Orchestrator.ts";
  import * as ProjectionStore from "./ProjectionStore.ts";
  
-@@ -68,7 +72,7 @@ export const make = Effect.gen(function* () {
+@@ -69,7 +73,7 @@ export const make = Effect.gen(function* () {
            type: "message.dispatch",
            // One compaction per completed run, even across duplicate events.
            commandId: CommandId.make(`server:idle-compact:${threadId}:${runId}`),
 -          messageId: MessageId.make(`idle-compact:${threadId}:${runId}`),
 +          messageId: idleCompactionMessageId(threadId, runId),
            threadId,
-           text: "/compact",
+           text: IDLE_COMPACTION_TEXT,
            attachments: [],
-@@ -85,13 +89,36 @@ export const make = Effect.gen(function* () {
+@@ -87,13 +91,36 @@ export const make = Effect.gen(function* () {
        ),
    );
  
@@ -243,7 +244,7 @@ index 30c81ba703..f4f0b348d4 100644
        ),
      );
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.test.ts b/apps/server/src/relay/AgentAwarenessRelay.test.ts
-index 9dacdf11b6..ec3e071d34 100644
+index 5e624ad660..b35442f7f5 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.test.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.test.ts
 @@ -6,6 +6,7 @@ import {
@@ -265,7 +266,7 @@ index 9dacdf11b6..ec3e071d34 100644
      readonly domainEvents?: Stream.Stream<OrchestrationV2DomainEvent>;
      readonly directPush?: DirectPush.DirectPush["Service"];
    } = {},
-@@ -198,7 +203,13 @@ const makeTestRelay = Effect.fnUntraced(function* (
+@@ -200,7 +205,13 @@ const makeTestRelay = Effect.fnUntraced(function* (
      getTimelinePage: () => Effect.die("Unused timeline read"),
      getMessageCount: () => Effect.die("unused message count"),
      getTurnItem: () => Effect.die("unused turn item read"),
@@ -280,7 +281,7 @@ index 9dacdf11b6..ec3e071d34 100644
      getThreadProjection: unused,
      getCheckpointContext: unused,
      getThreadSnapshot: unused,
-@@ -361,6 +372,41 @@ describe("AgentAwarenessRelay", () => {
+@@ -362,6 +373,41 @@ describe("AgentAwarenessRelay", () => {
      }),
    );
  
@@ -323,7 +324,7 @@ index 9dacdf11b6..ec3e071d34 100644
      Effect.gen(function* () {
        const direct: Array<boolean | undefined> = [];
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.ts b/apps/server/src/relay/AgentAwarenessRelay.ts
-index 4ae6b652af..92ce49be10 100644
+index 9c06cc10f0..680032df37 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.ts
 @@ -48,6 +48,7 @@ import {
@@ -334,9 +335,9 @@ index 4ae6b652af..92ce49be10 100644
  import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
  import * as ProjectService from "../project/ProjectService.ts";
  import { forkParked } from "../serverActivation.ts";
-@@ -533,6 +534,22 @@ export const make = Effect.gen(function* () {
-     // domain event, so materializing the full shell here would make the cost
-     // of one thread's activity proportional to how many threads exist.
+@@ -532,6 +533,22 @@ export const make = Effect.gen(function* () {
+ 
+     // Read only this thread; full shell reads would make each activity event scale with all threads.
      const threadShell = yield* threads.getThreadShell(threadId);
 +    // Fork: an idle compaction is housekeeping, so it neither starts nor ends
 +    // a card or alert; the last published state stands. Archiving and

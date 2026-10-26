@@ -5,7 +5,7 @@ Subject: [PATCH 3/7] feat(mobile): show stats for nerds in the composer
 
 ---
  .../settings/SettingsThreadsRouteScreen.tsx   |  26 +
- .../src/features/threads/ComposerStats.tsx    | 623 ++++++++++++++++
+ .../src/features/threads/ComposerStats.tsx    | 622 ++++++++++++++++
  .../features/threads/NewTaskDraftScreen.tsx   |   1 +
  .../src/features/threads/ThreadComposer.tsx   |   3 +
  .../features/threads/ThreadDetailScreen.tsx   |  42 +-
@@ -23,13 +23,13 @@ Subject: [PATCH 3/7] feat(mobile): show stats for nerds in the composer
  .../components/chat/ComposerStats.logic.ts    | 307 +-------
  .../web/src/components/chat/ComposerStats.tsx |  57 +-
  .../components/chat/ContextWindowMeter.tsx    |   5 +-
- apps/web/src/lib/contextWindow.ts             | 196 +----
+ apps/web/src/lib/contextWindow.ts             | 195 +----
  packages/client-runtime/package.json          |   8 +
  .../src/state/composerStats.test.ts           | 668 ++++++++++++++++++
  .../client-runtime/src/state/composerStats.ts | 433 ++++++++++++
  .../src/state/contextWindow.test.ts           | 158 +++++
- .../client-runtime/src/state/contextWindow.ts | 195 +++++
- 25 files changed, 2732 insertions(+), 597 deletions(-)
+ .../client-runtime/src/state/contextWindow.ts | 194 +++++
+ 25 files changed, 2730 insertions(+), 596 deletions(-)
  create mode 100644 apps/mobile/src/features/threads/ComposerStats.tsx
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.test.ts
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.ts
@@ -41,7 +41,7 @@ Subject: [PATCH 3/7] feat(mobile): show stats for nerds in the composer
  create mode 100644 packages/client-runtime/src/state/contextWindow.ts
 
 diff --git a/apps/mobile/src/features/settings/SettingsThreadsRouteScreen.tsx b/apps/mobile/src/features/settings/SettingsThreadsRouteScreen.tsx
-index c7883989dd..40cfcc33db 100644
+index c8f3c4c7d1..61c23625c6 100644
 --- a/apps/mobile/src/features/settings/SettingsThreadsRouteScreen.tsx
 +++ b/apps/mobile/src/features/settings/SettingsThreadsRouteScreen.tsx
 @@ -47,6 +47,7 @@ export function SettingsThreadsRouteScreen() {
@@ -86,10 +86,10 @@ index c7883989dd..40cfcc33db 100644
    const preferences = useAtomValue(mobilePreferencesAtom);
 diff --git a/apps/mobile/src/features/threads/ComposerStats.tsx b/apps/mobile/src/features/threads/ComposerStats.tsx
 new file mode 100644
-index 0000000000..decc32e1cf
+index 0000000000..c461bcb2a5
 --- /dev/null
 +++ b/apps/mobile/src/features/threads/ComposerStats.tsx
-@@ -0,0 +1,623 @@
+@@ -0,0 +1,622 @@
 +import {
 +  COMPOSER_STATS_CLOCK_MS,
 +  composerLimitDisplay,
@@ -111,7 +111,7 @@ index 0000000000..decc32e1cf
 +import { formatDuration } from "@t3tools/shared/orchestrationTiming";
 +import { formatResetsIn } from "@t3tools/shared/usageLimits";
 +import * as DateTime from "effect/DateTime";
-+import { Fragment, useEffect, useState, type ReactNode } from "react";
++import { Children, useEffect, useState, type ReactNode } from "react";
 +import { Pressable, ScrollView, View } from "react-native";
 +import { useSafeAreaInsets } from "react-native-safe-area-context";
 +
@@ -148,8 +148,8 @@ index 0000000000..decc32e1cf
 +
 +function useStatsClock(fast: boolean): number {
 +  const [now, setNow] = useState(Date.now);
++  // oxlint-disable-next-line t3code/react-effect-budget -- a wall clock so limit freshness and resets stay current.
 +  useEffect(() => {
-+    setNow(Date.now());
 +    const timer = setInterval(() => setNow(Date.now()), fast ? 1000 : COMPOSER_STATS_CLOCK_MS);
 +    return () => clearInterval(timer);
 +  }, [fast]);
@@ -244,12 +244,11 @@ index 0000000000..decc32e1cf
 +function Separated(props: { readonly children: ReadonlyArray<ReactNode> }) {
 +  return (
 +    <>
-+      {props.children.map((child, index) => (
-+        <Fragment key={index}>
-+          {index > 0 ? <View className="ml-4 h-px bg-border" /> : null}
-+          {child}
-+        </Fragment>
-+      ))}
++      {Children.toArray(
++        props.children.flatMap((child, index) =>
++          index > 0 ? [<View className="ml-4 h-px bg-border" />, child] : [child],
++        ),
++      )}
 +    </>
 +  );
 +}
@@ -304,7 +303,7 @@ index 0000000000..decc32e1cf
 +                  display.resetPending
 +                    ? "0% used"
 +                    : display.freshness.status === "expired"
-+                      ? "—"
++                      ? "–"
 +                      : `${Math.round(window.usedPercent)}% used`
 +                }
 +              />
@@ -600,7 +599,7 @@ index 0000000000..decc32e1cf
 +        ) : null}
 +        <Chip
 +          label={
-+            row.cache.value === "—%"
++            row.cache.value === "–%"
 +              ? "Cache and turn details, no cache figure yet"
 +              : `Cache and turn details, ${row.cache.value} cached`
 +          }
@@ -608,7 +607,7 @@ index 0000000000..decc32e1cf
 +          dimmed={!row.cache.openable}
 +        >
 +          {/* Invisible "100%" in the flow reserves the widest value at the current text
-+              size (tabular figures), so "—%" and "NN%" never shift the label. */}
++              size (tabular figures), so "–%" and "NN%" never shift the label. */}
 +          <View>
 +            <View accessibilityElementsHidden importantForAccessibility="no-hide-descendants">
 +              <StatText className="opacity-0">100%</StatText>
@@ -714,10 +713,10 @@ index 0000000000..decc32e1cf
 +  );
 +}
 diff --git a/apps/mobile/src/features/threads/NewTaskDraftScreen.tsx b/apps/mobile/src/features/threads/NewTaskDraftScreen.tsx
-index 12a451d72d..d8078b6989 100644
+index a9f6d5db7c..3eb18d7b77 100644
 --- a/apps/mobile/src/features/threads/NewTaskDraftScreen.tsx
 +++ b/apps/mobile/src/features/threads/NewTaskDraftScreen.tsx
-@@ -1251,6 +1251,7 @@ export function NewTaskDraftScreen(props: {
+@@ -1238,6 +1238,7 @@ export function NewTaskDraftScreen(props: {
          onNativePasteText={handleNativePasteText}
          onRemoveDraftImage={flow.removeAttachment}
          onStopThread={() => {}}
@@ -726,10 +725,10 @@ index 12a451d72d..d8078b6989 100644
          onSendMessage={handleStart}
          onReconnectEnvironment={() => onReconnectEnvironment(selectedProject.environmentId)}
 diff --git a/apps/mobile/src/features/threads/ThreadComposer.tsx b/apps/mobile/src/features/threads/ThreadComposer.tsx
-index 08ae70f300..b9ab33603f 100644
+index 9f94ecd2ed..9997b218dc 100644
 --- a/apps/mobile/src/features/threads/ThreadComposer.tsx
 +++ b/apps/mobile/src/features/threads/ThreadComposer.tsx
-@@ -239,6 +239,8 @@ export interface ThreadComposerProps {
+@@ -241,6 +241,8 @@ export interface ThreadComposerProps {
    readonly selectedThread: EnvironmentThreadShell;
    readonly reportedModelSelection?: ModelSelection | null;
    readonly hasCompactableConversation: boolean;
@@ -738,7 +737,7 @@ index 08ae70f300..b9ab33603f 100644
    readonly serverConfig: T3ServerConfig | null;
    readonly queueCount: number;
    readonly activeThreadBusy: boolean;
-@@ -1278,6 +1280,7 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
+@@ -1271,6 +1273,7 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
              This connection cannot control this task. You can still edit your draft.
            </Text>
          ) : null}
@@ -747,29 +746,29 @@ index 08ae70f300..b9ab33603f 100644
  
        <VideoPreviewModal source={previewVideo} onRequestClose={closePreview} />
 diff --git a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
-index e8f99bf4e6..3244f4837c 100644
+index 77351fbd23..570d0fcf1c 100644
 --- a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
 +++ b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
-@@ -166,6 +166,9 @@ import {
+@@ -187,6 +187,9 @@ import {
    ThreadComposer,
  } from "./ThreadComposer";
  import { ComposerPopoverHost } from "./ComposerPopoverHost";
 +import { composerCompactDisabledReason } from "@t3tools/client-runtime/state/composer-stats";
 +import { ComposerStats, COMPOSER_STATS_ROW_HEIGHT } from "./ComposerStats";
 +import { useComposerStats } from "../../state/use-composer-stats";
- import { ThreadFeed, type ThreadFeedHistoryControls } from "./ThreadFeed";
+ import { ThreadFeed, type ThreadFeedHandle, type ThreadFeedHistoryControls } from "./ThreadFeed";
  import { useThreadTurnSubagents } from "./ThreadAgentsSheet";
  import { ComposerQueuedEditBanner } from "./ComposerQueuedEdit";
-@@ -260,6 +263,8 @@ export interface ThreadDetailScreenProps {
-     followUp?: ActiveTurnComposerAction,
-     beforeDispatch?: () => Promise<boolean>,
+@@ -283,6 +286,8 @@ export interface ThreadDetailScreenProps {
+       hasAttachmentsOrContext: boolean,
+     ) => Promise<boolean | "responded">,
    ) => Promise<MessageId | null>;
 +  /** Sends "/compact" without touching the draft. */
 +  readonly onCompactContext: () => void;
    readonly onReconnectEnvironment: () => void;
    readonly canSwitchThreadProvider: boolean;
    readonly onUpdateThreadModelSelection: (modelSelection: ModelSelection) => void;
-@@ -807,8 +812,17 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
+@@ -771,8 +776,17 @@ function ThreadDetailBody(props: ThreadDetailScreenProps) {
      ) ||
      (props.historyControls?.hasMoreHistory === true &&
        props.selectedThread.latestUserMessageAt !== null);
@@ -785,10 +784,10 @@ index e8f99bf4e6..3244f4837c 100644
 +      (hasSidebarTabBar ? 14 : 0) +
 +      (composerStatsVisible ? COMPOSER_STATS_ROW_HEIGHT : 0) +
 +      composerBottomInset;
-   const [collapsedUserInputRequestId, setCollapsedUserInputRequestId] =
-     useState<RuntimeRequestId | null>(null);
-   const activeUserInputRequestId = props.activePendingUserInput?.requestId ?? null;
-@@ -1652,6 +1666,32 @@ export const ThreadDetailScreen = function ThreadDetailScreen(props: ThreadDetai
+   // The last collapse toggle; it only applies to the request it was made on.
+   const [userInputToggle, setUserInputToggle] = useState<{
+     readonly requestId: RuntimeRequestId;
+@@ -1586,6 +1600,32 @@ function ThreadDetailBody(props: ThreadDetailScreenProps) {
                          hasCompactableConversation={
                            hasCompactableConversation && !props.isCompacting
                          }
@@ -822,10 +821,10 @@ index e8f99bf4e6..3244f4837c 100644
                          queueCount={props.selectedThreadQueueCount}
                          activeThreadBusy={props.activeThreadBusy}
 diff --git a/apps/mobile/src/features/threads/ThreadRouteScreen.tsx b/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
-index eedfa6e1d8..4273d9e7d0 100644
+index 43a1462a65..7a65cce6b5 100644
 --- a/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
 +++ b/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
-@@ -1001,6 +1001,7 @@ function ThreadRouteContent(
+@@ -1053,6 +1053,7 @@ function ThreadRouteContent(
            onStopThread={awaitingBootstrapTurn ? handleCancelWorktreeSetup : handleStopThread}
            onResumeQueue={composer.queueHeld ? handleResumeQueue : null}
            onSendMessage={composer.onSendMessage}
@@ -835,7 +834,7 @@ index eedfa6e1d8..4273d9e7d0 100644
            onUpdateThreadModelSelection={composer.onUpdateModelSelection}
 diff --git a/apps/mobile/src/features/threads/composerStatsRow.test.ts b/apps/mobile/src/features/threads/composerStatsRow.test.ts
 new file mode 100644
-index 0000000000..c69f5d4212
+index 0000000000..a480247a0f
 --- /dev/null
 +++ b/apps/mobile/src/features/threads/composerStatsRow.test.ts
 @@ -0,0 +1,223 @@
@@ -970,8 +969,8 @@ index 0000000000..c69f5d4212
 +      },
 +      { showContext: true, nowMs, compact: false },
 +    );
-+    expect(noCache.cache).toEqual({ value: "—%", label: "cached", openable: true });
-+    expect(composerStatsRowText(noCache)).toBe("5h 12% Week 3% 15% context —% cached");
++    expect(noCache.cache).toEqual({ value: "–%", label: "cached", openable: true });
++    expect(composerStatsRowText(noCache)).toBe("5h 12% Week 3% 15% context –% cached");
 +    expect(composerStatsRowText(noCache)).not.toMatch(/tokens/);
 +    // With a cache figure the chip shows it and opens the turn sheet.
 +    expect(row().cache).toEqual({ value: "96%", label: "cached", openable: true });
@@ -991,8 +990,8 @@ index 0000000000..c69f5d4212
 +        turnTokenUsage: undefined,
 +      } as unknown as ComposerStatsData["turn"]),
 +    ]) {
-+      expect(noTurn.cache).toEqual({ value: "—%", label: "cached", openable: false });
-+      expect(composerStatsRowText(noTurn)).toBe("5h 12% Week 3% 15% ctx —% cached");
++      expect(noTurn.cache).toEqual({ value: "–%", label: "cached", openable: false });
++      expect(composerStatsRowText(noTurn)).toBe("5h 12% Week 3% 15% ctx –% cached");
 +    }
 +  });
 +
@@ -1002,7 +1001,7 @@ index 0000000000..c69f5d4212
 +      { showContext: false, nowMs, compact: false },
 +    );
 +    // Only the cache placeholder stays, so the row keeps its shape.
-+    expect(composerStatsRowText(empty)).toBe("—% cached");
++    expect(composerStatsRowText(empty)).toBe("–% cached");
 +  });
 +
 +  describe("remembering the cache figure when a thread is re-entered", () => {
@@ -1064,7 +1063,7 @@ index 0000000000..c69f5d4212
 +});
 diff --git a/apps/mobile/src/features/threads/composerStatsRow.ts b/apps/mobile/src/features/threads/composerStatsRow.ts
 new file mode 100644
-index 0000000000..db084616b0
+index 0000000000..d223c210f5
 --- /dev/null
 +++ b/apps/mobile/src/features/threads/composerStatsRow.ts
 @@ -0,0 +1,143 @@
@@ -1115,7 +1114,7 @@ index 0000000000..db084616b0
 + * The stats line under the mobile composer: the 5h and weekly limits, context and the
 + * cache hit rate, on one line. Unlike the desktop it leaves out the output rate (tok/s);
 + * the turn sheet, opened from the cache chip, still shows it. The cache chip is always
-+ * there ("—% cached" without a figure), so the row does not jump when the figure arrives.
++ * there ("–% cached" without a figure), so the row does not jump when the figure arrives.
 + */
 +export interface ComposerStatsRow {
 +  readonly limits: ReadonlyArray<ComposerStatsRowLimit>;
@@ -1125,7 +1124,7 @@ index 0000000000..db084616b0
 +    readonly tone: ComposerStatsTone | null;
 +  } | null;
 +  readonly cache: {
-+    /** "NN%", or "—%" when the turn has no cache figure. */
++    /** "NN%", or "–%" when the turn has no cache figure. */
 +    readonly value: string;
 +    readonly label: string;
 +    /** Opens the turn sheet; false without a turn, or when it has nothing to show. */
@@ -1189,13 +1188,13 @@ index 0000000000..db084616b0
 +            ),
 +          }
 +        : {
-+            value: context ? formatContextWindowTokens(context.usedTokens) : "—",
++            value: context ? formatContextWindowTokens(context.usedTokens) : "–",
 +            label: compact ? "ctx" : "context",
 +            tone: null,
 +          }
 +      : null,
 +    cache: {
-+      value: cache === null ? "—%" : formatRowCachePercentage(cache),
++      value: cache === null ? "–%" : formatRowCachePercentage(cache),
 +      label: "cached",
 +      openable: turn !== null && (cache !== null || hasTurnDetails),
 +    },
@@ -1212,10 +1211,10 @@ index 0000000000..db084616b0
 +  ].join(" ");
 +}
 diff --git a/apps/mobile/src/lib/storage.test.ts b/apps/mobile/src/lib/storage.test.ts
-index e5dc872abe..649011e5e3 100644
+index 5d973742e4..066bb5c746 100644
 --- a/apps/mobile/src/lib/storage.test.ts
 +++ b/apps/mobile/src/lib/storage.test.ts
-@@ -149,6 +149,16 @@ describe("mobile connection storage", () => {
+@@ -177,6 +177,16 @@ describe("mobile connection storage", () => {
      expect(fallback.updatedAt).toEqual(expect.any(Number));
    });
  
@@ -1233,10 +1232,10 @@ index e5dc872abe..649011e5e3 100644
      mocks.setPreferencesJson(JSON.stringify({ baseFontSize: 15 }), 10);
      await mocks.setItemAsync(
 diff --git a/apps/mobile/src/persistence/mobile-preferences.ts b/apps/mobile/src/persistence/mobile-preferences.ts
-index 7acdd47e4e..78096db53e 100644
+index dda5313287..0562671a9f 100644
 --- a/apps/mobile/src/persistence/mobile-preferences.ts
 +++ b/apps/mobile/src/persistence/mobile-preferences.ts
-@@ -76,6 +76,8 @@ export interface Preferences {
+@@ -107,6 +107,8 @@ export interface Preferences {
    readonly projectGroupingMode?: SidebarProjectGroupingMode;
    readonly planModeEnabled?: boolean;
    readonly workingShelfEnabled?: boolean;
@@ -1245,7 +1244,7 @@ index 7acdd47e4e..78096db53e 100644
    readonly modelFavorites?: ReadonlyArray<{
      readonly provider: ProviderInstanceId;
      readonly model: string;
-@@ -149,6 +151,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
+@@ -183,6 +185,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
      projectGroupingMode?: SidebarProjectGroupingMode;
      planModeEnabled?: boolean;
      workingShelfEnabled?: boolean;
@@ -1253,7 +1252,7 @@ index 7acdd47e4e..78096db53e 100644
      modelFavorites?: Preferences["modelFavorites"];
      threadListSettledShelfExpanded?: boolean;
      threadListSnoozedShelfExpanded?: boolean;
-@@ -256,6 +259,9 @@ function sanitizePreferences(parsed: Preferences): Preferences {
+@@ -303,6 +306,9 @@ function sanitizePreferences(parsed: Preferences): Preferences {
    if (typeof parsed.workingShelfEnabled === "boolean") {
      preferences.workingShelfEnabled = parsed.workingShelfEnabled;
    }
@@ -1397,10 +1396,10 @@ index 0000000000..3cc2cb612f
 +  }, [enabled, projection, environmentId, serverConfig, instanceId]);
 +}
 diff --git a/apps/mobile/src/state/use-thread-composer-state.ts b/apps/mobile/src/state/use-thread-composer-state.ts
-index afd952d43a..9c1a907023 100644
+index 5b86b88650..e513be1bdc 100644
 --- a/apps/mobile/src/state/use-thread-composer-state.ts
 +++ b/apps/mobile/src/state/use-thread-composer-state.ts
-@@ -728,6 +728,45 @@ export function useThreadComposerState() {
+@@ -724,6 +724,45 @@ export function useThreadComposerState() {
      return messageId;
    };
  
@@ -1446,7 +1445,7 @@ index afd952d43a..9c1a907023 100644
    const onChangeDraftMessage = (value: string) => {
      if (!selectedThreadShell) {
        return;
-@@ -912,6 +951,7 @@ export function useThreadComposerState() {
+@@ -908,6 +947,7 @@ export function useThreadComposerState() {
      onNativePasteText,
      onRemoveDraftImage,
      onSendMessage,
@@ -1455,10 +1454,10 @@ index afd952d43a..9c1a907023 100644
      onUpdateRuntimeMode,
      onUpdateInteractionMode,
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index cf446360d5..d98e9853f7 100644
+index cd4b75ad34..d3a5e769a9 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -303,7 +303,7 @@ import { useRightPanelSurfaceClose } from "../hooks/useRightPanelSurfaceClose";
+@@ -307,7 +307,7 @@ import { useRightPanelSurfaceClose } from "../hooks/useRightPanelSurfaceClose";
  import { useAgentOpenedPreviews } from "./preview/useAgentOpenedPreviews";
  import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
  import { ComposerStats } from "./chat/ComposerStats";
@@ -1467,7 +1466,7 @@ index cf446360d5..d98e9853f7 100644
  import { ComposerSurface } from "./chat/ComposerSurface";
  import { resolveThreadSyncPhase } from "../threadSync";
  import {
-@@ -1435,45 +1435,11 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1402,45 +1402,11 @@ export default function ChatView(props: ChatViewProps) {
      activeProviderStatus?.displayName?.trim() || activeProviderStatus?.instanceId || "";
    const composerStats = (() => {
      if (!settings.statsForNerdsEnabled) return null;
@@ -1517,7 +1516,7 @@ index cf446360d5..d98e9853f7 100644
    })();
    const pendingBackgroundTasks = deriveThreadPendingBackgroundTasks(serverProjection);
    const activeWorkStartedAt =
-@@ -3782,15 +3748,12 @@ export default function ChatView(props: ChatViewProps) {
+@@ -3771,15 +3737,12 @@ export default function ChatView(props: ChatViewProps) {
                            {...composerStats}
                            onCompact={() => composerRef.current?.compactContext()}
                            compactDisabled={compactDisabled}
@@ -1540,7 +1539,7 @@ index cf446360d5..d98e9853f7 100644
                            subscriptionSwitch={{
                              providers: providerStatuses,
 diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
-index b74e691ddd..5fba9b44a1 100644
+index 2420604c8a..fe98b622d5 100644
 --- a/apps/web/src/components/chat/ChatComposer.tsx
 +++ b/apps/web/src/components/chat/ChatComposer.tsx
 @@ -269,7 +269,7 @@ import {
@@ -1553,13 +1552,13 @@ index b74e691ddd..5fba9b44a1 100644
    resolveProviderSkillsForCwd,
    resolveProviderSlashCommandsForCwd,
 diff --git a/apps/web/src/components/chat/ComposerPrimaryActions.tsx b/apps/web/src/components/chat/ComposerPrimaryActions.tsx
-index 03d7403994..acd1064b84 100644
+index 51c233807d..bd1d97b8cb 100644
 --- a/apps/web/src/components/chat/ComposerPrimaryActions.tsx
 +++ b/apps/web/src/components/chat/ComposerPrimaryActions.tsx
 @@ -3,7 +3,7 @@ import { CheckIcon, ChevronDownIcon, ChevronLeftIcon, Minimize2Icon, PlayIcon }
  import { CornerUpRight, ListPlus } from "lucide";
  import { MorphIcon } from "~/components/MorphIcon";
- import { useEnvironmentIdentificationMode } from "~/hooks/useSettings";
+ import { useClientSettings, useEnvironmentIdentificationMode } from "~/hooks/useSettings";
 -import { formatContextWindowTokens } from "~/lib/contextWindow";
 +import { formatContextWindowTokens } from "@t3tools/client-runtime/state/context-window";
  import { cn } from "~/lib/utils";
@@ -1878,7 +1877,7 @@ index ba83c879d3..f9196990b5 100644
 -}
 +export * from "@t3tools/client-runtime/state/composer-stats";
 diff --git a/apps/web/src/components/chat/ComposerStats.tsx b/apps/web/src/components/chat/ComposerStats.tsx
-index 4a4b72fcd4..63fcc5f5b9 100644
+index 86a3b74ed7..cb719bcb18 100644
 --- a/apps/web/src/components/chat/ComposerStats.tsx
 +++ b/apps/web/src/components/chat/ComposerStats.tsx
 @@ -11,7 +11,10 @@ import { formatResetsIn } from "@t3tools/shared/usageLimits";
@@ -1893,7 +1892,7 @@ index 4a4b72fcd4..63fcc5f5b9 100644
  import { Button } from "../ui/button";
  import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
  import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
-@@ -26,8 +29,14 @@ import {
+@@ -25,8 +28,14 @@ import {
    deriveTurnCachePercentage,
    formatCachePercentage,
    deriveTurnElapsedMs,
@@ -1959,7 +1958,7 @@ index 4a4b72fcd4..63fcc5f5b9 100644
  /** Ages and reset countdowns share the summary clock while the popover is open. */
  function UsageLimitRows({
    windows,
-@@ -388,14 +361,10 @@ export function ComposerStats({
+@@ -390,14 +363,10 @@ export function ComposerStats({
      compactDisabled
    )
      return null;
@@ -1991,10 +1990,10 @@ index e7f4042f53..bba073eb57 100644
  import {
    formatContextWindowCompactionMessage,
 diff --git a/apps/web/src/lib/contextWindow.ts b/apps/web/src/lib/contextWindow.ts
-index 93054e57a5..b4e8bb5647 100644
+index ff9ef9318c..b4e8bb5647 100644
 --- a/apps/web/src/lib/contextWindow.ts
 +++ b/apps/web/src/lib/contextWindow.ts
-@@ -1,195 +1 @@
+@@ -1,194 +1 @@
 -import type { ThreadStructure, ThreadStructureTurnItem } from "@t3tools/client-runtime/state/shell";
 -import type {
 -  OrchestrationV2ProviderTurn,
@@ -2021,8 +2020,7 @@ index 93054e57a5..b4e8bb5647 100644
 -  readonly updatedAt: string;
 -};
 -
--/** Newest usage report across a thread's provider turns. Snapshots order turns
--    by provider thread, not time, so pick by timestamp. */
+-/** Newest report by timestamp; snapshots order turns by provider thread. */
 -export function latestProviderTurnTokenUsage(
 -  turns: ReadonlyArray<Pick<OrchestrationV2ProviderTurn, "tokenUsage">>,
 -  projection?: Pick<ThreadStructure, "thread" | "contextTransfers"> | null,
@@ -2192,7 +2190,7 @@ index 93054e57a5..b4e8bb5647 100644
 -}
 +export * from "@t3tools/client-runtime/state/context-window";
 diff --git a/packages/client-runtime/package.json b/packages/client-runtime/package.json
-index 7bec2b2c08..45a658da4a 100644
+index 03779b627e..05c4071935 100644
 --- a/packages/client-runtime/package.json
 +++ b/packages/client-runtime/package.json
 @@ -127,6 +127,14 @@
@@ -2212,7 +2210,7 @@ index 7bec2b2c08..45a658da4a 100644
        "default": "./src/state/auth.ts"
 diff --git a/packages/client-runtime/src/state/composerStats.test.ts b/packages/client-runtime/src/state/composerStats.test.ts
 new file mode 100644
-index 0000000000..81ebba342f
+index 0000000000..a7b6fa8701
 --- /dev/null
 +++ b/packages/client-runtime/src/state/composerStats.test.ts
 @@ -0,0 +1,668 @@
@@ -2654,7 +2652,7 @@ index 0000000000..81ebba342f
 +      now,
 +    );
 +    expect(display.displayPercent).toBeNull();
-+    expect(display.percentText).toBe("—");
++    expect(display.percentText).toBe("–");
 +    expect(display.dimmed).toBe(true);
 +  });
 +});
@@ -2886,7 +2884,7 @@ index 0000000000..81ebba342f
 +});
 diff --git a/packages/client-runtime/src/state/composerStats.ts b/packages/client-runtime/src/state/composerStats.ts
 new file mode 100644
-index 0000000000..5733e22796
+index 0000000000..64949ac445
 --- /dev/null
 +++ b/packages/client-runtime/src/state/composerStats.ts
 @@ -0,0 +1,433 @@
@@ -3134,7 +3132,7 @@ index 0000000000..5733e22796
 +      freshness,
 +      resetPending: false,
 +      displayPercent: null,
-+      percentText: "—",
++      percentText: "–",
 +      dimmed: true,
 +    };
 +  }
@@ -3489,10 +3487,10 @@ index 0000000000..45a882ab47
 +});
 diff --git a/packages/client-runtime/src/state/contextWindow.ts b/packages/client-runtime/src/state/contextWindow.ts
 new file mode 100644
-index 0000000000..61b7dd2f32
+index 0000000000..45319b8b13
 --- /dev/null
 +++ b/packages/client-runtime/src/state/contextWindow.ts
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,194 @@
 +import type { ThreadStructure, ThreadStructureTurnItem } from "./shell.ts";
 +import type {
 +  OrchestrationV2ProviderTurn,
@@ -3519,8 +3517,7 @@ index 0000000000..61b7dd2f32
 +  readonly updatedAt: string;
 +};
 +
-+/** Newest usage report across a thread's provider turns. Snapshots order turns
-+    by provider thread, not time, so pick by timestamp. */
++/** Newest report by timestamp; snapshots order turns by provider thread. */
 +export function latestProviderTurnTokenUsage(
 +  turns: ReadonlyArray<Pick<OrchestrationV2ProviderTurn, "tokenUsage">>,
 +  projection?: Pick<ThreadStructure, "thread" | "contextTransfers"> | null,
