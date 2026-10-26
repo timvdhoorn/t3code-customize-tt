@@ -975,6 +975,8 @@ def checks(env, log, target, force=False):
         raise NeedsFix('These apps/mobile dependencies have an install script that --ignore-scripts skips:\n'
                        + '\n'.join('  ' + n for n in unsorted) + f'\nAdd each to IOS_INSTALL_SCRIPTS in {NAME} if the'
                        ' iOS build needs it (pod install or the archive fails without it), else to IOS_SKIPPED_INSTALL_SCRIPTS.')
+    if WITH_IOS:
+        desktop_stack_checks(env, log, target)
     step('Testing the patches...')
     # Upstream's `prepare` patches tsc with the Effect diagnostics (globalDateInEffect and
     # friends) and its CI typechecks with them; --ignore-scripts skips that, so a checkout
@@ -1041,6 +1043,30 @@ def checks(env, log, target, force=False):
         raise NeedsFix(f'The checks failed (log: {log.name}):\n' + '\n'.join('  ' + f for f in failures))
     save(git_dir() / CHECKS_STAMP, dict(checks_stamp(target), at=time.strftime('%Y-%m-%dT%H:%M:%S')))
 
+
+
+def desktop_stack_checks(env, log, target):
+    """The desktop app and the servers build without patches-ios/, so the commit below the iOS layer
+    must pass on its own too: a fix the iOS layer makes to shared or patches-tt code ships nowhere else."""
+    global WITH_IOS
+    count = len(list(IOS_PATCHES.glob('*.patch')))
+    above = git('rev-list', '--count', target + '..HEAD', check=False).strip()
+    if not count or not above.isdigit() or int(above) <= count:
+        return
+    if git('status', '--porcelain', '--untracked-files=no').strip():
+        raise NeedsFix(f'Commit or stash the changes in {SOURCE} first: the checks also run on the commit below patches-ios/.')
+    head = git('rev-parse', 'HEAD').strip()
+    step(f'Checking the desktop and server stack first (HEAD~{count}, without patches-ios/)...')
+    git('checkout', '--quiet', '--detach', f'HEAD~{count}')
+    WITH_IOS = False
+    try:
+        checks(env, log, target, force=True)
+    except NeedsFix as error:
+        raise NeedsFix(f'Without patches-ios/ (what the desktop app and the servers build), {error}\n'
+                       'Fix it in the shared or patches-tt commit that causes it, not in patches-ios/.')
+    finally:
+        WITH_IOS = True
+        git('checkout', '--quiet', '--detach', head)
 
 # A lint of every changed file takes 10 to 30 seconds. One hung for 35 minutes in an unattended
 # port (oxlint idle at 0% CPU), which blocks every update, so the step has a hard limit.

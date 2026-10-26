@@ -254,6 +254,47 @@ class ChecksStampTest(Sandbox):
         self.assertEqual(len(calls), 2)
 
 
+
+class DesktopStackChecksTest(Sandbox):
+    """With patches-ios/ the checks first run on the commit below it: the desktop app and the servers
+    build that stack, so a fix only the iOS layer carries must not hide a failure there."""
+
+    def setUp(self):
+        super().setUp()
+        git(self.source, 'checkout', '-q', '--detach', self.base)
+        for folder in ('patches', 'patches-tt', 'patches-ios'):
+            git(self.source, 'am', '-q', *map(str, sorted((self.recipe / folder).glob('*.patch'))))
+        self.head = git(self.source, 'rev-parse', 'HEAD')
+        (self.recipe / 'checks.json').write_text('{"tests": [], "typecheck": ["packages/x"]}\n')
+
+    def run_checks(self, failing_head=None):
+        heads = []
+
+        def fake(args, env, log, timeout, cwd=None, merge=False):
+            heads.append(git(self.source, 'rev-parse', 'HEAD'))
+            return (1, 'x.ts(1,1): error TS1: no') if heads[-1] == failing_head else (0, '')
+        with patch.object(customize, 'run_bounded', fake):
+            self.quiet(customize.checks, {}, self.log, self.base)
+        return heads
+
+    def test_the_stack_below_the_ios_layer_is_checked_first(self):
+        below = git(self.source, 'rev-parse', 'HEAD~1')
+        self.assertEqual(self.run_checks(), [below, self.head])
+        self.assertEqual(git(self.source, 'rev-parse', 'HEAD'), self.head)
+        self.assertTrue(customize.checks_stamped(self.base))
+
+    def test_a_failure_without_the_ios_layer_stops_and_names_it(self):
+        below = git(self.source, 'rev-parse', 'HEAD~1')
+        with self.assertRaises(customize.NeedsFix) as stop:
+            self.run_checks(failing_head=below)
+        self.assertIn('Without patches-ios/', str(stop.exception))
+        self.assertEqual(git(self.source, 'rev-parse', 'HEAD'), self.head)
+        self.assertTrue(customize.WITH_IOS)
+
+    def test_without_the_ios_layer_it_checks_once(self):
+        with patch.object(customize, 'WITH_IOS', False):
+            self.assertEqual(self.run_checks(), [self.head])
+
 # Stands in for `vp test run`: the full run fails slow.test.ts by a timeout and bad.test.ts for real;
 # slow.test.ts alone passes when FAKE_RERUN is "pass".
 FAKE_VP = '''#!{python}

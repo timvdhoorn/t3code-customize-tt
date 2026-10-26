@@ -34,6 +34,8 @@ Run every command from the repo (`./t3code-customize`, or the path the prompt gi
 3. **`./t3code-customize checks`** installs dependencies if needed and runs every test, typecheck
    and lint in `checks.json`, `checks-tt.json` and (with `patches-ios/`) `checks-ios.json`. It
    prints `pass` or `FAIL` per step with the failing files; the full output is in the log it names.
+   With `patches-ios/` it first runs them on the commit below that layer, the stack the desktop app
+   and the servers build, so a fix belongs in the shared or `patches-tt/` commit that needs it.
    A test file that failed only by a timeout runs once more on its own before it counts; a
    non-zero exit with an unhandled error fails the step too. When everything passes it stamps the
    commit (with the nightly, the check lists and the recipe), so the tool's own run afterwards skips
