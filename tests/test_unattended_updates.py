@@ -787,6 +787,56 @@ class FleetCommandTest(unittest.TestCase):
         self.assertEqual(customize.autoupdate_command(machines['mba']), ['autoupdate', 'on'])
 
 
+class AutoupdateReloadTest(unittest.TestCase):
+    """autoupdate on (fleet runs it after every merge) must not kill a build the agent is running."""
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+
+    def run_autoupdate(self, existing, loaded, bootstrap_codes=(0,)):
+        home = self.home
+        plist = home / 'Library/LaunchAgents/agent.plist'
+        if existing is not None:
+            plist.parent.mkdir(parents=True, exist_ok=True)
+            plist.write_bytes(existing)
+        calls, codes = [], list(bootstrap_codes)
+
+        def launchctl(command, **kwargs):
+            calls.append(command[1])
+            code = 0
+            if command[1] == 'print':
+                code = 0 if loaded else 113
+            elif command[1] == 'bootstrap':
+                code = codes.pop(0)
+            return subprocess.CompletedProcess(command, code)
+
+        app = argparse.Namespace(path=home / 'T3.app', resources=home / 'T3.app/Contents/Resources')
+        args = argparse.Namespace(state='on', fix=None, ios=True, every=60)
+        with patch.object(customize, 'MAC', True), patch.object(customize, 'AUTOUPDATE_PLIST', plist), \
+                patch.object(customize, 'CACHE', home / 'cache'), patch.object(customize, 'installed_app', return_value=app), \
+                patch.object(customize.subprocess, 'run', side_effect=launchctl), patch.object(customize, 'run'), \
+                patch.object(customize.time, 'sleep'), patch.object(customize, 'say'):
+            customize.cmd_autoupdate(args)
+        return calls, plist
+
+    def test_an_unchanged_loaded_agent_is_left_running(self):
+        _, plist = self.run_autoupdate(None, loaded=False)
+        calls, _ = self.run_autoupdate(plist.read_bytes(), loaded=True)
+        self.assertEqual(calls, ['enable', 'print'])
+
+    def test_a_changed_or_unloaded_agent_is_enabled_and_reloaded(self):
+        calls, plist = self.run_autoupdate(b'old', loaded=True)
+        self.assertEqual(calls, ['enable', 'print', 'bootout', 'bootstrap'])
+        self.assertIn(b'--ios', plist.read_bytes())
+        _, plist = self.run_autoupdate(None, loaded=False)
+        calls, _ = self.run_autoupdate(plist.read_bytes(), loaded=False)
+        self.assertEqual(calls, ['enable', 'print', 'bootout', 'bootstrap'])
+
+    def test_bootstrap_is_retried_while_launchd_removes_the_old_job(self):
+        calls, _ = self.run_autoupdate(b'old', loaded=True, bootstrap_codes=(5, 5, 0))
+        self.assertEqual(calls, ['enable', 'print', 'bootout', 'bootstrap', 'bootstrap', 'bootstrap'])
+
+
 class IosAfterUpdateTest(unittest.TestCase):
     def test_ios_builds_only_when_the_nightly_changed(self):
         cases = (({'version': 'n2'}, {'version': 'n1'}, True), ({'version': 'n2'}, {'version': 'n2'}, False),

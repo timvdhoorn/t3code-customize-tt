@@ -3049,9 +3049,10 @@ def cmd_autoupdate(args):
             return server_autoupdate(args)
         raise Stop('On a Linux desktop T3 Code updates its AppImage itself; autoupdate is for macOS and T3 servers.')
     domain = f'gui/{os.getuid()}'
-    subprocess.run(['launchctl', 'bootout', f'{domain}/{AUTOUPDATE_LABEL}'], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    service = f'{domain}/{AUTOUPDATE_LABEL}'
     if args.state == 'off':
+        subprocess.run(['launchctl', 'bootout', service], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         AUTOUPDATE_PLIST.unlink(missing_ok=True)
         say('Background updates off.')
         return
@@ -3063,7 +3064,7 @@ def cmd_autoupdate(args):
     (CACHE / 'logs').mkdir(parents=True, exist_ok=True)
     AUTOUPDATE_PLIST.parent.mkdir(parents=True, exist_ok=True)
     app = installed_app()
-    AUTOUPDATE_PLIST.write_bytes(plistlib.dumps({
+    plist = plistlib.dumps({
         'Label': AUTOUPDATE_LABEL, 'ProgramArguments': command,
         # T3's updater replaces the app; a rebuild starts as soon as it does, the interval catches
         # patch changes. The run waits until T3 has stopped writing (see cmd_update).
@@ -3073,8 +3074,25 @@ def cmd_autoupdate(args):
         'EnvironmentVariables': {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(HOME)},
         'StartInterval': args.every * 60, 'RunAtLoad': True, 'ProcessType': 'Background', 'LowPriorityIO': True,
         'StandardOutPath': str(CACHE / 'logs/autoupdate.log'), 'StandardErrorPath': str(CACHE / 'logs/autoupdate.log'),
-    }))
-    run(['launchctl', 'bootstrap', domain, str(AUTOUPDATE_PLIST)])
+    })
+    # A disabled label (launchctl disable) makes bootstrap fail with error 5.
+    subprocess.run(['launchctl', 'enable', service], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    loaded = subprocess.run(['launchctl', 'print', service], check=False, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL).returncode == 0
+    # Reloading kills the job, and with it a build or iOS upload it is running (fleet after a merge
+    # cut off an iOS build this way), so an unchanged, loaded agent stays as it is.
+    if not (loaded and AUTOUPDATE_PLIST.exists() and AUTOUPDATE_PLIST.read_bytes() == plist):
+        subprocess.run(['launchctl', 'bootout', service], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        AUTOUPDATE_PLIST.write_bytes(plist)
+        # bootout returns before launchd has removed the job; bootstrap fails with 5 until it has.
+        for attempt in range(10):
+            if subprocess.run(['launchctl', 'bootstrap', domain, str(AUTOUPDATE_PLIST)], check=False,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                break
+            time.sleep(1)
+        else:
+            run(['launchctl', 'bootstrap', domain, str(AUTOUPDATE_PLIST)])
     say(f'Background updates on: it rebuilds as soon as T3 Code has updated itself, and every {args.every}'
         ' minutes when the patches changed.' + (f' Broken patches are ported by {AGENT_NAMES[args.fix]}.' if args.fix else ''))
     say(f'Log: {CACHE / "logs/autoupdate.log"}')
