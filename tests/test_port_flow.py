@@ -543,6 +543,26 @@ class HandOffTest(Sandbox):
         self.assertEqual(self.started, [])
 
 
+class FindAgentTest(unittest.TestCase):
+    def test_an_agent_in_local_bin_is_found_without_it_on_path(self):
+        # zsh -lc over SSH reads no .zshrc, so units written from it lack ~/.local/bin.
+        with tempfile.TemporaryDirectory() as home:
+            folder = Path(home) / '.local/bin'
+            folder.mkdir(parents=True)
+            agent = folder / 'claude'
+            agent.write_text('#!/bin/sh\n')
+            agent.chmod(0o755)
+            with patch.object(customize, 'HOME', Path(home)), patch.dict(os.environ, {'PATH': '/usr/bin:/bin'}):
+                self.assertEqual(customize.choose_agent('claude'), 'claude')
+                self.assertEqual(os.environ['PATH'].split(os.pathsep)[0], str(folder))
+
+    def test_a_missing_agent_still_stops(self):
+        with tempfile.TemporaryDirectory() as home, patch.object(customize, 'HOME', Path(home)), \
+                patch.dict(os.environ, {'PATH': '/usr/bin:/bin'}):
+            with self.assertRaises(customize.Stop):
+                customize.choose_agent('claude')
+
+
 class OneAgentSessionTest(Sandbox):
     def test_one_session_resolves_every_stage_and_the_run_does_not_start_another(self):
         sessions = []
