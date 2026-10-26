@@ -26,7 +26,7 @@ For T3 Code Nightly on macOS, a headless Linux T3 server, a Linux AppImage, Wind
 - **Direct push**: your own servers send notifications and Live Activity updates to your iPhone over APNs.
 
 **iOS app** (`patches-ios/`, TestFlight under your own Apple team): the same stats line, nested
-child threads and direct push, SF Pro as the UI font, and the desktop's Claude theme.
+child threads and direct push, JetBrains Sans and JetBrains Mono as the fonts, and the desktop's Claude theme.
 
 Everything else is stock T3 Code, including T3 Connect.
 

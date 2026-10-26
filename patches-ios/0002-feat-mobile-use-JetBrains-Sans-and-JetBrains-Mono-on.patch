@@ -1,53 +1,87 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: timvdhoorn <timvdhoorn@gmail.com>
 Date: Thu, 15 Oct 2026 20:09:23 +0200
-Subject: [PATCH 2/7] feat(mobile): use the iOS system font for UI text
+Subject: [PATCH 2/7] feat(mobile): use JetBrains Sans and JetBrains Mono on
+ iOS
 
 ---
- apps/mobile/app.config.ts                     |   4 +-
- apps/mobile/global.css                        |  12 ++
- .../ios/T3ComposerEditorView.swift            |   5 +-
- apps/mobile/src/lib/fontFamilies.ts           |  12 +-
- apps/mobile/src/lib/system-font.test.ts       |  89 ++++++++++
+ apps/mobile/app.config.ts                     |  17 +-
+ apps/mobile/assets/fonts/.gitignore           |   2 +
+ apps/mobile/global.css                        |  13 ++
+ .../ios/T3ComposerEditorView.swift            |   4 +-
+ .../t3-review-diff/ios/T3ReviewDiffView.swift |  13 +-
+ .../features/review/reviewDiffRendering.tsx   |   9 +-
+ apps/mobile/src/lib/fontFamilies.ts           |  18 +-
+ apps/mobile/src/lib/ios-font.test.ts          | 103 +++++++++++
  .../lib/uniwind-platform-variants.fixture.cjs | 167 ++++++++++++++++++
- .../src/native/EnrichedMarkdownText.tsx       |   7 +-
- 7 files changed, 284 insertions(+), 12 deletions(-)
- create mode 100644 apps/mobile/src/lib/system-font.test.ts
+ .../src/native/EnrichedMarkdownText.tsx       |   9 +-
+ 10 files changed, 334 insertions(+), 21 deletions(-)
+ create mode 100644 apps/mobile/assets/fonts/.gitignore
+ create mode 100644 apps/mobile/src/lib/ios-font.test.ts
  create mode 100644 apps/mobile/src/lib/uniwind-platform-variants.fixture.cjs
 
 diff --git a/apps/mobile/app.config.ts b/apps/mobile/app.config.ts
-index c3ab0a386d..a3bd9bc0f1 100644
+index c3ab0a386d..0adb5eb753 100644
 --- a/apps/mobile/app.config.ts
 +++ b/apps/mobile/app.config.ts
-@@ -333,9 +333,7 @@ const config: ExpoConfig = {
+@@ -145,6 +145,18 @@ const dmSansFonts = {
+   bold: "@expo-google-fonts/dm-sans/700Bold/DMSans_700Bold.ttf",
+ } as const;
+ 
++// iOS uses JetBrains Sans and JetBrains Mono. t3code-customize downloads them into assets/fonts
++// (checksum-pinned, not committed); the file names match the PostScript names.
++const iosFonts = [
++  "JetBrainsSans-Regular",
++  "JetBrainsSans-Medium",
++  "JetBrainsSans-SemiBold",
++  "JetBrainsSans-Bold",
++  "JetBrainsMono-Regular",
++  "JetBrainsMono-Medium",
++  "JetBrainsMono-Bold",
++].map((name) => `./assets/fonts/${name}.ttf`);
++
+ const widgetsPlugin: NonNullable<ExpoConfig["plugins"]>[number] = [
+   "expo-widgets",
+   {
+@@ -333,9 +345,8 @@ const config: ExpoConfig = {
      [
        "expo-font",
        {
 -        ios: {
 -          fonts: [dmSansFonts.regular, dmSansFonts.medium, dmSansFonts.bold],
 -        },
-+        // iOS uses the system font, so DM Sans ships to Android only.
++        // DM Sans ships to Android only.
++        ios: { fonts: iosFonts },
          android: {
            fonts: [
              {
+diff --git a/apps/mobile/assets/fonts/.gitignore b/apps/mobile/assets/fonts/.gitignore
+new file mode 100644
+index 0000000000..762c77d6ff
+--- /dev/null
++++ b/apps/mobile/assets/fonts/.gitignore
+@@ -0,0 +1,2 @@
++# JetBrains Sans and JetBrains Mono, downloaded by t3code-customize for the iOS build.
++JetBrains*.ttf
 diff --git a/apps/mobile/global.css b/apps/mobile/global.css
-index 730b9e1a97..42d28e7b90 100644
+index 730b9e1a97..b69f3b8ffc 100644
 --- a/apps/mobile/global.css
 +++ b/apps/mobile/global.css
-@@ -5,6 +5,12 @@
+@@ -5,6 +5,13 @@
  /* ─── Theme tokens ──────────────────────────────────────────────────── */
  @layer theme {
    :root {
-+    /* iOS uses the system font (SF Pro); weights come from font-weight below. */
++    /* iOS uses JetBrains Sans and JetBrains Mono (PostScript names, see app.config.ts). */
 +    @variant ios {
-+      --font-sans: "System";
-+      --font-medium: "System";
-+      --font-bold: "System";
++      --font-sans: "JetBrainsSans-Regular";
++      --font-medium: "JetBrainsSans-Medium";
++      --font-bold: "JetBrainsSans-Bold";
++      --font-mono: "JetBrainsMono-Regular";
 +    }
      @variant android {
        --font-mono: "monospace";
      }
-@@ -42,10 +48,16 @@
+@@ -42,10 +49,16 @@
  /* ─── Custom utilities ──────────────────────────────────────────────── */
  @utility font-t3-medium {
    font-family: var(--font-medium);
@@ -65,7 +99,7 @@ index 730b9e1a97..42d28e7b90 100644
  
  @utility font-t3-extrabold {
 diff --git a/apps/mobile/modules/t3-composer-editor/ios/T3ComposerEditorView.swift b/apps/mobile/modules/t3-composer-editor/ios/T3ComposerEditorView.swift
-index f54f75caf5..845abd80c4 100644
+index f54f75caf5..9412e219e9 100644
 --- a/apps/mobile/modules/t3-composer-editor/ios/T3ComposerEditorView.swift
 +++ b/apps/mobile/modules/t3-composer-editor/ios/T3ComposerEditorView.swift
 @@ -429,7 +429,7 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
@@ -73,25 +107,78 @@ index f54f75caf5..845abd80c4 100644
      placeholder: "#8e8e93"
    )
 -  private var fontFamily = "DMSans-Regular"
-+  private var fontFamily = "System"
++  private var fontFamily = "JetBrainsSans-Regular"
    private var fontSize: CGFloat = 14
    private var lineHeight: CGFloat = 20
    private var contentInsetVertical: CGFloat = 0
-@@ -934,8 +934,7 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
+@@ -934,7 +934,7 @@ public final class T3ComposerEditorView: ExpoView, UITextViewDelegate, UITextDro
    private func makeAttachmentString(_ token: ComposerTokenPayload) -> NSAttributedString {
      let color = token.accent.flatMap { UIColor(composerHex: $0) }
        ?? UIColor(composerHex: theme.text) ?? .label
 -    let chipFont = UIFont(name: "DMSans-Medium", size: fontSize)
--      ?? UIFont.systemFont(ofSize: fontSize, weight: .medium)
-+    let chipFont = UIFont.systemFont(ofSize: fontSize, weight: .medium)
++    let chipFont = UIFont(name: "JetBrainsSans-Medium", size: fontSize)
+       ?? UIFont.systemFont(ofSize: fontSize, weight: .medium)
      let icon = token.iconUri.flatMap(iconImage(for:)).map {
        token.tintsIcon == true ? Self.tinted($0, color: color) : $0
-     }
+diff --git a/apps/mobile/modules/t3-review-diff/ios/T3ReviewDiffView.swift b/apps/mobile/modules/t3-review-diff/ios/T3ReviewDiffView.swift
+index 8d8a84c406..ea67917989 100644
+--- a/apps/mobile/modules/t3-review-diff/ios/T3ReviewDiffView.swift
++++ b/apps/mobile/modules/t3-review-diff/ios/T3ReviewDiffView.swift
+@@ -1410,15 +1410,22 @@ private final class ReviewDiffContentView: UIView, UIGestureRecognizerDelegate {
+   }
+ 
+   private var codeFont: UIFont {
+-    UIFont.monospacedSystemFont(ofSize: style.codeFontSize, weight: style.codeFontWeight)
++    Self.monoFont(ofSize: style.codeFontSize, weight: style.codeFontWeight)
+   }
+ 
+   private var lineNumberFont: UIFont {
+-    UIFont.monospacedSystemFont(ofSize: style.lineNumberFontSize, weight: style.lineNumberFontWeight)
++    Self.monoFont(ofSize: style.lineNumberFontSize, weight: style.lineNumberFontWeight)
+   }
+ 
+   private var hunkFont: UIFont {
+-    UIFont.monospacedSystemFont(ofSize: style.hunkFontSize, weight: style.hunkFontWeight)
++    Self.monoFont(ofSize: style.hunkFontSize, weight: style.hunkFontWeight)
++  }
++
++  // JetBrains Mono ships with the app; the system monospace font covers a build without it.
++  private static func monoFont(ofSize size: CGFloat, weight: UIFont.Weight) -> UIFont {
++    let name = weight >= .bold ? "JetBrainsMono-Bold"
++      : weight >= .medium ? "JetBrainsMono-Medium" : "JetBrainsMono-Regular"
++    return UIFont(name: name, size: size) ?? UIFont.monospacedSystemFont(ofSize: size, weight: weight)
+   }
+ 
+   private var fileHeaderFont: UIFont {
+diff --git a/apps/mobile/src/features/review/reviewDiffRendering.tsx b/apps/mobile/src/features/review/reviewDiffRendering.tsx
+index 4b2c66a2af..1cbff6dd57 100644
+--- a/apps/mobile/src/features/review/reviewDiffRendering.tsx
++++ b/apps/mobile/src/features/review/reviewDiffRendering.tsx
+@@ -1,16 +1,13 @@
+-import { Platform, Text as NativeText, View } from "react-native";
++import { Text as NativeText, View } from "react-native";
+ 
+ import { cn } from "../../lib/cn";
++import { MONO_FONT_FAMILY } from "../../lib/fontFamilies";
+ import { MOBILE_CODE_SURFACE } from "../../lib/typography";
+ 
+ import type { ReviewRenderableLineRow } from "./reviewModel";
+ import type { ReviewHighlightedToken } from "./reviewHighlightedToken.types";
+ 
+-export const REVIEW_MONO_FONT_FAMILY = Platform.select({
+-  ios: "ui-monospace",
+-  android: "monospace",
+-  default: "monospace",
+-});
++export const REVIEW_MONO_FONT_FAMILY = MONO_FONT_FAMILY;
+ 
+ export const REVIEW_DIFF_LINE_HEIGHT = MOBILE_CODE_SURFACE.rowHeight;
+ 
 diff --git a/apps/mobile/src/lib/fontFamilies.ts b/apps/mobile/src/lib/fontFamilies.ts
-index 38602ec7c9..de67deaaca 100644
+index 38602ec7c9..7c41f9c544 100644
 --- a/apps/mobile/src/lib/fontFamilies.ts
 +++ b/apps/mobile/src/lib/fontFamilies.ts
-@@ -1,5 +1,7 @@
+@@ -1,5 +1,13 @@
 -export const FONT_FAMILIES = {
 -  regular: "DMSans-Regular",
 -  medium: "DMSans-Medium",
@@ -99,17 +186,23 @@ index 38602ec7c9..de67deaaca 100644
 -} as const;
 +import { Platform } from "react-native";
 +
-+// iOS uses the system font (SF Pro): the family stays "System" and callers set the weight.
++// iOS uses JetBrains Sans and JetBrains Mono, Android DM Sans; the names are PostScript names.
 +export const FONT_FAMILIES =
 +  Platform.OS === "ios"
-+    ? ({ regular: "System", medium: "System", bold: "System" } as const)
++    ? ({
++        regular: "JetBrainsSans-Regular",
++        medium: "JetBrainsSans-Medium",
++        bold: "JetBrainsSans-Bold",
++      } as const)
 +    : ({ regular: "DMSans-Regular", medium: "DMSans-Medium", bold: "DMSans-Bold" } as const);
-diff --git a/apps/mobile/src/lib/system-font.test.ts b/apps/mobile/src/lib/system-font.test.ts
++
++export const MONO_FONT_FAMILY = Platform.OS === "ios" ? "JetBrainsMono-Regular" : "monospace";
+diff --git a/apps/mobile/src/lib/ios-font.test.ts b/apps/mobile/src/lib/ios-font.test.ts
 new file mode 100644
-index 0000000000..dec4dc66ac
+index 0000000000..de3fe4c434
 --- /dev/null
-+++ b/apps/mobile/src/lib/system-font.test.ts
-@@ -0,0 +1,89 @@
++++ b/apps/mobile/src/lib/ios-font.test.ts
+@@ -0,0 +1,103 @@
 +import * as NodeChildProcess from "node:child_process";
 +import * as NodeFS from "node:fs";
 +import * as NodeOS from "node:os";
@@ -117,9 +210,8 @@ index 0000000000..dec4dc66ac
 +import * as NodeURL from "node:url";
 +import { beforeAll, describe, expect, it } from "vite-plus/test";
 +
-+// iOS renders UI text in the system font (SF Pro). The family is "System" for every weight,
-+// so the weight utilities must carry a font-weight on iOS, while Android keeps DM Sans,
-+// whose weights live in the family names.
++// iOS renders UI text in JetBrains Sans and code in JetBrains Mono, Android keeps DM Sans.
++// The families are PostScript names, which must match the fonts app.config.ts bundles.
 +
 +interface FixtureOutput {
 +  platforms: Record<
@@ -129,7 +221,7 @@ index 0000000000..dec4dc66ac
 +}
 +
 +const runFixture = (globalCss: string, probeSource: string): FixtureOutput => {
-+  const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "uniwind-system-font-"));
++  const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "uniwind-ios-font-"));
 +  try {
 +    NodeFS.symlinkSync(
 +      NodeFS.realpathSync(new URL("../../node_modules", import.meta.url)),
@@ -156,7 +248,14 @@ index 0000000000..dec4dc66ac
 +  }
 +};
 +
-+describe("the app typography uses the iOS system font", () => {
++const IOS_FAMILIES = [
++  ["--font-sans", "JetBrainsSans-Regular"],
++  ["--font-medium", "JetBrainsSans-Medium"],
++  ["--font-bold", "JetBrainsSans-Bold"],
++  ["--font-mono", "JetBrainsMono-Regular"],
++] as const;
++
++describe("the app typography uses JetBrains Sans and JetBrains Mono on iOS", () => {
 +  let output: FixtureOutput;
 +
 +  beforeAll(() => {
@@ -172,16 +271,24 @@ index 0000000000..dec4dc66ac
 +    );
 +  });
 +
-+  it("resolves every sans family to System on iOS only", () => {
++  it("resolves the font families to JetBrains on iOS only", () => {
 +    const ios = output.platforms.ios?.payload ?? "";
 +    const iosVars = /"__uniwind-platform-ios": \(\{([^}]*)\}\)/.exec(ios)?.[1] ?? "";
-+    for (const variable of ["--font-sans", "--font-medium", "--font-bold"]) {
-+      expect(iosVars).toContain(`"${variable}": vars => "System"`);
++    for (const [variable, family] of IOS_FAMILIES) {
++      expect(iosVars).toContain(`"${variable}": vars => "${family}"`);
 +    }
 +    const android = output.platforms.android?.payload ?? "";
 +    const androidVars = /"__uniwind-platform-android": \(\{([^}]*)\}\)/.exec(android)?.[1] ?? "";
-+    expect(androidVars).not.toContain("System");
++    expect(androidVars).not.toContain("JetBrains");
 +    expect(android).toContain('"--font-bold": vars => "DMSans-Bold"');
++  });
++
++  it("bundles every iOS family in app.config.ts", () => {
++    const appConfig = NodeFS.readFileSync(new URL("../../app.config.ts", import.meta.url), "utf8");
++    expect(appConfig).toContain("ios: { fonts: iosFonts }");
++    for (const [, family] of IOS_FAMILIES) {
++      expect(appConfig).toContain(`"${family}",`);
++    }
 +  });
 +
 +  it("gives the weight utilities an iOS-only font weight", () => {
@@ -373,10 +480,27 @@ index 0000000000..13d24442c4
 +  process.exit(1);
 +});
 diff --git a/apps/mobile/src/native/EnrichedMarkdownText.tsx b/apps/mobile/src/native/EnrichedMarkdownText.tsx
-index e3887fdb85..0b031bd229 100644
+index e3887fdb85..c109a07593 100644
 --- a/apps/mobile/src/native/EnrichedMarkdownText.tsx
 +++ b/apps/mobile/src/native/EnrichedMarkdownText.tsx
-@@ -81,7 +81,12 @@ function enrichedStyle(
+@@ -26,6 +26,7 @@ import { Menu } from "../components/ui/Menu";
+ import { useEnrichedLinkVariants } from "./useEnrichedLinkVariants";
+ import { useRetryingImageSource } from "./useRetryingImageSource";
+ import { copyTextWithHaptic } from "../lib/copyTextWithHaptic";
++import { MONO_FONT_FAMILY } from "../lib/fontFamilies";
+ import {
+   ENRICHED_INLINE_FILE_LINK_REGEX,
+   enrichedSkillLinkRegex,
+@@ -36,7 +37,7 @@ function enrichedStyle(
+   style: SelectableMarkdownTextProps["textStyle"],
+   dark: boolean,
+ ): MarkdownStyle {
+-  const monospace = Platform.OS === "ios" ? "Menlo" : "monospace";
++  const monospace = MONO_FONT_FAMILY;
+   // Keep the radius modest: iOS clips square table-cell borders without stroking the corner arcs.
+   const block = {
+     marginTop: 4,
+@@ -81,7 +82,11 @@ function enrichedStyle(
      h4: heading(4),
      h5: heading(5),
      h6: heading(6),
@@ -384,7 +508,6 @@ index e3887fdb85..0b031bd229 100644
 +    strong: {
 +      color: style.strongColor,
 +      fontFamily: style.boldFontFamily,
-+      // The iOS system family carries no weight of its own.
 +      fontWeight: Platform.OS === "ios" ? "bold" : "normal",
 +    },
      link: { color: style.linkColor, underline: false },

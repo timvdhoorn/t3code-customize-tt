@@ -1,5 +1,7 @@
+import hashlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 from pathlib import Path
 import plistlib
@@ -61,6 +63,37 @@ class InstallScriptsTest(unittest.TestCase):
         patch.object(customize, 'step', side_effect=StopIteration).start()
         with self.assertRaises(StopIteration):  # got past the install-script check
             customize.checks({}, None, 'base')
+
+
+class IosFontsTest(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.mobile = self.root / 'source/apps/mobile'
+        self.fonts = {'Sans-Regular': ('https://fonts.test/', hashlib.sha256(b'sans').hexdigest())}
+        self.served = {'https://fonts.test/Sans-Regular.ttf': b'sans'}
+        self.requests = []
+        patch.object(customize, 'CACHE', self.root / 'cache').start()
+        patch.object(customize, 'IOS_FONTS', self.fonts).start()
+        patch.object(customize.urllib.request, 'urlopen', self.urlopen).start()
+        self.addCleanup(patch.stopall)
+        self.log = io.StringIO()
+
+    def urlopen(self, url, timeout):
+        self.requests.append(url)
+        return io.BytesIO(self.served[url])
+
+    def test_downloads_once_and_copies_into_the_app(self):
+        customize.install_ios_fonts(self.mobile, self.log)
+        customize.install_ios_fonts(self.mobile, self.log)
+        self.assertEqual(self.requests, ['https://fonts.test/Sans-Regular.ttf'])
+        self.assertEqual((self.mobile / 'assets/fonts/Sans-Regular.ttf').read_bytes(), b'sans')
+
+    def test_refuses_a_font_that_does_not_match_its_checksum(self):
+        self.served['https://fonts.test/Sans-Regular.ttf'] = b'tampered'
+        with self.assertRaisesRegex(customize.Stop, 'pinned checksum'):
+            customize.install_ios_fonts(self.mobile, self.log)
+        self.assertFalse((self.mobile / 'assets/fonts/Sans-Regular.ttf').exists())
+        self.assertEqual(list((self.root / 'cache/ios-fonts').iterdir()), [])
 
 
 class PodInstallErrorTest(unittest.TestCase):

@@ -3540,6 +3540,54 @@ def xcode_auth(config):
             '-authenticationKeyID', config['ascKeyId'], '-authenticationKeyIssuerID', config['ascIssuerId']]
 
 
+# The iOS app's fonts (patches-ios/0002). JetBrains does not license JetBrains Sans for
+# redistribution, so this public repo pins the files by checksum instead of committing them.
+IOS_FONT_SANS = 'https://resources.jetbrains.com/storage/jetbrains-sans/google-fonts/v1.309/ttf/'
+IOS_FONT_MONO = 'https://raw.githubusercontent.com/JetBrains/JetBrainsMono/v2.304/fonts/ttf/'
+IOS_FONTS = {
+    'JetBrainsSans-Regular': (IOS_FONT_SANS, '43f01ca524655299996e80d0b35671f142e648897cb99868d5d72e4b313209a9'),
+    'JetBrainsSans-Medium': (IOS_FONT_SANS, 'd1f57bb85382b87a2999cb7ae492214dbb918a4d8e9d41acdb06d2dd28aa84c4'),
+    'JetBrainsSans-SemiBold': (IOS_FONT_SANS, '7c62ff4bba4357360afb80210a177b5b7e33484d76b66e7e2ec24575baae9888'),
+    'JetBrainsSans-Bold': (IOS_FONT_SANS, 'c48a8a8a5748ca6adc18bda3d1deebb61e49ba190d73197039b4f045ca1bf619'),
+    'JetBrainsMono-Regular': (IOS_FONT_MONO, 'a0bf60ef0f83c5ed4d7a75d45838548b1f6873372dfac88f71804491898d138f'),
+    'JetBrainsMono-Medium': (IOS_FONT_MONO, '31c92d01a8a08528b718a43addf0ad3df0af2ca4b7b3290a452f70f358e14d3d'),
+    'JetBrainsMono-Bold': (IOS_FONT_MONO, '5590990c82e097397517f275f430af4546e1c45cff408bde4255dad142479dcb'),
+}
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def install_ios_fonts(mobile, log):
+    """Download the pinned fonts once into the cache and copy them into apps/mobile/assets/fonts."""
+    cache = CACHE / 'ios-fonts'
+    cache.mkdir(parents=True, exist_ok=True)
+    target = mobile / 'assets/fonts'
+    target.mkdir(parents=True, exist_ok=True)
+    for name, (base, digest) in IOS_FONTS.items():
+        cached = cache / f'{name}.ttf'
+        if not cached.is_file() or sha256_file(cached) != digest:
+            url = base + f'{name}.ttf'
+            log.write(f'Downloading {url}\n')
+            log.flush()
+            partial = cache / f'{name}.ttf.part'
+            try:
+                with urllib.request.urlopen(url, timeout=60) as response, open(partial, 'wb') as out:
+                    shutil.copyfileobj(response, out)
+            except OSError as error:
+                raise Stop(f'Could not download the iOS font {name} ({error}).')
+            if sha256_file(partial) != digest:
+                partial.unlink()
+                raise Stop(f'The iOS font {name} from {url} does not match its pinned checksum.')
+            partial.replace(cached)
+        shutil.copyfile(cached, target / f'{name}.ttf')
+
+
 def build_ios(env, config, public, build_number, job, log):
     mobile = SOURCE / 'apps/mobile'
     # public: T3 Connect's public config from the installed app, as the official build has it.
@@ -3549,6 +3597,7 @@ def build_ios(env, config, public, build_number, job, log):
                T3CODE_IOS_BUNDLE_ID=config['bundleId'], T3CODE_IOS_TEAM_ID=config['teamId'],
                T3CODE_IOS_APP_NAME=config['appName'])
     run([*pnpm(env), 'rebuild', *IOS_INSTALL_SCRIPTS], cwd=mobile, env=env, log=log)
+    install_ios_fonts(mobile, log)
     step('Generating the iOS project...')
     run([*pnpm(env), 'exec', 'expo', 'prebuild', '--clean', '--platform', 'ios'], cwd=mobile, env=env, log=log)
     workspace = next((mobile / 'ios').glob('*.xcworkspace'), None)
