@@ -4,7 +4,7 @@ Date: Thu, 15 Oct 2026 13:05:36 +0200
 Subject: [PATCH 2/9] fix(orchestration): resume continuations after planned
  worktree handoffs
 
-Port of pingdotgg/t3code#15203 (head 19f7ff972e13) until it is merged upstream. Fixes #15136.
+Port of pingdotgg/t3code#15203 (head 3430a29a65cf) until it is merged upstream. Fixes #15136.
 
 The PR's last commit also ends the run's open root items, such as the
 t3_worktree_handoff call itself, as interrupted when the planned detach
@@ -24,8 +24,8 @@ closes ingestion.
  docs/internals/overview.md                    |   4 +
  docs/user/composer.md                         |   4 +
  packages/contracts/src/orchestrationV2.ts     |   4 +
- .../src/server/ProviderAdapter.ts             |  19 +-
- 15 files changed, 1022 insertions(+), 238 deletions(-)
+ .../src/server/ProviderAdapter.ts             |  16 +-
+ 15 files changed, 1019 insertions(+), 238 deletions(-)
 
 diff --git a/apps/server/src/mcp/WorktreeMcpService.test.ts b/apps/server/src/mcp/WorktreeMcpService.test.ts
 index 3be8705cc0..0a715a2f89 100644
@@ -1110,7 +1110,7 @@ index 394cc1527c..dd8a4f62af 100644
          } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
          run: {
 diff --git a/apps/server/src/orchestration-v2/RunExecutionService.ts b/apps/server/src/orchestration-v2/RunExecutionService.ts
-index 2ea57af67d..965df29df0 100644
+index 2ea57af67d..3563632f02 100644
 --- a/apps/server/src/orchestration-v2/RunExecutionService.ts
 +++ b/apps/server/src/orchestration-v2/RunExecutionService.ts
 @@ -626,6 +626,7 @@ export const layer: Layer.Layer<
@@ -1283,7 +1283,7 @@ index 2ea57af67d..965df29df0 100644
      updatedAt: input.completedAt,
      type: "run_interrupt_result",
 -    message: input.reason ?? "Stopped by the provider",
-+    message: input.message ?? input.reason ?? "Stopped by the provider",
++    message: input.reason ?? input.message ?? "Stopped by the provider",
    };
  }
 diff --git a/apps/server/src/orchestration-v2/SelectionRestart.integration.test.ts b/apps/server/src/orchestration-v2/SelectionRestart.integration.test.ts
@@ -1860,7 +1860,7 @@ index 897a25e1f0..244341f591 100644
      expectedEmpty: Schema.optional(Schema.Boolean),
      limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecoveryUpdate)),
 diff --git a/packages/provider-core/src/server/ProviderAdapter.ts b/packages/provider-core/src/server/ProviderAdapter.ts
-index 7c77b7bb0a..c0b2cae0c9 100644
+index 7c77b7bb0a..e628cb8271 100644
 --- a/packages/provider-core/src/server/ProviderAdapter.ts
 +++ b/packages/provider-core/src/server/ProviderAdapter.ts
 @@ -359,6 +359,15 @@ const ProviderAdapterFailureReason = Schema.Literals([
@@ -1887,16 +1887,13 @@ index 7c77b7bb0a..c0b2cae0c9 100644
    ProviderAdapterProtocolError,
  ]);
  export type ProviderAdapterV2Error = typeof ProviderAdapterV2Error.Type;
-@@ -546,8 +556,13 @@ export interface ProviderAdapterV2SessionRuntime {
+@@ -546,8 +556,10 @@ export interface ProviderAdapterV2SessionRuntime {
    readonly providerSessionId: ProviderSessionId;
    readonly providerSession: OrchestrationV2ProviderSession;
    readonly events: Stream.Stream<ProviderAdapterV2Event, ProviderAdapterV2Error>;
 -  /** Manager runtimes broadcast independent subscriptions; adapters may expose only a single-consumer stream. */
 -  readonly subscribeEvents?: Effect.Effect<ProviderAdapterV2EventSubscription>;
-+  /**
-+   * Manager runtimes broadcast independent subscriptions; a run passes its thread so detach
-+   * ends only that stream. Adapters may expose only a single-consumer stream.
-+   */
++  /** Manager subscriptions broadcast independently; a thread ID limits detach to its stream. */
 +  readonly subscribeEvents?: (
 +    threadId?: ThreadId,
 +  ) => Effect.Effect<ProviderAdapterV2EventSubscription>;
