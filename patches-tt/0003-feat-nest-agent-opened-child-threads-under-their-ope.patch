@@ -23,9 +23,9 @@ guide line, context-menu collapse and a summary stub.
  .../src/orchestration-v2/runtimeLayer.test.ts |  20 +
  .../Sidebar.childThreads.browser.test.tsx     | 139 +++++
  .../components/Sidebar.childThreads.test.ts   | 191 ++++++
- .../src/components/Sidebar.childThreads.tsx   | 571 +++++++++++++++++
+ .../src/components/Sidebar.childThreads.tsx   | 568 +++++++++++++++++
  .../src/components/Sidebar.families.test.ts   | 575 ++++++++++++++++++
- apps/web/src/components/Sidebar.families.ts   | 453 ++++++++++++++
+ apps/web/src/components/Sidebar.families.ts   | 426 +++++++++++++
  apps/web/src/components/Sidebar.tsx           |  76 ++-
  .../components/sidebar/SidebarThreadRow.tsx   |  24 +-
  .../components/threadActionMenu.logic.test.ts |  15 +
@@ -38,7 +38,7 @@ guide line, context-menu collapse and a summary stub.
  .../src/state/threadCommands.ts               |  14 +-
  .../src/state/threadShell.test.ts             |  37 ++
  packages/contracts/src/orchestrationV2.ts     |  25 +
- 29 files changed, 2494 insertions(+), 47 deletions(-)
+ 29 files changed, 2464 insertions(+), 47 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.childThreads.browser.test.tsx
  create mode 100644 apps/web/src/components/Sidebar.childThreads.test.ts
  create mode 100644 apps/web/src/components/Sidebar.childThreads.tsx
@@ -1043,15 +1043,12 @@ index 0000000000..c20485246c
 +});
 diff --git a/apps/web/src/components/Sidebar.childThreads.tsx b/apps/web/src/components/Sidebar.childThreads.tsx
 new file mode 100644
-index 0000000000..0029fe64a0
+index 0000000000..250d5d86f8
 --- /dev/null
 +++ b/apps/web/src/components/Sidebar.childThreads.tsx
-@@ -0,0 +1,571 @@
-+// Child threads in the sidebar (patches-tt/0003): a thread an agent opened
-+// renders under its opener when both sit in the same section, with a
-+// disclosure row that folds the family. The family rules live in
-+// Sidebar.families.ts; this module holds the sidebar's state and rendering so
-+// Sidebar.tsx only calls into it.
+@@ -0,0 +1,568 @@
++// Child threads in the sidebar (patches-tt/0003). Family rules live in Sidebar.families.ts;
++// this module holds the sidebar's state and rendering so Sidebar.tsx only calls into it.
 +import type { EnvironmentServerConfig } from "@t3tools/client-runtime/connection";
 +import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
 +import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
@@ -1063,10 +1060,10 @@ index 0000000000..0029fe64a0
 +  CircleAlertIcon,
 +  CircleCheckIcon,
 +  CircleDashedIcon,
-+  UserRoundIcon,
 +  CircleDotDashedIcon,
 +  MessageCircleQuestionIcon,
 +  ShieldQuestionIcon,
++  UserRoundIcon,
 +} from "lucide-react";
 +import { useEffect, useState, type ComponentType, type ReactElement, type ReactNode } from "react";
 +
@@ -1305,10 +1302,10 @@ index 0000000000..0029fe64a0
 +  // Opened "N settled" rows, by head key; they start closed each session.
 +  const [shownSettledChildThreadKeys, setShownSettledChildThreadKeys] = useState<
 +    ReadonlySet<string>
-+  // oxlint-disable-next-line t3code/react-effect-budget -- prunes persisted fold state as threads and the clock change.
 +  >(() => new Set());
 +  // Drops folds of families that left Settled or are gone (Sidebar.families.ts),
 +  // so a family that comes back to Settled starts collapsed again.
++  // oxlint-disable-next-line t3code/react-effect-budget -- prunes persisted fold state as threads and the clock change.
 +  useEffect(() => {
 +    const stateOf = childThreadFoldHeadStateOf(threads, threadShellKey, (thread) => {
 +      const capabilities = serverConfigs.get(thread.environmentId)?.environment.capabilities;
@@ -1454,10 +1451,10 @@ index 0000000000..0029fe64a0
 +}
 +
 +export type SidebarChildThreadStatusIcon =
-+  | "request"
 +  | "working"
 +  | "waiting"
 +  | "input"
++  | "request"
 +  | "approval"
 +  | "failed"
 +  | "done"
@@ -1468,11 +1465,11 @@ index 0000000000..0029fe64a0
 +    case "working":
 +      return <CircleDashedIcon aria-hidden className="size-4 shrink-0" />;
 +    case "waiting":
-+    case "request":
-+      return <UserRoundIcon aria-hidden className="size-4 shrink-0" />;
 +      return <CircleDotDashedIcon aria-hidden className="size-4 shrink-0" />;
 +    case "input":
 +      return <MessageCircleQuestionIcon aria-hidden className="size-4 shrink-0" />;
++    case "request":
++      return <UserRoundIcon aria-hidden className="size-4 shrink-0" />;
 +    case "approval":
 +      return <ShieldQuestionIcon aria-hidden className="size-4 shrink-0" />;
 +    case "failed":
@@ -2201,25 +2198,14 @@ index 0000000000..005b8d5e81
 +});
 diff --git a/apps/web/src/components/Sidebar.families.ts b/apps/web/src/components/Sidebar.families.ts
 new file mode 100644
-index 0000000000..c9b9bed009
+index 0000000000..ec6adb8b89
 --- /dev/null
 +++ b/apps/web/src/components/Sidebar.families.ts
-@@ -0,0 +1,453 @@
-+// Child threads in the sidebar, after Claude.app's nested sessions: a thread
-+// an agent opened through T3 tools renders under the thread that opened it.
-+// Nesting is a view inside one section. A settled child stays with an opener
-+// that is not settled, folded behind an "N settled" row, and moves to Settled
-+// with the whole family once its opener settles. A settled child that runs or
-+// waits on the user again shows as a live child. Otherwise every thread keeps
-+// the section its own state puts it in: a live child under a settled opener
-+// stays live on its own, and a child whose opener is archived, hidden, or
-+// paged out renders on its own. Families are one level deep: a grandchild
-+// hangs under the topmost ancestor in its section.
-+//
-+// A task an agent delegated (`delegate_task`) belongs to the thread that
-+// delegated it: it renders in that thread's section whatever its own state,
-+// so the orchestrator keeps its workers together, and it stays hidden while
-+// that thread is not shown.
+@@ -0,0 +1,426 @@
++// A thread an agent opened through T3 tools nests under its opener, one level deep, within one
++// section. A settled child stays folded under an unsettled opener and moves to Settled with the
++// family; otherwise each thread keeps its own section. A delegated task (`delegate_task`) always
++// follows its delegator's section and hides while the delegator is not shown.
 +
 +import type { SidebarThreadStatus } from "./Sidebar.logic";
 +
@@ -2276,12 +2262,9 @@ index 0000000000..c9b9bed009
 +}
 +
 +/**
-+ * Settled threads whose opener chain reaches a thread that is not settled
-+ * move to that thread's section, where the family folds them away; the rest
-+ * stay in Settled. The walk passes through settled openers only, so a settled
-+ * grandchild follows its settled parent up to the live root, and a missing
-+ * opener keeps the child in Settled. When the opener settles too, the whole
-+ * family lands in Settled together.
++ * Settled threads whose opener chain (through settled openers only) reaches an unsettled
++ * thread move to that thread's section; the rest, including those with a missing opener,
++ * stay in Settled. When the opener settles too, the whole family lands in Settled together.
 + */
 +export function placeSettledChildThreads<T, S>(
 +  settled: readonly T[],
@@ -2388,11 +2371,9 @@ index 0000000000..c9b9bed009
 +}
 +
 +/**
-+ * One page of a section, a family at a time: a family counts as one item and
-+ * its children come along, so a child never shows without its head. The
-+ * family of `keepKey` (the open thread) joins past the page. `hiddenCount`
-+ * counts the threads left out and `nextPageCount` the threads the next
-+ * `pageSize` families bring.
++ * Pages a section by family, so a child never shows without its head; the family of
++ * `keepKey` (the open thread) joins past the page. `hiddenCount` counts threads left out,
++ * `nextPageCount` the threads the next `pageSize` families bring.
 + */
 +export function pageSidebarThreadFamilies<T>(
 +  threads: readonly T[],
@@ -2430,14 +2411,10 @@ index 0000000000..c9b9bed009
 +}
 +
 +/**
-+ * A collapsed family still shows a child that needs the user (an approval or
-+ * a question) and the open thread. A child that is only working stays hidden:
-+ * its status shows on the disclosure row instead.
-+ *
-+ * An expanded family shows its live children, then its settled ones (that no
-+ * longer run or wait on the user) behind one "N settled" row, open while
-+ * `settledShown`. A family in Settled passes no `isSettled`: there every
-+ * child is settled, so they all show as children.
++ * Collapsed, a family still shows children that need the user and the open thread; working
++ * ones show only on the disclosure row. Expanded, live children come first and settled ones
++ * sit behind an "N settled" row, open while `settledShown`. A family in Settled passes no
++ * `isSettled`, so all its children show.
 + */
 +export function foldSidebarThreadFamily<T>(
 +  children: readonly T[],
@@ -2468,13 +2445,10 @@ index 0000000000..c9b9bed009
 +}
 +
 +/**
-+ * Which families the user folded, by their head's scoped key. Outside Settled
-+ * a family is expanded unless the user collapsed it there (`collapsed`). In
-+ * Settled it is collapsed unless the user expanded it during this stay
-+ * (`expandedInSettled`, keyed by head key and `settledEntryOf` the head), so
-+ * every entry into Settled starts collapsed, and a family that leaves Settled
-+ * falls back to its `collapsed` entry. `pruneChildThreadFolds` drops
-+ * expansions of heads outside Settled and folds of threads that are gone.
++ * Folds by head key. Outside Settled a family is expanded unless in `collapsed`; in Settled it
++ * is collapsed unless expanded during this stay (`expandedInSettled`, keyed by head key and
++ * `settledEntryOf`), so every entry into Settled starts collapsed. `pruneChildThreadFolds`
++ * drops expansions of heads outside Settled and folds of threads that are gone.
 + */
 +export interface ChildThreadFolds {
 +  readonly collapsed: readonly string[];
@@ -2487,11 +2461,9 @@ index 0000000000..c9b9bed009
 +  | { readonly section: "settled"; readonly headKey: string; readonly entry: string };
 +
 +/**
-+ * One stay of a head in Settled. A new settle changes `settledAt`; a snooze
-+ * keeps it but sets `snoozedAt`, which a wake by time leaves in place; a
-+ * wake by hand clears `snoozedAt` and stamps `lastSnoozeWakeAt`. So a head
-+ * that wakes back into Settled starts a new stay, also on a device that
-+ * never saw it snoozed.
++ * One stay of a head in Settled. A new settle changes `settledAt`; a snooze sets `snoozedAt`
++ * (kept by a timed wake); a manual wake clears it and stamps `lastSnoozeWakeAt`. So a head that
++ * wakes back into Settled starts a new stay, also on a device that never saw it snoozed.
 + */
 +export function settledEntryOf(head: {
 +  readonly settledAt: string | null;
@@ -2512,11 +2484,9 @@ index 0000000000..c9b9bed009
 +export type ChildThreadFoldHeadState = "settled" | "elsewhere" | "gone" | "unknown";
 +
 +/**
-+ * Judges folded heads against the loaded threads for `pruneChildThreadFolds`.
-+ * `isInSettled` decides with the thread's own state, whatever the project
-+ * filter shows, or returns null while it cannot tell yet (no server config).
-+ * A key of an environment with no loaded threads is not judged either; keys
-+ * start with their environment id and a colon.
++ * Judges folded heads against the loaded threads for `pruneChildThreadFolds`. `isInSettled`
++ * uses the thread's own state, or returns null while it cannot tell (no server config). Keys
++ * (`<environmentId>:...`) of an environment with no loaded threads are not judged either.
 + */
 +export function childThreadFoldHeadStateOf<T extends { readonly environmentId: string }>(
 +  threads: readonly T[],
@@ -2594,7 +2564,7 @@ index 0000000000..c9b9bed009
 +}
 +
 +export function childThreadNeedsUser(status: SidebarThreadStatus): boolean {
-+  return status === "approval" || status === "input";
++  return status === "approval" || status === "input" || status === "request";
 +}
 +
 +/** A child that is still working or waits on the user keeps its family. */
