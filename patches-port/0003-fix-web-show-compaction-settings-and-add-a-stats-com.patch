@@ -14,10 +14,10 @@ Subject: [PATCH 3/5] fix(web): show compaction settings and add a stats
  6 files changed, 313 insertions(+), 25 deletions(-)
 
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index fac1678355..3a32f56425 100644
+index 711cd7a4af..7e301ca8ab 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -1421,20 +1421,40 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1388,20 +1388,40 @@ export default function ChatView(props: ChatViewProps) {
      const usageLimits = activeUsageLimits
        ? { limits: activeUsageLimits, providerName: activeProviderName }
        : null;
@@ -62,7 +62,7 @@ index fac1678355..3a32f56425 100644
        ),
      };
    })();
-@@ -3740,7 +3760,23 @@ export default function ChatView(props: ChatViewProps) {
+@@ -3729,7 +3749,23 @@ export default function ChatView(props: ChatViewProps) {
                      </ComposerSurface.Shell>
                      {/* Opaque so timeline content scrolling under the overlay can't show through the stats line. */}
                      <div className={composerStats !== null ? "bg-background" : undefined}>
@@ -88,7 +88,7 @@ index fac1678355..3a32f56425 100644
                          aria-hidden
                          className="h-[calc(env(safe-area-inset-bottom)+1rem)] sm:h-[calc(env(safe-area-inset-bottom)+1.25rem)]"
 diff --git a/apps/web/src/components/chat/ComposerStats.logic.test.ts b/apps/web/src/components/chat/ComposerStats.logic.test.ts
-index 479e94b193..79b01fd80e 100644
+index 96fdfb1145..fdc86f7fba 100644
 --- a/apps/web/src/components/chat/ComposerStats.logic.test.ts
 +++ b/apps/web/src/components/chat/ComposerStats.logic.test.ts
 @@ -14,6 +14,7 @@ import { describe, expect, it } from "vite-plus/test";
@@ -266,7 +266,7 @@ index e059cb8792..96f52e05f5 100644
 +  return { threshold, source, remainingTokens, thresholdPercentage, pressurePercentage, status };
 +}
 diff --git a/apps/web/src/components/chat/ComposerStats.tsx b/apps/web/src/components/chat/ComposerStats.tsx
-index 025f57253e..53b81a83a1 100644
+index 31597b9912..b6547265ac 100644
 --- a/apps/web/src/components/chat/ComposerStats.tsx
 +++ b/apps/web/src/components/chat/ComposerStats.tsx
 @@ -10,6 +10,7 @@ import * as DateTime from "effect/DateTime";
@@ -277,15 +277,15 @@ index 025f57253e..53b81a83a1 100644
  import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
  import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
  import { composerFloatingLayerProps } from "./composerEventScope";
-@@ -18,6 +19,7 @@ import {
+@@ -17,6 +18,7 @@ import {
+   COMPOSER_STATS_CLOCK_MS,
    composerLimitDisplay,
-   composerLimitSourceLabel,
    composerLimitsFreshness,
 +  deriveContextCompaction,
    deriveResponseRate,
    deriveTurnCachePercentage,
    formatCachePercentage,
-@@ -234,7 +236,7 @@ function UsageLimitsSummary({
+@@ -235,7 +237,7 @@ function UsageLimitsSummary({
            <button
              type="button"
              aria-label="Usage limit details"
@@ -294,7 +294,7 @@ index 025f57253e..53b81a83a1 100644
            />
          }
        >
-@@ -278,12 +280,25 @@ export function ComposerStats({
+@@ -279,12 +281,25 @@ export function ComposerStats({
    turn,
    compactions,
    usageLimits,
@@ -320,7 +320,7 @@ index 025f57253e..53b81a83a1 100644
    const responseRate = deriveResponseRate(turn);
    const estimated = turn?.responseThroughput?.basis === "codex_active_windows_estimate";
    const usage = turn?.turnTokenUsage;
-@@ -301,7 +316,8 @@ export function ComposerStats({
+@@ -302,7 +317,8 @@ export function ComposerStats({
      !hasTokens &&
      responseRate === null &&
      compactions.length === 0 &&
@@ -330,7 +330,7 @@ index 025f57253e..53b81a83a1 100644
    )
      return null;
    const count = (value: number | undefined) =>
-@@ -327,7 +343,7 @@ export function ComposerStats({
+@@ -328,7 +344,7 @@ export function ComposerStats({
                <button
                  type="button"
                  aria-label="Turn token details"
@@ -339,7 +339,7 @@ index 025f57253e..53b81a83a1 100644
                />
              }
            >
-@@ -392,7 +408,7 @@ export function ComposerStats({
+@@ -393,7 +409,7 @@ export function ComposerStats({
              render={
                <span
                  tabIndex={0}
@@ -348,7 +348,7 @@ index 025f57253e..53b81a83a1 100644
                />
              }
            >
-@@ -410,7 +426,7 @@ export function ComposerStats({
+@@ -411,7 +427,7 @@ export function ComposerStats({
    }
  
    // Context is per thread, so it sits with the turn stats; the left side is account limits.
@@ -357,7 +357,7 @@ index 025f57253e..53b81a83a1 100644
      stats.unshift({
        key: "context",
        node: (
-@@ -423,13 +439,13 @@ export function ComposerStats({
+@@ -424,13 +440,13 @@ export function ComposerStats({
                <button
                  type="button"
                  aria-label="Context usage details"
@@ -373,7 +373,7 @@ index 025f57253e..53b81a83a1 100644
                    {Math.round(context.usedPercentage)}%
                  </span>
                ) : (
-@@ -444,7 +460,7 @@ export function ComposerStats({
+@@ -445,7 +461,7 @@ export function ComposerStats({
                  <h3 className="font-medium">Context usage</h3>
                  <span className="text-muted-foreground tabular-nums">
                    {context?.usedPercentage != null
@@ -382,7 +382,7 @@ index 025f57253e..53b81a83a1 100644
                      : "Not reported"}
                  </span>
                </div>
-@@ -456,11 +472,37 @@ export function ComposerStats({
+@@ -457,11 +473,37 @@ export function ComposerStats({
                    {context ? count(context.usedTokens) : "Not reported"}
                  </Detail>
                  <Detail label="Window size">{count(context?.maxTokens ?? undefined)}</Detail>
@@ -421,7 +421,7 @@ index 025f57253e..53b81a83a1 100644
                {compactions.length > 0 && (
                  <div className="space-y-1.5">
                    <p className="font-medium">Recent compactions</p>
-@@ -498,6 +540,19 @@ export function ComposerStats({
+@@ -499,6 +541,19 @@ export function ComposerStats({
                  Compactions count completed events in the loaded main-agent history for this
                  provider session.
                </p>
@@ -528,10 +528,10 @@ index c27ddd9a04..f83d682aa1 100644
 +  });
 +});
 diff --git a/apps/web/src/lib/contextWindow.ts b/apps/web/src/lib/contextWindow.ts
-index 32c3bb8de3..93054e57a5 100644
+index 8c449249e0..ff9ef9318c 100644
 --- a/apps/web/src/lib/contextWindow.ts
 +++ b/apps/web/src/lib/contextWindow.ts
-@@ -88,8 +88,11 @@ export function deriveLatestContextWindowSnapshot(
+@@ -87,8 +87,11 @@ export function deriveLatestContextWindowSnapshot(
        lastReasoningOutputTokens: null,
        toolUses: null,
        durationMs: null,
@@ -545,7 +545,7 @@ index 32c3bb8de3..93054e57a5 100644
        cost: null,
        updatedAt: liveUsage.updatedAt,
      };
-@@ -131,7 +134,7 @@ export function deriveLatestContextWindowSnapshot(
+@@ -130,7 +133,7 @@ export function deriveLatestContextWindowSnapshot(
    }
    for (let index = entries.length - 1; index >= 0; index -= 1) {
      const entry = entries[index];
@@ -554,7 +554,7 @@ index 32c3bb8de3..93054e57a5 100644
        continue;
      }
      const payload = entry.item;
-@@ -149,7 +152,7 @@ export function deriveLatestContextWindowSnapshot(
+@@ -148,7 +151,7 @@ export function deriveLatestContextWindowSnapshot(
  
      return {
        usedTokens,
@@ -563,7 +563,7 @@ index 32c3bb8de3..93054e57a5 100644
        maxTokens,
        remainingTokens,
        usedPercentage,
-@@ -165,10 +168,10 @@ export function deriveLatestContextWindowSnapshot(
+@@ -164,10 +167,10 @@ export function deriveLatestContextWindowSnapshot(
        lastReasoningOutputTokens: null,
        toolUses: null,
        durationMs: null,
