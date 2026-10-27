@@ -1,6 +1,7 @@
 import argparse
 import contextlib
 import json
+import plistlib
 import importlib.machinery
 import importlib.util
 from pathlib import Path
@@ -831,6 +832,14 @@ class AutoupdateReloadTest(unittest.TestCase):
         _, plist = self.run_autoupdate(None, loaded=False)
         calls, _ = self.run_autoupdate(plist.read_bytes(), loaded=False)
         self.assertEqual(calls, ['enable', 'print', 'bootout', 'bootstrap'])
+
+    def test_the_agent_runs_at_normal_priority_with_nice(self):
+        # Background jobs stay on the efficiency cores, where browser tests time out.
+        _, plist = self.run_autoupdate(None, loaded=False)
+        agent = plistlib.loads(plist.read_bytes())
+        self.assertEqual(agent['ProcessType'], 'Standard')
+        self.assertEqual(agent['Nice'], 10)
+        self.assertTrue(agent['LowPriorityIO'])
 
     def test_bootstrap_is_retried_while_launchd_removes_the_old_job(self):
         calls, _ = self.run_autoupdate(b'old', loaded=True, bootstrap_codes=(5, 5, 0))
