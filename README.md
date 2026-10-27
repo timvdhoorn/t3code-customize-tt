@@ -127,8 +127,9 @@ t3code-customize status          versions, what the launcher opens, background u
 T3 Code updates itself as usual. With `autoupdate on`, the rebuild starts as soon as T3 has
 installed the update, and a notification tells you when to quit T3 Code and reopen the
 launcher. Until then T3 Code runs stock; a launcher opened in between starts the rebuild itself.
-The look of Rex comes in two parts: the window glass is built in (Settings >
-Appearance > Window glass), and its Merino colors are a theme file. Import
+The look of Rex comes in two parts: the window glass and the conversation card are built in
+(Settings > Appearance > Window glass and Conversation card, each its own switch), and its Merino
+colors are a theme file. Import
 [`themes/merino.t3theme.json`](themes/merino.t3theme.json) in Settings > Appearance and pick
 Merino for light and dark. The iOS app ships the same theme as a built-in card.
 
