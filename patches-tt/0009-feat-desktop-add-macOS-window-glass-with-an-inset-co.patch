@@ -7,20 +7,20 @@ Subject: [PATCH 9/9] feat(desktop): add macOS window glass with an inset
 ---
  .../src/window/DesktopWindow.glass.test.ts    |  18 ++
  apps/desktop/src/window/DesktopWindow.ts      |  24 +-
- apps/web/src/appInit.tsx                      |  15 +
+ apps/web/src/appInit.tsx                      |  29 ++
  .../src/components/ThreadTerminalDrawer.tsx   |   3 +-
- .../settings/AppearanceSettingsPanel.tsx      |  87 ++++++
- .../components/settings/SettingsPanels.tsx    |   6 +
- .../src/components/settings/settingsSearch.ts |  12 +
- apps/web/src/index.css                        | 276 ++++++++++++++++++
+ .../settings/AppearanceSettingsPanel.tsx      | 111 +++++++
+ .../components/settings/SettingsPanels.tsx    |   8 +
+ .../src/components/settings/settingsSearch.ts |  18 ++
+ apps/web/src/index.css                        | 306 ++++++++++++++++++
  apps/web/src/terminal/ghostty/core.ts         |   2 +
  .../web/src/terminal/ghostty/renderer.test.ts |  92 ++++++
  apps/web/src/terminal/ghostty/renderer.ts     |  15 +-
  apps/web/src/terminal/ghostty/surface.ts      |   9 +-
- apps/web/src/windowGlass.test.ts              |  82 ++++++
- apps/web/src/windowGlass.ts                   |  61 ++++
- packages/contracts/src/settings.ts            |  19 ++
- 15 files changed, 712 insertions(+), 9 deletions(-)
+ apps/web/src/windowGlass.test.ts              | 106 ++++++
+ apps/web/src/windowGlass.ts                   |  76 +++++
+ packages/contracts/src/settings.ts            |  21 ++
+ 15 files changed, 829 insertions(+), 9 deletions(-)
  create mode 100644 apps/desktop/src/window/DesktopWindow.glass.test.ts
  create mode 100644 apps/web/src/terminal/ghostty/renderer.test.ts
  create mode 100644 apps/web/src/windowGlass.test.ts
@@ -107,18 +107,23 @@ index ab5fc8be26..72e6b13bdd 100644
      let boundsPersistFiber: Fiber.Fiber<void, never> | undefined;
      let pendingBoundsPersistFiber: Fiber.Fiber<void, never> | undefined;
 diff --git a/apps/web/src/appInit.tsx b/apps/web/src/appInit.tsx
-index 0d1855882d..05edc0d4e6 100644
+index 0d1855882d..436d6fba8b 100644
 --- a/apps/web/src/appInit.tsx
 +++ b/apps/web/src/appInit.tsx
-@@ -7,6 +7,7 @@ import { applyAppearanceFontVariables } from "./appearanceFonts";
+@@ -7,6 +7,12 @@ import { applyAppearanceFontVariables } from "./appearanceFonts";
  import { startElectronBrowserHost } from "./browser/ElectronBrowserHost";
  import { startBrowserProfileReporting } from "./browser/BrowserProfileReporter";
  import { startPreviewTitleRecording } from "./browserHistoryStore";
-+import { applyWindowGlass, resolveWindowGlass } from "./windowGlass";
++import {
++  applyWindowCard,
++  applyWindowGlass,
++  resolveWindowCard,
++  resolveWindowGlass,
++} from "./windowGlass";
  import { retainThreadOverlaysForThread } from "./components/chat/threadOverlayRetention";
  import { startBackgroundThreadAnnouncements } from "./components/BackgroundThreadAnnouncer";
  import { startSshPasswordPromptQueue } from "./components/desktop/SshPasswordPromptDialog";
-@@ -23,6 +24,7 @@ import { startGuideRunNotifications } from "./components/pullRequest/guide/PullR
+@@ -23,6 +29,7 @@ import { startGuideRunNotifications } from "./components/pullRequest/guide/PullR
  import { APP_BASE_NAME, APP_DISPLAY_NAME, APP_STAGE_LABEL } from "./branding";
  import { resolveServerBackedAppDisplayName } from "./branding.logic";
  import { isElectron } from "./env";
@@ -126,7 +131,7 @@ index 0d1855882d..05edc0d4e6 100644
  import { subscribeDraftThreadPromotion, useComposerDraftStore } from "./composerDraftStore";
  import { startDefaultThemeAdoption } from "./hooks/useDefaultTheme";
  import { startEnvironmentThemeRepaint } from "./hooks/useEnvironmentTheme";
-@@ -73,6 +75,19 @@ function startClientAppearance(): void {
+@@ -73,6 +80,28 @@ function startClientAppearance(): void {
          root.style.removeProperty("--glass-blur");
        }
      }
@@ -140,6 +145,15 @@ index 0d1855882d..05edc0d4e6 100644
 +          macDesktop: isElectron && isMacPlatform(navigator.platform),
 +          enabled: settings.windowGlass,
 +          transparency: settings.windowTransparency,
++        }),
++      );
++    }
++    if (previous?.windowCard !== settings.windowCard) {
++      applyWindowCard(
++        root,
++        resolveWindowCard({
++          macDesktop: isElectron && isMacPlatform(navigator.platform),
++          enabled: settings.windowCard,
 +        }),
 +      );
 +    }
@@ -168,7 +182,7 @@ index 301255c7d5..7e64f69c32 100644
        setupCleanups.push(() => themeObserver.disconnect());
  
 diff --git a/apps/web/src/components/settings/AppearanceSettingsPanel.tsx b/apps/web/src/components/settings/AppearanceSettingsPanel.tsx
-index e0877c8574..b28c66a505 100644
+index e0877c8574..d2c44a1817 100644
 --- a/apps/web/src/components/settings/AppearanceSettingsPanel.tsx
 +++ b/apps/web/src/components/settings/AppearanceSettingsPanel.tsx
 @@ -8,10 +8,14 @@ import {
@@ -202,14 +216,14 @@ index e0877c8574..b28c66a505 100644
    const appearanceContrastRatio =
      (settings.appearanceContrast - MIN_APPEARANCE_CONTRAST) /
      (MAX_APPEARANCE_CONTRAST - MIN_APPEARANCE_CONTRAST);
-@@ -199,6 +212,80 @@ export function AppearanceSettingsPanel() {
+@@ -199,6 +212,104 @@ export function AppearanceSettingsPanel() {
            }
          />
  
 +        {showWindowGlass ? (
 +          <SettingsRow
 +            {...searchableSetting("window-glass")}
-+            description="Let the desktop show through the sidebar and frame the conversation as a card."
++            description="Let the desktop show through the sidebar and the conversation."
 +            resetAction={
 +              settings.windowGlass !== DEFAULT_UNIFIED_SETTINGS.windowGlass ? (
 +                <SettingResetButton
@@ -233,7 +247,7 @@ index e0877c8574..b28c66a505 100644
 +        {showWindowGlass && settings.windowGlass ? (
 +          <SettingsRow
 +            {...searchableSetting("window-transparency")}
-+            description="Higher values let more of the desktop through the sidebar and the card."
++            description="Higher values let more of the desktop through the sidebar and the conversation."
 +            resetAction={
 +              settings.windowTransparency !== DEFAULT_UNIFIED_SETTINGS.windowTransparency ? (
 +                <SettingResetButton
@@ -280,38 +294,64 @@ index e0877c8574..b28c66a505 100644
 +          />
 +        ) : null}
 +
++        {showWindowGlass ? (
++          <SettingsRow
++            {...searchableSetting("window-card")}
++            description="Frame the conversation as a card with rounded corners beside the sidebar."
++            resetAction={
++              settings.windowCard !== DEFAULT_UNIFIED_SETTINGS.windowCard ? (
++                <SettingResetButton
++                  label="conversation card"
++                  onClick={() =>
++                    updateSettings({ windowCard: DEFAULT_UNIFIED_SETTINGS.windowCard })
++                  }
++                />
++              ) : null
++            }
++            control={
++              <Switch
++                aria-label="Conversation card"
++                checked={settings.windowCard}
++                onCheckedChange={(checked) => updateSettings({ windowCard: Boolean(checked) })}
++              />
++            }
++          />
++        ) : null}
++
          <SettingsRow
            {...searchableSetting("chat-width")}
            description="Set how wide messages and the composer can grow on large screens."
 diff --git a/apps/web/src/components/settings/SettingsPanels.tsx b/apps/web/src/components/settings/SettingsPanels.tsx
-index c2e7057907..a436ae3ea0 100644
+index c2e7057907..7cee568bba 100644
 --- a/apps/web/src/components/settings/SettingsPanels.tsx
 +++ b/apps/web/src/components/settings/SettingsPanels.tsx
-@@ -402,6 +402,10 @@ export function useSettingsRestore(onRestored?: () => void) {
+@@ -402,6 +402,11 @@ export function useSettingsRestore(onRestored?: () => void) {
        ? ["Contrast"]
        : []),
      ...(settings.glassOpacity !== DEFAULT_UNIFIED_SETTINGS.glassOpacity ? ["Glass opacity"] : []),
 +    ...(settings.windowGlass !== DEFAULT_UNIFIED_SETTINGS.windowGlass ? ["Window glass"] : []),
++    ...(settings.windowCard !== DEFAULT_UNIFIED_SETTINGS.windowCard ? ["Conversation card"] : []),
 +    ...(settings.windowTransparency !== DEFAULT_UNIFIED_SETTINGS.windowTransparency
 +      ? ["Window transparency"]
 +      : []),
      ...(settings.diffColorScheme !== DEFAULT_UNIFIED_SETTINGS.diffColorScheme
        ? ["Diff colors"]
        : []),
-@@ -603,6 +607,8 @@ export function useSettingsRestore(onRestored?: () => void) {
+@@ -603,6 +608,9 @@ export function useSettingsRestore(onRestored?: () => void) {
        contextWindowMeterEnabled: DEFAULT_UNIFIED_SETTINGS.contextWindowMeterEnabled,
        environmentIdentificationMode: DEFAULT_UNIFIED_SETTINGS.environmentIdentificationMode,
        glassOpacity: DEFAULT_UNIFIED_SETTINGS.glassOpacity,
 +      windowGlass: DEFAULT_UNIFIED_SETTINGS.windowGlass,
++      windowCard: DEFAULT_UNIFIED_SETTINGS.windowCard,
 +      windowTransparency: DEFAULT_UNIFIED_SETTINGS.windowTransparency,
        panelAnimationDurationMs: DEFAULT_UNIFIED_SETTINGS.panelAnimationDurationMs,
        sidebarThreadPreviewCount: DEFAULT_UNIFIED_SETTINGS.sidebarThreadPreviewCount,
        sidebarProjectGroupingMode: DEFAULT_UNIFIED_SETTINGS.sidebarProjectGroupingMode,
 diff --git a/apps/web/src/components/settings/settingsSearch.ts b/apps/web/src/components/settings/settingsSearch.ts
-index 3919748801..5ea4c7481c 100644
+index 3919748801..f2a36c11a8 100644
 --- a/apps/web/src/components/settings/settingsSearch.ts
 +++ b/apps/web/src/components/settings/settingsSearch.ts
-@@ -301,6 +301,18 @@ export const SETTINGS_SEARCH_ITEMS = [
+@@ -301,6 +301,24 @@ export const SETTINGS_SEARCH_ITEMS = [
      to: "/settings/appearance",
      searchTerms: ["transparent transparency solid menus dialogs composer"],
    },
@@ -327,14 +367,20 @@ index 3919748801..5ea4c7481c 100644
 +    to: "/settings/appearance",
 +    searchTerms: ["vibrancy glass blur translucent macos sidebar card opacity"],
 +  },
++  {
++    id: "window-card",
++    title: "Conversation card",
++    to: "/settings/appearance",
++    searchTerms: ["inset card rounded corners frame gap macos rex"],
++  },
    {
      id: "diff-color-scheme",
      title: "Diff colors",
 diff --git a/apps/web/src/index.css b/apps/web/src/index.css
-index 80c16a1b43..831e579168 100644
+index 80c16a1b43..8354706ae1 100644
 --- a/apps/web/src/index.css
 +++ b/apps/web/src/index.css
-@@ -2575,3 +2575,279 @@ code {
+@@ -2575,3 +2575,309 @@ code {
      }
    }
  }
@@ -346,19 +392,11 @@ index 80c16a1b43..831e579168 100644
 +   content becomes an inset card tinted with the canvas again, with the light
 +   rim of a macOS 26 glass pane. Unlayered so it wins over the sidebar's
 +   background utilities. */
-+html[data-window-glass] {
++/* The conversation card (Settings > Appearance > Conversation card) is its own
++   switch: its gap, corners, rim and shadow apply with or without the glass. */
++html[data-window-card] {
 +  --window-glass-gap: 8px;
 +  --window-glass-radius: 10px;
-+  --window-glass-tint-color: var(--background);
-+  --window-glass-card-color: var(--background);
-+  /* Resolved here, before the card clears --background for its contents. */
-+  --window-glass-card-background: color-mix(
-+    in srgb,
-+    var(--window-glass-card-color) var(--window-glass-card),
-+    transparent
-+  );
-+  /* Liquid Glass lifts Rex's pane above its tint. */
-+  --window-glass-card-lift: rgb(255 255 255 / 0.065);
 +  /* Rex's pane: a glass rim (the card's ::after) on the top and bottom edge
 +     that runs round the corners and fades out along the sides, a soft glow
 +     inward from those edges, and a dark hairline outside. */
@@ -377,6 +415,26 @@ index 80c16a1b43..831e579168 100644
 +    0 6px 16px rgb(0 0 0 / 0.18);
 +}
 +
++html[data-window-card]:not(.dark) {
++  --window-glass-card-rim: linear-gradient(rgb(255 255 255 / 0.6), rgb(255 255 255 / 0.25));
++  --window-glass-card-shadow:
++    inset 0 0.5px 0 rgb(255 255 255 / 0.8), inset 0 0 0 0.5px rgb(0 0 0 / 0.06),
++    0 1px 2px rgb(0 0 0 / 0.06), 0 6px 16px rgb(0 0 0 / 0.08);
++}
++
++html[data-window-glass] {
++  --window-glass-tint-color: var(--background);
++  --window-glass-card-color: var(--background);
++  /* Resolved here, before the card clears --background for its contents. */
++  --window-glass-card-background: color-mix(
++    in srgb,
++    var(--window-glass-card-color) var(--window-glass-card),
++    transparent
++  );
++  /* Liquid Glass lifts Rex's pane above its tint. */
++  --window-glass-card-lift: rgb(255 255 255 / 0.065);
++}
++
 +html[data-window-glass]:not(.dark) {
 +  /* Light glass over a dark backdrop needs far more tint to reach Rex's
 +     near-white sidebar and card; the slider still scales both. */
@@ -386,10 +444,6 @@ index 80c16a1b43..831e579168 100644
 +    transparent
 +  );
 +  --window-glass-card-lift: transparent;
-+  --window-glass-card-rim: linear-gradient(rgb(255 255 255 / 0.6), rgb(255 255 255 / 0.25));
-+  --window-glass-card-shadow:
-+    inset 0 0.5px 0 rgb(255 255 255 / 0.8), inset 0 0 0 0.5px rgb(0 0 0 / 0.06),
-+    0 1px 2px rgb(0 0 0 / 0.06), 0 6px 16px rgb(0 0 0 / 0.08);
 +}
 +
 +/* useTheme and the boot script paint html and body inline. */
@@ -415,7 +469,7 @@ index 80c16a1b43..831e579168 100644
 +    in srgb,
 +    var(--window-glass-tint-color) min(100%, calc(var(--window-glass-tint) * 1.73)),
 +    transparent
-+  );  /* The black shade only belongs to the dark glass. */
++  ); /* The black shade only belongs to the dark glass. */
 +  background-image: none;
 +}
 +
@@ -426,14 +480,19 @@ index 80c16a1b43..831e579168 100644
 +
 +/* Measured on screen, the rows sat about 1px further from the card than
 +   from the window edge; trim the right inset so both sides match. */
-+html[data-window-glass]
++html[data-window-card]
 +  [data-slot="sidebar-container"]
 +  :is([data-slot="sidebar-header"], [data-slot="sidebar-group"], [data-slot="sidebar-footer"]) {
 +  padding-right: calc(var(--sidebar-content-inset) - 1px);
 +}
 +
-+html[data-window-glass] [data-slot="sidebar-container"] {
++html:is([data-window-glass], [data-window-card]) [data-slot="sidebar-container"] {
 +  border-color: transparent !important;
++}
++
++/* Without the glass the card sits on the sidebar's own color. */
++html[data-window-card]:not([data-window-glass]) [data-slot="sidebar-wrapper"] {
++  background-color: var(--sidebar);
 +}
 +
 +html[data-window-glass] [data-slot="sidebar-inset"] {
@@ -442,13 +501,16 @@ index 80c16a1b43..831e579168 100644
 +  --background: transparent;
 +  --app-chrome-background: transparent;
 +  --toolbar-background: transparent;
++  background-color: var(--window-glass-card-background);
++  background-image: linear-gradient(var(--window-glass-card-lift), var(--window-glass-card-lift));
++}
++
++html[data-window-card] [data-slot="sidebar-inset"] {
 +  margin: var(--window-glass-gap) var(--window-glass-gap) var(--window-glass-gap) 0;
 +  height: calc(100dvh - 2 * var(--window-glass-gap));
 +  min-height: 0;
 +  overflow: hidden;
 +  border-radius: var(--window-glass-radius);
-+  background-color: var(--window-glass-card-background);
-+  background-image: linear-gradient(var(--window-glass-card-lift), var(--window-glass-card-lift));
 +  box-shadow: var(--window-glass-card-shadow);
 +}
 +
@@ -461,10 +523,6 @@ index 80c16a1b43..831e579168 100644
 +  --chat-composer-outline: rgb(255 255 255 / 0.07);
 +  --message-surface: color-mix(in srgb, var(--foreground) 8%, transparent);
 +  --card: color-mix(in srgb, var(--foreground) 4.2%, transparent);
-+  /* Pressed toggles, the active terminal tab and hovers: Rex's pressed veil,
-+     not the theme's tinted accent surface. */
-+  --accent: color-mix(in srgb, var(--foreground) 7.3%, transparent);
-+  --accent-foreground: var(--foreground);
 +  --surface-raised: color-mix(in srgb, var(--foreground) 6%, transparent);
 +  --secondary: color-mix(in srgb, var(--foreground) 6%, transparent);
 +  --muted: color-mix(in srgb, var(--foreground) 7.3%, transparent);
@@ -500,13 +558,16 @@ index 80c16a1b43..831e579168 100644
 +  --chat-composer-glass-surface: var(--window-glass-raised);
 +  --app-theme-surface-raised: var(--window-glass-raised);
 +  --chat-composer-outline: rgb(255 255 255 / 0.09);
-+  --accent: color-mix(in srgb, var(--foreground) 7.3%, transparent);
-+  --accent-foreground: var(--foreground);
 +  --secondary: color-mix(in srgb, var(--foreground) 6%, transparent);
 +}
 +
 +/* Sidebar rows and controls: Rex's veils instead of the theme's opaque row
 +   colors, and no fade to an opaque sidebar color under sticky art. */
++html[data-window-glass].dark [data-app-sidebar] {
++  --accent: color-mix(in srgb, var(--foreground) 7.3%, transparent);
++  --accent-foreground: var(--foreground);
++}
++
 +html[data-window-glass].dark [data-slot="sidebar-container"] {
 +  --sidebar-row-hover: color-mix(in srgb, var(--foreground) 4.2%, transparent);
 +  --sidebar-row-active: color-mix(in srgb, var(--foreground) 7.3%, transparent);
@@ -518,6 +579,14 @@ index 80c16a1b43..831e579168 100644
 +
 +/* Light sidebar rows: Rex lifts the selection with white instead of the
 +   theme's opaque gray. */
++/* Light glass: a dark veil like the light sidebar's hover, not the theme's
++   tinted accent surface. */
++html[data-window-glass]:not(.dark),
++html[data-window-glass]:not(.dark) [data-app-sidebar] {
++  --accent: color-mix(in srgb, var(--foreground) 6%, transparent);
++  --accent-foreground: var(--foreground);
++}
++
 +html[data-window-glass]:not(.dark) [data-slot="sidebar-container"] {
 +  --sidebar-row-hover: rgb(0 0 0 / 0.04);
 +  --sidebar-row-active: rgb(255 255 255 / 0.5);
@@ -553,6 +622,13 @@ index 80c16a1b43..831e579168 100644
 +     the colors measured next to Rex. */
 +  --window-glass-raised: color-mix(in srgb, var(--foreground) 15%, var(--background));
 +  --popover: var(--window-glass-raised);
++  /* Hovered, highlighted and pressed items (toggles, tabs, menu and list rows,
++     file trees): Rex's pressed veil, never the theme's tinted accent surface.
++     Set here and on the sidebar, the two places the theme sets it, so the
++     card and everything portaled out of it (menus, popovers, dialogs, the
++     composer's command menu) follow. */
++  --accent: color-mix(in srgb, var(--foreground) 7.3%, transparent);
++  --accent-foreground: var(--foreground);
 +  /* Rex's pane is a touch cooler than its canvas: lean toward the theme surface. */
 +  --window-glass-card-color: color-mix(
 +    in srgb,
@@ -582,7 +658,7 @@ index 80c16a1b43..831e579168 100644
 +  background-color: transparent !important;
 +}
 +
-+html[data-window-glass] [data-slot="sidebar-inset"]::after {
++html[data-window-card] [data-slot="sidebar-inset"]::after {
 +  content: "";
 +  position: absolute;
 +  inset: 0;
@@ -596,22 +672,22 @@ index 80c16a1b43..831e579168 100644
 +  pointer-events: none;
 +}
 +
-+html[data-window-glass] [data-sidebar-state="collapsed"] [data-slot="sidebar-inset"] {
++html[data-window-card] [data-sidebar-state="collapsed"] [data-slot="sidebar-inset"] {
 +  margin-left: var(--window-glass-gap);
 +}
 +
 +/* The resize rail keeps its cursor but draws no line beside the card. */
-+html[data-window-glass] [data-slot="sidebar-rail"],
-+html[data-window-glass] [data-slot="sidebar-rail"]::after {
++html[data-window-card] [data-slot="sidebar-rail"],
++html[data-window-card] [data-slot="sidebar-rail"]::after {
 +  background-color: transparent !important;
 +}
 +
 +/* Keep scrollbars out of the card's rounded corners. */
-+html[data-window-glass] [data-slot="sidebar-inset"] ::-webkit-scrollbar-track:vertical {
++html[data-window-card] [data-slot="sidebar-inset"] ::-webkit-scrollbar-track:vertical {
 +  margin-block: var(--window-glass-radius);
 +}
 +
-+html[data-window-glass] [data-slot="sidebar-inset"] ::-webkit-scrollbar-track:horizontal {
++html[data-window-card] [data-slot="sidebar-inset"] ::-webkit-scrollbar-track:horizontal {
 +  margin-inline: var(--window-glass-radius);
 +}
 diff --git a/apps/web/src/terminal/ghostty/core.ts b/apps/web/src/terminal/ghostty/core.ts
@@ -802,13 +878,18 @@ index 321bc0b48c..42985ce02a 100644
          : {}),
 diff --git a/apps/web/src/windowGlass.test.ts b/apps/web/src/windowGlass.test.ts
 new file mode 100644
-index 0000000000..fb620275ef
+index 0000000000..d03fdb4731
 --- /dev/null
 +++ b/apps/web/src/windowGlass.test.ts
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,106 @@
 +import { describe, expect, it } from "vite-plus/test";
 +
-+import { applyWindowGlass, resolveWindowGlass } from "./windowGlass";
++import {
++  applyWindowCard,
++  applyWindowGlass,
++  resolveWindowCard,
++  resolveWindowGlass,
++} from "./windowGlass";
 +
 +describe("resolveWindowGlass", () => {
 +  it("stays off outside the macOS desktop app", () => {
@@ -857,6 +938,14 @@ index 0000000000..fb620275ef
 +  });
 +});
 +
++describe("resolveWindowCard", () => {
++  it("frames the conversation only in the macOS desktop app, with or without glass", () => {
++    expect(resolveWindowCard({ macDesktop: true, enabled: true })).toBe(true);
++    expect(resolveWindowCard({ macDesktop: true, enabled: false })).toBe(false);
++    expect(resolveWindowCard({ macDesktop: false, enabled: true })).toBe(false);
++  });
++});
++
 +describe("applyWindowGlass", () => {
 +  function fakeRoot() {
 +    const attributes = new Map<string, string>();
@@ -887,13 +976,24 @@ index 0000000000..fb620275ef
 +    expect(attributes.size).toBe(0);
 +    expect(properties.size).toBe(0);
 +  });
++
++  it("sets the card apart from the glass", () => {
++    const { attributes, root } = fakeRoot();
++    applyWindowCard(root, true);
++    applyWindowGlass(root, { active: false });
++    expect(attributes.has("data-window-card")).toBe(true);
++    expect(attributes.has("data-window-glass")).toBe(false);
++
++    applyWindowCard(root, false);
++    expect(attributes.size).toBe(0);
++  });
 +});
 diff --git a/apps/web/src/windowGlass.ts b/apps/web/src/windowGlass.ts
 new file mode 100644
-index 0000000000..0cd65ab07c
+index 0000000000..e58808e548
 --- /dev/null
 +++ b/apps/web/src/windowGlass.ts
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,76 @@
 +/**
 + * Window glass for the macOS desktop app: the main window has native HUD
 + * vibrancy behind a transparent page; this decides how strongly the window
@@ -942,6 +1042,21 @@ index 0000000000..0cd65ab07c
 +  };
 +}
 +
++/**
++ * The conversation card (gap, corners, rim, shadow) is a separate switch: it
++ * frames the conversation with or without the glass behind it.
++ */
++export function resolveWindowCard(
++  input: Readonly<{ macDesktop: boolean; enabled: boolean }>,
++): boolean {
++  return input.macDesktop && input.enabled;
++}
++
++export function applyWindowCard(root: HTMLElement, card: boolean): void {
++  if (card) root.setAttribute("data-window-card", "");
++  else root.removeAttribute("data-window-card");
++}
++
 +export function applyWindowGlass(root: HTMLElement, glass: WindowGlass): void {
 +  if (!glass.active) {
 +    root.removeAttribute("data-window-glass");
@@ -956,7 +1071,7 @@ index 0000000000..0cd65ab07c
 +  root.style.setProperty("--window-glass-card", `${Math.round(glass.cardAlpha * 1000) / 10}%`);
 +}
 diff --git a/packages/contracts/src/settings.ts b/packages/contracts/src/settings.ts
-index 463f934ccb..cf770b8230 100644
+index 463f934ccb..6a95332207 100644
 --- a/packages/contracts/src/settings.ts
 +++ b/packages/contracts/src/settings.ts
 @@ -103,6 +103,19 @@ export const GlassOpacity = Schema.Int.check(
@@ -979,22 +1094,24 @@ index 463f934ccb..cf770b8230 100644
  export const MIN_APPEARANCE_CONTRAST = 50;
  export const MAX_APPEARANCE_CONTRAST = 200;
  export const AppearanceContrast = Schema.Int.check(
-@@ -386,6 +399,10 @@ export const ClientSettingsSchema = Schema.Struct({
+@@ -386,6 +399,11 @@ export const ClientSettingsSchema = Schema.Struct({
    glassOpacity: GlassOpacity.pipe(
      Schema.withDecodingDefault(Effect.succeed(DEFAULT_GLASS_OPACITY)),
    ),
 +  windowGlass: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
++  windowCard: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
 +  windowTransparency: WindowTransparency.pipe(
 +    Schema.withDecodingDefault(Effect.succeed(DEFAULT_WINDOW_TRANSPARENCY)),
 +  ),
    fontSizeInterface: InterfaceFontSize.pipe(
      Schema.withDecodingDefault(Effect.succeed(DEFAULT_INTERFACE_FONT_SIZE)),
    ),
-@@ -1635,6 +1652,8 @@ export const ClientSettingsPatch = Schema.Struct({
+@@ -1635,6 +1653,9 @@ export const ClientSettingsPatch = Schema.Struct({
    diffLayout: Schema.optionalKey(DiffLayout),
    environmentIdentificationMode: Schema.optionalKey(EnvironmentIdentificationMode),
    glassOpacity: Schema.optionalKey(GlassOpacity),
 +  windowGlass: Schema.optionalKey(Schema.Boolean),
++  windowCard: Schema.optionalKey(Schema.Boolean),
 +  windowTransparency: Schema.optionalKey(WindowTransparency),
    onboardingCompletedAt: Schema.optionalKey(Schema.NullOr(Schema.String)),
    fontSizeInterface: Schema.optionalKey(InterfaceFontSize),
