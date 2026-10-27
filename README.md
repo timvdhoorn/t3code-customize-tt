@@ -127,6 +127,11 @@ t3code-customize status          versions, what the launcher opens, background u
 T3 Code updates itself as usual. With `autoupdate on`, the rebuild starts as soon as T3 has
 installed the update, and a notification tells you when to quit T3 Code and reopen the
 launcher. Until then T3 Code runs stock; a launcher opened in between starts the rebuild itself.
+The look of Rex comes in two parts: the window glass is built in (Settings >
+Appearance > Window glass), and its Merino colors are a theme file. Import
+[`themes/merino.t3theme.json`](themes/merino.t3theme.json) in Settings > Appearance and pick
+Merino for light and dark. The iOS app ships the same theme as a built-in card.
+
 The label next to the T3 logo shows which customized build you run (the first characters of the recipe in `status`; hover it for the build time). Settings > General > About and the macOS About panel show it too.
 
 When a nightly changes code the patches touch, you get a notification and T3 Code stays stock.
