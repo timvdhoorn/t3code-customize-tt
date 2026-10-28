@@ -17,7 +17,7 @@ Subject: [PATCH 7/8] feat(mobile): label child agents as agent or subagent
  create mode 100644 apps/mobile/src/lib/threadActivity.kind.test.ts
 
 diff --git a/apps/mobile/src/features/threads/SubagentRow.tsx b/apps/mobile/src/features/threads/SubagentRow.tsx
-index bd785f20e8..b98479b3b8 100644
+index a888adb827..a57d213946 100644
 --- a/apps/mobile/src/features/threads/SubagentRow.tsx
 +++ b/apps/mobile/src/features/threads/SubagentRow.tsx
 @@ -18,6 +18,7 @@ type SubagentRowSubagent = Pick<
@@ -28,7 +28,7 @@ index bd785f20e8..b98479b3b8 100644
    | "model"
    | "driver"
    | "providerInstanceId"
-@@ -56,13 +57,13 @@ export function SubagentRow(props: {
+@@ -59,13 +60,13 @@ export function SubagentRow(props: {
              >
                ·
              </Text>
@@ -47,15 +47,15 @@ index bd785f20e8..b98479b3b8 100644
 +                {presentation.statusLabel}
 +              </Text>
              </Text>
-           </View>
-           {props.elapsed}
+             {presentation.runsOn !== null ? (
+               <Text numberOfLines={1} className="shrink text-xs text-foreground-muted">
 diff --git a/apps/mobile/src/features/threads/thread-subagent-group.tsx b/apps/mobile/src/features/threads/thread-subagent-group.tsx
-index c408b1771f..bf93d6b2c6 100644
+index f83b85de0b..5b918a7ae1 100644
 --- a/apps/mobile/src/features/threads/thread-subagent-group.tsx
 +++ b/apps/mobile/src/features/threads/thread-subagent-group.tsx
 @@ -1,7 +1,10 @@
  import { useAtomValue } from "@effect/atom-react";
- import { StackActions, useIsFocused, useNavigation } from "@react-navigation/native";
+ import { StackActions, useNavigation } from "@react-navigation/native";
  import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 -import { summarizeSubagentStatuses } from "@t3tools/client-runtime/state/subagent-display";
 +import {
@@ -65,7 +65,7 @@ index c408b1771f..bf93d6b2c6 100644
  import { isActiveSubagentStatus } from "@t3tools/client-runtime/state/subagentRuntime";
  import type {
    EnvironmentId,
-@@ -95,7 +98,7 @@ export function ThreadSubagentGroup(props: {
+@@ -86,7 +89,7 @@ export function ThreadSubagentGroup(props: {
      };
    });
    const grouped = agents.length > 1;
@@ -73,9 +73,9 @@ index c408b1771f..bf93d6b2c6 100644
 +  const label = childAgentCountLabel(agents.map((agent) => agent.origin));
    const summary = summarizeSubagentStatuses(agents.map((agent) => agent.status));
    const expanded = props.expandedRows[props.anchorKey] ?? false;
-   const iconUrl = (item: SubagentItem) =>
+   const serverConfigs = useServerConfigs();
 diff --git a/apps/mobile/src/features/threads/thread-work-log.tsx b/apps/mobile/src/features/threads/thread-work-log.tsx
-index 62251650c5..c5f36bd0ee 100644
+index c07a04217d..d559944187 100644
 --- a/apps/mobile/src/features/threads/thread-work-log.tsx
 +++ b/apps/mobile/src/features/threads/thread-work-log.tsx
 @@ -70,6 +70,7 @@ import {
@@ -86,7 +86,7 @@ index 62251650c5..c5f36bd0ee 100644
  import {
    toolCallLines,
    turnItemOutputImages,
-@@ -1386,11 +1387,7 @@ export const ThreadAgentSpawnCard = function ThreadAgentSpawnCard(props: {
+@@ -1389,11 +1390,7 @@ export const ThreadAgentSpawnCard = function ThreadAgentSpawnCard(props: {
          accessibilityRole={canExpand ? "button" : undefined}
          accessibilityState={canExpand ? { expanded } : undefined}
          accessibilityLabel={`${summary.title}, ${summary.status}`}
@@ -196,7 +196,7 @@ index 0000000000..cb0945036d
 +  });
 +});
 diff --git a/apps/mobile/src/features/threads/threadAgentsPresentation.ts b/apps/mobile/src/features/threads/threadAgentsPresentation.ts
-index 96981ab3a3..5785d8ac5d 100644
+index 3bf82e35c4..a2a5b21f86 100644
 --- a/apps/mobile/src/features/threads/threadAgentsPresentation.ts
 +++ b/apps/mobile/src/features/threads/threadAgentsPresentation.ts
 @@ -1,6 +1,9 @@
@@ -208,8 +208,8 @@ index 96981ab3a3..5785d8ac5d 100644
 +  subagentKindLabel,
  } from "@t3tools/client-runtime/state/subagent-display";
  import { isActiveSubagentStatus } from "@t3tools/client-runtime/state/subagentRuntime";
- import type { OrchestrationV2Subagent } from "@t3tools/contracts";
-@@ -13,16 +16,22 @@ export interface SubagentRowPresentation {
+ import type { EnvironmentId, OrchestrationV2Subagent, ThreadId } from "@t3tools/contracts";
+@@ -13,6 +16,8 @@ export interface SubagentRowPresentation {
    readonly title: string;
    readonly detail: string | null;
    readonly statusLabel: string;
@@ -218,6 +218,8 @@ index 96981ab3a3..5785d8ac5d 100644
    readonly tone: SubagentRowTone;
    readonly live: boolean;
    readonly canOpenThread: boolean;
+@@ -39,11 +44,15 @@ export function subagentThreadTarget(
+     : null;
  }
  
 -function rowTitle(subagent: Pick<OrchestrationV2Subagent, "title" | "prompt">): string {
@@ -234,22 +236,25 @@ index 96981ab3a3..5785d8ac5d 100644
    return prompt.length > PROMPT_TITLE_LIMIT
      ? `${prompt.slice(0, PROMPT_TITLE_LIMIT - 3)}...`
      : prompt;
-@@ -59,15 +68,26 @@ export function resolveSubagentRowPresentation(
+@@ -80,7 +89,7 @@ export function resolveSubagentRowPresentation(
    subagent: Pick<
      OrchestrationV2Subagent,
-     "title" | "prompt" | "status" | "progress" | "result" | "childThreadId"
+     "title" | "prompt" | "status" | "progress" | "result" | "childThreadId" | "remoteChild"
 -  >,
 +  > & { readonly origin?: OrchestrationV2Subagent["origin"] },
+   canOpenRemote = false,
  ): SubagentRowPresentation {
    const live = isActiveSubagentStatus(subagent.status);
-   return {
+@@ -88,6 +97,7 @@ export function resolveSubagentRowPresentation(
      title: rowTitle(subagent),
      detail: subagentDetailPreview(subagent),
      statusLabel: rowStatusLabel(subagent.status),
 +    kindLabel: subagentKindLabel(subagent.origin),
      tone: rowTone(subagent.status),
      live,
-     canOpenThread: subagent.childThreadId !== null,
+     canOpenThread:
+@@ -95,3 +105,13 @@ export function resolveSubagentRowPresentation(
+     runsOn: subagent.remoteChild?.label ?? null,
    };
  }
 +
@@ -330,7 +335,7 @@ index 0000000000..52626bbb66
 +  });
 +});
 diff --git a/apps/mobile/src/lib/threadActivity.ts b/apps/mobile/src/lib/threadActivity.ts
-index 0038bc9bf4..9bdcf06226 100644
+index f0f36b119a..378a61509d 100644
 --- a/apps/mobile/src/lib/threadActivity.ts
 +++ b/apps/mobile/src/lib/threadActivity.ts
 @@ -5,7 +5,10 @@ import type {
@@ -362,7 +367,7 @@ index 0038bc9bf4..9bdcf06226 100644
    }>;
  }
  
-@@ -662,7 +668,8 @@ function itemSummary(
+@@ -671,7 +677,8 @@ function itemSummary(
      (item.type === "dynamic_tool"
        ? dynamicToolTitle(item.toolName, item.input, item.title)
        : undefined) ?? item.title?.trim();

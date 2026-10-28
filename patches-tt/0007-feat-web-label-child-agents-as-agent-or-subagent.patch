@@ -5,8 +5,8 @@ Subject: [PATCH 7/9] feat(web): label child agents as agent or subagent
 
 ---
  .../orchestration-v2/ProjectionStore.test.ts  |   8 +-
- apps/web/src/components/ChatView.tsx          |   4 +
- .../chat/MessagesTimeline.browser.test.tsx    |  23 +++
+ apps/web/src/components/ChatView.tsx          |   5 +
+ .../chat/MessagesTimeline.browser.test.tsx    |  19 +++
  .../src/components/chat/MessagesTimeline.tsx  |   4 +-
  .../chat/SubagentTooltipContent.tsx           |   5 +
  .../components/chat/ThreadActivityBanners.tsx |   2 +-
@@ -14,8 +14,8 @@ Subject: [PATCH 7/9] feat(web): label child agents as agent or subagent
  .../chat/ThreadRelationshipsControl.logic.ts  |  39 +++++
  .../chat/ThreadRelationshipsControl.tsx       |  44 +++--
  .../components/chat/TimelineV2EventRow.tsx    |   4 +-
- .../chat/V2LifecycleRow.kind.test.tsx         |  84 +++++++++
- .../src/components/chat/V2LifecycleRow.tsx    |  33 +++-
+ .../chat/V2LifecycleRow.kind.test.tsx         |  90 ++++++++++
+ .../src/components/chat/V2LifecycleRow.tsx    |  27 ++-
  .../src/state/subagentDisplay.kind.test.ts    |  57 +++++++
  .../src/state/subagentDisplay.ts              |  40 ++++-
  .../src/state/threadExecution.kind.test.ts    |  95 +++++++++++
@@ -25,7 +25,7 @@ Subject: [PATCH 7/9] feat(web): label child agents as agent or subagent
  .../client-runtime/src/state/threadShell.ts   |  13 +-
  packages/contracts/src/orchestrationV2.ts     |   1 +
  .../orchestrationV2PendingBackgroundWork.ts   |   2 +
- 21 files changed, 657 insertions(+), 68 deletions(-)
+ 21 files changed, 655 insertions(+), 67 deletions(-)
  create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.kind.browser.test.tsx
  create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.logic.ts
  create mode 100644 apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx
@@ -34,7 +34,7 @@ Subject: [PATCH 7/9] feat(web): label child agents as agent or subagent
  create mode 100644 packages/client-runtime/src/state/threadShell.kind.test.ts
 
 diff --git a/apps/server/src/orchestration-v2/ProjectionStore.test.ts b/apps/server/src/orchestration-v2/ProjectionStore.test.ts
-index 3a16b56d48..79375ebb0e 100644
+index 420f0b5d41..8105fb8336 100644
 --- a/apps/server/src/orchestration-v2/ProjectionStore.test.ts
 +++ b/apps/server/src/orchestration-v2/ProjectionStore.test.ts
 @@ -516,7 +516,13 @@ it.effect.each([
@@ -53,7 +53,7 @@ index 3a16b56d48..79375ebb0e 100644
        yield* assertOwners(threadId, owned);
        yield* assertOwners(otherThreadId, owned);
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index 2a7bbca25f..95368b1e2e 100644
+index fb3ac1f655..b61df19872 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
 @@ -96,6 +96,7 @@ import {
@@ -64,21 +64,29 @@ index 2a7bbca25f..95368b1e2e 100644
  import {
    parseScopedThreadKey,
    scopedThreadKey,
-@@ -840,6 +841,9 @@ export default function ChatView(props: ChatViewProps) {
-       : {
-           threadId: parentSubagentThreadRef.threadId,
-           title: parentSubagentThread?.title ?? "Parent thread",
-+          label: `${subagentFallbackTitle(
-+            serverThread?.delegatedByThreadId === undefined ? "provider_native" : "app_owned",
-+          )} of`,
-         };
-   const threadError = isServerThread
-     ? (localServerError ?? serverRuntime?.lastError ?? null)
+@@ -850,6 +851,9 @@ export default function ChatView(props: ChatViewProps) {
+     if (parentSubagentThreadRef !== null) {
+       return {
+         title: parentSubagentThread?.title ?? "Parent thread",
++        label: `${subagentFallbackTitle(
++          serverThread?.delegatedByThreadId === undefined ? "provider_native" : "app_owned",
++        )} of`,
+         open: (): void => {
+           void navigate({
+             to: "/$environmentId/$threadId",
+@@ -862,6 +866,7 @@ export default function ChatView(props: ChatViewProps) {
+     const parentRef = delegatedFromRef;
+     return {
+       title: delegatedFromThread?.title ?? delegatedFrom.title,
++      label: `${subagentFallbackTitle("app_owned")} of`,
+       environmentLabel: delegatedFromEnvironment?.label ?? activeThread?.linkOrigin?.label ?? "",
+       // Only an environment this client is connected to can open the parent.
+       ...(delegatedFromEnvironment === null
 diff --git a/apps/web/src/components/chat/MessagesTimeline.browser.test.tsx b/apps/web/src/components/chat/MessagesTimeline.browser.test.tsx
-index 6ea5ea5656..750323ac2a 100644
+index 6ea5ea5656..6e2e3233b4 100644
 --- a/apps/web/src/components/chat/MessagesTimeline.browser.test.tsx
 +++ b/apps/web/src/components/chat/MessagesTimeline.browser.test.tsx
-@@ -993,3 +993,26 @@ it("renders automatic compaction as one live divider that finishes with its reas
+@@ -993,3 +993,22 @@ it("renders automatic compaction as one live divider that finishes with its reas
    expect(container.querySelectorAll('[role="separator"]')).toHaveLength(1);
    expect(container.textContent).not.toContain("Compacting before");
  });
@@ -86,11 +94,7 @@ index 6ea5ea5656..750323ac2a 100644
 +describe("MessagesTimeline thread links", () => {
 +  it("names a delegate_task worker's parent-thread link agent of", async () => {
 +    await using screen = await renderTimeline([], {
-+      parentThreadLink: {
-+        threadId: ThreadId.make("thread-parent"),
-+        title: "Architecture audit",
-+        label: "agent of",
-+      },
++      parentThreadLink: { title: "Architecture audit", label: "agent of" },
 +    });
 +    expect(screen.text()).toContain("agent of");
 +    expect(screen.text()).not.toContain("subagent of");
@@ -99,34 +103,34 @@ index 6ea5ea5656..750323ac2a 100644
 +
 +  it("names a provider-native subagent's parent-thread link subagent of", async () => {
 +    await using screen = await renderTimeline([], {
-+      parentThreadLink: { threadId: ThreadId.make("thread-parent"), title: "Architecture audit" },
++      parentThreadLink: { title: "Architecture audit" },
 +    });
 +    expect(screen.text()).toContain("subagent of");
 +    expect(screen.text()).toContain("Architecture audit");
 +  });
 +});
 diff --git a/apps/web/src/components/chat/MessagesTimeline.tsx b/apps/web/src/components/chat/MessagesTimeline.tsx
-index fbfa67e61b..de39635578 100644
+index 07bc698e02..0dabb7a6f6 100644
 --- a/apps/web/src/components/chat/MessagesTimeline.tsx
 +++ b/apps/web/src/components/chat/MessagesTimeline.tsx
-@@ -240,6 +240,8 @@ interface MessagesTimelineProps {
-   parentThreadLink?: {
-     readonly threadId: ThreadId;
-     readonly title: string;
+@@ -243,6 +243,8 @@ interface MessagesTimelineProps {
+     /** Where it runs, when that is another environment. */
+     readonly environmentLabel?: string;
+     readonly open?: () => void;
 +    /** "agent of" for a T3 delegate_task worker, "subagent of" for a provider-native one. */
 +    readonly label?: string;
    } | null;
    workflowOpening?: WorkflowOpening | null;
    onForkFromRun?: (input: {
-@@ -1092,7 +1094,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
+@@ -1096,7 +1098,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
        <div className="messages-timeline-row-frame">
          <div className="chat-content-lane pt-1 sm:pt-2">
            <TimelineSystemDivider
 -            label="Subagent of"
 +            label={parentThreadLink.label ?? "subagent of"}
-             detail={parentThreadLink.title}
-             icon={BotIcon}
-             actionLabel="Open parent thread"
+             detail={
+               parentThreadLink.environmentLabel === undefined
+                 ? parentThreadLink.title
 diff --git a/apps/web/src/components/chat/SubagentTooltipContent.tsx b/apps/web/src/components/chat/SubagentTooltipContent.tsx
 index a965e89efd..2d1224287a 100644
 --- a/apps/web/src/components/chat/SubagentTooltipContent.tsx
@@ -381,7 +385,7 @@ index 0000000000..deeab95cdf
 +  return edge.sourceThreadId === currentThreadId ? "Fork" : "Parent thread";
 +}
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
-index 66fc6b6f21..bb6e8c3330 100644
+index b37f9d1d10..8e38b179c6 100644
 --- a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
 +++ b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
 @@ -1,5 +1,6 @@
@@ -412,7 +416,7 @@ index 66fc6b6f21..bb6e8c3330 100644
    type ThreadRelationshipWalkRow,
  } from "@t3tools/client-runtime/state/thread-relationships";
  import {
-@@ -170,14 +174,6 @@ function ThreadLineageGroup(props: {
+@@ -172,14 +176,6 @@ function ThreadLineageGroup(props: {
    );
  }
  
@@ -427,7 +431,7 @@ index 66fc6b6f21..bb6e8c3330 100644
  function relationshipThreadTitle(input: {
    readonly title: string;
    readonly isSubagent: boolean;
-@@ -375,7 +371,7 @@ export function ThreadRelationshipsPanel(props: {
+@@ -450,7 +446,7 @@ export function ThreadRelationshipsPanel(props: {
  
    const stopSubagent = async (
      childThreadId: ThreadId,
@@ -436,7 +440,7 @@ index 66fc6b6f21..bb6e8c3330 100644
    ) => {
      if (stoppingId !== null) return;
      setStoppingId(childThreadId);
-@@ -385,7 +381,10 @@ export function ThreadRelationshipsPanel(props: {
+@@ -460,7 +456,10 @@ export function ThreadRelationshipsPanel(props: {
      });
      setStoppingId(null);
      if (result._tag === "Failure") {
@@ -448,7 +452,7 @@ index 66fc6b6f21..bb6e8c3330 100644
      }
    };
  
-@@ -457,7 +456,6 @@ export function ThreadRelationshipsPanel(props: {
+@@ -532,7 +531,6 @@ export function ThreadRelationshipsPanel(props: {
                  : isSubagent
                    ? BotIcon
                    : GitForkIcon;
@@ -456,7 +460,7 @@ index 66fc6b6f21..bb6e8c3330 100644
                const projectedAgent =
                  isSubagent && !isParent ? subagentsByThreadId.get(threadId) : undefined;
                const workflowGroup =
-@@ -467,6 +465,11 @@ export function ThreadRelationshipsPanel(props: {
+@@ -542,6 +540,11 @@ export function ThreadRelationshipsPanel(props: {
                const agent = workflowGroup
                  ? projectedAgent
                  : currentSubagent(projectedAgent, node?.thread);
@@ -468,7 +472,7 @@ index 66fc6b6f21..bb6e8c3330 100644
                const failed = rowStatus === "failed" || rowStatus === "error";
                const canStop =
                  agent &&
-@@ -536,10 +539,15 @@ export function ThreadRelationshipsPanel(props: {
+@@ -611,10 +614,15 @@ export function ThreadRelationshipsPanel(props: {
                      fallbackIcon={RelationshipIcon}
                      status={rowStatus}
                    />
@@ -486,7 +490,7 @@ index 66fc6b6f21..bb6e8c3330 100644
                    </span>
                    {agent ? null : (
                      <ArrowRightIcon className="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
-@@ -678,7 +686,7 @@ export function ThreadRelationshipsPanel(props: {
+@@ -753,7 +761,7 @@ export function ThreadRelationshipsPanel(props: {
                                variant="ghost"
                                part="icon"
                                tone="destructive"
@@ -495,7 +499,7 @@ index 66fc6b6f21..bb6e8c3330 100644
                                disabled={stoppingId !== null}
                                onClick={() => void stopSubagent(threadId, agent)}
                              />
-@@ -690,7 +698,9 @@ export function ThreadRelationshipsPanel(props: {
+@@ -765,7 +773,9 @@ export function ThreadRelationshipsPanel(props: {
                              <SquareIcon aria-hidden className="size-3 fill-current" />
                            )}
                          </TooltipTrigger>
@@ -507,7 +511,7 @@ index 66fc6b6f21..bb6e8c3330 100644
                      </div>
                    ) : null}
 diff --git a/apps/web/src/components/chat/TimelineV2EventRow.tsx b/apps/web/src/components/chat/TimelineV2EventRow.tsx
-index 650c930cd1..3257d91f67 100644
+index 04d6effdd4..f598258832 100644
 --- a/apps/web/src/components/chat/TimelineV2EventRow.tsx
 +++ b/apps/web/src/components/chat/TimelineV2EventRow.tsx
 @@ -3,6 +3,7 @@ import { scopeThreadRef } from "@t3tools/client-runtime/environment";
@@ -518,7 +522,7 @@ index 650c930cd1..3257d91f67 100644
    subagentGroupSummary,
    summarizeSubagentStatuses,
  } from "@t3tools/client-runtime/state/subagent-display";
-@@ -234,13 +235,14 @@ const V2SubagentGroup = memo(function V2SubagentGroup({
+@@ -244,13 +245,14 @@ const V2SubagentGroup = memo(function V2SubagentGroup({
      const live = liveAgents?.find((agent) => agent.id === item.subagentId);
      return {
        item,
@@ -536,10 +540,10 @@ index 650c930cd1..3257d91f67 100644
      ctx.onToggleWorkEntry(row.id, expanded);
 diff --git a/apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx b/apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx
 new file mode 100644
-index 0000000000..e5525cd210
+index 0000000000..1b83a07158
 --- /dev/null
 +++ b/apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,90 @@
 +import { type ReactNode } from "react";
 +import { renderToStaticMarkup } from "react-dom/server";
 +import { EnvironmentId, type OrchestrationV2TurnItem } from "@t3tools/contracts";
@@ -555,6 +559,12 @@ index 0000000000..e5525cd210
 +vi.mock("../../state/entities", () => ({
 +  useThreadShell: () => undefined,
 +  useProject: () => undefined,
++}));
++vi.mock("../../state/environments", () => ({
++  useEnvironment: () => null,
++}));
++vi.mock("@tanstack/react-router", () => ({
++  useNavigate: () => () => undefined,
 +}));
 +vi.mock("../ui/tooltip", () => ({
 +  Tooltip: ({ children }: { children: ReactNode }) => children,
@@ -625,10 +635,10 @@ index 0000000000..e5525cd210
 +  });
 +});
 diff --git a/apps/web/src/components/chat/V2LifecycleRow.tsx b/apps/web/src/components/chat/V2LifecycleRow.tsx
-index 2562601140..58fe9275e1 100644
+index 96387b59df..8911c5c7ff 100644
 --- a/apps/web/src/components/chat/V2LifecycleRow.tsx
 +++ b/apps/web/src/components/chat/V2LifecycleRow.tsx
-@@ -16,7 +16,11 @@ import {
+@@ -19,7 +19,11 @@ import {
    type HandoffEndpoints,
    type HandoffTimelineRun,
  } from "@t3tools/client-runtime/handoff";
@@ -641,7 +651,7 @@ index 2562601140..58fe9275e1 100644
  import {
    ProviderDriverKind,
    type OrchestrationV2Notification,
-@@ -193,7 +197,7 @@ export function V2LifecycleRow(props: {
+@@ -197,7 +201,7 @@ export function V2LifecycleRow(props: {
          origin={item.origin}
          status={item.status}
          driver={item.driver}
@@ -650,7 +660,7 @@ index 2562601140..58fe9275e1 100644
          result={item.result}
          progress={item.progress}
          startedAt={item.startedAt}
-@@ -365,7 +369,7 @@ export function SubagentNotificationLink(props: {
+@@ -370,7 +374,7 @@ export function SubagentNotificationLink(props: {
        origin={agent.origin}
        status={agent.status}
        driver={agent.driver}
@@ -659,7 +669,7 @@ index 2562601140..58fe9275e1 100644
        result={agent.result}
        progress={agent.progress}
        startedAt={agent.startedAt}
-@@ -413,6 +417,8 @@ function SubagentTimelineLink(props: {
+@@ -434,6 +438,8 @@ function SubagentTimelineLink(props: {
    const liveStatus = agent?.status ?? props.status;
    const status = props.event ? props.event.status : liveStatus;
    const statusLabel = props.event?.label ?? subagentStatusVisual(liveStatus).label;
@@ -668,23 +678,17 @@ index 2562601140..58fe9275e1 100644
    const result = (agent?.result ?? props.result)?.trim();
    const progress = (agent?.progress ?? props.progress)?.trim();
    const settled = SETTLED_SUBAGENT_STATUSES.has(status ?? liveStatus);
-@@ -434,7 +440,14 @@ function SubagentTimelineLink(props: {
-         status={status ?? undefined}
-       />
-       <span className="min-w-0 flex-1">
--        <span className="block truncate text-xs font-medium text-foreground">{props.title}</span>
-+        <span className="flex items-baseline gap-2">
-+          <span className="min-w-0 truncate text-xs font-medium text-foreground">
-+            {props.title}
-+          </span>
+@@ -459,6 +465,9 @@ function SubagentTimelineLink(props: {
+           <span className="min-w-0 truncate text-xs font-medium text-foreground">
+             {props.title}
+           </span>
 +          {detail !== null && props.event === undefined && status === "completed" && kindLabel ? (
 +            <span className="shrink-0 text-3xs text-muted-foreground">{kindLabel}</span>
 +          ) : null}
-+        </span>
-         <span
-           className={cn(
-             "block text-2xs leading-relaxed",
-@@ -442,7 +455,7 @@ function SubagentTimelineLink(props: {
+           {remote !== undefined ? (
+             <span className="shrink-0 text-xs text-muted-foreground">on {remote.label}</span>
+           ) : null}
+@@ -470,7 +479,7 @@ function SubagentTimelineLink(props: {
            )}
          >
            {detail === null ? (
@@ -693,7 +697,7 @@ index 2562601140..58fe9275e1 100644
            ) : detail.includes("/") && !detail.includes(" ") ? (
              <MiddleTruncate value={detail} showTitle={false} className="flex" />
            ) : (
-@@ -454,7 +467,7 @@ function SubagentTimelineLink(props: {
+@@ -482,7 +491,7 @@ function SubagentTimelineLink(props: {
          <span
            className={cn("shrink-0 text-xs", failed ? "text-destructive" : "text-muted-foreground")}
          >
@@ -702,10 +706,10 @@ index 2562601140..58fe9275e1 100644
          </span>
        ) : null}
        <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
-@@ -476,7 +489,11 @@ function SubagentTimelineLink(props: {
+@@ -504,7 +513,11 @@ function SubagentTimelineLink(props: {
          delay={200}
          render={
-           threadId === null ? (
+           open === null ? (
 -            <div data-v2-item-type="subagent" aria-description={statusLabel} className={className}>
 +            <div
 +              data-v2-item-type="subagent"
@@ -715,13 +719,13 @@ index 2562601140..58fe9275e1 100644
                {content}
              </div>
            ) : (
-@@ -484,7 +501,7 @@ function SubagentTimelineLink(props: {
+@@ -512,7 +525,7 @@ function SubagentTimelineLink(props: {
                type="button"
                data-v2-item-type="subagent"
                aria-label={`Open ${props.title}`}
 -              aria-description={statusLabel}
 +              aria-description={kindStatusLabel}
-               onClick={() => props.onOpenThread(threadId)}
+               onClick={open}
                className={cn(
                  className,
 diff --git a/packages/client-runtime/src/state/subagentDisplay.kind.test.ts b/packages/client-runtime/src/state/subagentDisplay.kind.test.ts
@@ -1108,7 +1112,7 @@ index 0000000000..9f66e6f578
 +  });
 +});
 diff --git a/packages/client-runtime/src/state/threadShell.test.ts b/packages/client-runtime/src/state/threadShell.test.ts
-index c668305268..4f08292cb0 100644
+index e4afe1482c..3430f4c691 100644
 --- a/packages/client-runtime/src/state/threadShell.test.ts
 +++ b/packages/client-runtime/src/state/threadShell.test.ts
 @@ -239,7 +239,7 @@ describe("v2 thread shell lists", () => {
@@ -1121,7 +1125,7 @@ index c668305268..4f08292cb0 100644
      registry.set(snapshotAtom(environmentId), {
        ...v2ShellSnapshot,
 diff --git a/packages/client-runtime/src/state/threadShell.ts b/packages/client-runtime/src/state/threadShell.ts
-index 8d61ff6ac5..706d3b320c 100644
+index 69df72418c..887accfa14 100644
 --- a/packages/client-runtime/src/state/threadShell.ts
 +++ b/packages/client-runtime/src/state/threadShell.ts
 @@ -13,6 +13,7 @@ import { Atom } from "effect/reactivity";
@@ -1132,8 +1136,8 @@ index 8d61ff6ac5..706d3b320c 100644
  import {
    arrayElementsEqual,
    parseProjectRefCollectionKey,
-@@ -84,13 +85,19 @@ export function pendingSubagentRequestsByThread(
- }
+@@ -121,13 +122,19 @@ const sameRequests = (
+   [...right].every(([threadId, request]) => left.get(threadId) === request);
  
  export function childThreadInputsTitle(
 -  children: ReadonlyArray<Pick<EnvironmentThreadShell, "hasPendingApprovals">>,
@@ -1156,10 +1160,10 @@ index 8d61ff6ac5..706d3b320c 100644
  
  const sameWireThreadShell = Schema.toEquivalence(OrchestrationV2ThreadShell);
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
-index 391f55a09b..12991af84c 100644
+index a351f2e533..9df026251b 100644
 --- a/packages/contracts/src/orchestrationV2.ts
 +++ b/packages/contracts/src/orchestrationV2.ts
-@@ -946,6 +946,7 @@ export const OrchestrationV2PendingBackgroundTask = kindUnionWithFallback(
+@@ -1010,6 +1010,7 @@ export const OrchestrationV2PendingBackgroundTask = kindUnionWithFallback(
        /** The owning provider thread's instance, populated in derived pending work. */
        providerInstanceId: Schema.optional(ProviderInstanceId),
        childThreadId: Schema.optional(ThreadId),

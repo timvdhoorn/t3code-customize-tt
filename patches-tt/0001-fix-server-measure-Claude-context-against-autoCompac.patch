@@ -13,10 +13,10 @@ Subject: [PATCH 1/9] fix(server): measure Claude context against
  5 files changed, 160 insertions(+), 9 deletions(-)
 
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-index 0985dbf3bc..532c518b34 100644
+index d7ea497a75..0e73e5c27c 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-@@ -624,6 +624,27 @@ describe("ClaudeAdapterV2 context usage", () => {
+@@ -638,6 +638,27 @@ describe("ClaudeAdapterV2 context usage", () => {
      );
      assert.strictEqual(usage.promptCacheExpiresAt, "2026-08-29T00:05:00.000Z");
    });
@@ -45,7 +45,7 @@ index 0985dbf3bc..532c518b34 100644
  
  describe("ClaudeAdapterV2 approval presentation", () => {
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-index 88d883299e..780ec428bb 100644
+index dbfb6e8bc6..10737eec93 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 @@ -133,7 +133,10 @@ import {
@@ -60,7 +60,7 @@ index 88d883299e..780ec428bb 100644
  import {
    compileClaudeModelSelection,
    type CompiledClaudeModelSelection,
-@@ -208,6 +211,23 @@ function claudeContextWindow(modelSelection: ModelSelection): number | null {
+@@ -209,6 +212,23 @@ function claudeContextWindow(modelSelection: ModelSelection): number | null {
    );
  }
  
@@ -84,7 +84,7 @@ index 88d883299e..780ec428bb 100644
  interface ClaudeCacheCreation {
    readonly ephemeral_1h_input_tokens: number;
    readonly ephemeral_5m_input_tokens: number;
-@@ -254,11 +274,13 @@ export function claudeProviderTurnTokenUsage(
+@@ -255,11 +275,13 @@ export function claudeProviderTurnTokenUsage(
    updatedAt: string,
    autoCompactWindow = "",
    requestedAt?: DateTime.Utc,
@@ -99,7 +99,7 @@ index 88d883299e..780ec428bb 100644
    // The cache lifetime starts with the request, not when its response ends.
    const promptCacheExpiresAt =
      promptCacheTtlMs === undefined || requestedAt === undefined
-@@ -266,13 +288,13 @@ export function claudeProviderTurnTokenUsage(
+@@ -267,13 +289,13 @@ export function claudeProviderTurnTokenUsage(
        : DateTime.formatIso(DateTime.add(requestedAt, { milliseconds: promptCacheTtlMs }));
    return {
      usedTokens: inputTokens + outputTokens,
@@ -115,7 +115,7 @@ index 88d883299e..780ec428bb 100644
      ...(promptCacheExpiresAt === undefined ? {} : { promptCacheExpiresAt }),
      updatedAt,
    };
-@@ -3735,6 +3757,8 @@ function formatClaudeUsageLimitWait(waitMs: number): string {
+@@ -3806,6 +3828,8 @@ function formatClaudeUsageLimitWait(waitMs: number): string {
  interface ActiveClaudeTurnContext {
    readonly queryPolicy: ClaudeRuntimeQueryPolicy;
    readonly responseThroughput: ClaudeResponseThroughput;
@@ -124,7 +124,7 @@ index 88d883299e..780ec428bb 100644
    readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
    readonly nativeThreadId: string;
    readonly nativeTurnId: string;
-@@ -4423,6 +4447,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -4502,6 +4526,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
            model: input.modelSelection.model,
            now,
          });
@@ -141,7 +141,7 @@ index 88d883299e..780ec428bb 100644
          const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
          const activeTurn = yield* Ref.make<ActiveClaudeTurnContext | null>(null);
          const taskOutputTails = new Map<
-@@ -4767,6 +4801,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -4846,6 +4880,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
              DateTime.formatIso(now),
              adapterOptions.settings.autoCompactWindow,
              context.streamUsage?.requestedAt,
@@ -149,7 +149,7 @@ index 88d883299e..780ec428bb 100644
            );
            if (tokenUsage.inputTokens <= 0) return;
            yield* emitProviderEvent({
-@@ -8284,7 +8319,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -8363,7 +8398,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                  ? Math.round(postTokens)
                  : undefined;
              if (afterTokenCount !== undefined) {
@@ -158,7 +158,7 @@ index 88d883299e..780ec428bb 100644
                yield* emitProviderEvent({
                  type: "provider_turn.updated",
                  driver: CLAUDE_PROVIDER,
-@@ -8305,10 +8340,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -8384,10 +8419,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                    completedAt: null,
                    tokenUsage: {
                      usedTokens: afterTokenCount,
@@ -171,7 +171,7 @@ index 88d883299e..780ec428bb 100644
                      ),
                      updatedAt: DateTime.formatIso(now),
                    },
-@@ -9971,6 +10006,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -10061,6 +10096,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
              const querySession = yield* openQuery(turnInput, nativeThreadId);
              const context: ActiveClaudeTurnContext = {
                responseThroughput: new ClaudeResponseThroughput(),

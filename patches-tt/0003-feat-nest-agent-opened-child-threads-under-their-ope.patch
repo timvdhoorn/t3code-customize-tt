@@ -10,7 +10,7 @@ a child nests under its opener only within the same inbox section, with a
 guide line, context-menu collapse and a summary stub.
 ---
  apps/server/src/mcp/OrchestratorMcpService.ts |   1 +
- .../src/mcp/toolkits/project/handlers.test.ts |  78 +++
+ .../src/mcp/toolkits/project/handlers.test.ts |  79 ++-
  .../src/mcp/toolkits/project/handlers.ts      |   1 +
  .../src/orchestration-v2/Orchestrator.ts      |  10 +-
  .../src/orchestration-v2/ProjectionStore.ts   |  15 +
@@ -38,7 +38,7 @@ guide line, context-menu collapse and a summary stub.
  .../src/state/threadCommands.ts               |  14 +-
  .../src/state/threadShell.test.ts             |  37 ++
  packages/contracts/src/orchestrationV2.ts     |  25 +
- 29 files changed, 2464 insertions(+), 47 deletions(-)
+ 29 files changed, 2464 insertions(+), 48 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.childThreads.browser.test.tsx
  create mode 100644 apps/web/src/components/Sidebar.childThreads.test.ts
  create mode 100644 apps/web/src/components/Sidebar.childThreads.tsx
@@ -46,22 +46,22 @@ guide line, context-menu collapse and a summary stub.
  create mode 100644 apps/web/src/components/Sidebar.families.ts
 
 diff --git a/apps/server/src/mcp/OrchestratorMcpService.ts b/apps/server/src/mcp/OrchestratorMcpService.ts
-index 54c9717671..9483fdd252 100644
+index ea9e8a0556..1b939306fc 100644
 --- a/apps/server/src/mcp/OrchestratorMcpService.ts
 +++ b/apps/server/src/mcp/OrchestratorMcpService.ts
-@@ -2587,6 +2587,7 @@ const make = Effect.gen(function* () {
-                   interactionMode,
-                   branch: parent.thread.branch,
-                   worktreePath: parent.thread.worktreePath,
+@@ -2665,6 +2665,7 @@ const make = Effect.gen(function* () {
+                   ...(parent.thread.linkOrigin === undefined
+                     ? {}
+                     : { linkOrigin: parent.thread.linkOrigin }),
 +                  openedByThreadId: parent.thread.id,
                  })
                  .pipe(
                    Effect.mapError((error) =>
 diff --git a/apps/server/src/mcp/toolkits/project/handlers.test.ts b/apps/server/src/mcp/toolkits/project/handlers.test.ts
-index 4212fe5b16..2adca8aa04 100644
+index 3e9fe6a21f..24f773dd4c 100644
 --- a/apps/server/src/mcp/toolkits/project/handlers.test.ts
 +++ b/apps/server/src/mcp/toolkits/project/handlers.test.ts
-@@ -3,6 +3,8 @@ import {
+@@ -3,10 +3,11 @@ import {
    EnvironmentId,
    ProjectId,
    ProviderInstanceId,
@@ -70,7 +70,11 @@ index 4212fe5b16..2adca8aa04 100644
    type Project as ProjectRecord,
    type ModelSelection,
    type RuntimeMode,
-@@ -30,6 +32,81 @@ import * as McpToolAccess from "../../McpToolAccess.ts";
+-  type OrchestrationV2ThreadShell,
+ } from "@t3tools/contracts";
+ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
+ import * as NodeServices from "@effect/platform-node/NodeServices";
+@@ -34,6 +35,81 @@ import * as McpToolAccess from "../../McpToolAccess.ts";
  import * as ProjectHandlers from "./handlers.ts";
  import { ProjectToolkit } from "./tools.ts";
  
@@ -152,7 +156,7 @@ index 4212fe5b16..2adca8aa04 100644
  const clientLaunchHarness = (input: {
    readonly runtimeModeCeiling: RuntimeMode;
    readonly defaultRuntimeMode?: RuntimeMode;
-@@ -165,6 +242,7 @@ it.effect(
+@@ -189,6 +265,7 @@ it.effect(
        });
        expect(belowCeiling.launched[0]?.runtimeMode).toBe("approval-required");
        expect(belowCeiling.launched[0]?.initialMessage?.senderThreadId).toBeUndefined();
@@ -161,22 +165,22 @@ index 4212fe5b16..2adca8aa04 100644
        const aboveCeiling = yield* launchWith("auto-accept-edits", "full-access", { title: "Fix" });
        expect(aboveCeiling.launched[0]?.runtimeMode).toBe("auto-accept-edits");
 diff --git a/apps/server/src/mcp/toolkits/project/handlers.ts b/apps/server/src/mcp/toolkits/project/handlers.ts
-index aaf37468f8..cd3573bbfb 100644
+index f5a67ae025..bbb24bd678 100644
 --- a/apps/server/src/mcp/toolkits/project/handlers.ts
 +++ b/apps/server/src/mcp/toolkits/project/handlers.ts
-@@ -175,6 +175,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
+@@ -214,6 +214,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
                    attachments,
                  },
                }),
 +          ...(caller === undefined ? {} : { openedByThreadId: caller.id }),
            createdBy: "agent",
            creationSource: "mcp",
-         }).pipe(
+           ...(linkOrigin === undefined ? {} : { linkOrigin }),
 diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
-index 6c6bae3ca2..7ec6d61a6a 100644
+index 228b8c0eba..6c50d06565 100644
 --- a/apps/server/src/orchestration-v2/Orchestrator.ts
 +++ b/apps/server/src/orchestration-v2/Orchestrator.ts
-@@ -2544,6 +2544,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -2560,6 +2560,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
          relationshipToParent: null,
          rootThreadId: command.threadId,
        },
@@ -186,7 +190,7 @@ index 6c6bae3ca2..7ec6d61a6a 100644
        forkedFrom: null,
        createdAt: now,
        updatedAt: now,
-@@ -3269,8 +3272,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -3285,8 +3288,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
            const wasPinned = thread.pinnedAt != null;
            const alreadySettled =
              thread.settledOverride === "settled" && thread.settledAt !== null && !wasPinned;
@@ -200,7 +204,7 @@ index 6c6bae3ca2..7ec6d61a6a 100644
              settledOverride: "settled",
              settledAt: alreadySettled ? thread.settledAt : (command.settledAt ?? now),
              pullRequests: thread.pullRequests?.map((link) => withPullRequestWatch(link, undefined)),
-@@ -11873,6 +11880,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -12503,6 +12510,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
              type: "thread.settle",
              commandId: command.commandId,
              threadId: command.threadId,
@@ -209,10 +213,10 @@ index 6c6bae3ca2..7ec6d61a6a 100644
            },
            events,
 diff --git a/apps/server/src/orchestration-v2/ProjectionStore.ts b/apps/server/src/orchestration-v2/ProjectionStore.ts
-index c7188e0e9a..c20b01d5b0 100644
+index a0c4d2ef73..c67dc88896 100644
 --- a/apps/server/src/orchestration-v2/ProjectionStore.ts
 +++ b/apps/server/src/orchestration-v2/ProjectionStore.ts
-@@ -1655,6 +1655,12 @@ export function threadShellFromProjection(
+@@ -1669,6 +1669,12 @@ export function threadShellFromProjection(
        ? {}
        : { activeOrderKey: projection.thread.activeOrderKey }),
      lineage: projection.thread.lineage,
@@ -225,7 +229,7 @@ index c7188e0e9a..c20b01d5b0 100644
      forkedFrom: projection.thread.forkedFrom,
      activeProviderThreadId: projection.thread.activeProviderThreadId,
      ...(projection.thread.historyOrigin === undefined
-@@ -1709,6 +1715,7 @@ export function threadShellFromProjection(
+@@ -1729,6 +1735,7 @@ export function threadShellFromProjection(
      unsettledAt: projection.thread.unsettledAt ?? null,
      snoozedUntil: projection.thread.snoozedUntil ?? null,
      snoozedAt: projection.thread.snoozedAt ?? null,
@@ -233,7 +237,7 @@ index c7188e0e9a..c20b01d5b0 100644
      pinnedAt: projection.thread.pinnedAt ?? null,
  
      autoSettleDisabledAt: projection.thread.autoSettleDisabledAt ?? null,
-@@ -1931,6 +1938,12 @@ function shellFromState(input: {
+@@ -1951,6 +1958,12 @@ function shellFromState(input: {
        ? {}
        : { activeOrderKey: input.state.thread.activeOrderKey }),
      lineage: input.state.thread.lineage,
@@ -246,7 +250,7 @@ index c7188e0e9a..c20b01d5b0 100644
      forkedFrom: input.state.thread.forkedFrom,
      activeProviderThreadId: input.state.thread.activeProviderThreadId,
      ...(input.state.thread.historyOrigin === undefined
-@@ -1969,6 +1982,7 @@ function shellFromState(input: {
+@@ -1995,6 +2008,7 @@ function shellFromState(input: {
      unsettledAt: input.state.thread.unsettledAt ?? null,
      snoozedUntil: input.state.thread.snoozedUntil ?? null,
      snoozedAt: input.state.thread.snoozedAt ?? null,
@@ -254,7 +258,7 @@ index c7188e0e9a..c20b01d5b0 100644
      pinnedAt: input.state.thread.pinnedAt ?? null,
  
      autoSettleDisabledAt: input.state.thread.autoSettleDisabledAt ?? null,
-@@ -6222,6 +6236,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -6276,6 +6290,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                    autoSettleDisabledAt: thread.autoSettleDisabledAt ?? null,
                    snoozedUntil: thread.snoozedUntil ?? null,
                    snoozedAt: thread.snoozedAt ?? null,
@@ -263,10 +267,10 @@ index c7188e0e9a..c20b01d5b0 100644
                    latestRunId,
                    latestRunRequestedAt:
 diff --git a/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts b/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
-index a091d96fed..f8c6a941af 100644
+index 1e3fd1a8b3..0658cf69fc 100644
 --- a/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
 +++ b/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
-@@ -502,6 +502,25 @@ it.effect("retains automation and sender attribution while a message waits in th
+@@ -505,6 +505,25 @@ it.effect("retains automation and sender attribution while a message waits in th
    }).pipe(Effect.provide(harness.layer));
  });
  
@@ -293,10 +297,10 @@ index a091d96fed..f8c6a941af 100644
    Effect.gen(function* () {
      const setupCount = yield* Ref.make(0);
 diff --git a/apps/server/src/orchestration-v2/ThreadLaunchService.ts b/apps/server/src/orchestration-v2/ThreadLaunchService.ts
-index ff032f757b..988001cba0 100644
+index 289df535c1..2bc5808abb 100644
 --- a/apps/server/src/orchestration-v2/ThreadLaunchService.ts
 +++ b/apps/server/src/orchestration-v2/ThreadLaunchService.ts
-@@ -86,6 +86,8 @@ export interface ThreadLaunchInput {
+@@ -89,6 +89,8 @@ export interface ThreadLaunchInput {
    readonly interactionMode: ProviderInteractionMode;
    readonly workspaceStrategy: ThreadLaunchWorkspaceStrategy;
    readonly initialMessage?: ThreadLaunchInitialMessage;
@@ -305,7 +309,7 @@ index ff032f757b..988001cba0 100644
    readonly importedNativeThread?: {
      readonly ref: {
        readonly driver: ProviderDriverKind;
-@@ -908,6 +910,9 @@ const make = Effect.gen(function* () {
+@@ -915,6 +917,9 @@ const make = Effect.gen(function* () {
                  interactionMode: input.interactionMode,
                  branch: initialBranch,
                  worktreePath: initialWorktreePath,
@@ -316,10 +320,10 @@ index ff032f757b..988001cba0 100644
                    ? {}
                    : { importedNativeThread: input.importedNativeThread }),
 diff --git a/apps/server/src/orchestration-v2/ThreadManagementService.test.ts b/apps/server/src/orchestration-v2/ThreadManagementService.test.ts
-index 0314008c63..51fee110d5 100644
+index dfd244ebe2..61509dde79 100644
 --- a/apps/server/src/orchestration-v2/ThreadManagementService.test.ts
 +++ b/apps/server/src/orchestration-v2/ThreadManagementService.test.ts
-@@ -424,7 +424,11 @@ it.effect.each([
+@@ -611,7 +611,11 @@ it.effect.each([
              } as unknown as OrchestrationV2ThreadProjection),
            dispatch: (command) =>
              Effect.sync(() => {
@@ -332,7 +336,7 @@ index 0314008c63..51fee110d5 100644
                return { sequence: 1, storedEvents: [] } as never;
              }),
          }),
-@@ -438,6 +442,7 @@ it.effect.each([
+@@ -625,6 +629,7 @@ it.effect.each([
  
      yield* service.settleAfterRun({ projectId, threadId, runId });
  
@@ -342,10 +346,10 @@ index 0314008c63..51fee110d5 100644
    }),
  );
 diff --git a/apps/server/src/orchestration-v2/ThreadManagementService.ts b/apps/server/src/orchestration-v2/ThreadManagementService.ts
-index 9a80f8d284..cf988c3509 100644
+index aeeaf2ed82..3fb0be760e 100644
 --- a/apps/server/src/orchestration-v2/ThreadManagementService.ts
 +++ b/apps/server/src/orchestration-v2/ThreadManagementService.ts
-@@ -956,6 +956,7 @@ const make = Effect.gen(function* () {
+@@ -1013,6 +1013,7 @@ const make = Effect.gen(function* () {
        type: "thread.settle",
        commandId: CommandId.make(`server:settle-after-run:${input.runId}`),
        threadId: input.threadId,
@@ -353,7 +357,7 @@ index 9a80f8d284..cf988c3509 100644
      });
    });
  
-@@ -975,6 +976,7 @@ const make = Effect.gen(function* () {
+@@ -1032,6 +1033,7 @@ const make = Effect.gen(function* () {
        type: "thread.settle",
        commandId: input.commandId,
        threadId: input.threadId,
@@ -655,10 +659,10 @@ index 1077f341f6..b48825e368 100644
  });
  
 diff --git a/apps/server/src/orchestration-v2/runtimeLayer.test.ts b/apps/server/src/orchestration-v2/runtimeLayer.test.ts
-index 025191f098..3ad7098166 100644
+index 87da6479ad..f6c2602ee3 100644
 --- a/apps/server/src/orchestration-v2/runtimeLayer.test.ts
 +++ b/apps/server/src/orchestration-v2/runtimeLayer.test.ts
-@@ -2038,6 +2038,12 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
+@@ -2261,6 +2261,12 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
        const autoSettledProjection = yield* orchestrator.getThreadProjection(threadId);
        assert.equal(autoSettledProjection.thread.settledOverride, "settled");
        assert.isNull(autoSettledProjection.thread.activeOrderKey);
@@ -671,7 +675,7 @@ index 025191f098..3ad7098166 100644
        yield* orchestrator.dispatch({
          type: "thread.unsettle",
          commandId: CommandId.make("runtime-layer-lifecycle-auto-unsettle"),
-@@ -2063,6 +2069,15 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
+@@ -2286,6 +2292,15 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
        const settledProjection = yield* orchestrator.getThreadProjection(threadId);
        assert.equal(settledProjection.thread.settledOverride, "settled");
        assert.isNotNull(settledProjection.thread.settledAt);
@@ -687,7 +691,7 @@ index 025191f098..3ad7098166 100644
  
        yield* orchestrator.dispatch({
          type: "thread.unsettle",
-@@ -5561,6 +5576,11 @@ it.layer(layerSharedApplicationDataPlaneTest)("snooze projection", (it) => {
+@@ -5784,6 +5799,11 @@ it.layer(layerSharedApplicationDataPlaneTest)("snooze projection", (it) => {
        );
        const [candidate] = yield* projections.getSettlementCandidates(threadId);
        assert.deepEqual(candidate?.lastSnoozeWakeAt, yield* DateTime.now);
@@ -1043,7 +1047,7 @@ index 0000000000..c20485246c
 +});
 diff --git a/apps/web/src/components/Sidebar.childThreads.tsx b/apps/web/src/components/Sidebar.childThreads.tsx
 new file mode 100644
-index 0000000000..250d5d86f8
+index 0000000000..9269d5172b
 --- /dev/null
 +++ b/apps/web/src/components/Sidebar.childThreads.tsx
 @@ -0,0 +1,568 @@
@@ -1305,7 +1309,7 @@ index 0000000000..250d5d86f8
 +  >(() => new Set());
 +  // Drops folds of families that left Settled or are gone (Sidebar.families.ts),
 +  // so a family that comes back to Settled starts collapsed again.
-+  // oxlint-disable-next-line t3code/react-effect-budget -- prunes persisted fold state as threads and the clock change.
++  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- prunes persisted fold state as threads and the clock change.
 +  useEffect(() => {
 +    const stateOf = childThreadFoldHeadStateOf(threads, threadShellKey, (thread) => {
 +      const capabilities = serverConfigs.get(thread.environmentId)?.environment.capabilities;
@@ -2629,10 +2633,10 @@ index 0000000000..ec6adb8b89
 +  ].join(", ");
 +}
 diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
-index 99f4287406..f5b712d0d1 100644
+index f4ec80f8c5..5426b8e460 100644
 --- a/apps/web/src/components/Sidebar.tsx
 +++ b/apps/web/src/components/Sidebar.tsx
-@@ -189,6 +189,7 @@ import {
+@@ -190,6 +190,7 @@ import {
    type SidebarSection,
    resolveSidebarRowThreadId,
  } from "./Sidebar.logic";
@@ -2640,7 +2644,7 @@ index 99f4287406..f5b712d0d1 100644
  import {
    createSidebarCollisionDetection,
    createSidebarSortingStrategy,
-@@ -224,6 +225,7 @@ import { TooltipProvider } from "./ui/tooltip";
+@@ -225,6 +226,7 @@ import { TooltipProvider } from "./ui/tooltip";
  import { composerDraftHasUserContent, DraftId, useComposerDraftStore } from "../composerDraftStore";
  import { useThreadRouteTarget } from "../hooks/useThreadRouteTarget";
  import {
@@ -2648,7 +2652,7 @@ index 99f4287406..f5b712d0d1 100644
    SidebarSearchResultRow,
    SortableThreadRow,
    type SidebarProviderEntry,
-@@ -435,35 +437,30 @@ function useSidebarThreads(input: {
+@@ -441,35 +443,30 @@ function useSidebarThreads(input: {
    useOlderSettledShelfGrowth(olderSettledShelf, listedSettledThreads);
    const settledCount =
      settledThreads.length + olderSettledShelf.unloadedCount(partition.visibleThreads);
@@ -2702,7 +2706,7 @@ index 99f4287406..f5b712d0d1 100644
    const sectionByThreadKey = new Map<string, SidebarSection>();
    for (const [list, section] of [
      [pinnedThreads, "pinned"],
-@@ -488,7 +485,8 @@ function useSidebarThreads(input: {
+@@ -494,7 +491,8 @@ function useSidebarThreads(input: {
      settledVisibleCount,
      settledCount,
      olderSettledShelf,
@@ -2712,7 +2716,7 @@ index 99f4287406..f5b712d0d1 100644
      showMoreSettled: () =>
        setSettledTail((current) => ({
          scopeKey: current.scopeKey,
-@@ -500,7 +498,8 @@ function useSidebarThreads(input: {
+@@ -506,7 +504,8 @@ function useSidebarThreads(input: {
      toggleSnoozedShelf: () => setSnoozedShelfExpanded((value) => !value),
      workingShelfExpanded,
      toggleWorkingShelf: () => setWorkingShelfExpanded((value) => !value),
@@ -2722,7 +2726,7 @@ index 99f4287406..f5b712d0d1 100644
      visibleSnoozedThreads,
      visibleWorkingThreads,
      orderedThreadKeys: orderedThreads.map(threadShellKey),
-@@ -508,8 +507,8 @@ function useSidebarThreads(input: {
+@@ -514,8 +513,8 @@ function useSidebarThreads(input: {
      settledThreadKeys: new Set(settledThreads.map(threadShellKey)),
      snoozedThreadKeys: new Set(snoozedThreads.map(threadShellKey)),
      sectionByThreadKey,
@@ -2733,7 +2737,7 @@ index 99f4287406..f5b712d0d1 100644
      pinnedKeysById: new Map(
        threads.map((thread) => [threadShellKey(thread), thread.pinOrderKey ?? null] as const),
      ),
-@@ -578,6 +577,12 @@ function partitionSidebarThreads(input: SidebarThreadPartitionInput) {
+@@ -591,6 +590,12 @@ function partitionSidebarThreads(input: SidebarThreadPartitionInput) {
        ).push(thread);
      }
    }
@@ -2746,7 +2750,7 @@ index 99f4287406..f5b712d0d1 100644
    // Capability gates dragging only; mixed server versions must preserve the same pinned order across clients.
    const sortedPinned = sortPinnedThreadsForSidebar(pinned);
    const sortedActive = workingShelfEnabled
-@@ -1120,6 +1125,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -1136,6 +1141,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
      workingShelfExpanded,
      toggleWorkingShelf,
      renderedSettledThreads,
@@ -2754,7 +2758,7 @@ index 99f4287406..f5b712d0d1 100644
      visibleSnoozedThreads,
      visibleWorkingThreads,
      orderedThreadKeys,
-@@ -1696,7 +1702,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -1715,7 +1721,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
        list: readonly EnvironmentThreadShell[],
        section: SidebarSection,
      ): SidebarListItem[] =>
@@ -2763,7 +2767,7 @@ index 99f4287406..f5b712d0d1 100644
          const key = scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
          return { kind: "thread", key, section };
        });
-@@ -2406,6 +2412,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -2427,6 +2433,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                  titleRegeneration: supportsTitleRegeneration,
                },
                snoozePresets,
@@ -2771,7 +2775,7 @@ index 99f4287406..f5b712d0d1 100644
              }),
              position,
            ),
-@@ -2518,6 +2525,10 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -2539,6 +2546,10 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
            case "mark-unread":
              markThreadUnread(threadRef);
              return;
@@ -2782,7 +2786,7 @@ index 99f4287406..f5b712d0d1 100644
            case "copy-path":
              if (!threadWorkspacePath) {
                toastManager.add(
-@@ -3073,6 +3084,13 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -3095,6 +3106,13 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                        for (const item of sidebarListItems) {
                          if (item.kind === "thread") {
                            items.push(renderThreadRow(threadByKey.get(item.key)!, item.section));
@@ -2796,7 +2800,7 @@ index 99f4287406..f5b712d0d1 100644
                            continue;
                          }
                          switch (item.marker) {
-@@ -3209,7 +3227,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -3231,7 +3249,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                              ? "Loading"
                              : olderSettledShelf.failed
                                ? "Could not load older threads. Retry"
@@ -2968,7 +2972,7 @@ index 2b1442310e..4584033370 100644
      {
        tag: "path",
 diff --git a/packages/client-runtime/src/state/models.ts b/packages/client-runtime/src/state/models.ts
-index d772989f23..daa57f1e3c 100644
+index ac40471a85..63563fb0d8 100644
 --- a/packages/client-runtime/src/state/models.ts
 +++ b/packages/client-runtime/src/state/models.ts
 @@ -1,5 +1,6 @@
@@ -2978,10 +2982,10 @@ index d772989f23..daa57f1e3c 100644
  import type {
    ThreadLinkedPullRequest,
    EnvironmentId,
-@@ -147,6 +148,13 @@ export interface EnvironmentThreadShell {
-   readonly worktreePath: string | null;
-   readonly lineage: OrchestrationV2ThreadShell["lineage"];
-   readonly forkedFrom: OrchestrationV2ThreadShell["forkedFrom"];
+@@ -150,6 +151,13 @@ export interface EnvironmentThreadShell {
+   readonly linkOrigin: OrchestrationV2ThreadShell["linkOrigin"] | null;
+   /** The thread in a linked environment that delegated this one, if one did. */
+   readonly delegatedFrom: OrchestrationV2ThreadShell["delegatedFrom"] | null;
 +  /** Thread whose agent opened this one through T3 tools; absent otherwise. */
 +  readonly openedByThreadId?: ThreadId;
 +  /** Set when an agent or automatic settlement settled the thread. */
@@ -2992,7 +2996,7 @@ index d772989f23..daa57f1e3c 100644
    readonly activeProviderThreadId: OrchestrationV2ThreadShell["activeProviderThreadId"];
    readonly latestRun: ThreadRunSummary | null;
    readonly runtime: ThreadRuntimeSummary | null;
-@@ -174,6 +182,8 @@ export interface EnvironmentThreadShell {
+@@ -177,6 +185,8 @@ export interface EnvironmentThreadShell {
    readonly unsettledAt: string | null;
    readonly snoozedUntil: string | null;
    readonly snoozedAt: string | null;
@@ -3001,10 +3005,10 @@ index d772989f23..daa57f1e3c 100644
    readonly limitRecovery?: import("@t3tools/contracts").OrchestrationV2LimitRecovery | null;
    readonly pinnedAt: string | null;
    readonly autoSettleDisabledAt?: string | null;
-@@ -298,6 +308,13 @@ export function presentThreadShell(
-     branchPullRequest: thread.branchPullRequest ?? null,
-     lineage: thread.lineage,
+@@ -303,6 +313,13 @@ export function presentThreadShell(
      forkedFrom: thread.forkedFrom,
+     linkOrigin: thread.linkOrigin ?? null,
+     delegatedFrom: thread.delegatedFrom ?? null,
 +    ...(thread.openedByThreadId === undefined ? {} : { openedByThreadId: thread.openedByThreadId }),
 +    ...(thread.settledBy === undefined ? {} : { settledBy: thread.settledBy }),
 +    ...(thread.lineage.relationshipToParent === "subagent" &&
@@ -3015,7 +3019,7 @@ index d772989f23..daa57f1e3c 100644
      activeProviderThreadId: thread.activeProviderThreadId,
      latestRun,
      runtime,
-@@ -329,6 +346,7 @@ export function presentThreadShell(
+@@ -334,6 +351,7 @@ export function presentThreadShell(
      unsettledAt: nullableIso(thread.unsettledAt ?? null),
      snoozedUntil: nullableIso(thread.snoozedUntil ?? null),
      snoozedAt: nullableIso(thread.snoozedAt ?? null),
@@ -3122,7 +3126,7 @@ index ad0cd9ec2a..fbb79e0a82 100644
      setAutoSettle: optimistic.wrap(commands.setAutoSettle, (thread, input, now) => ({
        ...thread,
 diff --git a/packages/client-runtime/src/state/threadShell.test.ts b/packages/client-runtime/src/state/threadShell.test.ts
-index 2dcc3233db..c668305268 100644
+index ec40d5f679..e4afe1482c 100644
 --- a/packages/client-runtime/src/state/threadShell.test.ts
 +++ b/packages/client-runtime/src/state/threadShell.test.ts
 @@ -108,6 +108,43 @@ describe("v2 thread shell lists", () => {
@@ -3170,12 +3174,12 @@ index 2dcc3233db..c668305268 100644
      const { registry, threads, snapshotAtom } = makeHarness();
      const root = v2ThreadShell;
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
-index 244341f591..391f55a09b 100644
+index a0c408f38e..a351f2e533 100644
 --- a/packages/contracts/src/orchestrationV2.ts
 +++ b/packages/contracts/src/orchestrationV2.ts
-@@ -415,6 +415,13 @@ export const OrchestrationV2AppThread = Schema.Struct({
-   activeProviderThreadId: Schema.NullOr(ProviderThreadId),
-   historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
+@@ -452,6 +452,13 @@ export const OrchestrationV2AppThread = Schema.Struct({
+   linkOrigin: Schema.optional(OrchestrationV2LinkOrigin),
+   delegatedFrom: Schema.optional(OrchestrationV2DelegatedFrom),
    lineage: OrchestrationV2AppThreadLineage,
 +  /** Thread whose agent opened this one through T3 tools; absent otherwise. */
 +  openedByThreadId: Schema.optional(ThreadId),
@@ -3187,7 +3191,7 @@ index 244341f591..391f55a09b 100644
    forkedFrom: Schema.NullOr(
      Schema.Union([
        Schema.Struct({ type: Schema.Literal("run"), threadId: ThreadId, runId: RunId }),
-@@ -540,6 +547,17 @@ export function idleCompactionOf(
+@@ -577,6 +584,17 @@ export function idleCompactionOf(
      : undefined;
  }
  
@@ -3205,7 +3209,7 @@ index 244341f591..391f55a09b 100644
  export const OrchestrationV2RunStatus = Schema.Literals([
    "preparing",
    "queued",
-@@ -1949,6 +1967,8 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
+@@ -2054,6 +2072,8 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
    pullRequests: Schema.optional(Schema.Array(ThreadPullRequestLink)),
    branchPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
    lineage: OrchestrationV2AppThreadLineage,
@@ -3214,7 +3218,7 @@ index 244341f591..391f55a09b 100644
    forkedFrom: Schema.NullOr(OrchestrationV2AppThread.fields.forkedFrom),
    activeProviderThreadId: Schema.NullOr(ProviderThreadId),
    historyOrigin: Schema.optional(OrchestrationV2ThreadHistoryOrigin),
-@@ -1993,6 +2013,8 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
+@@ -2100,6 +2120,8 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
    unsettledAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
    snoozedUntil: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
    snoozedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
@@ -3223,15 +3227,15 @@ index 244341f591..391f55a09b 100644
    limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecovery)),
    pinnedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
    autoSettleDisabledAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
-@@ -2784,6 +2806,7 @@ export const OrchestrationV2Command = Schema.Union([
-     interactionMode: ProviderInteractionMode,
-     branch: Schema.NullOr(TrimmedNonEmptyString),
-     worktreePath: Schema.NullOr(TrimmedNonEmptyString),
+@@ -2900,6 +2922,7 @@ export const OrchestrationV2Command = Schema.Union([
+     linkOrigin: Schema.optional(OrchestrationV2LinkOrigin),
+     /** Only the server sets this, with `linkOrigin`, for a linked environment's delegated task. */
+     delegatedFrom: Schema.optional(OrchestrationV2DelegatedFrom),
 +    openedByThreadId: Schema.optional(ThreadId),
      importedNativeThread: Schema.optional(
        Schema.Struct({
          ref: Schema.Struct({
-@@ -2826,6 +2849,8 @@ export const OrchestrationV2Command = Schema.Union([
+@@ -2942,6 +2965,8 @@ export const OrchestrationV2Command = Schema.Union([
      commandId: CommandId,
      threadId: ThreadId,
      settledAt: Schema.optional(Schema.DateTimeUtc),
