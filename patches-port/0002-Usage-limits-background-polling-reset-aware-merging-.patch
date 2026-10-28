@@ -13,7 +13,7 @@ Subject: [PATCH 2/5] Usage limits: background polling, reset-aware merging and
  .../src/provider/claudeUsageLimits.test.ts    | 165 +++++-
  apps/server/src/provider/claudeUsageLimits.ts | 140 ++++-
  .../src/provider/codexUsageLimits.test.ts     |  38 +-
- apps/server/src/provider/codexUsageLimits.ts  |  17 +-
+ apps/server/src/provider/codexUsageLimits.ts  |  16 +-
  apps/server/src/usage/cliproxyApi.ts          |   1 +
  packages/contracts/src/providerUsageLimits.ts |  10 +
  .../src/server/managedProvider.test.ts        | 221 +++++++-
@@ -23,13 +23,13 @@ Subject: [PATCH 2/5] Usage limits: background polling, reset-aware merging and
  .../provider-cursor/src/server/usageLimits.ts |   1 +
  .../provider-grok/src/server/usageLimits.ts   |   1 +
  .../src/server/usageLimits.ts                 |   3 +
- 18 files changed, 1783 insertions(+), 100 deletions(-)
+ 18 files changed, 1782 insertions(+), 100 deletions(-)
 
 diff --git a/apps/server/src/provider/CodexProvider.ts b/apps/server/src/provider/CodexProvider.ts
-index 8458315f64..76588d0e36 100644
+index 2b2d550188..7227fe3902 100644
 --- a/apps/server/src/provider/CodexProvider.ts
 +++ b/apps/server/src/provider/CodexProvider.ts
-@@ -56,6 +56,7 @@ const RATE_LIMITS_PROBE_TIMEOUT_MS = 3_000;
+@@ -57,6 +57,7 @@ const RATE_LIMITS_PROBE_TIMEOUT_MS = 3_000;
  
  type CodexRateLimitsProbe =
    | {
@@ -37,7 +37,7 @@ index 8458315f64..76588d0e36 100644
        readonly snapshot: CodexRateLimitSnapshot;
        readonly rateLimitsByLimitId?:
          | Readonly<Record<string, CodexRateLimitSnapshot>>
-@@ -563,15 +564,20 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
+@@ -564,15 +565,20 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
              deadlineMs,
              RATE_LIMITS_PROBE_TIMEOUT_MS,
            ).pipe(
@@ -67,7 +67,7 @@ index 8458315f64..76588d0e36 100644
              ),
              Effect.catch((error) =>
                Effect.logDebug("Codex rate-limit read failed.", { cause: error }).pipe(
-@@ -794,7 +800,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
+@@ -795,7 +801,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
              snapshot: snapshot.rateLimits.snapshot,
              rateLimitsByLimitId: snapshot.rateLimits.rateLimitsByLimitId,
              resetCredits: snapshot.rateLimits.resetCredits,
@@ -1344,10 +1344,10 @@ index d0acf43bb4..247dade1d5 100644
 +    : undefined;
 +}
 diff --git a/apps/server/src/provider/codexUsageLimits.test.ts b/apps/server/src/provider/codexUsageLimits.test.ts
-index 51970a3a54..328f63486e 100644
+index 9c863f54c0..39a683201f 100644
 --- a/apps/server/src/provider/codexUsageLimits.test.ts
 +++ b/apps/server/src/provider/codexUsageLimits.test.ts
-@@ -20,15 +20,13 @@ describe("codexRateLimitsToLimits", () => {
+@@ -19,15 +19,13 @@ describe("codexRateLimitsToLimits", () => {
        secondary: null,
        individualLimit: { remainingPercent: 99, resetsAt: 1_784_500_000 },
      };
@@ -1370,7 +1370,7 @@ index 51970a3a54..328f63486e 100644
  
      expect(
        codexRateLimitsToLimits({
-@@ -36,8 +34,10 @@ describe("codexRateLimitsToLimits", () => {
+@@ -35,8 +33,10 @@ describe("codexRateLimitsToLimits", () => {
          snapshot: { limitId: "spark" },
          rateLimitsByLimitId: { codex: snapshot },
        }),
@@ -1383,7 +1383,7 @@ index 51970a3a54..328f63486e 100644
    });
  
    it("maps primary and secondary onto the session and weekly windows", () => {
-@@ -46,8 +46,8 @@ describe("codexRateLimitsToLimits", () => {
+@@ -45,8 +45,8 @@ describe("codexRateLimitsToLimits", () => {
          checkedAt,
          snapshot: {
            planType: "plus",
@@ -1394,7 +1394,7 @@ index 51970a3a54..328f63486e 100644
          },
        }),
      ).toEqual({
-@@ -57,17 +57,19 @@ describe("codexRateLimitsToLimits", () => {
+@@ -56,17 +56,19 @@ describe("codexRateLimitsToLimits", () => {
            id: "primary",
            kind: "session",
            label: "Session",
@@ -1416,7 +1416,7 @@ index 51970a3a54..328f63486e 100644
          },
        ],
      });
-@@ -84,6 +86,7 @@ describe("codexRateLimitsToLimits", () => {
+@@ -83,6 +85,7 @@ describe("codexRateLimitsToLimits", () => {
          id: "primary",
          kind: "monthly",
          label: "Monthly",
@@ -1424,7 +1424,7 @@ index 51970a3a54..328f63486e 100644
          usedPercent: 80,
          windowDurationMins: 43_200,
        },
-@@ -111,6 +114,7 @@ describe("codexRateLimitsToLimits", () => {
+@@ -110,6 +113,7 @@ describe("codexRateLimitsToLimits", () => {
          id: "secondary",
          kind: "weekly",
          label: "Weekly",
@@ -1432,7 +1432,7 @@ index 51970a3a54..328f63486e 100644
          usedPercent: 42,
          windowDurationMins: 10080,
        },
-@@ -140,6 +144,7 @@ describe("codexRateLimitsToUpdate", () => {
+@@ -162,6 +166,7 @@ describe("codexRateLimitsToUpdate", () => {
            id: "secondary",
            kind: "weekly",
            label: "Weekly",
@@ -1440,7 +1440,7 @@ index 51970a3a54..328f63486e 100644
            usedPercent: 51,
            windowDurationMins: 10080,
          },
-@@ -167,6 +172,7 @@ describe("codexRateLimitsToUpdate", () => {
+@@ -189,6 +194,7 @@ describe("codexRateLimitsToUpdate", () => {
          id: "secondary",
          kind: "weekly",
          label: "Weekly",
@@ -1448,7 +1448,7 @@ index 51970a3a54..328f63486e 100644
          usedPercent: 42,
          windowDurationMins: 10080,
        },
-@@ -248,6 +254,7 @@ describe("mergeCodexRateLimits", () => {
+@@ -226,6 +232,7 @@ describe("mergeCodexRateLimits", () => {
            id: "primary",
            kind: "session",
            label: "Session",
@@ -1456,7 +1456,7 @@ index 51970a3a54..328f63486e 100644
            usedPercent: 12,
            windowDurationMins: 300,
          },
-@@ -255,6 +262,7 @@ describe("mergeCodexRateLimits", () => {
+@@ -233,6 +240,7 @@ describe("mergeCodexRateLimits", () => {
            id: "individual",
            kind: "monthly",
            label: "Monthly credit limit",
@@ -1465,7 +1465,7 @@ index 51970a3a54..328f63486e 100644
            resetsAt: "2026-08-17T20:53:20.000Z",
          },
 diff --git a/apps/server/src/provider/codexUsageLimits.ts b/apps/server/src/provider/codexUsageLimits.ts
-index 053700026b..7055e3bb21 100644
+index d4f9c62111..ac65395da2 100644
 --- a/apps/server/src/provider/codexUsageLimits.ts
 +++ b/apps/server/src/provider/codexUsageLimits.ts
 @@ -59,6 +59,7 @@ function labelForKind(kind: ServerProviderUsageWindow["kind"]): string {
@@ -1504,26 +1504,19 @@ index 053700026b..7055e3bb21 100644
    return {
      ...makeUsageLimits({
        checkedAt: input.checkedAt,
-@@ -136,7 +142,7 @@ export function codexRateLimitsToLimits(input: {
- export function codexRateLimitsToUpdate(
+@@ -137,9 +143,9 @@ export function codexRateLimitsToUpdate(
    snapshot: CodexRateLimitSnapshot,
+   previous?: CodexRateLimitSnapshot,
  ): ProviderUsageLimitsUpdate | undefined {
--  const windows = codexRateLimitsToWindows(snapshot);
-+  const windows = codexRateLimitsToWindows(snapshot, "turn");
-   return windows.length > 0 ? { windows } : undefined;
- }
- 
-@@ -202,7 +208,8 @@ export function codexUsageLimitMessage(
-   atIso: string,
- ): string {
-   const atMs = Date.parse(atIso);
--  const windows = snapshot && Number.isFinite(atMs) ? codexRateLimitsToWindows(snapshot) : [];
-+  const windows =
-+    snapshot && Number.isFinite(atMs) ? codexRateLimitsToWindows(snapshot, "probe") : [];
-   let reset = "";
-   let latestResetMs = Number.NEGATIVE_INFINITY;
-   for (const window of windows) {
-@@ -220,7 +227,9 @@ export function codexUsageLimitResetAt(
+-  const previousWindows = previous ? codexRateLimitsToWindows(previous) : [];
++  const previousWindows = previous ? codexRateLimitsToWindows(previous, "turn") : [];
+   // Token ticks repeat session-cached limits that may predate an account probe or reset.
+-  const windows = codexRateLimitsToWindows(snapshot).filter((window) => {
++  const windows = codexRateLimitsToWindows(snapshot, "turn").filter((window) => {
+     const existing = previousWindows.find((candidate) => candidate.id === window.id);
+     return (
+       !existing ||
+@@ -191,7 +197,9 @@ export function codexUsageLimitResetAt(
    snapshot: CodexRateLimitSnapshot | undefined,
  ): string | null {
    if (!snapshot) return null;
