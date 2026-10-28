@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jake Leventhal <jakeleventhal@me.com>
 Date: Thu, 15 Oct 2026 13:05:36 +0200
-Subject: [PATCH 2/9] fix(orchestration): resume continuations after planned
+Subject: [PATCH] fix(orchestration): resume continuations after planned
  worktree handoffs
 
 Port of pingdotgg/t3code#15203 (head 3430a29a65cf) until it is merged upstream. Fixes #15136.
@@ -17,15 +17,15 @@ closes ingestion.
  .../src/orchestration-v2/Orchestrator.ts      |  63 ++-
  .../ProviderSessionManager.test.ts            |  12 +-
  .../ProviderSessionManager.ts                 |  82 ++--
- .../RunExecutionService.test.ts               | 327 +++++++------
- .../orchestration-v2/RunExecutionService.ts   |  97 +++-
+ .../RunExecutionService.test.ts               | 408 ++++++++++------
+ .../orchestration-v2/RunExecutionService.ts   | 116 ++++-
  .../SelectionRestart.integration.test.ts      | 456 +++++++++++++++++-
  .../testkit/ProviderReplayHarness.ts          |   3 +-
  docs/internals/overview.md                    |   4 +
  docs/user/composer.md                         |   4 +
  packages/contracts/src/orchestrationV2.ts     |   4 +
  .../src/server/ProviderAdapter.ts             |  16 +-
- 15 files changed, 1019 insertions(+), 238 deletions(-)
+ 15 files changed, 1119 insertions(+), 238 deletions(-)
 
 diff --git a/apps/server/src/mcp/WorktreeMcpService.test.ts b/apps/server/src/mcp/WorktreeMcpService.test.ts
 index 3be8705cc0..0a715a2f89 100644
@@ -718,7 +718,7 @@ index df2ee630df..eec76fbfc2 100644
                detached.value.attachedThreadIds.size === 0 &&
                !detached.value.supportsMultipleProviderThreads
 diff --git a/apps/server/src/orchestration-v2/RunExecutionService.test.ts b/apps/server/src/orchestration-v2/RunExecutionService.test.ts
-index 394cc1527c..dd8a4f62af 100644
+index 394cc1527c..e5e6083160 100644
 --- a/apps/server/src/orchestration-v2/RunExecutionService.test.ts
 +++ b/apps/server/src/orchestration-v2/RunExecutionService.test.ts
 @@ -2120,98 +2120,99 @@ it.effect(
@@ -909,7 +909,7 @@ index 394cc1527c..dd8a4f62af 100644
              startTurn: () => Effect.void,
            } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
            run: {
-@@ -2548,6 +2549,45 @@ it.effect("does not refresh pull requests for auxiliary or stale provider termin
+@@ -2548,6 +2549,126 @@ it.effect("does not refresh pull requests for auxiliary or stale provider termin
    }),
  );
  
@@ -952,10 +952,91 @@ index 394cc1527c..dd8a4f62af 100644
 +  }),
 +);
 +
++it.effect("flushes the latest buffered assistant message on a planned detach", () =>
++  Effect.gen(function* () {
++    const key = "workspace-detach-message";
++    const now = yield* DateTime.now;
++    const { ingested } = yield* captureRootRunTermination({
++      key,
++      shouldFinalizeRun: () => Effect.succeed(true),
++      events: (ids) =>
++        Stream.concat(
++          Stream.fromIterable(
++            ["partial", "partial final words"].map((text) => ({
++              type: "message.updated" as const,
++              driver,
++              message: {
++                id: MessageId.make(`message:${key}`),
++                threadId: ids.threadId,
++                runId: ids.runId,
++                nodeId: ids.rootNodeId,
++                role: "assistant" as const,
++                text,
++                attachments: [],
++                streaming: true,
++                createdBy: "agent" as const,
++                creationSource: "provider" as const,
++                createdAt: now,
++                updatedAt: now,
++              },
++            })),
++          ),
++          Stream.fail(
++            new ProviderAdapter.ProviderAdapterSessionDetached({
++              driver,
++              providerSessionId: ProviderSessionId.make(`session:${key}`),
++              threadId: ids.threadId,
++              reason: "workspace_changed",
++            }),
++          ),
++        ),
++    });
++    const messages = ingested.flatMap((event) =>
++      event.type === "message.updated" ? [event.message] : [],
++    );
++    assert.equal(messages.at(-1)?.text, "partial final words");
++    assert.equal(messages.at(-1)?.streaming, false);
++  }),
++);
++
++it.effect(
++  "ends background items detached after the root has finalized without finalizing twice",
++  () =>
++    Effect.gen(function* () {
++      const key = "workspace-detach-after-root";
++      const { ingested, observed } = yield* captureRootRunTermination({
++        key,
++        shouldFinalizeRun: () => Effect.succeed(true),
++        events: (ids) =>
++          Stream.concat(
++            Stream.make(
++              backgroundTurnItemEvent(ids, "command_execution", "running", 1),
++              rootTerminalEvent(ids, "completed"),
++            ),
++            Stream.fail(
++              new ProviderAdapter.ProviderAdapterSessionDetached({
++                driver,
++                providerSessionId: ProviderSessionId.make(`session:${key}`),
++                threadId: ids.threadId,
++                reason: "workspace_changed",
++              }),
++            ),
++          ),
++      });
++      assert.equal(
++        ingested.filter(
++          (event) => event.type === "turn_item.updated" && event.turnItem.status === "interrupted",
++        ).length,
++        1,
++      );
++      assert.deepEqual(observed, ["run:waiting", "pull-requests-refreshed"]);
++    }),
++);
++
  it.effect("refreshes pull requests after a provider stream exits with an error", () =>
    Effect.gen(function* () {
      const { written, observed } = yield* captureRootRunTermination({
-@@ -3014,6 +3054,7 @@ function captureRootRunTermination(input: {
+@@ -3014,6 +3135,7 @@ function captureRootRunTermination(input: {
      });
      const writtenItems = yield* Ref.make<ReadonlyArray<OrchestrationV2TurnItem>>([]);
      const finalEvents = yield* Ref.make<ReadonlyArray<OrchestrationV2DomainEvent>>([]);
@@ -963,7 +1044,7 @@ index 394cc1527c..dd8a4f62af 100644
      const observed = yield* Ref.make<ReadonlyArray<string>>([]);
      const submittedEffects = yield* Ref.make<ReadonlyArray<PendingOrchestrationEffectV2>>([]);
      const committedEffects = yield* Ref.make<ReadonlyArray<PendingOrchestrationEffectV2>>([]);
-@@ -3075,7 +3116,10 @@ function captureRootRunTermination(input: {
+@@ -3075,7 +3197,10 @@ function captureRootRunTermination(input: {
            }),
            IdAllocator.layer,
            Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
@@ -975,7 +1056,7 @@ index 394cc1527c..dd8a4f62af 100644
            }),
            ServerSettings.layerTest(),
            Layer.succeed(RunFinalizationService.RunFinalizationObserver, {
-@@ -3098,37 +3142,38 @@ function captureRootRunTermination(input: {
+@@ -3098,37 +3223,38 @@ function captureRootRunTermination(input: {
          providerSessionId: ProviderSessionId.make(`session:${input.key}`),
          session: {
            events: Stream.empty,
@@ -1044,7 +1125,7 @@ index 394cc1527c..dd8a4f62af 100644
            startTurn: input.startTurn ?? (() => Effect.void),
            interruptTurn: input.interruptTurn ?? (() => Effect.void),
            hasPendingBackgroundWorkForThread: input.hasPendingBackgroundWorkForThread,
-@@ -3201,6 +3246,7 @@ function captureRootRunTermination(input: {
+@@ -3201,6 +3327,7 @@ function captureRootRunTermination(input: {
        previewActivityEnded,
        written: yield* Ref.get(writtenItems),
        finalEvents: yield* Ref.get(finalEvents),
@@ -1052,7 +1133,7 @@ index 394cc1527c..dd8a4f62af 100644
        observed: yield* Ref.get(observed),
        submittedEffects: yield* Ref.get(submittedEffects),
        committedEffects: yield* Ref.get(committedEffects),
-@@ -3276,7 +3322,7 @@ function childBackgroundTurnItemEvent(
+@@ -3276,7 +3403,7 @@ function childBackgroundTurnItemEvent(
  function backgroundTurnItemEvent(
    ids: BackgroundScenarioIds,
    type: "command_execution" | "dynamic_tool" | "subagent",
@@ -1061,7 +1142,7 @@ index 394cc1527c..dd8a4f62af 100644
    ordinal: number,
    itemId?: TurnItemId,
  ): ProviderAdapter.ProviderAdapterV2Event {
-@@ -3605,26 +3651,27 @@ function runBackgroundItemScenario(
+@@ -3605,26 +3732,27 @@ function runBackgroundItemScenario(
          providerSessionId: ProviderSessionId.make(`session:${key}`),
          session: {
            events: Stream.empty,
@@ -1110,10 +1191,19 @@ index 394cc1527c..dd8a4f62af 100644
          } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
          run: {
 diff --git a/apps/server/src/orchestration-v2/RunExecutionService.ts b/apps/server/src/orchestration-v2/RunExecutionService.ts
-index 3e3f37a15a..8931c2db02 100644
+index 3e3f37a15a..0647d541c2 100644
 --- a/apps/server/src/orchestration-v2/RunExecutionService.ts
 +++ b/apps/server/src/orchestration-v2/RunExecutionService.ts
-@@ -626,6 +626,7 @@ export const layer: Layer.Layer<
+@@ -5,6 +5,8 @@ import {
+   CommandId,
+   type EventId,
+   type ModelSelection,
++  type MessageId,
++  type OrchestrationV2ConversationMessage,
+   type NodeId,
+   type OrchestrationV2AppThread,
+   type OrchestrationV2CheckpointScope,
+@@ -626,6 +628,7 @@ export const layer: Layer.Layer<
          // Root turn snapshot written with the run when T3 ends the run itself.
          readonly abandonedProviderTurn?: OrchestrationV2ProviderTurn;
          readonly terminal: ProviderTerminalEvent;
@@ -1121,7 +1211,7 @@ index 3e3f37a15a..8931c2db02 100644
          readonly completedAt?: DateTime.Utc;
          readonly failureItemPersisted: boolean;
          readonly refreshAfterTurn: Effect.Effect<void>;
-@@ -792,6 +793,9 @@ export const layer: Layer.Layer<
+@@ -792,6 +795,9 @@ export const layer: Layer.Layer<
                        providerThread: input.providerThread,
                        reason,
                        completedAt,
@@ -1131,16 +1221,17 @@ index 3e3f37a15a..8931c2db02 100644
                      }),
                    },
                  ]
-@@ -988,6 +992,8 @@ export const layer: Layer.Layer<
+@@ -988,6 +994,9 @@ export const layer: Layer.Layer<
          const latestTurnItemOrdinal = yield* Ref.make(input.providerTurnOrdinal * 100);
          const latestProviderThread = yield* Ref.make(input.providerThread);
          const latestRootProviderTurn = yield* Ref.make<OrchestrationV2ProviderTurn | null>(null);
 +        // A planned detach closes ingestion before the adapter can end its open root items.
 +        const openRootTurnItems = new Map<TurnItemId, OrchestrationV2TurnItem>();
++        const streamingRootMessages = new Map<MessageId, OrchestrationV2ConversationMessage>();
          const routeIdentity: ProviderEventRouteIdentity = {
            threadId: input.run.threadId,
            runId: input.run.id,
-@@ -997,7 +1003,7 @@ export const layer: Layer.Layer<
+@@ -997,7 +1006,7 @@ export const layer: Layer.Layer<
          const eventSubscription =
            input.session.subscribeEvents === undefined
              ? { events: input.session.events, close: Effect.void }
@@ -1149,7 +1240,7 @@ index 3e3f37a15a..8931c2db02 100644
          const inheritedBackgroundTurnItems = yield* (
            input.loadInheritedBackgroundTurnItems?.() ?? Effect.succeed([])
          ).pipe(
-@@ -1029,6 +1035,7 @@ export const layer: Layer.Layer<
+@@ -1029,6 +1038,7 @@ export const layer: Layer.Layer<
          );
          const rootTerminalSeen = yield* Ref.make(false);
          const rootRunFinalized = yield* Ref.make(false);
@@ -1157,7 +1248,7 @@ index 3e3f37a15a..8931c2db02 100644
          const providerThreadOwnerLost = yield* Ref.make(false);
          const activeChildProviderTurns = yield* Ref.make<ReadonlySet<ProviderTurnId>>(new Set());
          const activeChildSubagents = yield* Ref.make<ReadonlyMap<NodeId, ThreadId>>(new Map());
-@@ -1044,6 +1051,7 @@ export const layer: Layer.Layer<
+@@ -1044,6 +1054,7 @@ export const layer: Layer.Layer<
            }
            const providerThread = yield* Ref.get(latestProviderThread);
            const openSubagents = yield* Ref.get(openRunOwnedSubagents);
@@ -1165,7 +1256,7 @@ index 3e3f37a15a..8931c2db02 100644
            yield* writeFinalRunEvents({
              run: input.run,
              rootNode: input.rootNode,
-@@ -1071,6 +1079,7 @@ export const layer: Layer.Layer<
+@@ -1071,6 +1082,7 @@ export const layer: Layer.Layer<
                : { loadRunInterruptReason: input.loadRunInterruptReason }),
              openRunOwnedSubagents: openSubagents,
              terminal,
@@ -1173,7 +1264,7 @@ index 3e3f37a15a..8931c2db02 100644
              failureItemPersisted: terminal.status === "failed",
              refreshAfterTurn,
            }).pipe(
-@@ -1283,6 +1292,80 @@ export const layer: Layer.Layer<
+@@ -1283,6 +1295,86 @@ export const layer: Layer.Layer<
          // as a dev server keep this consumer alive afterwards and must not pin preview focus.
          const endPreviewActivity = yield* previewAgentActivity.begin(input.run.threadId);
          const providerEventFiber = yield* eventSubscription.events.pipe(
@@ -1183,7 +1274,7 @@ index 3e3f37a15a..8931c2db02 100644
 +              ? Stream.fail(detached)
 +              : Stream.unwrap(
 +                  Effect.gen(function* () {
-+                    if (yield* Ref.get(rootRunFinalized)) return Stream.empty;
++                    const rootFinalized = yield* Ref.get(rootRunFinalized);
 +                    yield* Ref.set(
 +                      interruptionMessage,
 +                      "Run interrupted because the workspace changed",
@@ -1233,7 +1324,13 @@ index 3e3f37a15a..8931c2db02 100644
 +                          updatedAt: completedAt,
 +                        },
 +                      })),
-+                      ...(providerTurn?.status === "running" || providerTurn?.status === "pending"
++                      ...[...streamingRootMessages.values()].map((message) => ({
++                        type: "message.updated" as const,
++                        driver: input.providerThread.driver,
++                        message: { ...message, streaming: false, updatedAt: completedAt },
++                      })),
++                      ...(!rootFinalized &&
++                      (providerTurn?.status === "running" || providerTurn?.status === "pending")
 +                        ? [
 +                            {
 +                              type: "provider_turn.updated" as const,
@@ -1246,7 +1343,7 @@ index 3e3f37a15a..8931c2db02 100644
 +                            },
 +                          ]
 +                        : []),
-+                      terminal,
++                      ...(!rootFinalized ? [terminal] : []),
 +                    ]);
 +                  }),
 +                ),
@@ -1254,7 +1351,24 @@ index 3e3f37a15a..8931c2db02 100644
            Stream.mapEffect((event) =>
              Effect.gen(function* () {
                const previous = yield* Ref.get(eventRouting);
-@@ -1448,6 +1531,15 @@ export const layer: Layer.Layer<
+@@ -1368,6 +1460,16 @@ export const layer: Layer.Layer<
+               ) {
+                 yield* Ref.set(latestRootProviderTurn, event.providerTurn);
+               }
++              if (
++                event.type === "message.updated" &&
++                event.message.threadId === input.run.threadId &&
++                event.message.runId === input.run.id &&
++                event.message.role === "assistant"
++              ) {
++                if (event.message.streaming)
++                  streamingRootMessages.set(event.message.id, event.message);
++                else streamingRootMessages.delete(event.message.id);
++              }
+               let storedEventCount = 0;
+               const deliveredEvent = filterAssistantEvent(
+                 event,
+@@ -1448,6 +1550,15 @@ export const layer: Layer.Layer<
                  yield* Ref.update(latestTurnItemOrdinal, (current) =>
                    Math.max(current, event.turnItem.ordinal),
                  );
@@ -1270,7 +1384,7 @@ index 3e3f37a15a..8931c2db02 100644
                }
                if (event.type === "turn.terminal") {
                  yield* Ref.set(terminalEvent, event);
-@@ -1748,6 +1840,7 @@ export function makeInterruptResultTurnItem(input: {
+@@ -1748,6 +1859,7 @@ export function makeInterruptResultTurnItem(input: {
    /** The Stop's own reason, from its run_interrupt_request item. */
    readonly reason: string | undefined;
    readonly completedAt: DateTime.Utc;
@@ -1278,7 +1392,7 @@ index 3e3f37a15a..8931c2db02 100644
  }): OrchestrationV2TurnItem {
    return {
      id: input.idAllocator.derive.runSignalTurnItem({
-@@ -1771,6 +1864,6 @@ export function makeInterruptResultTurnItem(input: {
+@@ -1771,6 +1883,6 @@ export function makeInterruptResultTurnItem(input: {
      completedAt: input.completedAt,
      updatedAt: input.completedAt,
      type: "run_interrupt_result",
