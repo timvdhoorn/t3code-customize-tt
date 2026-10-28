@@ -14,11 +14,11 @@ Custom-identity iOS builds register their APNs device token, Live Activity token
  .../directPushSnapshot.test.ts                |  56 ++++++
  .../agent-awareness/directPushSnapshot.ts     |  36 ++++
  .../remoteRegistration.test.ts                |  84 ++++++++
- .../agent-awareness/remoteRegistration.ts     | 100 +++++++++-
+ .../agent-awareness/remoteRegistration.ts     | 109 ++++++++++-
  ...ctPushSettingsNotificationsRouteScreen.tsx | 181 ++++++++++++++++++
  .../SettingsNotificationsRouteScreen.tsx      |   6 +-
  .../features/settings/SettingsRouteScreen.tsx |  24 ++-
- 12 files changed, 588 insertions(+), 16 deletions(-)
+ 12 files changed, 596 insertions(+), 17 deletions(-)
  create mode 100644 apps/mobile/src/connection/direct-push.ts
  create mode 100644 apps/mobile/src/features/agent-awareness/directPushSnapshot.test.ts
  create mode 100644 apps/mobile/src/features/agent-awareness/directPushSnapshot.ts
@@ -45,10 +45,10 @@ index 12d618cf03..1010c6790e 100644
  
    it("requires a valid team ID with a custom bundle identifier", async () => {
 diff --git a/apps/mobile/app.config.ts b/apps/mobile/app.config.ts
-index 0adb5eb753..ef0863d707 100644
+index 96b101183b..144c5edf8b 100644
 --- a/apps/mobile/app.config.ts
 +++ b/apps/mobile/app.config.ts
-@@ -477,6 +477,10 @@ const config: ExpoConfig = {
+@@ -483,6 +483,10 @@ const config: ExpoConfig = {
    extra: {
      appVariant: APP_VARIANT,
      iosPersonalTeamBuild: isIosPersonalTeamBuild,
@@ -314,32 +314,31 @@ index 0000000000..396f51a24c
 +  return { aggregate };
 +}
 diff --git a/apps/mobile/src/features/agent-awareness/remoteRegistration.test.ts b/apps/mobile/src/features/agent-awareness/remoteRegistration.test.ts
-index d2ce9ca558..4691b5ae35 100644
+index d7e340d886..6c2fdde466 100644
 --- a/apps/mobile/src/features/agent-awareness/remoteRegistration.test.ts
 +++ b/apps/mobile/src/features/agent-awareness/remoteRegistration.test.ts
-@@ -16,6 +16,8 @@ import { ManagedRelay } from "@t3tools/client-runtime/relay";
- import type { EnvironmentId } from "@t3tools/contracts";
+@@ -14,6 +14,8 @@ import { Cookies, FetchHttpClient, HttpClientRequest, HttpClientResponse } from
+ import { ManagedRelay } from "@t3tools/client-runtime/relay";
+ 
  import { verifyDpopProof } from "@t3tools/shared/dpop";
- import type { SavedRemoteConnection } from "../../lib/connection";
 +import { loadPreferences } from "../../persistence/imperative";
 +import type { Preferences } from "../../persistence/mobile-preferences";
  import * as Dpop from "../cloud/dpop";
  import * as ManagedRelayLayer from "../cloud/managedRelayLayer";
  import {
-@@ -28,10 +30,12 @@ import { makeRelayDeviceRegistrationRequest } from "./registrationPayload";
+@@ -26,9 +28,11 @@ import { makeRelayDeviceRegistrationRequest } from "./registrationPayload";
  import {
    __resetAgentAwarenessRemoteRegistrationForTest,
    getAgentAwarenessRegistrationStatus,
 +  refreshAgentAwarenessDirectRegistration,
    refreshAgentAwarenessRegistration,
-   registerAgentAwarenessConnection,
    registerLiveActivityPushToken,
    releaseAgentAwarenessRelayTokenProvider,
 +  setAgentAwarenessDirectTransport,
    setAgentAwarenessRelayTokenProvider,
-   unregisterAgentAwarenessConnection,
    updateAgentAwarenessRegistrationPreferences,
-@@ -774,4 +778,84 @@ describe("makeRelayDeviceRegistrationRequest", () => {
+ } from "./remoteRegistration";
+@@ -719,4 +723,84 @@ describe("makeRelayDeviceRegistrationRequest", () => {
        }).pipe(Effect.provide(layerRelayTest));
      },
    );
@@ -425,10 +424,10 @@ index d2ce9ca558..4691b5ae35 100644
 +  });
  });
 diff --git a/apps/mobile/src/features/agent-awareness/remoteRegistration.ts b/apps/mobile/src/features/agent-awareness/remoteRegistration.ts
-index 9a88e1863b..69203b1a51 100644
+index fc24d180a3..78670acc2a 100644
 --- a/apps/mobile/src/features/agent-awareness/remoteRegistration.ts
 +++ b/apps/mobile/src/features/agent-awareness/remoteRegistration.ts
-@@ -114,6 +114,7 @@ export function subscribeAgentAwarenessRegistrationStatus(listener: () => void):
+@@ -112,6 +112,7 @@ export function subscribeAgentAwarenessRegistrationStatus(listener: () => void):
    };
  }
  let activeLiveActivityRegistrationRetry: ReturnType<typeof setTimeout> | null = null;
@@ -436,7 +435,7 @@ index 9a88e1863b..69203b1a51 100644
  let relayTokenProvider: (() => Promise<string | null>) | null = null;
  let relayTokenProviderIdentity: string | null = null;
  let deviceRegistrationGeneration = 0;
-@@ -159,6 +160,64 @@ function canRegisterPushNotifications(): boolean {
+@@ -156,6 +157,64 @@ function canRegisterPushNotifications(): boolean {
    return Platform.OS === "ios" || Platform.OS === "android";
  }
  
@@ -498,10 +497,10 @@ index 9a88e1863b..69203b1a51 100644
 +  );
 +}
 +
- export function shouldRegisterAgentAwarenessDeviceForProvider(
+ function shouldRegisterAgentAwarenessDeviceForProvider(
    previousIdentity: string | null,
    identity: string | undefined,
-@@ -170,6 +229,7 @@ export function setAgentAwarenessRelayTokenProvider(
+@@ -167,6 +226,7 @@ export function setAgentAwarenessRelayTokenProvider(
    provider: (() => Promise<string | null>) | null,
    identity?: string,
  ): void {
@@ -509,7 +508,7 @@ index 9a88e1863b..69203b1a51 100644
    const isExistingIdentity =
      provider !== null &&
      !shouldRegisterAgentAwarenessDeviceForProvider(relayTokenProviderIdentity, identity);
-@@ -221,6 +281,7 @@ export function setAgentAwarenessRelayTokenProvider(
+@@ -218,6 +278,7 @@ export function setAgentAwarenessRelayTokenProvider(
  
  // Provider remounts retain a valid relay registration; teardown must preserve it and lock-screen activities.
  export function releaseAgentAwarenessRelayTokenProvider(): void {
@@ -517,8 +516,8 @@ index 9a88e1863b..69203b1a51 100644
    relayTokenProvider = null;
    relayTokenProviderIdentity = null;
    deviceRegistrationGeneration++;
-@@ -332,6 +393,17 @@ const registerDeviceWithRelay = Effect.fn("remoteRegistration.registerDeviceWith
-     });
+@@ -325,6 +386,17 @@ const registerDeviceWithRelay = Effect.fn("remoteRegistration.registerDeviceWith
+   if (expectedGeneration !== deviceRegistrationGeneration) {
      return;
    }
 +  if (directTransport) {
@@ -535,7 +534,7 @@ index 9a88e1863b..69203b1a51 100644
    const relayConfig = readRelayConfig();
    if (!relayConfig) {
      setRegistrationStatus("unknown");
-@@ -459,7 +531,7 @@ export function armAgentAwarenessLiveActivityForLocalWork(input: {
+@@ -429,7 +501,7 @@ export function armAgentAwarenessLiveActivityForLocalWork(input: {
    readonly threadTitle: string;
    readonly projectTitle: string;
  }): void {
@@ -544,7 +543,7 @@ index 9a88e1863b..69203b1a51 100644
      return;
    }
    if (!environmentPublishesAgentActivity(input.environmentId)) {
-@@ -530,6 +602,13 @@ const readAgentActivitySnapshot: () => Effect.Effect<
+@@ -494,6 +566,13 @@ const readAgentActivitySnapshot: () => Effect.Effect<
    ManagedRelay.ManagedRelayClient
  > = Effect.fn("remoteRegistration.readAgentActivitySnapshot")(
    function* () {
@@ -558,7 +557,7 @@ index 9a88e1863b..69203b1a51 100644
      if (!readRelayConfig()) return null;
      const token = yield* relayToken("read-live-activity-registration-relay-token");
      if (!token) {
-@@ -550,6 +629,13 @@ const registerLiveActivityWithRelay = Effect.fn("remoteRegistration.registerLive
+@@ -514,6 +593,13 @@ const registerLiveActivityWithRelay = Effect.fn("remoteRegistration.registerLive
    function* (
      body: RelayLiveActivityRegistrationRequest,
    ): Effect.fn.Return<boolean, unknown, ManagedRelay.ManagedRelayClient> {
@@ -572,7 +571,21 @@ index 9a88e1863b..69203b1a51 100644
      if (!readRelayConfig()) return false;
      const token = yield* relayToken("read-live-activity-registration-relay-token");
      if (!token) {
-@@ -652,9 +738,14 @@ function startPendingDeviceRegistration(): void {
+@@ -529,6 +615,13 @@ const registerLiveActivityWithRelay = Effect.fn("remoteRegistration.registerLive
+   },
+ );
+ 
++function logRegistrationDebug(context: string, details?: unknown): void {
++  if (!__DEV__) {
++    return;
++  }
++  console.log(`[agent-awareness] ${context}`, details ?? "");
++}
++
+ function logRegistrationError(context: string, error: unknown): void {
+   if (!__DEV__) {
+     return;
+@@ -603,9 +696,14 @@ function startPendingDeviceRegistration(): void {
    })();
  }
  
@@ -587,8 +600,8 @@ index 9a88e1863b..69203b1a51 100644
 +    !options.afterActive &&
      !registrationAddsInformation(activeDeviceRegistration.input, input)
    ) {
-     logRegistrationDebug("device registration coalesced with active request", {
-@@ -882,6 +973,7 @@ export function __resetAgentAwarenessRemoteRegistrationForTest(): void {
+     return;
+@@ -795,6 +893,7 @@ export function __resetAgentAwarenessRemoteRegistrationForTest(): void {
      clearTimeout(activeLiveActivityRegistrationRetry);
      activeLiveActivityRegistrationRetry = null;
    }
@@ -596,7 +609,7 @@ index 9a88e1863b..69203b1a51 100644
    relayTokenProvider = null;
    relayTokenProviderIdentity = null;
    deviceRegistrationGeneration++;
-@@ -1006,7 +1098,7 @@ const registerLiveActivityPushTokenValue = Effect.fn(
+@@ -909,7 +1008,7 @@ const registerLiveActivityPushTokenValue = Effect.fn(
  });
  
  function scheduleActiveLiveActivityRegistrationRetry(): void {
@@ -605,8 +618,12 @@ index 9a88e1863b..69203b1a51 100644
      return;
    }
  
-@@ -1022,7 +1114,7 @@ function scheduleActiveLiveActivityRegistrationRetry(): void {
- export const refreshActiveLiveActivityRemoteRegistration = Effect.fn(
+@@ -922,10 +1021,10 @@ function scheduleActiveLiveActivityRegistrationRetry(): void {
+   }, REMOTE_ACTIVITY_REGISTRATION_RETRY_MS);
+ }
+ 
+-const refreshActiveLiveActivityRemoteRegistration = Effect.fn(
++export const refreshActiveLiveActivityRemoteRegistration = Effect.fn(
    "remoteRegistration.refreshActiveLiveActivityRemoteRegistration",
  )(function* (): Effect.fn.Return<void, never, ManagedRelay.ManagedRelayClient> {
 -  if (!canRegisterRemoteLiveActivities() || !relayTokenProvider) {
@@ -616,7 +633,7 @@ index 9a88e1863b..69203b1a51 100644
  
 diff --git a/apps/mobile/src/features/settings/DirectPushSettingsNotificationsRouteScreen.tsx b/apps/mobile/src/features/settings/DirectPushSettingsNotificationsRouteScreen.tsx
 new file mode 100644
-index 0000000000..0fc79322f0
+index 0000000000..d0cf0bf7d9
 --- /dev/null
 +++ b/apps/mobile/src/features/settings/DirectPushSettingsNotificationsRouteScreen.tsx
 @@ -0,0 +1,181 @@
@@ -687,7 +704,7 @@ index 0000000000..0fc79322f0
 +    setNotificationStatus(result.value.granted ? "enabled" : "disabled");
 +  }, []);
 +
-+  // oxlint-disable-next-line t3code/react-effect-budget -- follows the native permission across foregrounds.
++  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- follows the native permission across foregrounds.
 +  useEffect(() => {
 +    // oxlint-disable-next-line react/set-state-in-effect -- Reads native notification permission on mount and on every foreground.
 +    void refreshNotifications();
@@ -802,7 +819,7 @@ index 0000000000..0fc79322f0
 +  );
 +}
 diff --git a/apps/mobile/src/features/settings/SettingsNotificationsRouteScreen.tsx b/apps/mobile/src/features/settings/SettingsNotificationsRouteScreen.tsx
-index 701403f3a4..310b149f9a 100644
+index 4aa5cc4c70..f033972101 100644
 --- a/apps/mobile/src/features/settings/SettingsNotificationsRouteScreen.tsx
 +++ b/apps/mobile/src/features/settings/SettingsNotificationsRouteScreen.tsx
 @@ -20,7 +20,7 @@ import {
@@ -814,7 +831,7 @@ index 701403f3a4..310b149f9a 100644
  import {
    openAndroidLiveUpdateSettings,
    supportsAndroidLiveUpdateSettings,
-@@ -41,6 +41,7 @@ import { SettingsRow } from "./components/SettingsRow";
+@@ -42,6 +42,7 @@ import { SettingsRow } from "./components/SettingsRow";
  import { SettingsSection } from "./components/SettingsSection";
  import { SettingsSwitchRow } from "./components/SettingsSwitchRow";
  import { SettingsScreen } from "./components/SettingsScreen";
@@ -822,7 +839,7 @@ index 701403f3a4..310b149f9a 100644
  import { resolveAgentAwarenessPlatformPresentation } from "./SettingsRouteScreen.logic";
  
  type NotificationStatus = "checking" | "enabled" | "disabled" | "unsupported";
-@@ -56,6 +57,9 @@ function useDeviceRegistered(): boolean {
+@@ -89,6 +90,9 @@ function useDeviceRegistered(): boolean {
  }
  
  export function SettingsNotificationsRouteScreen() {
@@ -833,7 +850,7 @@ index 701403f3a4..310b149f9a 100644
      return (
        <SettingsScreen title="Notifications">
 diff --git a/apps/mobile/src/features/settings/SettingsRouteScreen.tsx b/apps/mobile/src/features/settings/SettingsRouteScreen.tsx
-index 64de1a8b20..4207daed0d 100644
+index 34de55fd44..68346c33e2 100644
 --- a/apps/mobile/src/features/settings/SettingsRouteScreen.tsx
 +++ b/apps/mobile/src/features/settings/SettingsRouteScreen.tsx
 @@ -23,6 +23,7 @@ import { useNativeColumnLayoutMetrics } from "../../native/native-layout-metrics
