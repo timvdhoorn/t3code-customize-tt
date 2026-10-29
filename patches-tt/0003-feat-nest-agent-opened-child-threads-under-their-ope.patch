@@ -10,7 +10,7 @@ a child nests under its opener only within the same inbox section, with a
 guide line, context-menu collapse and a summary stub.
 ---
  apps/server/src/mcp/OrchestratorMcpService.ts |   1 +
- .../src/mcp/toolkits/project/handlers.test.ts |  77 +++
+ .../src/mcp/toolkits/project/handlers.test.ts |  78 +++
  .../src/mcp/toolkits/project/handlers.ts      |   1 +
  .../src/orchestration-v2/Orchestrator.ts      |  10 +-
  .../src/orchestration-v2/ProjectionStore.ts   |  15 +
@@ -38,7 +38,7 @@ guide line, context-menu collapse and a summary stub.
  .../src/state/threadCommands.ts               |  14 +-
  .../src/state/threadShell.test.ts             |  37 ++
  packages/contracts/src/orchestrationV2.ts     |  25 +
- 29 files changed, 2470 insertions(+), 49 deletions(-)
+ 29 files changed, 2471 insertions(+), 49 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.childThreads.browser.test.tsx
  create mode 100644 apps/web/src/components/Sidebar.childThreads.test.ts
  create mode 100644 apps/web/src/components/Sidebar.childThreads.tsx
@@ -46,7 +46,7 @@ guide line, context-menu collapse and a summary stub.
  create mode 100644 apps/web/src/components/Sidebar.families.ts
 
 diff --git a/apps/server/src/mcp/OrchestratorMcpService.ts b/apps/server/src/mcp/OrchestratorMcpService.ts
-index 8b32603a71..e9baf4cf2e 100644
+index d8dacb35a0..40467897be 100644
 --- a/apps/server/src/mcp/OrchestratorMcpService.ts
 +++ b/apps/server/src/mcp/OrchestratorMcpService.ts
 @@ -2676,6 +2676,7 @@ const make = Effect.gen(function* () {
@@ -58,18 +58,18 @@ index 8b32603a71..e9baf4cf2e 100644
                  .pipe(
                    Effect.mapError((error) =>
 diff --git a/apps/server/src/mcp/toolkits/project/handlers.test.ts b/apps/server/src/mcp/toolkits/project/handlers.test.ts
-index 4031654a8c..04274c6e9c 100644
+index 03b97c32af..308d029323 100644
 --- a/apps/server/src/mcp/toolkits/project/handlers.test.ts
 +++ b/apps/server/src/mcp/toolkits/project/handlers.test.ts
-@@ -3,6 +3,7 @@ import {
-   EnvironmentId,
-   ProjectId,
+@@ -6,6 +6,7 @@ import {
    ProviderInstanceId,
+   ProviderDriverKind,
+   type ServerProvider,
 +  ThreadId,
    type Project as ProjectRecord,
    type ModelSelection,
    type RuntimeMode,
-@@ -34,6 +35,81 @@ import * as McpToolAccess from "../../McpToolAccess.ts";
+@@ -37,6 +38,82 @@ import * as McpToolAccess from "../../McpToolAccess.ts";
  import * as ProjectHandlers from "./handlers.ts";
  import { ProjectToolkit } from "./tools.ts";
  
@@ -93,6 +93,7 @@ index 4031654a8c..04274c6e9c 100644
 +    let launchedSender: ThreadId | undefined;
 +    let launchedOpener: ThreadId | undefined;
 +    const layerDependencies = Layer.mergeAll(
++      Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
 +      ServerSettings.layerTest(),
 +      NodeCrypto.layer,
 +      Layer.succeed(McpInvocationContext.McpInvocationContext, {
@@ -151,19 +152,19 @@ index 4031654a8c..04274c6e9c 100644
  const clientLaunchHarness = (input: {
    readonly runtimeModeCeiling: RuntimeMode;
    readonly defaultRuntimeMode?: RuntimeMode;
-@@ -189,6 +265,7 @@ it.effect(
+@@ -202,6 +279,7 @@ it.effect(
        });
        expect(belowCeiling.launched[0]?.runtimeMode).toBe("approval-required");
        expect(belowCeiling.launched[0]?.initialMessage?.senderThreadId).toBeUndefined();
 +      expect(belowCeiling.launched[0]?.openedByThreadId).toBeUndefined();
  
-       const aboveCeiling = yield* launchWith("auto-accept-edits", "full-access", { title: "Fix" });
-       expect(aboveCeiling.launched[0]?.runtimeMode).toBe("auto-accept-edits");
+       const aboveCeiling = yield* launchWith("auto-accept-edits", "full-access", {
+         title: "Fix",
 diff --git a/apps/server/src/mcp/toolkits/project/handlers.ts b/apps/server/src/mcp/toolkits/project/handlers.ts
-index 950cb38c6c..64b21d69c6 100644
+index 014b109448..8b04e58d2e 100644
 --- a/apps/server/src/mcp/toolkits/project/handlers.ts
 +++ b/apps/server/src/mcp/toolkits/project/handlers.ts
-@@ -214,6 +214,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
+@@ -227,6 +227,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
                    attachments,
                  },
                }),
@@ -262,7 +263,7 @@ index 1cfe7a51c8..f2951d2fad 100644
                    latestRunId,
                    latestRunRequestedAt:
 diff --git a/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts b/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
-index 88fc87d3bc..077362c1a2 100644
+index ea1669f4b7..4a4c8906f2 100644
 --- a/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
 +++ b/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
 @@ -505,6 +505,25 @@ it.effect("retains automation and sender attribution while a message waits in th
@@ -292,7 +293,7 @@ index 88fc87d3bc..077362c1a2 100644
    Effect.gen(function* () {
      const setupCount = yield* Ref.make(0);
 diff --git a/apps/server/src/orchestration-v2/ThreadLaunchService.ts b/apps/server/src/orchestration-v2/ThreadLaunchService.ts
-index 289df535c1..2bc5808abb 100644
+index 7a45a54a31..decac29581 100644
 --- a/apps/server/src/orchestration-v2/ThreadLaunchService.ts
 +++ b/apps/server/src/orchestration-v2/ThreadLaunchService.ts
 @@ -89,6 +89,8 @@ export interface ThreadLaunchInput {
@@ -304,7 +305,7 @@ index 289df535c1..2bc5808abb 100644
    readonly importedNativeThread?: {
      readonly ref: {
        readonly driver: ProviderDriverKind;
-@@ -915,6 +917,9 @@ const make = Effect.gen(function* () {
+@@ -916,6 +918,9 @@ const make = Effect.gen(function* () {
                  interactionMode: input.interactionMode,
                  branch: initialBranch,
                  worktreePath: initialWorktreePath,
@@ -3190,7 +3191,7 @@ index fda1054064..4c07d5759d 100644
      const { registry, threads, snapshotAtom } = makeHarness();
      const root = v2ThreadShell;
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
-index 2362f157c9..c102110bda 100644
+index acfcdfec23..f7bc392dd2 100644
 --- a/packages/contracts/src/orchestrationV2.ts
 +++ b/packages/contracts/src/orchestrationV2.ts
 @@ -452,6 +452,13 @@ export const OrchestrationV2AppThread = Schema.Struct({
