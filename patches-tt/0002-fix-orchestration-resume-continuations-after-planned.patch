@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jake Leventhal <jakeleventhal@me.com>
 Date: Thu, 15 Oct 2026 13:05:36 +0200
-Subject: [PATCH] fix(orchestration): resume continuations after planned
+Subject: [PATCH 2/9] fix(orchestration): resume continuations after planned
  worktree handoffs
 
 Port of pingdotgg/t3code#15203 (head 3430a29a65cf) until it is merged upstream. Fixes #15136.
@@ -14,7 +14,7 @@ closes ingestion.
  apps/server/src/mcp/WorktreeMcpService.ts     |  46 +-
  .../src/orchestration-v2/EffectOutbox.ts      |   1 +
  .../src/orchestration-v2/EffectWorker.ts      |   1 +
- .../src/orchestration-v2/Orchestrator.ts      |  63 ++-
+ .../src/orchestration-v2/Orchestrator.ts      |  69 ++-
  .../ProviderSessionManager.test.ts            |  12 +-
  .../ProviderSessionManager.ts                 |  82 ++--
  .../RunExecutionService.test.ts               | 408 ++++++++++------
@@ -25,7 +25,7 @@ closes ingestion.
  docs/user/composer.md                         |   4 +
  packages/contracts/src/orchestrationV2.ts     |   4 +
  .../src/server/ProviderAdapter.ts             |  16 +-
- 15 files changed, 1119 insertions(+), 238 deletions(-)
+ 15 files changed, 1122 insertions(+), 241 deletions(-)
 
 diff --git a/apps/server/src/mcp/WorktreeMcpService.test.ts b/apps/server/src/mcp/WorktreeMcpService.test.ts
 index 3be8705cc0..0a715a2f89 100644
@@ -341,7 +341,7 @@ index 92e1e01ad4..3fd9c675aa 100644
    }),
    Schema.Struct({
 diff --git a/apps/server/src/orchestration-v2/EffectWorker.ts b/apps/server/src/orchestration-v2/EffectWorker.ts
-index d174db2fb3..9c5c4e6b3c 100644
+index 534043aeb4..6c71a7b0be 100644
 --- a/apps/server/src/orchestration-v2/EffectWorker.ts
 +++ b/apps/server/src/orchestration-v2/EffectWorker.ts
 @@ -124,6 +124,7 @@ export const layerExecutor: Layer.Layer<
@@ -353,10 +353,10 @@ index d174db2fb3..9c5c4e6b3c 100644
                    ? {}
                    : { revokeMcpCredential: effect.request.revokeMcpCredential }),
 diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
-index 91acb88163..e7f0495268 100644
+index 50f9a2acc0..4490f53064 100644
 --- a/apps/server/src/orchestration-v2/Orchestrator.ts
 +++ b/apps/server/src/orchestration-v2/Orchestrator.ts
-@@ -2917,6 +2917,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -3033,6 +3033,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
          cause: `Thread ${command.threadId} branch changed before the metadata update could be applied.`,
        });
      }
@@ -383,7 +383,7 @@ index 91acb88163..e7f0495268 100644
      if (command.type === "thread.metadata.update" && command.expectedEmpty === true) {
        const records = yield* projectionStore
          .getThreadRecords(command.threadId, ["runs"])
-@@ -3908,6 +3928,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -4041,6 +4061,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                            ? "Runtime mode changed."
                            : "Provider or model selection changed.",
                  // Terminal detaches revoke MCP credentials; reattachments need other detach reasons to preserve them.
@@ -393,7 +393,7 @@ index 91acb88163..e7f0495268 100644
                  ...(command.type === "thread.archive" ? { revokeMcpCredential: true } : {}),
                },
              } satisfies PendingOrchestrationEffectV2;
-@@ -4967,6 +4990,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -5150,6 +5173,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
      command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
      effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
@@ -401,17 +401,23 @@ index 91acb88163..e7f0495268 100644
    ) {
      let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
      if (command.manualContinuationOfRunId !== undefined) {
-@@ -5037,7 +5061,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -5220,10 +5244,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
        const source = projection.runs.find((run) => run.id === command.restartContinuationOfRunId);
        if (
          !source ||
--        !isRestartContinuationSource(source, projection.providerTurns) ||
+-        !(
+-          isRestartContinuationSource(source, projection.providerTurns) ||
+-          continuationFailedBeforePrompt(source, projection.providerTurns)
+-        ) ||
 +        (!(source.id === worktreeContinuationOfRunId && isBlockingRun(source)) &&
-+          !isRestartContinuationSource(source, projection.providerTurns)) ||
++          !(
++            isRestartContinuationSource(source, projection.providerTurns) ||
++            continuationFailedBeforePrompt(source, projection.providerTurns)
++          )) ||
          projection.thread.archivedAt !== null ||
          projection.thread.deletedAt !== null ||
          projection.thread.providerInstanceId !== source.providerInstanceId ||
-@@ -5050,6 +5075,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -5236,6 +5261,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
          ) ||
          (yield* stopReachedRun(command, command.threadId, source.id))
        ) {
@@ -425,7 +431,7 @@ index 91acb88163..e7f0495268 100644
          // Preserve the current row so stale automatic deliveries receive an
          // accepted receipt without changing work or repeatedly retrying.
          yield* emit(
-@@ -12461,7 +12493,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -12732,7 +12764,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
        case "thread.pin.reorder":
        case "thread.active.reorder":
        case "thread.mark-unread":
@@ -433,7 +439,7 @@ index 91acb88163..e7f0495268 100644
        case "thread.pull-request.link":
        case "thread.pull-request.unlink":
        case "thread.pull-request-link.sync":
-@@ -12474,6 +12505,34 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -12745,6 +12776,34 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
        case "provider.switch":
          yield* dispatchThreadMutation(command, events, effects);
          break;
@@ -469,10 +475,10 @@ index 91acb88163..e7f0495268 100644
          yield* dispatchPullRequestWatchSync(command, events, effects);
          break;
 diff --git a/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts b/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
-index 9ae9ddce81..38b889a6e3 100644
+index 5bbb3926e2..1bac1bdbbe 100644
 --- a/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
 +++ b/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
-@@ -1422,8 +1422,8 @@ it.effect("ProviderSessionManagerV2 interrupts event subscriptions on server shu
+@@ -1583,8 +1583,8 @@ it.effect("ProviderSessionManagerV2 interrupts event subscriptions on server shu
          modelSelection,
          runtimePolicy,
        });
@@ -483,7 +489,7 @@ index 9ae9ddce81..38b889a6e3 100644
        const adapterQueue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
        assert.isDefined(adapterQueue);
        yield* Queue.offer(adapterQueue!, {
-@@ -1465,7 +1465,7 @@ it.effect("ProviderSessionManagerV2 drains subscribers when the provider stops",
+@@ -1626,7 +1626,7 @@ it.effect("ProviderSessionManagerV2 drains subscribers when the provider stops",
          modelSelection,
          runtimePolicy,
        });
@@ -492,7 +498,7 @@ index 9ae9ddce81..38b889a6e3 100644
        const collected = yield* subscription.events.pipe(Stream.runCollect, Effect.forkScoped);
        const adapterQueue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
        assert.isDefined(adapterQueue);
-@@ -3198,8 +3198,8 @@ it.effect(
+@@ -3363,8 +3363,8 @@ it.effect(
          const subscribe = firstRuntime.subscribeEvents;
          assert.isDefined(subscribe);
          if (subscribe === undefined) return;
@@ -503,7 +509,7 @@ index 9ae9ddce81..38b889a6e3 100644
          const queue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
          assert.isDefined(queue);
          yield* Queue.offer(queue!, {
-@@ -3309,7 +3309,7 @@ it.effect(
+@@ -3474,7 +3474,7 @@ it.effect(
          const publish = Effect.fnUntraced(function* (
            event: ProviderAdapter.ProviderAdapterV2Event,
          ) {
@@ -513,18 +519,18 @@ index 9ae9ddce81..38b889a6e3 100644
            // Observing the exact event ensures the manager has handled it before resuming.
            assert.deepEqual(yield* subscription.events.pipe(Stream.runHead), Option.some(event));
 diff --git a/apps/server/src/orchestration-v2/ProviderSessionManager.ts b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
-index df2ee630df..eec76fbfc2 100644
+index 03a7278774..c65d2654d4 100644
 --- a/apps/server/src/orchestration-v2/ProviderSessionManager.ts
 +++ b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
-@@ -178,6 +178,7 @@ export interface ProviderSessionManagerV2Shape {
+@@ -187,6 +187,7 @@ export interface ProviderSessionManagerV2Shape {
      readonly providerSessionId: ProviderSessionId;
      readonly threadId: ThreadId;
      readonly detail?: string;
 +    readonly reason?: "workspace_changed";
      readonly revokeMcpCredential?: boolean;
    }) => Effect.Effect<void, ProviderSessionManagerV2Error>;
- }
-@@ -195,9 +196,7 @@ interface LiveSessionEntry {
+   /**
+@@ -223,9 +224,7 @@ interface LiveSessionEntry {
    readonly supportsMultipleProviderThreads: boolean;
    readonly runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime;
    readonly exposedRuntime: ProviderAdapter.ProviderAdapterV2SessionRuntime;
@@ -535,7 +541,7 @@ index df2ee630df..eec76fbfc2 100644
    readonly requestEventPermit: Semaphore.Semaphore;
    readonly scope: Scope.Closeable;
    readonly idleGeneration: number;
-@@ -213,6 +212,11 @@ interface IdleThreadUnload {
+@@ -241,6 +240,11 @@ interface IdleThreadUnload {
    readonly fiber: Fiber.Fiber<void, never> | null;
  }
  
@@ -547,7 +553,7 @@ index df2ee630df..eec76fbfc2 100644
  type ProviderSessionEventSignal =
    | { readonly type: "event"; readonly event: ProviderAdapter.ProviderAdapterV2Event }
    | {
-@@ -490,14 +494,12 @@ export const layerWithOptions = (
+@@ -518,14 +522,12 @@ export const layerWithOptions = (
              );
  
        const publishToSubscribers = (
@@ -564,7 +570,7 @@ index df2ee630df..eec76fbfc2 100644
                discard: true,
              }),
            ),
-@@ -505,17 +507,23 @@ export const layerWithOptions = (
+@@ -533,17 +535,23 @@ export const layerWithOptions = (
  
        const failSubscribers = Effect.fn("ProviderSessionManager.failSubscribers")(function* (
          entry: LiveSessionEntry,
@@ -596,7 +602,7 @@ index df2ee630df..eec76fbfc2 100644
              Queue.offer(queue, {
                type: "failure",
                cause: Cause.fail(error),
-@@ -532,7 +540,7 @@ export const layerWithOptions = (
+@@ -560,7 +568,7 @@ export const layerWithOptions = (
            const subscribers = yield* Ref.getAndSet(entry.eventSubscribers, new Map());
            yield* Effect.forEach(
              subscribers.values(),
@@ -605,7 +611,7 @@ index df2ee630df..eec76fbfc2 100644
              { discard: true },
            );
          },
-@@ -544,7 +552,7 @@ export const layerWithOptions = (
+@@ -572,7 +580,7 @@ export const layerWithOptions = (
          entry: LiveSessionEntry,
        ) {
          const subscribers = yield* Ref.getAndSet(entry.eventSubscribers, new Map());
@@ -614,7 +620,7 @@ index df2ee630df..eec76fbfc2 100644
            discard: true,
          });
        });
-@@ -997,7 +1005,11 @@ export const layerWithOptions = (
+@@ -1036,7 +1044,11 @@ export const layerWithOptions = (
                    } else {
                      yield* failSubscribers(
                        entry,
@@ -627,7 +633,7 @@ index df2ee630df..eec76fbfc2 100644
                      );
                    }
                    const closeExit = yield* closeScopeWithin(entry.scope, {
-@@ -1606,15 +1618,14 @@ export const layerWithOptions = (
+@@ -1653,15 +1665,14 @@ export const layerWithOptions = (
  
        const makeEventSubscription = Effect.fn("ProviderSessionManager.makeEventSubscription")(
          function* (
@@ -646,7 +652,7 @@ index df2ee630df..eec76fbfc2 100644
              return updated;
            });
            const close = Ref.modify(subscribers, (current) => {
-@@ -1645,12 +1656,11 @@ export const layerWithOptions = (
+@@ -1692,12 +1703,11 @@ export const layerWithOptions = (
  
        const decorateRuntime = (
          runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime,
@@ -662,7 +668,7 @@ index df2ee630df..eec76fbfc2 100644
          const turnMetrics = (operation: string, model?: string) =>
            withMetrics({
              counter: providerTurnsTotal,
-@@ -1665,7 +1675,7 @@ export const layerWithOptions = (
+@@ -1712,7 +1722,7 @@ export const layerWithOptions = (
            ...runtime,
            subscribeEvents,
            events: Stream.unwrap(
@@ -671,7 +677,7 @@ index df2ee630df..eec76fbfc2 100644
            ),
            ensureThread: (input) =>
              observeActivity(
-@@ -2140,7 +2150,7 @@ export const layerWithOptions = (
+@@ -2230,7 +2240,7 @@ export const layerWithOptions = (
                    }),
                  );
                const eventSubscribers = yield* Ref.make<
@@ -680,7 +686,7 @@ index df2ee630df..eec76fbfc2 100644
                >(new Map());
                const exposedRuntime = decorateRuntime(runtime, eventSubscribers);
                const entry: LiveSessionEntry = {
-@@ -2274,6 +2284,7 @@ export const layerWithOptions = (
+@@ -2398,6 +2408,7 @@ export const layerWithOptions = (
              const key = sessionKey(input.providerSessionId);
              const currentEntry = (yield* Ref.get(sessions)).get(key);
              let detachedProviderThreads: ReadonlyArray<OrchestrationV2ProviderThread> = [];
@@ -688,7 +694,7 @@ index df2ee630df..eec76fbfc2 100644
              if (currentEntry?.supportsMultipleProviderThreads === true) {
                const projection = yield* Effect.option(
                  projectionStore.getThreadRecords(input.threadId, [
-@@ -2291,7 +2302,7 @@ export const layerWithOptions = (
+@@ -2415,7 +2426,7 @@ export const layerWithOptions = (
                  const activeTurns = projection.value.providerTurns.filter(
                    (turn) => turn.status === "running" && providerThreads.has(turn.providerThreadId),
                  );
@@ -697,7 +703,7 @@ index df2ee630df..eec76fbfc2 100644
                    activeTurns,
                    (turn) =>
                      currentEntry.exposedRuntime
-@@ -2371,6 +2382,19 @@ export const layerWithOptions = (
+@@ -2495,6 +2506,19 @@ export const layerWithOptions = (
              if (Option.isNone(detached)) {
                return;
              }
@@ -1401,7 +1407,7 @@ index 3e3f37a15a..0647d541c2 100644
    };
  }
 diff --git a/apps/server/src/orchestration-v2/SelectionRestart.integration.test.ts b/apps/server/src/orchestration-v2/SelectionRestart.integration.test.ts
-index 03cdf5e85a..0ee6ed6a9a 100644
+index d059c4c20e..a7f4e3e90f 100644
 --- a/apps/server/src/orchestration-v2/SelectionRestart.integration.test.ts
 +++ b/apps/server/src/orchestration-v2/SelectionRestart.integration.test.ts
 @@ -17,6 +17,7 @@ import {
@@ -1509,7 +1515,7 @@ index 03cdf5e85a..0ee6ed6a9a 100644
                yield* publishTerminal(active, "completed");
              }),
            steerTurn: () => Effect.void,
-@@ -774,3 +834,397 @@ it.live.each(["active", "idle", "selection-command", "pooled", "separate-home"]
+@@ -886,3 +946,397 @@ it.live.each(["active", "idle", "selection-command", "pooled", "separate-home"]
        }),
      ),
  );
@@ -1908,10 +1914,10 @@ index 03cdf5e85a..0ee6ed6a9a 100644
 +    ),
 +);
 diff --git a/apps/server/src/orchestration-v2/testkit/ProviderReplayHarness.ts b/apps/server/src/orchestration-v2/testkit/ProviderReplayHarness.ts
-index 4da359f74c..3b2dbb7826 100644
+index afd11a9ab7..0530eacf0a 100644
 --- a/apps/server/src/orchestration-v2/testkit/ProviderReplayHarness.ts
 +++ b/apps/server/src/orchestration-v2/testkit/ProviderReplayHarness.ts
-@@ -267,6 +267,7 @@ export function layerWithRegistry<Error>(
+@@ -268,6 +268,7 @@ export function layerWithRegistry<Error>(
        SqlClient.SqlClient,
        MigrationError | PlatformError.PlatformError | SqlError
      >;
@@ -1919,7 +1925,7 @@ index 4da359f74c..3b2dbb7826 100644
      readonly runEffectWorker?: boolean;
      readonly runContinuationWorker?: boolean;
      readonly recoverOnStartup?: boolean;
-@@ -378,7 +379,7 @@ export function layerWithRegistry<Error>(
+@@ -383,7 +384,7 @@ export function layerWithRegistry<Error>(
    const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
      Layer.provide(
        Layer.mergeAll(
@@ -1959,10 +1965,10 @@ index 714572dfd5..9733f557a9 100644
  the oldest queued message as a steer. This leaves the current draft intact and
  requires an active turn that supports steering. If that shortcut sends the opposite
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
-index 231e73c95e..2362f157c9 100644
+index ef00b918a8..0d73aad5fd 100644
 --- a/packages/contracts/src/orchestrationV2.ts
 +++ b/packages/contracts/src/orchestrationV2.ts
-@@ -2999,6 +2999,10 @@ export const OrchestrationV2Command = Schema.Union([
+@@ -3012,6 +3012,10 @@ export const OrchestrationV2Command = Schema.Union([
      worktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
      expectedWorktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
      expectedBranch: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
@@ -1974,10 +1980,10 @@ index 231e73c95e..2362f157c9 100644
      expectedEmpty: Schema.optional(Schema.Boolean),
      limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecoveryUpdate)),
 diff --git a/packages/provider-core/src/server/ProviderAdapter.ts b/packages/provider-core/src/server/ProviderAdapter.ts
-index 9dc7ec1f62..950c891801 100644
+index 0b5459f647..95cbf5276f 100644
 --- a/packages/provider-core/src/server/ProviderAdapter.ts
 +++ b/packages/provider-core/src/server/ProviderAdapter.ts
-@@ -358,6 +358,15 @@ const ProviderAdapterFailureReason = Schema.Literals([
+@@ -374,6 +374,15 @@ const ProviderAdapterFailureReason = Schema.Literals([
    "attachment_unreadable",
  ]);
  export type ProviderAdapterFailureReason = typeof ProviderAdapterFailureReason.Type;
@@ -1993,15 +1999,15 @@ index 9dc7ec1f62..950c891801 100644
  
  export class ProviderAdapterProtocolError extends Schema.TaggedError<ProviderAdapterProtocolError>()(
    "ProviderAdapterProtocolError",
-@@ -389,6 +398,7 @@ export const ProviderAdapterV2Error = Schema.Union([
-   ProviderAdapterInterruptError,
+@@ -406,6 +415,7 @@ export const ProviderAdapterV2Error = Schema.Union([
+   ProviderAdapterInterruptTimeoutError,
    ProviderAdapterRuntimeRequestResponseError,
    ProviderAdapterEventStreamError,
 +  ProviderAdapterSessionDetached,
    ProviderAdapterProtocolError,
  ]);
  export type ProviderAdapterV2Error = typeof ProviderAdapterV2Error.Type;
-@@ -545,8 +555,10 @@ export interface ProviderAdapterV2SessionRuntime {
+@@ -562,8 +572,10 @@ export interface ProviderAdapterV2SessionRuntime {
    readonly providerSessionId: ProviderSessionId;
    readonly providerSession: OrchestrationV2ProviderSession;
    readonly events: Stream.Stream<ProviderAdapterV2Event, ProviderAdapterV2Error>;
