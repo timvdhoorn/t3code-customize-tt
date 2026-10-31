@@ -5,21 +5,22 @@ Subject: [PATCH 8/9] feat(server): keep idle compactions silent
 
 Upstream's idle compaction (#21682) sends /compact as a visible turn, which can push an alert or Live Activity and mark a read thread unread. The relay and direct push now skip a thread whose latest run is an idle compaction (settling and archiving still publish), and a finished compaction moves the read mark only when the thread was already read.
 ---
- .../src/orchestration-v2/IdleCompaction.ts    | 60 +++++++++++++-
+ .../src/orchestration-v2/IdleCompaction.ts    | 61 +++++++++++++-
  .../IdleCompactionReadState.test.ts           | 79 +++++++++++++++++++
  .../orchestration-v2/IdleCompactionService.ts | 35 +++++++-
  .../src/relay/AgentAwarenessRelay.test.ts     | 48 ++++++++++-
  apps/server/src/relay/AgentAwarenessRelay.ts  | 17 ++++
- 5 files changed, 233 insertions(+), 6 deletions(-)
+ 5 files changed, 234 insertions(+), 6 deletions(-)
  create mode 100644 apps/server/src/orchestration-v2/IdleCompactionReadState.test.ts
 
 diff --git a/apps/server/src/orchestration-v2/IdleCompaction.ts b/apps/server/src/orchestration-v2/IdleCompaction.ts
-index b142dd4efb..1a0842d5cb 100644
+index a89894045c..68c22b2c46 100644
 --- a/apps/server/src/orchestration-v2/IdleCompaction.ts
 +++ b/apps/server/src/orchestration-v2/IdleCompaction.ts
-@@ -1,4 +1,10 @@
--import type { OrchestrationV2ThreadProjection } from "@t3tools/contracts";
+@@ -1,4 +1,11 @@
+-import { isListedThreadLineage, type OrchestrationV2ThreadProjection } from "@t3tools/contracts";
 +import {
++  isListedThreadLineage,
 +  MessageId,
 +  type OrchestrationV2Run,
 +  type OrchestrationV2ThreadProjection,
@@ -29,7 +30,7 @@ index b142dd4efb..1a0842d5cb 100644
  import { COMPACTION_SUGGESTION_MIN_TOKENS } from "@t3tools/shared/claudeCompaction";
  import { derivePendingBackgroundWork } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
  import * as DateTime from "effect/DateTime";
-@@ -101,3 +107,55 @@ export function idleCompactionWindow(
+@@ -101,3 +108,55 @@ export function idleCompactionWindow(
    if (!Number.isFinite(endMs) || nowMs >= endMs) return null;
    return { runId: latestRun.id, startMs: endMs - LEAD_MS, endMs };
  }
@@ -171,7 +172,7 @@ index 0000000000..3ad294ad35
 +  });
 +});
 diff --git a/apps/server/src/orchestration-v2/IdleCompactionService.ts b/apps/server/src/orchestration-v2/IdleCompactionService.ts
-index 2b16cb8c1d..34a14511a9 100644
+index 415bb14fa1..1c0f4ff0fa 100644
 --- a/apps/server/src/orchestration-v2/IdleCompactionService.ts
 +++ b/apps/server/src/orchestration-v2/IdleCompactionService.ts
 @@ -1,7 +1,6 @@
@@ -196,7 +197,7 @@ index 2b16cb8c1d..34a14511a9 100644
  import * as Orchestrator from "./Orchestrator.ts";
  import * as ProjectionStore from "./ProjectionStore.ts";
  
-@@ -69,7 +73,7 @@ export const make = Effect.gen(function* () {
+@@ -83,7 +87,7 @@ export const make = Effect.gen(function* () {
            type: "message.dispatch",
            // One compaction per completed run, even across duplicate events.
            commandId: CommandId.make(`server:idle-compact:${threadId}:${runId}`),
@@ -205,7 +206,7 @@ index 2b16cb8c1d..34a14511a9 100644
            threadId,
            text: IDLE_COMPACTION_TEXT,
            attachments: [],
-@@ -87,13 +91,36 @@ export const make = Effect.gen(function* () {
+@@ -101,13 +105,36 @@ export const make = Effect.gen(function* () {
        ),
    );
  
@@ -244,7 +245,7 @@ index 2b16cb8c1d..34a14511a9 100644
        ),
      );
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.test.ts b/apps/server/src/relay/AgentAwarenessRelay.test.ts
-index ef97741466..b48a4bc2dd 100644
+index d1ddfbd9b6..82fb5ab3f3 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.test.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.test.ts
 @@ -6,6 +6,7 @@ import {
@@ -324,10 +325,10 @@ index ef97741466..b48a4bc2dd 100644
      Effect.gen(function* () {
        const direct: Array<boolean | undefined> = [];
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.ts b/apps/server/src/relay/AgentAwarenessRelay.ts
-index cadf707b20..d59ac29814 100644
+index 7fb1c7df34..39f7c5ecef 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.ts
-@@ -48,6 +48,7 @@ import {
+@@ -49,6 +49,7 @@ import {
  import { getOrCreateEnvironmentKeyPairFromSecretStore } from "../cloud/environmentKeys.ts";
  import * as DirectPush from "../directPush/DirectPush.ts";
  import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -356,5 +357,5 @@ index cadf707b20..d59ac29814 100644
 +      if (runs.some((run) => run.id === shellRunId && isIdleCompactionRun(run))) return;
 +    }
      if (
-       threadShell?.lineage.relationshipToParent === "subagent" &&
-       !(yield* Ref.get(publishedStateByThreadRef)).has(threadId)
+       threadShell !== null &&
+       !isListedThreadLineage(threadShell.lineage) &&
