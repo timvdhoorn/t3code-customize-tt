@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: timvdhoorn <t.vdhoorn@labelsenmeer.nl>
+Date: Sat, 31 Oct 2026 14:32:47 +0000
+Subject: [PATCH] fix(server): drop a usage window the account no longer
+ reports
+
+A Claude rate-limit event with unifiedWindows lists every rolling window the account has. When the 5h window disappears from it (a plan without a 5h limit), the merged snapshot kept the last 5h reading forever, so the composer stats showed a 5h meter that no longer exists. Such an update now names the ids it covers in full (replaces), and a covered id it omits drops out unless a newer reading still has it.
+---
+ .../src/provider/claudeUsageLimits.test.ts    | 30 +++++++++
+ apps/server/src/provider/claudeUsageLimits.ts |  4 ++
+ packages/contracts/src/providerUsageLimits.ts |  6 +-
+ .../src/server/usageLimits.test.ts            | 61 +++++++++++++++++++
+ .../provider-core/src/server/usageLimits.ts   | 21 ++++++-
+ 5 files changed, 120 insertions(+), 2 deletions(-)
+
+diff --git a/apps/server/src/provider/claudeUsageLimits.test.ts b/apps/server/src/provider/claudeUsageLimits.test.ts
+index 615d80a29e..b6e0226f50 100644
+--- a/apps/server/src/provider/claudeUsageLimits.test.ts
++++ b/apps/server/src/provider/claudeUsageLimits.test.ts
+@@ -325,8 +325,38 @@ describe("claudeRateLimitEventToUpdate", () => {
+           resetsAt: "2026-07-19T22:26:40.000Z",
+         },
+       ],
++      replaces: ["five_hour", "seven_day"],
+     });
+   });
++
++  it("replaces the rolling windows when unifiedWindows no longer lists the 5h window", () => {
++    const update = claudeRateLimitEventToUpdate(
++      {
++        status: "allowed",
++        rateLimitType: "seven_day",
++        resetsAt: 1_784_600_000,
++        unifiedWindows: { seven_day: { utilization: 0.79, resetsAt: 1_784_600_000 } },
++      } as never,
++      noNames,
++    );
++
++    expect(update?.windows.map((window) => window.id)).toEqual(["seven_day"]);
++    expect(update?.replaces).toEqual(["five_hour", "seven_day"]);
++  });
++
++  it("keeps a legacy single-window event partial", () => {
++    const update = claudeRateLimitEventToUpdate(
++      {
++        status: "allowed",
++        rateLimitType: "seven_day",
++        utilization: 0.5,
++        resetsAt: 1_784_600_000,
++      } as never,
++      noNames,
++    );
++
++    expect(update?.replaces).toBeUndefined();
++  });
+ });
+ 
+ describe("claudeOAuthUsageToLimits", () => {
+diff --git a/apps/server/src/provider/claudeUsageLimits.ts b/apps/server/src/provider/claudeUsageLimits.ts
+index 247dade1d5..b8b12cc829 100644
+--- a/apps/server/src/provider/claudeUsageLimits.ts
++++ b/apps/server/src/provider/claudeUsageLimits.ts
+@@ -211,6 +211,10 @@ export function claudeRateLimitEventToUpdate(
+       scopedWindow(names.overageIncluded, overage.usedPercent, overage.resetsAt, "turn"),
+     );
+   }
++  // unifiedWindows lists every rolling window the account has, so one it omits is gone.
++  if (Object.keys(unifiedWindows).length > 0) {
++    return { windows, replaces: Object.keys(WINDOWS) };
++  }
+   return windows.length > 0 ? { windows } : undefined;
+ }
+ 
+diff --git a/packages/contracts/src/providerUsageLimits.ts b/packages/contracts/src/providerUsageLimits.ts
+index b73e208c94..4502a08c8b 100644
+--- a/packages/contracts/src/providerUsageLimits.ts
++++ b/packages/contracts/src/providerUsageLimits.ts
+@@ -59,9 +59,13 @@ export const ServerProviderUsageLimits = Schema.Struct({
+ });
+ export type ServerProviderUsageLimits = typeof ServerProviderUsageLimits.Type;
+ 
+-/** Partial updates merge windows by id; omitted windows remain unchanged. */
++/**
++ * Partial updates merge windows by id; omitted windows remain unchanged, except
++ * ids in `replaces`: the reading covers those in full, so one it omits is gone.
++ */
+ export const ProviderUsageLimitsUpdate = Schema.Struct({
+   windows: Schema.Array(ServerProviderUsageWindow),
++  replaces: Schema.optional(Schema.Array(Schema.String)),
+ });
+ export type ProviderUsageLimitsUpdate = typeof ProviderUsageLimitsUpdate.Type;
+ 
+diff --git a/packages/provider-core/src/server/usageLimits.test.ts b/packages/provider-core/src/server/usageLimits.test.ts
+index 1543a82c9d..ed0cb0a229 100644
+--- a/packages/provider-core/src/server/usageLimits.test.ts
++++ b/packages/provider-core/src/server/usageLimits.test.ts
+@@ -84,6 +84,67 @@ describe("applyUsageLimitsUpdate", () => {
+   });
+ });
+ 
++describe("replaced windows", () => {
++  const later = "2026-09-03T12:05:00.000Z";
++
++  it("drops a replaced window the newer reading no longer reports", () => {
++    const next = applyUsageLimitsUpdate({
++      previous: published,
++      checkedAt: later,
++      update: {
++        windows: [{ ...weekly, checkedAt: later, usedPercent: 79 }],
++        replaces: ["five_hour", "seven_day"],
++      },
++    });
++    expect(next?.windows.map((window) => [window.id, window.usedPercent])).toEqual([
++      ["seven_day", 79],
++    ]);
++  });
++
++  it("drops it even when the reading reports no window at all", () => {
++    const next = applyUsageLimitsUpdate({
++      previous: published,
++      checkedAt: later,
++      update: { windows: [], replaces: ["five_hour"] },
++    });
++    expect(next?.windows.map((window) => window.id)).toEqual(["seven_day"]);
++  });
++
++  it("keeps a window outside replaces and one read after the update", () => {
++    const scoped = {
++      id: "seven_day_opus",
++      kind: "weekly",
++      label: "Weekly · Opus",
++      checkedAt,
++      usedPercent: 5,
++    } as const;
++    const next = applyUsageLimitsUpdate({
++      previous: {
++        checkedAt: later,
++        windows: [{ ...session, checkedAt: "2026-09-03T12:10:00.000Z" }, weekly, scoped],
++      },
++      checkedAt: later,
++      update: { windows: [{ ...weekly, checkedAt: later }], replaces: ["five_hour", "seven_day"] },
++    });
++    expect(next?.windows.map((window) => window.id).sort()).toEqual([
++      "five_hour",
++      "seven_day",
++      "seven_day_opus",
++    ]);
++  });
++
++  it("leaves the snapshot alone when nothing replaced is present", () => {
++    const only = { checkedAt, windows: [weekly] };
++    expect(
++      applyUsageLimitsUpdate({
++        previous: only,
++        checkedAt: later,
++        update: { windows: [], replaces: ["five_hour"] },
++      }),
++    ).toBe(only);
++  });
++});
++
+ describe("resolveUsageLimitsAfterProbe", () => {
+   it("uses read order for windows while taking metadata from the successful probe", () => {
+     const live = {
+diff --git a/packages/provider-core/src/server/usageLimits.ts b/packages/provider-core/src/server/usageLimits.ts
+index dce5f77c59..d6e59211fa 100644
+--- a/packages/provider-core/src/server/usageLimits.ts
++++ b/packages/provider-core/src/server/usageLimits.ts
+@@ -145,10 +145,29 @@ export function applyUsageLimitsUpdate(input: {
+     previous === undefined || mergeNowMs === undefined
+       ? previous
+       : normalizeUsageLimitsAt(previous, mergeNowMs);
+-  if (update.windows.length === 0) return normalizedPrevious;
++  if (update.windows.length === 0 && (update.replaces ?? []).length === 0) {
++    return normalizedPrevious;
++  }
+   const merged = new Map(normalizedPrevious?.windows.map((window) => [window.id, window] as const));
+   // Keep the newest fetch time even for unchanged values so delayed events cannot look newer.
+   let changed = normalizedPrevious !== previous;
++  // A window the account no longer has (a plan without a 5h limit) drops out
++  // unless a reading newer than this one still reports it.
++  for (const id of update.replaces ?? []) {
++    if (update.windows.some((window) => window.id === id)) continue;
++    const existing = merged.get(id);
++    if (existing === undefined) continue;
++    const existingCheckedAtMs = parseTimeMs(existing.checkedAt);
++    if (
++      updateCheckedAtMs !== undefined &&
++      existingCheckedAtMs !== undefined &&
++      existingCheckedAtMs > updateCheckedAtMs
++    ) {
++      continue;
++    }
++    merged.delete(id);
++    changed = true;
++  }
+   for (const window of update.windows) {
+     const existing = merged.get(window.id);
+     const checkedAt = window.checkedAt ?? input.checkedAt;
