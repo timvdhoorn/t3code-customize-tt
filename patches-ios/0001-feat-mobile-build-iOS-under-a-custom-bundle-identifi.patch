@@ -6,30 +6,63 @@ Subject: [PATCH 1/8] feat(mobile): build iOS under a custom bundle identifier
 
 T3CODE_IOS_BUNDLE_ID, T3CODE_IOS_TEAM_ID and T3CODE_IOS_APP_NAME sign a full-capability build (widgets, share extension, app group, push entitlement) with your own paid Apple team. Features bound to the T3 Tools identity are switched off: OTA updates from the T3 Expo project, Clerk associated domains and native Sign in with Apple.
 ---
- apps/mobile/app.config.test.ts | 67 ++++++++++++++++++++++++++++++++++
- apps/mobile/app.config.ts      | 55 +++++++++++++++++++++++-----
- 2 files changed, 112 insertions(+), 10 deletions(-)
- create mode 100644 apps/mobile/app.config.test.ts
+ apps/mobile/app.config.test.ts | 74 +++++++++++++++++++++++++++++++---
+ apps/mobile/app.config.ts      | 55 ++++++++++++++++++++-----
+ 2 files changed, 113 insertions(+), 16 deletions(-)
 
 diff --git a/apps/mobile/app.config.test.ts b/apps/mobile/app.config.test.ts
-new file mode 100644
-index 0000000000..12d618cf03
---- /dev/null
+index b8111f4558..01b831219b 100644
+--- a/apps/mobile/app.config.test.ts
 +++ b/apps/mobile/app.config.test.ts
-@@ -0,0 +1,67 @@
+@@ -1,22 +1,34 @@
+-import { afterEach, expect, it, vi } from "vite-plus/test";
 +import type { ExpoConfig } from "expo/config";
 +import { afterEach, describe, expect, it, vi } from "vite-plus/test";
-+
-+async function loadConfig(env: Record<string, string>): Promise<ExpoConfig> {
-+  vi.resetModules();
+ 
+ // Keep config parsing independent of local env files and build credentials.
+ vi.mock("../../scripts/lib/public-config.ts", () => ({
+-  loadRepoEnv: () => ({ APP_VARIANT: process.env.APP_VARIANT }),
++  // app.config.ts copies this into process.env, so unset keys must stay absent.
++  loadRepoEnv: () =>
++    Object.fromEntries(
++      ["APP_VARIANT", "T3CODE_IOS_BUNDLE_ID", "T3CODE_IOS_TEAM_ID", "T3CODE_IOS_APP_NAME"].flatMap(
++        (key) => (process.env[key] === undefined ? [] : [[key, process.env[key]]]),
++      ),
++    ),
+ }));
+ 
+ afterEach(() => {
+   vi.unstubAllEnvs();
+ });
+ 
+-async function loadConfig(variant: string | undefined) {
++async function loadConfig(env: Record<string, string | undefined>): Promise<ExpoConfig> {
+   vi.resetModules();
+-  vi.stubEnv("APP_VARIANT", variant);
 +  for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
-+  return (await import("./app.config.ts")).default;
-+}
-+
+   return (await import("./app.config.ts")).default;
+ }
+ 
 +function pluginOptions(config: ExpoConfig, name: string): Record<string, unknown> | undefined {
 +  const entry = config.plugins?.find((plugin) => Array.isArray(plugin) && plugin[0] === name);
 +  return Array.isArray(entry) ? (entry[1] as Record<string, unknown>) : undefined;
 +}
++
+ it.each(["prod", ""])("rejects APP_VARIANT=%j before selecting production IDs", async (value) => {
+-  await expect(loadConfig(value)).rejects.toThrow(
++  await expect(loadConfig({ APP_VARIANT: value })).rejects.toThrow(
+     "APP_VARIANT must be development, preview, or production.",
+   );
+ });
+@@ -27,7 +39,57 @@ it.each([
+   ["preview", "com.t3tools.t3code.preview"],
+   ["production", "com.t3tools.t3code"],
+ ])("keeps the iOS and Android identifiers for APP_VARIANT=%j", async (value, identifier) => {
+-  const config = await loadConfig(value);
++  const config = await loadConfig({ APP_VARIANT: value });
+   expect(config.ios?.bundleIdentifier).toBe(identifier);
+   expect(config.android?.package).toBe(identifier);
+ });
 +
 +const customIdentity = {
 +  APP_VARIANT: "production",
@@ -39,10 +72,6 @@ index 0000000000..12d618cf03
 +};
 +
 +describe("app config iOS identity", () => {
-+  afterEach(() => {
-+    vi.unstubAllEnvs();
-+  });
-+
 +  it("keeps the T3 Tools identity by default", async () => {
 +    const config = await loadConfig({ APP_VARIANT: "production", T3CODE_IOS_BUNDLE_ID: "" });
 +
@@ -85,7 +114,7 @@ index 0000000000..12d618cf03
 +  });
 +});
 diff --git a/apps/mobile/app.config.ts b/apps/mobile/app.config.ts
-index ea885f8199..16f9695b5f 100644
+index e6d388b9a9..bb7112dfc7 100644
 --- a/apps/mobile/app.config.ts
 +++ b/apps/mobile/app.config.ts
 @@ -16,6 +16,15 @@ const runtimeVersionPolicy =
@@ -127,7 +156,7 @@ index ea885f8199..16f9695b5f 100644
  const DEVELOPMENT_ASSETS = {
    appIcon: fromRepoRoot(BRAND_ASSET_PATHS.developmentIosIconPng),
    iosIcon: fromRepoRoot(BRAND_ASSET_PATHS.developmentIconComposerProject),
-@@ -116,7 +141,9 @@ function resolveAppVariant(value: string | undefined): AppVariant {
+@@ -118,7 +143,9 @@ function resolveAppVariant(value: string | undefined): AppVariant {
  const variant = VARIANT_CONFIG[APP_VARIANT];
  const iosBundleIdentifier = isIosPersonalTeamBuild
    ? personalTeamBundleIdentifier!
@@ -138,7 +167,7 @@ index ea885f8199..16f9695b5f 100644
  
  const dmSansFonts = {
    regular: "@expo-google-fonts/dm-sans/400Regular/DMSans_400Regular.ttf",
-@@ -222,7 +249,7 @@ const sharingPlugin: NonNullable<ExpoConfig["plugins"]>[number] = [
+@@ -224,7 +251,7 @@ const sharingPlugin: NonNullable<ExpoConfig["plugins"]>[number] = [
  // Match iOS PostScript names on Android so RN and the native composer share fonts before runtime loading.
  
  const config: ExpoConfig = {
@@ -147,7 +176,7 @@ index ea885f8199..16f9695b5f 100644
    slug: "t3-code",
    platforms: ["ios", "android"],
    scheme: variant.scheme,
-@@ -235,7 +262,7 @@ const config: ExpoConfig = {
+@@ -237,7 +264,7 @@ const config: ExpoConfig = {
    icon: variant.assets.appIcon,
    userInterfaceStyle: "automatic",
    updates: {
@@ -156,7 +185,7 @@ index ea885f8199..16f9695b5f 100644
      url: "https://u.expo.dev/d763fcb8-d37c-41ea-a773-b54a0ab4a454",
      checkAutomatically: "ON_LOAD",
      fallbackToCacheTimeout: 0,
-@@ -246,13 +273,15 @@ const config: ExpoConfig = {
+@@ -248,13 +275,15 @@ const config: ExpoConfig = {
      requireFullScreen: process.env.T3_SHOWCASE_CAPTURE_BUILD === "1",
      bundleIdentifier: iosBundleIdentifier,
      // Avoid Personal Team fallback: it cannot sign App Groups, Apple sign-in or push entitlements.
@@ -178,7 +207,7 @@ index ea885f8199..16f9695b5f 100644
      },
      infoPlist: {
        UISupportedInterfaceOrientations: [
-@@ -345,7 +374,13 @@ const config: ExpoConfig = {
+@@ -347,7 +376,13 @@ const config: ExpoConfig = {
        },
      ],
      // Gate Clerk here: withoutIosPersonalTeamCapabilities runs too early to strip its entitlement.
