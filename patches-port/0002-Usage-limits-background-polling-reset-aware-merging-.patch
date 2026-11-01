@@ -78,7 +78,7 @@ index ed9e3d0cde..72cb87ef0e 100644
  
    return buildServerProvider({
 diff --git a/apps/server/src/provider/Drivers/ClaudeDriver.ts b/apps/server/src/provider/Drivers/ClaudeDriver.ts
-index e1fbcd3008..35e337becb 100644
+index e1fbcd3008..d2dbd93847 100644
 --- a/apps/server/src/provider/Drivers/ClaudeDriver.ts
 +++ b/apps/server/src/provider/Drivers/ClaudeDriver.ts
 @@ -170,6 +170,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
@@ -110,13 +110,13 @@ index e1fbcd3008..35e337becb 100644
          ),
        checkProvider,
        invalidateUsageCache: Cache.invalidateAll(capabilitiesProbeCache),
-+      checkUsageLimits: (snapshot) =>
++      pollUsageLimits: (snapshot) =>
 +        snapshot.version ? readUsageLimits(snapshot.version) : Effect.undefined,
        enrichSnapshot: ({ settings, snapshot, publishSnapshot }) =>
          resolveMaintenance().pipe(
            Effect.flatMap((maintenanceCapabilities) =>
 diff --git a/apps/server/src/provider/Drivers/CodexDriver.ts b/apps/server/src/provider/Drivers/CodexDriver.ts
-index 97ec4954ed..b6ffe4349d 100644
+index 97ec4954ed..66d1d43889 100644
 --- a/apps/server/src/provider/Drivers/CodexDriver.ts
 +++ b/apps/server/src/provider/Drivers/CodexDriver.ts
 @@ -1,4 +1,8 @@
@@ -156,7 +156,7 @@ index 97ec4954ed..b6ffe4349d 100644
            (draft, catalog) => stampIdentity(applyCodexModelCatalog(draft, catalog)),
          ),
        checkProvider,
-+      checkUsageLimits: Effect.fn("CodexDriver.checkUsageLimits")(function* () {
++      pollUsageLimits: Effect.fn("CodexDriver.pollUsageLimits")(function* () {
 +        for (const reader of usageLimitsReaders) {
 +          const limits = yield* reader;
 +          if (limits) return limits;
@@ -184,7 +184,7 @@ index 5e1bc9e962..380cbcecc1 100644
              ),
            );
 diff --git a/apps/server/src/provider/claudeResetCredits.test.ts b/apps/server/src/provider/claudeResetCredits.test.ts
-index 8db7516574..9e7c23702f 100644
+index 8db7516574..2047596d7e 100644
 --- a/apps/server/src/provider/claudeResetCredits.test.ts
 +++ b/apps/server/src/provider/claudeResetCredits.test.ts
 @@ -1,14 +1,34 @@
@@ -304,7 +304,7 @@ index 8db7516574..9e7c23702f 100644
 +          Effect.andThen(Deferred.succeed(startupDone, undefined)),
 +          Effect.as(snapshot),
 +        ),
-+        checkUsageLimits: () =>
++        pollUsageLimits: () =>
 +          Effect.gen(function* () {
 +            loopCalls++;
 +            const limits = yield* reader("2.1.0");
@@ -1542,17 +1542,17 @@ index d4f9c62111..ac65395da2 100644
    return windows.reduce<string | null>(
      (latest, window) =>
 diff --git a/apps/server/src/usage/cliproxyApi.ts b/apps/server/src/usage/cliproxyApi.ts
-index 91504d8002..65d5eca625 100644
+index eb956a67a3..29bdfe118c 100644
 --- a/apps/server/src/usage/cliproxyApi.ts
 +++ b/apps/server/src/usage/cliproxyApi.ts
-@@ -284,6 +284,7 @@ export const makeCliproxyApi = Effect.gen(function* () {
+@@ -302,6 +302,7 @@ export const makeCliproxyApi = Effect.gen(function* () {
            plan: "Claude Subscription",
            usageLimits: claudeUsageResponseToLimits({
              checkedAt,
 +            source: "account",
              response: {
                rate_limits_available: true,
-               rate_limits: {
+               rate_limits: rateLimits,
 diff --git a/packages/contracts/src/providerUsageLimits.ts b/packages/contracts/src/providerUsageLimits.ts
 index 5c4927d4a1..b73e208c94 100644
 --- a/packages/contracts/src/providerUsageLimits.ts
@@ -1577,7 +1577,7 @@ index 5c4927d4a1..b73e208c94 100644
  });
  export type ServerProviderUsageWindow = typeof ServerProviderUsageWindow.Type;
 diff --git a/packages/provider-core/src/server/managedProvider.test.ts b/packages/provider-core/src/server/managedProvider.test.ts
-index 9df85130d6..8aead26c8f 100644
+index 9df85130d6..153c15e41d 100644
 --- a/packages/provider-core/src/server/managedProvider.test.ts
 +++ b/packages/provider-core/src/server/managedProvider.test.ts
 @@ -125,6 +125,7 @@ function layerProviderHost(input: {
@@ -1686,7 +1686,7 @@ index 9df85130d6..8aead26c8f 100644
 +            checkProvider: Deferred.succeed(initialDone, undefined).pipe(
 +              Effect.as(refreshedSnapshot),
 +            ),
-+            checkUsageLimits: () =>
++            pollUsageLimits: () =>
 +              Ref.update(calls, (count) => count + 1).pipe(Effect.as(undefined)),
 +            refreshInterval: "1 hour",
 +          });
@@ -1720,7 +1720,7 @@ index 9df85130d6..8aead26c8f 100644
 +              checkProvider: Deferred.succeed(started, undefined).pipe(
 +                Effect.as(refreshedSnapshot),
 +              ),
-+              checkUsageLimits: () =>
++              pollUsageLimits: () =>
 +                Effect.gen(function* () {
 +                  const count = yield* Ref.updateAndGet(calls, (count) => count + 1);
 +                  if (count === 1) return yield* Effect.die("one failed limits read");
@@ -1765,7 +1765,7 @@ index 9df85130d6..8aead26c8f 100644
 +          checkProvider: Deferred.succeed(initialDone, undefined).pipe(
 +            Effect.as(refreshedSnapshot),
 +          ),
-+          checkUsageLimits: () =>
++          pollUsageLimits: () =>
 +            Effect.gen(function* () {
 +              yield* Ref.update(calls, (count) => count + 1);
 +              yield* Deferred.succeed(entered, undefined);
@@ -1794,7 +1794,7 @@ index 9df85130d6..8aead26c8f 100644
 +          ...common,
 +          initialSnapshot: () => Effect.succeed({ ...initialSnapshot, enabled: false }),
 +          checkProvider: Effect.succeed({ ...refreshedSnapshot, enabled: false }),
-+          checkUsageLimits: () => Effect.die("disabled instance must not refresh"),
++          pollUsageLimits: () => Effect.die("disabled instance must not refresh"),
 +        });
 +        yield* TestClock.adjust("1 minute");
 +      }),
@@ -1852,7 +1852,7 @@ index 9df85130d6..8aead26c8f 100644
 +  ).pipe(Effect.provide(layerAlwaysRunTest)),
 +);
 diff --git a/packages/provider-core/src/server/managedProvider.ts b/packages/provider-core/src/server/managedProvider.ts
-index f83ba2408e..3125f4ab03 100644
+index 9471be743f..039b32b532 100644
 --- a/packages/provider-core/src/server/managedProvider.ts
 +++ b/packages/provider-core/src/server/managedProvider.ts
 @@ -4,7 +4,9 @@ import {
@@ -1884,17 +1884,17 @@ index f83ba2408e..3125f4ab03 100644
  }
  
  function withUsageLimits(
-@@ -45,6 +52,9 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
-   readonly initialSnapshot: (settings: Settings) => Effect.Effect<ServerProvider>;
+@@ -46,6 +53,9 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
    readonly checkProvider: Effect.Effect<ServerProvider, ServerSettingsError>;
+   readonly checkUsageLimits?: Effect.Effect<ServerProvider["usageLimits"]>;
    readonly invalidateUsageCache?: Effect.Effect<void>;
-+  readonly checkUsageLimits?: (
++  readonly pollUsageLimits?: (
 +    snapshot: ServerProvider,
 +  ) => Effect.Effect<ServerProvider["usageLimits"]>;
    readonly enrichSnapshot?: (input: {
      readonly settings: Settings;
      readonly snapshot: ServerProvider;
-@@ -201,11 +211,33 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
+@@ -202,11 +212,33 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
            update,
            checkedAt: update.checkedAt,
          });
@@ -1929,12 +1929,12 @@ index f83ba2408e..3125f4ab03 100644
        });
        if (snapshotToPublish !== null) {
          yield* PubSub.publish(changesPubSub, snapshotToPublish);
-@@ -269,6 +301,41 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
+@@ -301,6 +333,41 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
      return genericDemand || instanceDemand;
    });
  
-+  if (input.checkUsageLimits) {
-+    const checkUsageLimits = input.checkUsageLimits;
++  if (input.pollUsageLimits) {
++    const pollUsageLimits = input.pollUsageLimits;
 +    yield* Effect.forever(
 +      Effect.gen(function* () {
 +        const startedAt = yield* Clock.currentTimeMillis;
@@ -1943,7 +1943,7 @@ index f83ba2408e..3125f4ab03 100644
 +        yield* Effect.gen(function* () {
 +          const current = (yield* Ref.get(snapshotStateRef)).snapshot;
 +          if (current.enabled) {
-+            const limits = yield* checkUsageLimits(current);
++            const limits = yield* pollUsageLimits(current);
 +            if (limits) {
 +              const next = yield* Ref.modify(snapshotStateRef, (state) => {
 +                const usageLimits = resolveUsageLimitsAfterProbe({
