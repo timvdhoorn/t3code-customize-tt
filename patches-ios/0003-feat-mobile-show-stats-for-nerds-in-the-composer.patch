@@ -19,7 +19,6 @@ Subject: [PATCH 3/8] feat(mobile): show stats for nerds in the composer
  apps/mobile/src/state/use-composer-stats.ts   |  66 ++
  .../src/state/use-thread-composer-state.ts    |  40 ++
  apps/web/src/components/ChatView.tsx          |  59 +-
- apps/web/src/components/chat/ChatComposer.tsx |   2 +-
  .../components/chat/ComposerStats.logic.ts    | 307 +-------
  .../web/src/components/chat/ComposerStats.tsx |  58 +-
  .../components/chat/ContextWindowMeter.tsx    |   5 +-
@@ -29,7 +28,7 @@ Subject: [PATCH 3/8] feat(mobile): show stats for nerds in the composer
  .../client-runtime/src/state/composerStats.ts | 433 ++++++++++++
  .../src/state/contextWindow.test.ts           | 158 +++++
  .../client-runtime/src/state/contextWindow.ts | 194 +++++
- 25 files changed, 2724 insertions(+), 596 deletions(-)
+ 24 files changed, 2723 insertions(+), 595 deletions(-)
  create mode 100644 apps/mobile/src/features/threads/ComposerStats.tsx
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.test.ts
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.ts
@@ -764,10 +763,10 @@ index 52ef705e93..6a47855b95 100644
  
        <VideoPreviewModal source={previewVideo} onRequestClose={closePreview} />
 diff --git a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
-index a71920c199..f1a43ef03f 100644
+index 0cc08fdb3f..018df049b3 100644
 --- a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
 +++ b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
-@@ -191,6 +191,9 @@ import {
+@@ -196,6 +196,9 @@ import {
    ThreadComposer,
  } from "./ThreadComposer";
  import { ComposerPopoverHost } from "./ComposerPopoverHost";
@@ -777,7 +776,7 @@ index a71920c199..f1a43ef03f 100644
  import { ThreadFeed, type ThreadFeedHandle, type ThreadFeedHistoryControls } from "./ThreadFeed";
  import { useThreadTurnSubagents } from "./ThreadAgentsSheet";
  import { ComposerQueuedEditBanner } from "./ComposerQueuedEdit";
-@@ -288,6 +291,8 @@ export interface ThreadDetailScreenProps {
+@@ -293,6 +296,8 @@ export interface ThreadDetailScreenProps {
        hasAttachmentsOrContext: boolean,
      ) => Promise<boolean | "responded">,
    ) => Promise<MessageId | null>;
@@ -786,7 +785,7 @@ index a71920c199..f1a43ef03f 100644
    readonly onReconnectEnvironment: () => void;
    readonly canSwitchThreadProvider: boolean;
    readonly onUpdateThreadInteractionMode?: (interactionMode: ProviderInteractionMode) => void;
-@@ -859,10 +864,16 @@ function ThreadDetailBody(props: ThreadDetailScreenProps) {
+@@ -897,10 +902,16 @@ function ThreadDetailBody(
      ) ||
      (props.historyControls?.hasMoreHistory === true &&
        props.selectedThread.latestUserMessageAt !== null);
@@ -803,7 +802,7 @@ index a71920c199..f1a43ef03f 100644
        composerBottomInset;
    // The last collapse toggle; it only applies to the request it was made on.
    const [userInputToggle, setUserInputToggle] = useState<{
-@@ -1703,6 +1714,32 @@ function ThreadDetailBody(props: ThreadDetailScreenProps) {
+@@ -1755,6 +1766,32 @@ function ThreadDetailBody(
                          hasCompactableConversation={
                            hasCompactableConversation && !props.isCompacting
                          }
@@ -1470,7 +1469,7 @@ index 288d37d9f1..7b95614225 100644
    };
  }
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index e747718875..94a455f0a4 100644
+index db9cadd591..6f32e40eab 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
 @@ -314,7 +314,7 @@ import { useRightPanelSurfaceClose } from "../hooks/useRightPanelSurfaceClose";
@@ -1482,7 +1481,7 @@ index e747718875..94a455f0a4 100644
  import { ComposerSurface } from "./chat/ComposerSurface";
  import { resolveThreadSyncPhase } from "../threadSync";
  import {
-@@ -1480,45 +1480,11 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1479,45 +1479,11 @@ export default function ChatView(props: ChatViewProps) {
      activeProviderStatus?.displayName?.trim() || activeProviderStatus?.instanceId || "";
    const composerStats = (() => {
      if (!settings.statsForNerdsEnabled) return null;
@@ -1532,7 +1531,7 @@ index e747718875..94a455f0a4 100644
    })();
    const pendingBackgroundTasks = deriveThreadPendingBackgroundTasks(serverProjection);
    const activeWorkStartedAt =
-@@ -3867,15 +3833,12 @@ export default function ChatView(props: ChatViewProps) {
+@@ -3872,15 +3838,12 @@ export default function ChatView(props: ChatViewProps) {
                            {...composerStats}
                            onCompact={() => composerRef.current?.compactContext()}
                            compactDisabled={compactDisabled}
@@ -1554,19 +1553,6 @@ index e747718875..94a455f0a4 100644
                            isCompacting={isCompacting}
                            subscriptionSwitch={{
                              providers: providerStatuses,
-diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
-index 82b6b9617c..0c7c910bdb 100644
---- a/apps/web/src/components/chat/ChatComposer.tsx
-+++ b/apps/web/src/components/chat/ChatComposer.tsx
-@@ -253,7 +253,7 @@ import {
-   resolveComposerDispatchMode,
-   type ComposerDispatchMode,
- } from "@t3tools/client-runtime/state/composer-dispatch";
--import type { ContextWindowSnapshot } from "../../lib/contextWindow";
-+import type { ContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
- import {
-   resolveProviderSkillsForCwd,
-   resolveProviderSlashCommandsForCwd,
 diff --git a/apps/web/src/components/chat/ComposerStats.logic.ts b/apps/web/src/components/chat/ComposerStats.logic.ts
 index e6bf0e8125..f9196990b5 100644
 --- a/apps/web/src/components/chat/ComposerStats.logic.ts

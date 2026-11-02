@@ -138,18 +138,18 @@ index 0000000000..feeb28e3dd
 +  { defaultValue: () => resolveDesktopUpdateAutomation() },
 +);
 diff --git a/apps/desktop/src/updates/DesktopUpdates.ts b/apps/desktop/src/updates/DesktopUpdates.ts
-index 3a0b41cd9e..3cad45d4e1 100644
+index 6279e8b614..f92b5bdb00 100644
 --- a/apps/desktop/src/updates/DesktopUpdates.ts
 +++ b/apps/desktop/src/updates/DesktopUpdates.ts
-@@ -34,6 +34,7 @@ import * as ElectronUpdater from "../electron/ElectronUpdater.ts";
- import * as ElectronWindow from "../electron/ElectronWindow.ts";
+@@ -35,6 +35,7 @@ import * as ElectronWindow from "../electron/ElectronWindow.ts";
  import * as IpcChannels from "../ipc/channels.ts";
  import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
+ import * as DesktopUpdatePolicy from "./DesktopUpdatePolicy.ts";
 +import { DesktopUpdateAutomation } from "./DesktopUpdateAutomation.ts";
  import { normalizeDesktopUpdateReleaseNotes } from "./releaseNotes.ts";
  import { desktopUpdateChannelOf } from "@t3tools/shared/cliRelease";
  import { compareSemverVersions } from "@t3tools/shared/semver";
-@@ -348,6 +349,7 @@ export const make = Effect.gen(function* () {
+@@ -366,6 +367,7 @@ export const make = Effect.gen(function* () {
    const pool = yield* DesktopBackendPool.DesktopBackendPool;
    const desktopState = yield* DesktopState.DesktopState;
    const electronUpdater = yield* ElectronUpdater.ElectronUpdater;
@@ -157,7 +157,7 @@ index 3a0b41cd9e..3cad45d4e1 100644
    const electronWindow = yield* ElectronWindow.ElectronWindow;
    const environment = yield* DesktopEnvironment.DesktopEnvironment;
    const fileSystem = yield* FileSystem.FileSystem;
-@@ -540,12 +542,22 @@ export const make = Effect.gen(function* () {
+@@ -579,12 +581,22 @@ export const make = Effect.gen(function* () {
        );
      });
  
@@ -186,7 +186,7 @@ index 3a0b41cd9e..3cad45d4e1 100644
    });
  
    const downloadAvailableUpdate = Effect.gen(function* () {
-@@ -1098,8 +1110,10 @@ export const make = Effect.gen(function* () {
+@@ -1155,8 +1167,10 @@ export const make = Effect.gen(function* () {
        }
        yield* Ref.set(updaterConfiguredRef, true);
  
@@ -199,18 +199,18 @@ index 3a0b41cd9e..3cad45d4e1 100644
        yield* electronUpdater.setDisableDifferentialDownload(
          isArm64HostRunningIntelBuild(environment.runtimeInfo),
 diff --git a/apps/desktop/src/updates/updatesTestHarness.ts b/apps/desktop/src/updates/updatesTestHarness.ts
-index d8d16b7dbf..6da10ecdc5 100644
+index ec3b1ce9a1..3729081743 100644
 --- a/apps/desktop/src/updates/updatesTestHarness.ts
 +++ b/apps/desktop/src/updates/updatesTestHarness.ts
-@@ -14,6 +14,7 @@ import * as ElectronWindow from "../electron/ElectronWindow.ts";
- import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
+@@ -15,6 +15,7 @@ import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
  import * as DesktopState from "../app/DesktopState.ts";
+ import * as DesktopUpdatePolicy from "./DesktopUpdatePolicy.ts";
  import * as DesktopUpdates from "./DesktopUpdates.ts";
 +import * as DesktopUpdateAutomation from "./DesktopUpdateAutomation.ts";
  
  export const flushCallbacks = Effect.yieldNow;
  
-@@ -40,6 +41,7 @@ export interface UpdatesHarnessOptions {
+@@ -42,6 +43,7 @@ export interface UpdatesHarnessOptions {
    readonly savedChannel?: DesktopAppSettings.DesktopSettings["updateChannel"];
    /** Adds a WSL backend beside the primary, as on a Windows host with WSL enabled. */
    readonly wslBackend?: boolean;
@@ -218,7 +218,7 @@ index d8d16b7dbf..6da10ecdc5 100644
  }
  
  export function makeHarness(options: UpdatesHarnessOptions = {}) {
-@@ -49,6 +51,8 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
+@@ -51,6 +53,8 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
    let allowDowngrade = false;
    const checkAllowedDowngrade: boolean[] = [];
    let fullChangelog = false;
@@ -227,7 +227,7 @@ index d8d16b7dbf..6da10ecdc5 100644
    const feedUrls: ElectronUpdater.ElectronUpdaterFeedUrl[] = [];
    const listeners = new Map<string, Set<(...args: readonly unknown[]) => void>>();
    const sentStates: DesktopUpdateState[] = [];
-@@ -76,8 +80,14 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
+@@ -78,8 +82,14 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
        Effect.sync(() => {
          feedUrls.push(options);
        }),
@@ -244,10 +244,10 @@ index d8d16b7dbf..6da10ecdc5 100644
      setChannel: () => Effect.void,
      setAllowPrerelease: () => Effect.void,
      allowDowngrade: Effect.sync(() => allowDowngrade),
-@@ -271,6 +281,12 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
- 
+@@ -274,6 +284,12 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
    const layer = DesktopUpdates.layer.pipe(
      Layer.provide(layerFileSystem),
+     Layer.provide(DesktopUpdatePolicy.layerTest(options.policy)),
 +    Layer.provide(
 +      Layer.succeed(
 +        DesktopUpdateAutomation.DesktopUpdateAutomation,
@@ -257,7 +257,7 @@ index d8d16b7dbf..6da10ecdc5 100644
      Layer.provideMerge(layerUpdater),
      Layer.provideMerge(layerWindow),
      Layer.provideMerge(layerBackend),
-@@ -302,6 +318,8 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
+@@ -305,6 +321,8 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
      /** Whether each feed check could offer an older release, and the flag now. */
      checkAllowedDowngrade,
      allowDowngrade: () => allowDowngrade,

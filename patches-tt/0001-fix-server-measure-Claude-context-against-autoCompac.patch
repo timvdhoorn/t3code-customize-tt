@@ -13,7 +13,7 @@ Subject: [PATCH 01/10] fix(server): measure Claude context against
  5 files changed, 157 insertions(+), 8 deletions(-)
 
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-index 5f6b80fc6e..eea8894879 100644
+index b056eb4c94..4fe3e36393 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
 @@ -745,6 +745,27 @@ describe("ClaudeAdapterV2 context usage", () => {
@@ -45,10 +45,10 @@ index 5f6b80fc6e..eea8894879 100644
  
  describe("ClaudeAdapterV2 approval presentation", () => {
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-index 21955d95cc..a71c5edd50 100644
+index 8312ad6913..2516818943 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-@@ -142,6 +142,7 @@ import {
+@@ -149,6 +149,7 @@ import {
  import {
    claudeLaunchArgDirectories,
    discoverClaudeSkills,
@@ -56,7 +56,7 @@ index 21955d95cc..a71c5edd50 100644
  } from "../../provider/Drivers/ClaudeSkills.ts";
  import {
    compileClaudeModelSelection,
-@@ -220,6 +221,23 @@ function claudeContextWindow(modelSelection: ModelSelection): number | null {
+@@ -227,6 +228,23 @@ function claudeContextWindow(modelSelection: ModelSelection): number | null {
    );
  }
  
@@ -80,7 +80,7 @@ index 21955d95cc..a71c5edd50 100644
  interface ClaudeCacheCreation {
    readonly ephemeral_1h_input_tokens: number;
    readonly ephemeral_5m_input_tokens: number;
-@@ -270,11 +288,13 @@ export function claudeProviderTurnTokenUsage(
+@@ -277,11 +295,13 @@ export function claudeProviderTurnTokenUsage(
    updatedAt: string,
    autoCompactWindow = "",
    requestedAt?: DateTime.Utc,
@@ -95,7 +95,7 @@ index 21955d95cc..a71c5edd50 100644
    // The cache lifetime starts with the request, not when its response ends.
    const promptCacheExpiresAt =
      promptCacheTtlMs === undefined || requestedAt === undefined
-@@ -282,13 +302,13 @@ export function claudeProviderTurnTokenUsage(
+@@ -289,13 +309,13 @@ export function claudeProviderTurnTokenUsage(
        : DateTime.formatIso(DateTime.add(requestedAt, { milliseconds: promptCacheTtlMs }));
    return {
      usedTokens: inputTokens + outputTokens,
@@ -111,7 +111,7 @@ index 21955d95cc..a71c5edd50 100644
      ...(promptCacheExpiresAt === undefined ? {} : { promptCacheExpiresAt }),
      updatedAt,
    };
-@@ -3978,6 +3998,8 @@ function formatClaudeUsageLimitWait(waitMs: number): string {
+@@ -4027,6 +4047,8 @@ function formatClaudeUsageLimitWait(waitMs: number): string {
  interface ActiveClaudeTurnContext {
    readonly queryPolicy: ClaudeRuntimeQueryPolicy;
    readonly responseThroughput: ClaudeResponseThroughput;
@@ -120,7 +120,7 @@ index 21955d95cc..a71c5edd50 100644
    readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
    readonly nativeThreadId: string;
    readonly nativeTurnId: string;
-@@ -4691,6 +4713,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -4745,6 +4767,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
            model: input.modelSelection.model,
            now,
          });
@@ -137,7 +137,7 @@ index 21955d95cc..a71c5edd50 100644
          const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
          const activeTurn = yield* Ref.make<ActiveClaudeTurnContext | null>(null);
          const taskOutputTails = new Map<
-@@ -5035,6 +5067,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -5091,6 +5123,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
              DateTime.formatIso(now),
              adapterOptions.settings.autoCompactWindow,
              context.streamUsage?.requestedAt,
@@ -145,7 +145,7 @@ index 21955d95cc..a71c5edd50 100644
            );
            if (tokenUsage.inputTokens <= 0) return;
            yield* emitProviderEvent({
-@@ -8620,7 +8653,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -8725,7 +8758,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                  ? Math.round(postTokens)
                  : undefined;
              if (afterTokenCount !== undefined) {
@@ -154,7 +154,7 @@ index 21955d95cc..a71c5edd50 100644
                yield* emitProviderEvent({
                  type: "provider_turn.updated",
                  driver: CLAUDE_PROVIDER,
-@@ -8641,10 +8674,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -8746,10 +8779,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                    completedAt: null,
                    tokenUsage: {
                      usedTokens: afterTokenCount,
@@ -167,7 +167,7 @@ index 21955d95cc..a71c5edd50 100644
                      ),
                      updatedAt: DateTime.formatIso(now),
                    },
-@@ -10490,6 +10523,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -10615,6 +10648,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
              const querySession = yield* openQuery(turnInput, nativeThreadId);
              const context: ActiveClaudeTurnContext = {
                responseThroughput: new ClaudeResponseThroughput(),
@@ -242,10 +242,10 @@ index 860280aa91..d6f8aedffe 100644
 +  );
 +});
 diff --git a/apps/server/src/provider/Drivers/ClaudeSkills.ts b/apps/server/src/provider/Drivers/ClaudeSkills.ts
-index 6aff76d250..d3baccf2ae 100644
+index c73385374f..4954ae485d 100644
 --- a/apps/server/src/provider/Drivers/ClaudeSkills.ts
 +++ b/apps/server/src/provider/Drivers/ClaudeSkills.ts
-@@ -485,6 +485,51 @@ export function claudeLaunchArgDirectories(launchArgs?: string): ReadonlyArray<s
+@@ -484,6 +484,51 @@ export function claudeLaunchArgDirectories(launchArgs?: string): ReadonlyArray<s
    return directories;
  }
  
