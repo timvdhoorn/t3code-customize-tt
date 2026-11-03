@@ -1,0 +1,149 @@
+<!doctype html>
+<!-- PROTOTYPE, throwaway. Question: how do child threads in the sidebar become easier to scan?
+     Four structurally different variants side by side (A-D), same data as Tim's screenshots.
+     Click a family's disclosure row to fold it. Role comes from the title prefix here
+     (Rev = review, W: = worker, S1: = step, #nnn = build); in the real patch it could come from
+     the launch metadata instead. -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { --fg:#e6e8eb; --dim:#8b9096; --faint:#5d6268; --line:#33373c; --blue:#5b9cf6; --green:#4ecb8a; --amber:#e8b44c; --violet:#b48cf6; --row:#25292d; }
+  body { margin:0; font-family: var(--font-sans, Inter, system-ui, sans-serif); color:var(--fg); }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .panel { background:#16191c; border-radius:var(--radius,12px); padding:12px 8px 14px; box-shadow:0 0 0 1px #2a2e32; }
+  .vt { font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:.05em; padding:0 8px 2px; }
+  .vd { font-size:11.5px; color:var(--faint); padding:0 8px 10px; line-height:1.35; }
+  .proj { display:flex; align-items:center; gap:8px; padding:4px 8px 8px; font-weight:600; font-size:13px; }
+  .proj .lg { width:18px; height:18px; border-radius:4px; background:#000; font-size:8px; display:grid; place-items:center; }
+  svg.i { width:14px; height:14px; flex:none; fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
+  .spin { animation: r 1.6s linear infinite; } @keyframes r { to { transform: rotate(360deg) } }
+  .head { padding:6px 8px; border-radius:8px; }
+  .head.sel { background:var(--row); }
+  .head .t { display:flex; align-items:center; gap:6px; font-size:13px; font-weight:600; }
+  .head .t span.n { flex:1; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .head .m { display:flex; align-items:center; gap:6px; font-size:11.5px; color:var(--dim); margin-top:2px; }
+  .st { display:inline-flex; align-items:center; gap:4px; font-size:12px; font-weight:500; }
+  .blue{color:var(--blue)} .green{color:var(--green)} .amber{color:var(--amber)} .dim{color:var(--dim)} .faint{color:var(--faint)} .violet{color:var(--violet)}
+  .kids { margin-left:14px; border-left:1px solid var(--line); padding-left:6px; margin-bottom:6px; }
+  .disc { display:flex; align-items:center; gap:6px; padding:4px 6px; font-size:11.5px; color:var(--dim); cursor:pointer; border-radius:6px; }
+  .disc:hover { background:#1f2326; }
+  .chev { transition:transform .15s; } .open > .disc .chev { transform:rotate(90deg); }
+  .child { display:flex; align-items:center; gap:6px; padding:3px 6px; font-size:12.5px; border-radius:6px; color:#c3c7cc; }
+  .child .n { flex:1; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+  .child.settled { color:var(--faint); }
+  .child .when { font-size:10.5px; color:var(--faint); }
+  .chip { display:inline-flex; align-items:center; gap:3px; padding:1px 6px; border-radius:99px; background:#24282c; font-size:11px; font-variant-numeric:tabular-nums; }
+  .dots { display:flex; gap:3px; flex-wrap:wrap; }
+  .dot { width:7px; height:7px; border-radius:2px; }
+  .glabel { font-size:10.5px; color:var(--faint); text-transform:uppercase; letter-spacing:.05em; padding:6px 6px 2px; display:flex; gap:6px; align-items:center; }
+  .pr { font-family: var(--font-mono, ui-monospace, monospace); font-size:11px; color:var(--dim); min-width:38px; }
+  .collapsed .body { display:none; }
+</style>
+</head>
+<body>
+<div class="grid" id="grid"></div>
+<script>
+const P = {
+  chev:'<path d="m9 18 6-6-6-6"/>',
+  check:'<circle cx="12" cy="12" r="10"/><path d="m9 12 2 2 4-4"/>',
+  spin:'<circle cx="12" cy="12" r="10" stroke-dasharray="4 3.2"/>',
+  wait:'<circle cx="12" cy="12" r="10" stroke-dasharray="2 4"/><circle cx="12" cy="12" r="1"/>',
+  dotnew:'<circle cx="12" cy="12" r="4" fill="currentColor"/>',
+  eye:'<path d="M2.06 12.35a1 1 0 0 1 0-.7 10.75 10.75 0 0 1 19.88 0 1 1 0 0 1 0 .7 10.75 10.75 0 0 1-19.88 0"/><circle cx="12" cy="12" r="3"/>',
+  wrench:'<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
+  hammer:'<path d="m15 12-8.37 8.37a1 1 0 1 1-3-3L12 9"/><path d="m18 15 4-4"/><path d="m21.5 11.5-1.91-1.91A2 2 0 0 1 19 8.17V7l-2.26-2.26a6 6 0 0 0-4.2-1.76L9 2.96l.92.82A6.18 6.18 0 0 1 12 8.4V10l2 2h1.17a2 2 0 0 1 1.42.59L18.5 14.5"/>',
+  code:'<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>',
+  list:'<path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/>',
+  pr:'<circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7"/><path d="M6 9v12"/>',
+};
+const ic = (k, cls='') => `<svg class="i ${cls} ${k==='spin'?'spin':''}" viewBox="0 0 24 24">${P[k]}</svg>`;
+
+const ROLE = {
+  review:{icon:'eye', color:'violet', label:'Reviews'},
+  fix:{icon:'wrench', color:'amber', label:'Herstel'},
+  worker:{icon:'hammer', color:'blue', label:'Workers'},
+  step:{icon:'list', color:'green', label:'Stappen'},
+  build:{icon:'code', color:'dim', label:'Bouw'},
+};
+const roleOf = t => /herstel/i.test(t) ? 'fix' : /^Rev\b/.test(t) ? 'review' : /^W:/.test(t) ? 'worker' : /^S\d+:/.test(t) ? 'step' : 'build';
+const prOf = t => (t.match(/#(\d+)/)||[])[1] || null;
+const stripTitle = t => t.replace(/^(Rev|W:|S\d+:)\s*/,'').replace(/^#\d+\s*/,'') || t;
+const STATUS = { working:['spin','blue','werkt'], settled:['check','faint','klaar'], new:['dotnew','blue','nieuw'], waiting:['wait','amber','wacht'] };
+
+const families = [
+  { title:'Uren toevoegen aan werkbon', status:'working', sel:true, diff:'+5', kids:[
+    ['S1: MCP werkbon-velden','working','2m'],
+    ['Rev #2298 herstel','settled','8m'],['Rev #2298','settled','14m'],['Rev #2297','settled','22m'],
+    ['W: verify-skill web','settled','31m'],['#2294 annuleren','settled','40m'],['Rev #2296','settled','46m'],
+    ['Rev #2295','settled','52m'],['#2294 kopvelden+status','settled','1u'],['#2294 materiaal+werkverslag','settled','1u'],
+    ['Rev #2293','settled','1u'],['#2292 MCP werkbon-uren','settled','2u'] ]},
+  { title:'Werkbon werkdatum tonen', status:'waiting', diff:'+3', kids:[
+    ['Rev #2301','new','nu'],['#2300 werkdatum API','working','1m'],['#2300 werkdatum web','working','1m'],
+    ['#2300 werkdatum app','working','2m'],['W: e2e planbord','working','3m'],['Rev #2299','working','4m'],
+    ['S2: migratie','working','5m'],['#2299 sortering','settled','20m'],['Rev #2298','settled','25m'] ]},
+];
+const k = (r) => ({ title:r[0], status:r[1], when:r[2], role:roleOf(r[0]), pr:prOf(r[0]) });
+families.forEach(f => f.kids = f.kids.map(k));
+
+function head(f) {
+  const s = f.status==='working' ? `<span class="st blue">${ic('spin')}Working</span>` : `<span class="st dim">${ic('wait')}Waiting</span>`;
+  return `<div class="head ${f.sel?'sel':''}"><div class="t"><span class="n">${f.title}</span>${s}</div>
+    <div class="m">main<span style="flex:1"></span><span class="green">${ic('pr')}</span>${f.diff}</div></div>`;
+}
+const counts = f => f.kids.reduce((a,c)=>(a[c.status]=(a[c.status]||0)+1,a),{});
+const statusIcon = s => ic(STATUS[s][0], STATUS[s][1]);
+const disc = (inner) => `<div class="disc" onclick="this.parentNode.classList.toggle('collapsed');this.parentNode.classList.toggle('open')">${ic('chev','chev')}${inner}</div>`;
+
+// A: icon chips in the summary, role icon in front of each child, settled folded once.
+function A(f) {
+  const c = counts(f);
+  const chips = ['new','waiting','working','settled'].filter(s=>c[s]).map(s=>`<span class="chip ${STATUS[s][1]}">${statusIcon(s)}${c[s]}</span>`).join('');
+  const row = x => `<div class="child ${x.status==='settled'?'settled':''}"><span class="${ROLE[x.role].color}">${ic(ROLE[x.role].icon)}</span><span class="n">${x.title}</span>${statusIcon(x.status)}</div>`;
+  const live = f.kids.filter(x=>x.status!=='settled'), done = f.kids.filter(x=>x.status==='settled');
+  return head(f) + `<div class="kids open">${disc(`<span style="display:flex;gap:4px">${chips}</span>`)}
+    <div class="body">${live.map(row).join('')}${done.length?`<div class="child faint" style="font-size:11.5px">${ic('check')}<span class="n">${done.length} klaar · ${done.slice(0,3).map(x=>ic(ROLE[x.role].icon)).join('')}…</span></div>`:''}</div></div>`;
+}
+
+// B: one status square per child under the opener; expanded grouped by role.
+function B(f) {
+  const col = {working:'var(--blue)', settled:'#3a3f44', new:'var(--blue)', waiting:'var(--amber)'};
+  const dots = f.kids.map(x=>`<span class="dot" title="${x.title}" style="background:${col[x.status]};${x.status==='new'?'box-shadow:0 0 0 2px #16191c,0 0 0 3px var(--blue)':''}"></span>`).join('');
+  const groups = Object.keys(ROLE).map(r=>[r,f.kids.filter(x=>x.role===r)]).filter(g=>g[1].length);
+  return head(f) + `<div class="kids collapsed">${disc(`<span class="dots">${dots}</span><span style="margin-left:auto" class="faint">${f.kids.length}</span>`)}
+    <div class="body">${groups.map(([r,xs])=>`<div class="glabel"><span class="${ROLE[r].color}">${ic(ROLE[r].icon)}</span>${ROLE[r].label} <span>${xs.length}</span></div>`+
+      xs.map(x=>`<div class="child ${x.status==='settled'?'settled':''}" style="padding-left:26px"><span class="n">${stripTitle(x.title)}${x.pr?` <span class="pr">#${x.pr}</span>`:''}</span>${statusIcon(x.status)}</div>`).join('')).join('')}</div></div>`;
+}
+
+// C: grouped by PR/issue number, status icon leads, role as small icon.
+function C(f) {
+  const by = {}; f.kids.forEach(x=>{ const g = x.pr ? '#'+x.pr : 'Overig'; (by[g]=by[g]||[]).push(x); });
+  const keys = Object.keys(by).sort((a,b)=> a==='Overig'?1:b==='Overig'?-1:b.localeCompare(a));
+  const c = counts(f);
+  return head(f) + `<div class="kids open">${disc(`${f.kids.length} subthreads${c.working?` · <span class="blue">${c.working} actief</span>`:''}`)}
+    <div class="body">${keys.map(g=>{ const xs=by[g]; const allDone = xs.every(x=>x.status==='settled');
+      return `<div class="child ${allDone?'settled':''}"><span class="pr">${g}</span><span class="n" style="display:flex;gap:6px;align-items:center">${xs.map(x=>`<span title="${x.title}" class="${x.status==='settled'?'faint':ROLE[x.role].color}" style="display:inline-flex;gap:2px;align-items:center">${ic(ROLE[x.role].icon)}${g==='Overig'?`<span style="font-size:11.5px">${x.title}</span>`:''}</span>`).join('')}${g!=='Overig'&&xs.length===1?`<span style="font-size:11.5px">${stripTitle(xs[0].title)}</span>`:''}</span>${allDone?statusIcon('settled'):statusIcon(xs.find(x=>x.status!=='settled').status)}</div>`;}).join('')}</div></div>`;
+}
+
+// D: dense log: status icon leads, role icon, title, age right; settled stay inline but dimmed, no second fold.
+function D(f) {
+  const c = counts(f);
+  const sum = ['new','waiting','working','settled'].filter(s=>c[s]).map(s=>`<span class="${STATUS[s][1]}">${c[s]} ${STATUS[s][2]}</span>`).join('<span class="faint"> · </span>');
+  const shown = f.kids.slice(0, 6), more = f.kids.length - shown.length;
+  return head(f) + `<div class="kids open">${disc(sum)}
+    <div class="body">${shown.map(x=>`<div class="child ${x.status==='settled'?'settled':''}">${statusIcon(x.status)}<span class="${x.status==='settled'?'faint':ROLE[x.role].color}">${ic(ROLE[x.role].icon)}</span><span class="n">${x.title}</span><span class="when">${x.when}</span></div>`).join('')}
+    ${more>0?`<div class="child faint" style="font-size:11.5px;padding-left:26px">+${more} oudere</div>`:''}</div></div>`;
+}
+
+const V = [
+  ['A','Status-chips + rol-icoon','Telling als icon-chips i.p.v. tekst; rol-icoon vóór elke subthread; klaar-groep op één regel.', A],
+  ['B','Statusblokjes, open per rol','Ingeklapt: één blokje per subthread. Uitgeklapt: gegroepeerd per rol (reviews, workers…).', B],
+  ['C','Gegroepeerd per PR/issue','Eén regel per #nummer met rol-iconen van alles wat eraan werkte.', C],
+  ['D','Dichte log, status vooraan','Status + rol links, leeftijd rechts; geen tweede "settled"-fold, nieuwste 6 zichtbaar.', D],
+];
+document.getElementById('grid').innerHTML = V.map(([key,name,desc,fn]) =>
+  `<div class="panel"><div class="vt">${key} · ${name}</div><div class="vd">${desc}</div>
+   <div class="proj"><span class="lg">LM</span>timvdhoorn/LMManagement</div>${families.map(fn).join('')}</div>`).join('');
+</script>
+</body>
+</html>
