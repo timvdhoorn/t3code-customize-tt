@@ -163,6 +163,12 @@ class KnownFailuresTest(unittest.TestCase):
         self.assertEqual(failing, [FILE])
         self.assertNotIn('known upstream failure', printed)
 
+    def test_a_failing_hook_in_coloured_output_voids_the_entry(self):
+        passed, failing, _ = self.run_step(report([(KNOWN, 'failed'), (OTHER, 'skipped')]),
+                                           output='\x1b[31m\x1b[1m Failed Suites \x1b[22m\x1b[39m\x1b[31m1\x1b[39m\n')
+        self.assertFalse(passed)
+        self.assertEqual(failing, [FILE])
+
     def test_an_unusual_case_state_voids_the_entry(self):
         passed, _, _ = self.run_step(report([(KNOWN, 'failed'), (OTHER, 'errored')]))
         self.assertFalse(passed)
