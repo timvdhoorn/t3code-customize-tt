@@ -37,7 +37,10 @@ Run every command from the repo (`./t3code-customize`, or the path the prompt gi
    With `patches-ios/` it first runs them on the commit below that layer, the stack the desktop app
    and the servers build, so a fix belongs in the shared or `patches-tt/` commit that needs it.
    A test file that failed only by a timeout runs once more on its own before it counts; a
-   non-zero exit with an unhandled error fails the step too. When everything passes it stamps the
+   non-zero exit with an unhandled error fails the step too. A test listed in
+   `known-upstream-failures.json` (it fails on the plain nightly; see "Known upstream failures" in
+   `docs/machines.md`) prints `pass (known upstream failure: <name>)` instead of failing the step.
+   When everything passes it stamps the
    commit (with the nightly, the check lists and the recipe), so the tool's own run afterwards skips
    the checks.
 4. **Fix** a failing check in the commit of the patch that causes it: `git commit --fixup=<sha>`,
@@ -52,7 +55,9 @@ push or build.
 
 - One commit per patch, in the same order; the export maps commits to patches by count.
 - A port keeps every patch and every test. A failing check is fixed in the patch, so the checks
-  stay as strong as before and no step is skipped.
+  stay as strong as before and no step is skipped. Only a test that also fails without any patch
+  goes in `known-upstream-failures.json` (file, full name `describe > test`, upstream PR or issue,
+  date added), after you ran it on the plain nightly; never to hide a failure a patch causes.
 - A feature that cannot be ported sensibly: stop and explain why, with the patch and the upstream
   change that blocks it.
 - `node_modules` comes from `pnpm install --frozen-lockfile --ignore-scripts`; `checks` runs it.
