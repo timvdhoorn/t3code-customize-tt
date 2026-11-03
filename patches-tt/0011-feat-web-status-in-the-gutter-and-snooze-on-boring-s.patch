@@ -14,17 +14,17 @@ rows line their branch line up under the title.
 On hover or keyboard focus a boring row now offers Snooze next to Settle, with
 the same gating and open-menu handling as the card rows.
 ---
- .../SidebarThreadRow.folder.browser.test.tsx  | 228 ++++++++++++++++++
- .../components/sidebar/SidebarThreadRow.tsx   | 162 +++++++++++--
- 2 files changed, 372 insertions(+), 18 deletions(-)
+ .../SidebarThreadRow.folder.browser.test.tsx  | 245 ++++++++++++++++++
+ .../components/sidebar/SidebarThreadRow.tsx   | 177 +++++++++++--
+ 2 files changed, 404 insertions(+), 18 deletions(-)
  create mode 100644 apps/web/src/components/sidebar/SidebarThreadRow.folder.browser.test.tsx
 
 diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.folder.browser.test.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.folder.browser.test.tsx
 new file mode 100644
-index 0000000000..5838cc1469
+index 0000000000..66942b8554
 --- /dev/null
 +++ b/apps/web/src/components/sidebar/SidebarThreadRow.folder.browser.test.tsx
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,245 @@
 +import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 +import { describe, expect, it, vi } from "vite-plus/test";
 +import { page, userEvent } from "vite-plus/test/browser";
@@ -174,6 +174,8 @@ index 0000000000..5838cc1469
 +}
 +
 +const rect = (element: Element) => element.getBoundingClientRect();
++const GUTTER = '[data-slot="sidebar-row-gutter"]';
++const TITLE = '[data-slot="sidebar-row-title"]';
 +const rows = () => [...document.querySelectorAll('[data-testid="sidebar-row-folder"]')];
 +const centerX = (box: DOMRect) => box.left + box.width / 2;
 +
@@ -197,15 +199,18 @@ index 0000000000..5838cc1469
 +      expect(working!.getAttribute("aria-label")).toContain("Working");
 +      expect(waiting!.textContent).not.toContain("Waiting");
 +      // Without a status the gutter shows the age.
-+      expect(aged!.querySelector("span.w-5")!.textContent).toMatch(/^\d+d$/);
-+
-+      expect(old!.querySelector("span.w-5")!.textContent).toMatch(/^\d{3,}d$/);
++      expect(aged!.querySelector(GUTTER)!.textContent).toMatch(/^\d+d$/);
++      // The widest age still fits the gutter.
++      const oldGutter = old!.querySelector(GUTTER)!;
++      expect(oldGutter.textContent).toMatch(/^\d{3,}d$/);
++      expect(oldGutter.scrollWidth).toBeLessThanOrEqual(oldGutter.clientWidth);
 +      for (const row of [waiting!, aged!, working!, old!]) {
-+        const title = row.querySelector("span[aria-hidden].flex-1");
-+        const gutter = row.querySelector("span.w-5");
++        const title = row.querySelector(TITLE);
++        const gutter = row.querySelector(GUTTER);
 +        expect(Math.abs(centerX(rect(gutter!)) - centerX(rect(favicon)))).toBeLessThanOrEqual(1);
 +        // The title starts right after the gutter and runs to the row's edge.
-+        expect(rect(title!).left - rect(gutter!).right).toBeLessThanOrEqual(8);
++        expect(rect(title!).left - rect(gutter!).right).toBeLessThanOrEqual(4);
++        expect(rect(title!).left - rect(favicon).right).toBeLessThanOrEqual(10);
 +        expect(rect(row).right - rect(title!).right).toBeLessThanOrEqual(16);
 +        if (variant === "folder-multiline") {
 +          const meta = row.lastElementChild!.firstElementChild!;
@@ -231,8 +236,16 @@ index 0000000000..5838cc1469
 +    const actions = snooze.element().parentElement!;
 +    expect(getComputedStyle(actions).opacity).toBe("0");
 +
++    const title = row.querySelector(TITLE)!;
++    const titleBefore = rect(title);
 +    await userEvent.hover(row);
 +    await expect.poll(() => getComputedStyle(actions).opacity).toBe("1");
++    // The actions overlay the title's faded end; the title keeps its width.
++    expect(rect(title).width).toBe(titleBefore.width);
++    expect(getComputedStyle(title).maskImage).toContain("linear-gradient");
++    // The title is fully clear under the actions.
++    const clearFrom = rect(title).left + rect(title).width * 0.8;
++    expect(clearFrom).toBeLessThanOrEqual(rect(snooze.element()).left);
 +    expect(rect(snooze.element()).right).toBeLessThanOrEqual(rect(settle.element()).left + 1);
 +    await page.screenshot({
 +      path: "__screenshots__/boring-folder-hover.png",
@@ -250,21 +263,46 @@ index 0000000000..5838cc1469
 +    await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
 +    await userEvent.keyboard("{Enter}");
 +    await expect.element(page.getByRole("menuitem", { name: "Custom…" })).toBeVisible();
++    // With the menu open the actions stay up without hover or focus.
++    expect(row.matches(":hover")).toBe(false);
++    expect(actions.contains(document.activeElement)).toBe(false);
++    expect(getComputedStyle(actions).opacity).toBe("1");
 +    await userEvent.keyboard("{Escape}");
 +  });
 +});
 diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
-index 1826eeecef..64f4611a3c 100644
+index 1826eeecef..0421d86620 100644
 --- a/apps/web/src/components/sidebar/SidebarThreadRow.tsx
 +++ b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
-@@ -1203,6 +1203,32 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1025,8 +1025,17 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+   ) : (
+     <span
+       aria-hidden
++      data-slot="sidebar-row-title"
+       className={cn(
+         "min-w-0 flex-1 text-start text-sm transition-opacity motion-reduce:transition-none",
++        // Boring rows overlay their hover actions on the title's end; fade it under them.
++        // At the narrowest sidebar the clear last 20% is wider than the two actions.
++        (variant === "folder" || variant === "folder-multiline") &&
++          !isWokeStatus &&
++          cn(
++            "group-any-hover/sidebar-row:mask-r-from-70% group-any-hover/sidebar-row:mask-r-to-80% group-has-[:focus-visible]/sidebar-row:mask-r-from-70% group-has-[:focus-visible]/sidebar-row:mask-r-to-80%",
++            snoozeMenuOpen && "mask-r-from-70% mask-r-to-80%",
++          ),
+         shouldRecede ? "font-normal" : "font-medium",
+         variant !== "slim"
+           ? cn(
+@@ -1203,6 +1212,35 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
    if (variant !== "card") {
      const multiline = variant === "folder-multiline";
      const inFolder = variant === "folder" || multiline;
 +    // Folder rows carry their status (or age) in the gutter under the project
 +    // icon, so the title gets the row's full width.
 +    const gutterSlot = inFolder ? (
-+      <span className="flex w-5 shrink-0 items-center justify-center whitespace-nowrap text-2xs tabular-nums text-secondary-label">
++      <span
++        data-slot="sidebar-row-gutter"
++        className="flex w-6 shrink-0 items-center justify-center whitespace-nowrap text-2xs tabular-nums text-secondary-label"
++      >
 +        {topStatus ? (
 +          <Tooltip>
 +            <TooltipTrigger
@@ -290,7 +328,7 @@ index 1826eeecef..64f4611a3c 100644
      return (
        <li
          data-thread-item={threadKey}
-@@ -1214,7 +1240,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1214,7 +1252,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
            sortable?.isDragging && "relative z-20",
          )}
        >
@@ -299,31 +337,31 @@ index 1826eeecef..64f4611a3c 100644
            <TooltipTrigger
              render={
                <div
-@@ -1231,9 +1257,9 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1231,9 +1269,9 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                    rowSurfaceClassName,
                    multiline
                      ? "flex flex-col justify-center px-2.5 py-1.5"
 -                    : "flex h-9 items-center gap-2.5 px-2.5",
 -                  // Lines titles up with the folder name, past its chevron and icon.
 -                  inFolder && "ps-9",
-+                    : cn("flex h-9 items-center px-2.5", inFolder ? "gap-1.5" : "gap-2.5"),
++                    : cn("flex h-9 items-center px-2.5", inFolder ? "gap-1" : "gap-2.5"),
 +                  // Centers the gutter slot under the folder's project icon.
-+                  inFolder && "ps-2",
++                  inFolder && "ps-1.5",
                    props.nested && "ps-6",
                  )}
                  onClick={handleClick}
-@@ -1244,8 +1270,9 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1244,8 +1282,9 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
              }
            >
              {/* `contents` keeps one-line rows a single flex row. */}
 -            <div className={multiline ? "flex h-6 min-w-0 items-center gap-2.5" : "contents"}>
-+            <div className={multiline ? "flex h-6 min-w-0 items-center gap-1.5" : "contents"}>
++            <div className={multiline ? "flex h-6 min-w-0 items-center gap-1" : "contents"}>
                {accessibleTitle}
 +              {gutterSlot}
                {inFolder || props.nested ? null : (
                  <span
                    className={cn(
-@@ -1271,6 +1298,115 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1271,6 +1310,118 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                ) : null}
                {sortable?.isDragging ? (
                  dragDestination
@@ -336,7 +374,7 @@ index 1826eeecef..64f4611a3c 100644
 +                  )}
 +                >
 +                  {variantAction === "unsnooze" && props.snoozeWakeLabelText !== null ? (
-+                    <span className="inline-flex items-center gap-1 text-xs text-info-foreground tabular-nums group-any-hover/sidebar-row:absolute group-any-hover/sidebar-row:right-0 group-any-hover/sidebar-row:inset-y-0 group-any-hover/sidebar-row:opacity-0">
++                    <span className="inline-flex items-center gap-1 text-xs text-info-foreground tabular-nums group-any-hover/sidebar-row:opacity-0">
 +                      {/* The clock tells a wake time from an age at a glance. */}
 +                      <AlarmClockIcon aria-hidden className="size-3" />
 +                      {props.snoozeWakeLabelText}
@@ -368,7 +406,7 @@ index 1826eeecef..64f4611a3c 100644
 +                        onPointerDown={handleActionPointerDown}
 +                        className={cn(
 +                          folderActionClassName,
-+                          "pointer-events-none absolute inset-y-0 right-0 -mr-1 opacity-0 focus-visible:pointer-events-auto focus-visible:static focus-visible:opacity-100 group-any-hover/sidebar-row:pointer-events-auto group-any-hover/sidebar-row:static group-any-hover/sidebar-row:opacity-100",
++                          "pointer-events-none absolute inset-y-0 right-0 -mr-1 opacity-0 focus-visible:pointer-events-auto focus-visible:opacity-100 group-any-hover/sidebar-row:pointer-events-auto group-any-hover/sidebar-row:opacity-100",
 +                        )}
 +                      >
 +                        <AlarmClockOffIcon className="mb-px size-3" />
@@ -386,7 +424,7 @@ index 1826eeecef..64f4611a3c 100644
 +                              onPointerDown={handleActionPointerDown}
 +                              className={cn(
 +                                folderActionClassName,
-+                                "pointer-events-none absolute inset-y-0 right-0 -mr-1 opacity-0 focus-visible:pointer-events-auto focus-visible:static focus-visible:opacity-100 group-any-hover/sidebar-row:pointer-events-auto group-any-hover/sidebar-row:static group-any-hover/sidebar-row:opacity-100",
++                                "pointer-events-none absolute inset-y-0 right-0 -mr-1 opacity-0 focus-visible:pointer-events-auto focus-visible:opacity-100 group-any-hover/sidebar-row:pointer-events-auto group-any-hover/sidebar-row:opacity-100",
 +                              )}
 +                            />
 +                          }
@@ -400,9 +438,12 @@ index 1826eeecef..64f4611a3c 100644
 +                    <span
 +                      className={cn(
 +                        // Mouse clicks leave Settle focused; focus-within would pin the controls
-+                        // after the pointer leaves. Use focus-visible instead.
-+                        "pointer-events-none absolute inset-y-0 right-0 -mr-1 flex items-stretch opacity-0 has-[:focus-visible]:pointer-events-auto has-[:focus-visible]:static has-[:focus-visible]:opacity-100 group-any-hover/sidebar-row:pointer-events-auto group-any-hover/sidebar-row:static group-any-hover/sidebar-row:opacity-100",
-+                        snoozeMenuOpen && "pointer-events-auto static opacity-100",
++                        // after the pointer leaves. Use focus-visible instead. The controls
++                        // overlay the title's faded end, so the title never moves.
++                        "pointer-events-none absolute inset-y-0 right-0 -mr-1 flex items-stretch opacity-0 has-[:focus-visible]:pointer-events-auto has-[:focus-visible]:opacity-100 group-any-hover/sidebar-row:pointer-events-auto group-any-hover/sidebar-row:opacity-100",
++                        // Woke sits in the slot, so the controls make room beside it.
++                        isWokeStatus && "group-any-hover/sidebar-row:static",
++                        snoozeMenuOpen && "pointer-events-auto opacity-100",
 +                      )}
 +                    >
 +                      {showSnoozeButton ? (
@@ -439,7 +480,7 @@ index 1826eeecef..64f4611a3c 100644
                ) : (
                  <span
                    className={cn(
-@@ -1291,7 +1427,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1291,7 +1442,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                          <AlarmClockIcon aria-hidden className="size-3" />
                          {props.snoozeWakeLabelText}
                        </span>
@@ -448,7 +489,7 @@ index 1826eeecef..64f4611a3c 100644
                        <Tooltip>
                          <TooltipTrigger
                            render={
-@@ -1310,17 +1446,6 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1310,17 +1461,6 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                        </Tooltip>
                      ) : props.nested && topStatus !== null ? (
                        <SidebarChildThreadStatus status={topStatus} />
@@ -466,13 +507,13 @@ index 1826eeecef..64f4611a3c 100644
                      ) : (
                        <span className="text-xs">
                          <RelativeTimeLabel
-@@ -1394,7 +1519,8 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1394,7 +1534,8 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                )}
                {props.sweepAction !== null ? dragDestination : null}
              </div>
 -            {multiline ? metaLine : null}
 +            {/* Lines the meta line up with the title, past the gutter slot. */}
-+            {multiline && metaLine !== null ? <div className="ps-6.5">{metaLine}</div> : null}
++            {multiline && metaLine !== null ? <div className="ps-7">{metaLine}</div> : null}
            </TooltipTrigger>
            {detailsTooltip}
          </Tooltip>
