@@ -957,8 +957,10 @@ def test_source(text, title):
         if not match:
             continue
         indent = match.group(1)
-        end = next((i for i in range(number + 1, len(lines)) if lines[i].startswith(indent + '}')
-                    or lines[i].startswith(indent + ')')), None)
+        # The case's own closer at the it( indentation: `});` or `}, 10_000);`, not a template
+        # literal or object that happens to close at that column.
+        closer = re.compile(re.escape(indent) + r'\}(?:,[^`]*)?\);?\s*$')
+        end = next((i for i in range(number + 1, len(lines)) if closer.match(lines[i])), None)
         if end is None:
             return None
         cases.append('\n'.join(lines[number:end + 1]))
@@ -978,17 +980,37 @@ def unpatched_upstream_test(file, title, target):
     return upstream is not None and upstream == test_source(path.read_text(), title)
 
 
-def tolerated_failures(report, root, target):
+# The test states a file may hold next to a tolerated failure; anything else (a hook or suite error
+# reported as a case) voids it.
+PLAIN_STATES = ('passed', 'failed', 'skipped', 'pending', 'todo')
+# vitest's summary when a suite or hook (beforeAll, afterAll) failed: its tests show up as skipped.
+FAILED_SUITES = re.compile(r'Failed Suites \d+')
+
+
+def stale_known_failures():
+    """Keys (file :: full name) of the entries some earlier `checks` run saw pass."""
+    return {key for key, seen in load(KNOWN_SEEN, {}).items() if seen.get('passedOn')}
+
+
+def tolerated_failures(report, root, target, output=''):
     """{file relative to SOURCE: [full names]} of the files whose every failure is a known upstream
-    failure in an unpatched upstream test; files with a load error or any other failure are left out."""
-    known = {(e['file'], e['test']) for e in known_failures()}
+    failure in an unpatched upstream test; files with a load error or any other failure are left out,
+    and nothing is tolerated when a suite or hook failed or an entry went stale."""
+    if FAILED_SUITES.search(output or ''):
+        return {}
+    stale = stale_known_failures()
+    known = {(e['file'], e['test']) for e in known_failures()
+             if e['file'] + ' :: ' + e['test'] not in stale}
     tolerated = {}
     for result in report.get('testResults', []):
         if result.get('status') != 'failed' or result.get('message'):
             continue
         raw = result.get('name', '')
         name = os.path.relpath(raw, str(SOURCE)) if os.path.isabs(raw) else str(Path(root) / raw)
-        names = [test_full_name(a) for a in result.get('assertionResults', []) if a.get('status') == 'failed']
+        assertions = result.get('assertionResults', [])
+        if any(a.get('status') not in PLAIN_STATES for a in assertions):
+            continue
+        names = [test_full_name(a) for a in assertions if a.get('status') == 'failed']
         if names and all((name, n) in known and unpatched_upstream_test(name, n.split(' > ')[-1], target)
                          for n in names):
             tolerated[name] = names
@@ -1007,8 +1029,13 @@ def record_known_outcomes(report, root, target):
         for assertion in result.get('assertionResults', []):
             full = test_full_name(assertion)
             if (name, full) in listed and assertion.get('status') in ('passed', 'failed'):
-                seen[name + ' :: ' + full] = {'status': assertion['status'], 'target': target,
-                                              'at': time.strftime('%Y-%m-%dT%H:%M:%S')}
+                key = name + ' :: ' + full
+                # Once seen passing it stays stale (no longer tolerated) until the entry is removed.
+                passed_on = (seen.get(key) or {}).get('passedOn') or (
+                    target if assertion['status'] == 'passed' else None)
+                seen[key] = dict({'status': assertion['status'], 'target': target,
+                                  'at': time.strftime('%Y-%m-%dT%H:%M:%S')},
+                                 **({'passedOn': passed_on} if passed_on else {}))
                 if assertion['status'] == 'passed':
                     say(f'          known upstream failure now passes, remove it from {KNOWN_FAILURES.name}: {full}')
     try:
@@ -1027,7 +1054,7 @@ def report_known_failures():
     for entry in entries:
         last = seen.get(entry['file'] + ' :: ' + entry['test'])
         state = ('not run yet' if not last else
-                 f"stale, passed on {last['target'][:12]} at {last['at']}: remove it" if last['status'] == 'passed'
+                 f"stale, passed on {last['passedOn'][:12]}, no longer tolerated: remove it" if last.get('passedOn')
                  else f"still fails on {last['target'][:12]} ({last['at']})")
         say(f"    {entry['test']} ({entry['file']}; {entry.get('upstream', 'no reference')}): {state}")
 
@@ -1051,7 +1078,7 @@ def run_test_step(args, cwd, env, log, report_dir, target=None):
         return False, [f'(vitest exited {code} without a failing file; see the log)']
     if target:
         record_known_outcomes(parsed, root, target)
-        for name, names in sorted(tolerated_failures(parsed, root, target).items()):
+        for name, names in sorted(tolerated_failures(parsed, root, target, output).items()):
             if name in failed:
                 del failed[name]
                 for full in names:

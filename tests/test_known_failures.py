@@ -154,6 +154,37 @@ class KnownFailuresTest(unittest.TestCase):
             customize.report_known_failures()
         self.assertIn('still fails', out.getvalue())
 
+    def test_a_failing_hook_in_the_file_voids_the_entry(self):
+        # Real vitest 5.0.5 with a throwing beforeAll: message '', the known test failed, the tests
+        # under the hook skipped, and "Failed Suites 1" in the output.
+        passed, failing, printed = self.run_step(report([(KNOWN, 'failed'), (OTHER, 'skipped')]),
+                                                 output=' Failed Suites 1 \n FAIL  Timeline rows [ beforeAll ]')
+        self.assertFalse(passed)
+        self.assertEqual(failing, [FILE])
+        self.assertNotIn('known upstream failure', printed)
+
+    def test_an_unusual_case_state_voids_the_entry(self):
+        passed, _, _ = self.run_step(report([(KNOWN, 'failed'), (OTHER, 'errored')]))
+        self.assertFalse(passed)
+
+    def test_a_stale_entry_is_no_longer_tolerated(self):
+        self.run_step(report([(KNOWN, 'passed'), (OTHER, 'passed')]), code=0)
+        passed, failing, _ = self.run_step(report([(KNOWN, 'failed'), (OTHER, 'passed')]))
+        self.assertFalse(passed)
+        self.assertEqual(failing, [FILE])
+        out = io.StringIO()
+        with patch('sys.stdout', out):
+            customize.report_known_failures()
+        self.assertIn('stale', out.getvalue())
+
+    def test_a_top_level_case_ends_at_its_own_closer(self):
+        text = ('it("top", () => {\n  const block = `\nfirst\n}`;\n  expect(block).toBe(1);\n});\n'
+                'it("next", () => {});\n')
+        self.assertEqual(customize.test_source(text, 'top'),
+                         ['it("top", () => {\n  const block = `\nfirst\n}`;\n  expect(block).toBe(1);\n});'])
+        timed = 'it("slow", async () => {\n  await run();\n}, 10_000);\n'
+        self.assertEqual(customize.test_source(timed, 'slow'), [timed.rstrip('\n')])
+
     def test_the_list_is_part_of_the_recipe(self):
         before = customize.recipe_hash()
         self.known.write_text(json.dumps({'failures': []}))

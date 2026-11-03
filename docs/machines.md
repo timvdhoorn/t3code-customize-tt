@@ -122,8 +122,10 @@ An upstream test that fails on the plain nightly would stop every `checks`, `ser
 04:30 run, and with it the grant, until upstream fixes it. `known-upstream-failures.json` (fork-owned)
 lists such tests: `file`, `test` (the full name, `describe > ... > test`), `upstream` (PR or issue
 URL) and `added`. A failing vitest step passes only when every failed test in its JSON report matches
-an entry exactly by file and full name, its file has no load error, and the test is upstream's: the
-case's own source (its `it(`/`test(` line to the closing line at the same indentation) is identical
+an entry exactly by file and full name, its file has no load error and no case in an unusual state,
+no suite or hook failed in the step (`Failed Suites` in vitest's output: a throwing `beforeAll`
+skips the tests under it), and the test is upstream's: the case's own source (its `it(`/`test(`
+line to its `});` closer at the same indentation) is identical
 at the nightly commit and at HEAD, so a patch that edits the test voids the entry. Any other failure,
 an unhandled error or a non-zero exit without a parsable report still fails. Each tolerated test
 prints `pass (known upstream failure: <name>)`.
@@ -133,4 +135,5 @@ adding it (rerunning it there in every check would cost a second install); the s
 patch from rewriting the test itself. A patch that changes the code under test is not caught by it,
 so add an entry only after that plain-nightly run, with the upstream reference. `checks` records
 per entry whether it failed or passed (`~/.cache/t3code-customize/known-upstream-failures-seen.json`);
-`status` lists the entries and calls one stale once it passed: remove it then.
+`status` lists the entries and calls one stale once it passed on any nightly; from then on it is no
+longer tolerated, so remove it.
