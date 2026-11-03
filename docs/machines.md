@@ -94,7 +94,8 @@ against `main`. It merges that PR (squash) and starts `fleet`, without asking, o
    (the port did not run with `--skip-checks`, which blocks the grant). The tool trusts the stamp
    `checks` writes (`t3code-customize-checks.json` in the checkout's git dir: HEAD, nightly, check
    lists and `recipe_hash()`, which ignores operational code in the script: see "Recipe hash" in
-   `docs/fork-changes.md`); a run that finds it current skips the checks, and
+   `docs/fork-changes.md`, and it covers `known-upstream-failures.json`); a run that finds it
+   current skips the checks. A known upstream failure counts as passed (see below), and
 2. each patch keeps exactly the same code: per patch (shared set, `patches-tt/`, `patches-ios/`,
    matched by number) the files it changes, in order by their `diff --git` path, each with its
    added and removed lines in order, without blank and comment-only lines, are identical to the
@@ -114,3 +115,22 @@ the tool did not make is left alone; the port goes to `-2`, `-3` and so on. Afte
 Only a machine with git and `gh` can publish: the porter, devbox1. A port that does not qualify
 leaves its PR open (`status` lists it under "Open PRs") and notifies Tim. The grant covers
 exactly this case. An agent porting by hand follows the normal PR flow.
+
+### Known upstream failures
+
+An upstream test that fails on the plain nightly would stop every `checks`, `server`, `port` and
+04:30 run, and with it the grant, until upstream fixes it. `known-upstream-failures.json` (fork-owned)
+lists such tests: `file`, `test` (the full name, `describe > ... > test`), `upstream` (PR or issue
+URL) and `added`. A failing vitest step passes only when every failed test in its JSON report matches
+an entry exactly by file and full name, its file has no load error, and the test is upstream's: the
+case's own source (its `it(`/`test(` line to the closing line at the same indentation) is identical
+at the nightly commit and at HEAD, so a patch that edits the test voids the entry. Any other failure,
+an unhandled error or a non-zero exit without a parsable report still fails. Each tolerated test
+prints `pass (known upstream failure: <name>)`.
+
+The proof that a listed test fails without patches is the run on the plain nightly made before
+adding it (rerunning it there in every check would cost a second install); the source check keeps a
+patch from rewriting the test itself. A patch that changes the code under test is not caught by it,
+so add an entry only after that plain-nightly run, with the upstream reference. `checks` records
+per entry whether it failed or passed (`~/.cache/t3code-customize/known-upstream-failures-seen.json`);
+`status` lists the entries and calls one stale once it passed: remove it then.

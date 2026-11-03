@@ -247,7 +247,7 @@ OPERATIONAL_CODE = frozenset({
     'restart_service', 'stage_t3_update', 'restart_lock', 'mark_staged', 'discard_staged',
     'still_newest', 'restore_server_stock', 'systemctl', 'server_healthy', 'restart_server',
     'cmd_server_off', 'server_autoupdate', 'cmd_on', 'cmd_off', 'cmd_uninstall', 'cmd_autoupdate',
-    'start_background_update', 'app_settled', 'cmd_status', 'staged_app_update',
+    'start_background_update', 'app_settled', 'cmd_status', '_status', 'report_known_failures', 'staged_app_update',
     'report_ported_prs', '_report_ported_prs', 'fork_repo', 'report_open_prs', 'stuck_message',
     'port_failed', 'recent_failure', 'port_pending', 'porter_machine', 'port_command', 'repo_path',
     'remote_port_line', 'handed_off_already', 'hand_off_port', 'spawn_detached', 'publish_port',
@@ -286,7 +286,8 @@ def recipe_hash(full=False):
     folders = ['patches-tt'] + (['patches-ios'] if WITH_IOS else [])
     lists = [REPO / 'checks-tt.json'] + ([REPO / 'checks-ios.json'] if WITH_IOS else [])
     own = [p for folder in folders for p in sorted((REPO / folder).glob('*.patch'))]
-    for path in (shared + own + [REPO / 'checks.json'] + [c for c in lists if c.exists()]
+    known = [KNOWN_FAILURES] if KNOWN_FAILURES.exists() else []
+    for path in (shared + own + [REPO / 'checks.json'] + [c for c in lists if c.exists()] + known
                  + [REPO / NAME, REPO / 'platform_support.py'] + sorted((REPO / 'macos').glob('*'))):
         data = path.read_bytes()
         if path.name == NAME and not full:
@@ -925,20 +926,137 @@ def failed_test_files(report, root):
     return failed
 
 
-def run_test_step(args, cwd, env, log, report_dir):
-    """Run a vitest step; (passed, failing files). A file that failed only by timeout is rerun alone."""
+# --- Known upstream failures -----------------------------------------------------------
+# An upstream test that fails on the plain nightly (no patch involved) would stop every check run,
+# and with it the unattended port, until upstream fixes it. known-upstream-failures.json lists such
+# tests by file and full name ("describe > ... > test"). A failed test counts as passed only when it
+# is listed, its file exists at the nightly commit and the patches leave that test's own source
+# untouched; anything else in the step still fails it.
+
+KNOWN_FAILURES = REPO / 'known-upstream-failures.json'
+KNOWN_SEEN = CACHE / 'known-upstream-failures-seen.json'
+TEST_START = r'^(\s*)(?:it|test)(?:\.\w+)*\(\s*(["\'`]){title}\2'
+
+
+def known_failures():
+    return [e for e in load(KNOWN_FAILURES, {}).get('failures', []) if e.get('file') and e.get('test')]
+
+
+def test_full_name(assertion):
+    return ' > '.join(list(assertion.get('ancestorTitles') or []) + [assertion.get('title', '')])
+
+
+def test_source(text, title):
+    """The source of every it()/test() case named title (start line to its closing line at the same
+    indentation), or None when the case is not found."""
+    lines = text.splitlines()
+    pattern = re.compile(TEST_START.format(title=re.escape(title)))
+    cases = []
+    for number, line in enumerate(lines):
+        match = pattern.match(line)
+        if not match:
+            continue
+        indent = match.group(1)
+        end = next((i for i in range(number + 1, len(lines)) if lines[i].startswith(indent + '}')
+                    or lines[i].startswith(indent + ')')), None)
+        if end is None:
+            return None
+        cases.append('\n'.join(lines[number:end + 1]))
+    return cases or None
+
+
+def unpatched_upstream_test(file, title, target):
+    """True when the test case exists in file at the nightly commit and the patches did not change it."""
+    try:
+        before = git('show', f'{target}:{file}')
+    except Exception:
+        return False
+    path = SOURCE / file
+    if not path.exists():
+        return False
+    upstream = test_source(before, title)
+    return upstream is not None and upstream == test_source(path.read_text(), title)
+
+
+def tolerated_failures(report, root, target):
+    """{file relative to SOURCE: [full names]} of the files whose every failure is a known upstream
+    failure in an unpatched upstream test; files with a load error or any other failure are left out."""
+    known = {(e['file'], e['test']) for e in known_failures()}
+    tolerated = {}
+    for result in report.get('testResults', []):
+        if result.get('status') != 'failed' or result.get('message'):
+            continue
+        raw = result.get('name', '')
+        name = os.path.relpath(raw, str(SOURCE)) if os.path.isabs(raw) else str(Path(root) / raw)
+        names = [test_full_name(a) for a in result.get('assertionResults', []) if a.get('status') == 'failed']
+        if names and all((name, n) in known and unpatched_upstream_test(name, n.split(' > ')[-1], target)
+                         for n in names):
+            tolerated[name] = names
+    return tolerated
+
+
+def record_known_outcomes(report, root, target):
+    """Remember whether each listed test failed or passed in this run, for `status` (stale entries)."""
+    listed = {(e['file'], e['test']) for e in known_failures()}
+    if not listed:
+        return
+    seen = load(KNOWN_SEEN, {})
+    for result in report.get('testResults', []):
+        raw = result.get('name', '')
+        name = os.path.relpath(raw, str(SOURCE)) if os.path.isabs(raw) else str(Path(root) / raw)
+        for assertion in result.get('assertionResults', []):
+            full = test_full_name(assertion)
+            if (name, full) in listed and assertion.get('status') in ('passed', 'failed'):
+                seen[name + ' :: ' + full] = {'status': assertion['status'], 'target': target,
+                                              'at': time.strftime('%Y-%m-%dT%H:%M:%S')}
+                if assertion['status'] == 'passed':
+                    say(f'          known upstream failure now passes, remove it from {KNOWN_FAILURES.name}: {full}')
+    try:
+        save(KNOWN_SEEN, seen)
+    except OSError:
+        pass
+
+
+def report_known_failures():
+    entries = known_failures()
+    if not entries:
+        return
+    seen = load(KNOWN_SEEN, {})
+    say()
+    say(f'Known upstream failures ({KNOWN_FAILURES.name}):')
+    for entry in entries:
+        last = seen.get(entry['file'] + ' :: ' + entry['test'])
+        state = ('not run yet' if not last else
+                 f"stale, passed on {last['target'][:12]} at {last['at']}: remove it" if last['status'] == 'passed'
+                 else f"still fails on {last['target'][:12]} ({last['at']})")
+        say(f"    {entry['test']} ({entry['file']}; {entry.get('upstream', 'no reference')}): {state}")
+
+
+def run_test_step(args, cwd, env, log, report_dir, target=None):
+    """Run a vitest step; (passed, failing files). A file that failed only by timeout is rerun alone.
+    A file whose every failure is a known upstream failure (known-upstream-failures.json) passes."""
     report = Path(tempfile.mkstemp(prefix='vitest-', suffix='.json', dir=str(report_dir))[1])
+    root = Path(cwd).relative_to(SOURCE)
     try:
         code, output = run_bounded([*args, '--reporter=default', '--reporter=json', f'--outputFile.json={report}'],
                               env, log, STEP_TIMEOUT, cwd=cwd, merge=True)
         try:
-            failed = failed_test_files(json.loads(report.read_text() or '{}'), Path(cwd).relative_to(SOURCE))
+            parsed = json.loads(report.read_text() or '{}')
+            failed = failed_test_files(parsed, root)
         except ValueError:
-            failed = {}
+            parsed, failed = {}, {}
     finally:
         report.unlink(missing_ok=True)
     if code and not failed:
         return False, [f'(vitest exited {code} without a failing file; see the log)']
+    if target:
+        record_known_outcomes(parsed, root, target)
+        for name, names in sorted(tolerated_failures(parsed, root, target).items()):
+            if name in failed:
+                del failed[name]
+                for full in names:
+                    say(f'          pass (known upstream failure: {full})')
+                    log.write(f'\n{name}: {full} is a known upstream failure ({KNOWN_FAILURES.name}).\n')
     failing = []
     prefix = Path(cwd).relative_to(SOURCE)
     for name, timeout_only in sorted(failed.items()):
@@ -1027,7 +1145,7 @@ def checks(env, log, target, force=False):
             started = time.time()
             log.write(f'\n--- {name}: {" ".join(args)}\n')
             if args[1:3] == ['test', 'run']:
-                passed, failing = run_test_step(args, cwd, check_env, log, tmp)
+                passed, failing = run_test_step(args, cwd, check_env, log, tmp, target)
             else:
                 code, output = run_bounded(args, check_env, log, STEP_TIMEOUT, cwd=cwd, merge=True)
                 passed, failing = not code, sorted(set(TYPE_ERROR.findall(output)))
@@ -3102,6 +3220,13 @@ def cmd_autoupdate(args):
 
 
 def cmd_status(args):
+    try:
+        _status()
+    finally:
+        report_known_failures()
+
+
+def _status():
     runtime = server_runtime()
     if runtime:
         version, folder = runtime
