@@ -36,7 +36,7 @@ Subject: [PATCH 1/5] Stats for Nerds: response throughput and the composer
  create mode 100644 apps/web/src/components/chat/ComposerStats.tsx
 
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-index ef721644f6..efee2cf81d 100644
+index 3f771d6abe..15d8548f02 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
 @@ -3,6 +3,7 @@ import * as NodeEvents from "node:events";
@@ -47,7 +47,7 @@ index ef721644f6..efee2cf81d 100644
  
  import * as ClaudeSdk from "@anthropic-ai/claude-agent-sdk";
  import { beforeEach, vi } from "vite-plus/test";
-@@ -5303,6 +5304,215 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+@@ -5315,6 +5316,215 @@ describe("ClaudeAdapterV2 background wake turns", () => {
      ),
    );
  
@@ -264,16 +264,17 @@ index ef721644f6..efee2cf81d 100644
      "projects Claude thinking blocks when %s",
      (status) =>
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-index d2ae14545d..b562db5677 100644
+index 98c920f505..aed93c2969 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-@@ -1,4 +1,5 @@
+@@ -1,5 +1,6 @@
  import * as DocumentText from "../../provider/DocumentText.ts";
+ import { mcpToolResultOutput, toolOutputImages } from "@t3tools/shared/toolOutput";
 +import { ClaudeResponseThroughput, observeClaudeFrame } from "./ClaudeResponseThroughput.ts";
  import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
  import { claudeTaskOutputRoot, tailClaudeTaskOutput } from "./ClaudeTaskOutputTail.ts";
  import {
-@@ -1189,6 +1190,10 @@ export const layerQueryRunner: Layer.Layer<
+@@ -1190,6 +1191,10 @@ export const layerQueryRunner: Layer.Layer<
                    answered = true;
                  }),
                ),
@@ -284,7 +285,7 @@ index d2ae14545d..b562db5677 100644
                Stream.tap((message) =>
                  logProtocolEvent({
                    direction: "incoming",
-@@ -4077,6 +4082,7 @@ function formatClaudeUsageLimitWait(waitMs: number): string {
+@@ -4085,6 +4090,7 @@ function formatClaudeUsageLimitWait(waitMs: number): string {
  
  interface ActiveClaudeTurnContext {
    readonly queryPolicy: ClaudeRuntimeQueryPolicy;
@@ -292,7 +293,7 @@ index d2ae14545d..b562db5677 100644
    readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
    readonly nativeThreadId: string;
    readonly nativeTurnId: string;
-@@ -5682,6 +5688,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -5690,6 +5696,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
              return ordinal;
            });
  
@@ -301,7 +302,7 @@ index d2ae14545d..b562db5677 100644
          const providerTurnPayload = (input: {
            readonly context: ActiveClaudeTurnContext;
            readonly status: OrchestrationV2ProviderTurn["status"];
-@@ -5700,6 +5708,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -5708,6 +5716,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
            status: input.status,
            startedAt: input.context.startedAt,
            completedAt: input.completedAt,
@@ -311,7 +312,7 @@ index d2ae14545d..b562db5677 100644
          });
  
          const buildToolCallArtifacts = (input: {
-@@ -7714,6 +7725,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -7722,6 +7733,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                    failure: null,
                    threadDisposition,
                  };
@@ -319,7 +320,7 @@ index d2ae14545d..b562db5677 100644
            yield* Effect.all(
              [
                emitProviderEvent({
-@@ -8592,6 +8604,20 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -8600,6 +8612,20 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
            }
            yield* trackClaudeGoal({ nativeThreadId: liveQuery.nativeThreadId, context, message });
  
@@ -340,7 +341,7 @@ index d2ae14545d..b562db5677 100644
            if (message.type === "stream_event" && !message.parent_tool_use_id) {
              const event = message.event;
              const reasoning = context.reasoning;
-@@ -10610,8 +10636,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -10618,8 +10644,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
              return context;
            });
            yield* querySession.messages.pipe(
@@ -353,7 +354,7 @@ index d2ae14545d..b562db5677 100644
                  Effect.suspend(() => {
                    if (
                      message.type === "system" &&
-@@ -10648,8 +10676,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -10656,8 +10684,8 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                    }
                    return handleSdkMessage({ query: querySession, message });
                  }),
@@ -364,7 +365,7 @@ index d2ae14545d..b562db5677 100644
              Effect.exit,
              Effect.flatMap(
                Effect.fnUntraced(function* (exit: ClaudeQueryStreamExit) {
-@@ -10758,6 +10786,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -10766,6 +10794,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                    );
              const querySession = yield* openQuery(turnInput, nativeThreadId);
              const context: ActiveClaudeTurnContext = {
@@ -1042,7 +1043,7 @@ index 9482bb5a3f..3906e8cab6 100644
      Effect.scoped(
        Effect.gen(function* () {
 diff --git a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
-index 69fc35aa39..b37d3276f1 100644
+index 0f8e0ef1f3..e6693b6465 100644
 --- a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
 @@ -1,5 +1,6 @@
@@ -1060,7 +1061,7 @@ index 69fc35aa39..b37d3276f1 100644
    mergeCodexRateLimits,
    codexUsageLimitResetAt,
    type CodexRateLimitSnapshot,
-@@ -74,6 +76,7 @@ import type {
+@@ -75,6 +77,7 @@ import type {
    ProviderThreadId,
    ProviderTurnId,
    ProviderInstanceId,
@@ -1068,7 +1069,7 @@ index 69fc35aa39..b37d3276f1 100644
    RuntimeMode,
    ThreadId,
  } from "@t3tools/contracts";
-@@ -1166,6 +1169,7 @@ interface ActiveCodexTurnContext {
+@@ -1165,6 +1168,7 @@ interface ActiveCodexTurnContext {
    capacityRetryAttempt?: number;
    capacityRetryPending?: Deferred.Deferred<ActiveCodexTurnContext | undefined>;
    closedCommandItemIds?: ReadonlySet<string>;
@@ -1076,7 +1077,7 @@ index 69fc35aa39..b37d3276f1 100644
    latestProviderFailure?: {
      readonly nativeMessage: string;
      readonly nativeCode: string | null;
-@@ -1631,7 +1635,10 @@ export type CodexAdapterV2DriverEnv =
+@@ -1630,7 +1634,10 @@ export type CodexAdapterV2DriverEnv =
  
  export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapterV2")(function* (
    { instanceId, environment, enabled, config }: ProviderAdapterDriverCreateInput<CodexSettings>,
@@ -1088,7 +1089,7 @@ index 69fc35aa39..b37d3276f1 100644
  ) {
    const clientFactory = yield* CodexAppServerClientFactory;
    const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
-@@ -1676,6 +1683,9 @@ export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapter
+@@ -1675,6 +1682,9 @@ export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapter
  });
  
  export interface CodexAdapterV2Options {
@@ -1098,7 +1099,7 @@ index 69fc35aa39..b37d3276f1 100644
    readonly instanceId: ProviderInstanceId;
    readonly settings: CodexSettings;
    readonly environment: NodeJS.ProcessEnv;
-@@ -1826,6 +1836,23 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+@@ -1825,6 +1835,23 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
          );
          // A failed open is discarded, so the next turn spawns the updated binary.
          if (adapterOptions.compatibility !== undefined) yield* ensureInitialized;
@@ -1122,7 +1123,7 @@ index 69fc35aa39..b37d3276f1 100644
          const now = yield* DateTime.now;
          const session = providerSession({
            providerSessionId: input.providerSessionId,
-@@ -2111,6 +2138,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+@@ -2110,6 +2137,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
              itemParentNodeId: input.turnInput.rootNodeId,
              rootNodeId: input.turnInput.rootNodeId,
              subagent: null,
@@ -1132,7 +1133,7 @@ index 69fc35aa39..b37d3276f1 100644
              startedAt: input.startedAt,
              itemPositions: new Map(),
              fileChangeKindsByItem: new Map(),
-@@ -3461,12 +3491,15 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+@@ -3460,12 +3490,15 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
            return key;
          };
          const appendReasoning = Effect.fn("CodexAdapterV2.appendReasoning")(function* (
@@ -1149,7 +1150,7 @@ index 69fc35aa39..b37d3276f1 100644
            yield* completeProviderRetry(context, yield* DateTime.now);
            const itemId = reasoningPartKey(payload.turnId, payload.itemId, stream, index);
            // Reserve positions before delayed flushes so later tools stay after them.
-@@ -4199,6 +4232,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+@@ -4198,6 +4231,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
            readonly appName?: string;
            readonly options?: ReadonlyArray<ProviderApprovalOption>;
          }) {
@@ -1157,7 +1158,7 @@ index 69fc35aa39..b37d3276f1 100644
            const createdAt = yield* DateTime.now;
            const { owner, subagent } = approvalOwnerCodexTurn(input.context);
            const parentNodeId =
-@@ -4294,6 +4328,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+@@ -4293,6 +4327,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
            readonly questions: ReadonlyArray<CodexSchema.ToolRequestUserInputParams__ToolRequestUserInputQuestion>;
            readonly responseMode?: "message";
          }) {
@@ -1165,7 +1166,7 @@ index 69fc35aa39..b37d3276f1 100644
            const createdAt = yield* DateTime.now;
            const requestId = yield* idAllocator.allocate.runtimeRequest({
              driver: CODEX_PROVIDER,
-@@ -4383,10 +4418,16 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+@@ -4382,10 +4417,16 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
            return { node, request, turnItem };
          });
  
@@ -1184,7 +1185,7 @@ index 69fc35aa39..b37d3276f1 100644
                yield* completeProviderRetry(context, yield* DateTime.now);
              }
              yield* agentMessageDeltas.append({
-@@ -4394,8 +4435,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+@@ -4393,8 +4434,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                itemId: payload.itemId,
                delta: payload.delta,
              });
@@ -1195,7 +1196,7 @@ index 69fc35aa39..b37d3276f1 100644
  
          yield* client.handleServerNotification("item/commandExecution/outputDelta", (payload) =>
            Effect.gen(function* () {
-@@ -4418,33 +4459,41 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+@@ -4417,33 +4458,41 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
          );
  
          yield* client.handleServerNotification("item/reasoning/summaryTextDelta", (payload) =>
@@ -1245,7 +1246,7 @@ index 69fc35aa39..b37d3276f1 100644
              yield* completeProviderRetry(context, yield* DateTime.now);
              const steps = payload.plan.map((step, index) => ({
                id: `step-${index + 1}`,
-@@ -4474,8 +4523,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+@@ -4473,8 +4522,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                driver: CODEX_PROVIDER,
                turnItem: artifacts.turnItem,
              });
@@ -1256,7 +1257,7 @@ index 69fc35aa39..b37d3276f1 100644
  
          yield* client.handleServerNotification("account/rateLimits/updated", (payload) =>
            Effect.gen(function* () {
-@@ -4507,6 +4556,29 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+@@ -4506,6 +4555,29 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
            }).pipe(Effect.orDie),
          );
  
@@ -1286,7 +1287,7 @@ index 69fc35aa39..b37d3276f1 100644
          yield* client.handleServerNotification("thread/tokenUsage/updated", (payload) =>
            Effect.gen(function* () {
              accumulateCodexTurnTokenUsage(
-@@ -4833,13 +4905,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+@@ -4832,13 +4904,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
            }).pipe(Effect.orDie, turnTerminalizationPermit.withPermits(1)),
          );
  
@@ -1306,7 +1307,7 @@ index 69fc35aa39..b37d3276f1 100644
              if (payload.item.type === "contextCompaction") {
                yield* emitCompactionItem(
                  context,
-@@ -4971,11 +5047,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+@@ -4970,11 +5046,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                driver: CODEX_PROVIDER,
                turnItem: artifacts.turnItem,
              });
@@ -1323,7 +1324,7 @@ index 69fc35aa39..b37d3276f1 100644
              if (payload.item.type === "contextCompaction")
                // Fork requests off the notification reader so it can read their responses.
                yield* restoreAdditionalContext(payload.threadId).pipe(
-@@ -5001,6 +5078,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+@@ -5000,6 +5077,12 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                return;
              }
              const { context, settled } = resolved;
@@ -1336,7 +1337,7 @@ index 69fc35aa39..b37d3276f1 100644
  
              if (payload.item.type === "reasoning") {
                yield* completeReasoning(payload.turnId, payload.item);
-@@ -5293,8 +5376,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+@@ -5292,8 +5375,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                  result: text,
                });
              }
@@ -1347,7 +1348,7 @@ index 69fc35aa39..b37d3276f1 100644
  
          yield* client.handleServerRequest("item/commandExecution/requestApproval", (payload) =>
            Effect.gen(function* () {
-@@ -6175,6 +6258,19 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+@@ -6174,6 +6257,19 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                    yield* emitImageWorkState(input.context, images.running.size > 0);
                  }
                }
@@ -1367,7 +1368,7 @@ index 69fc35aa39..b37d3276f1 100644
                const nativeThreadId = input.context.providerThread.nativeThreadRef?.nativeId;
                const activation =
                  nativeThreadId == null ? undefined : goalActivations.get(nativeThreadId);
-@@ -6199,18 +6295,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+@@ -6198,18 +6294,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                  status: input.status,
                  startedAt: input.context.startedAt,
                  completedAt: input.completedAt,
@@ -1754,10 +1755,10 @@ index 0000000000..1df8c44435
 +  }
 +}
 diff --git a/apps/server/src/orchestration-v2/ProjectionStore.test.ts b/apps/server/src/orchestration-v2/ProjectionStore.test.ts
-index 14bb72e3c7..f2f29828b9 100644
+index c6187a97ea..075c5f0bee 100644
 --- a/apps/server/src/orchestration-v2/ProjectionStore.test.ts
 +++ b/apps/server/src/orchestration-v2/ProjectionStore.test.ts
-@@ -2227,6 +2227,13 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
+@@ -2301,6 +2301,13 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
          outputTokens: 1_000,
          updatedAt: "2026-08-29T12:00:00.000Z",
        } as const;
@@ -1771,7 +1772,7 @@ index 14bb72e3c7..f2f29828b9 100644
        const replacementUsage = {
          usedTokens: 18_000,
          maxTokens: 200_000,
-@@ -2283,10 +2290,10 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
+@@ -2357,10 +2364,10 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
          nodeId,
          driver,
          occurredAt: now,
@@ -1784,7 +1785,7 @@ index 14bb72e3c7..f2f29828b9 100644
          type: "provider-turn.updated",
          threadId,
          nodeId,
-@@ -2294,9 +2301,28 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
+@@ -2368,9 +2375,28 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
          occurredAt: now,
          payload: { ...providerTurn, status: "completed", completedAt: now },
        });
@@ -1814,7 +1815,7 @@ index 14bb72e3c7..f2f29828b9 100644
        assert.strictEqual(reloaded.providerTurns[0]?.status, "completed");
  
        yield* projectionStore.apply({
-@@ -2311,11 +2337,16 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
+@@ -2385,11 +2411,16 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
            status: "completed",
            completedAt: now,
            tokenUsage: replacementUsage,
@@ -1832,10 +1833,10 @@ index 14bb72e3c7..f2f29828b9 100644
    );
  
 diff --git a/apps/server/src/orchestration-v2/ProjectionStore.ts b/apps/server/src/orchestration-v2/ProjectionStore.ts
-index a46c801773..747851c193 100644
+index b5a0f2cfb5..27c57f9bd9 100644
 --- a/apps/server/src/orchestration-v2/ProjectionStore.ts
 +++ b/apps/server/src/orchestration-v2/ProjectionStore.ts
-@@ -728,6 +728,9 @@ function upsertProviderTurn(
+@@ -742,6 +742,9 @@ function upsertProviderTurn(
      ...((next.tokenUsage ?? current?.tokenUsage) === undefined
        ? {}
        : { tokenUsage: next.tokenUsage ?? current?.tokenUsage }),
@@ -1845,7 +1846,7 @@ index a46c801773..747851c193 100644
    });
  }
  
-@@ -2399,7 +2402,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -2424,7 +2427,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
              }
              case "provider-turn.updated": {
                const existingRows =

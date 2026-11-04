@@ -22,12 +22,13 @@ Activity it filled itself. Without a key the server behaves as upstream.
  .../src/directPush/agentActivityDelivery.ts   | 567 ++++++++++++++++++
  .../src/environment/ServerEnvironment.ts      |   8 +-
  .../src/observability/RpcInstrumentation.ts   |   3 +
+ .../src/orchestration-v2/ProjectionStore.ts   |   5 +
  .../src/relay/AgentAwarenessRelay.test.ts     |  67 +++
  apps/server/src/relay/AgentAwarenessRelay.ts  |  77 ++-
  apps/server/src/server.ts                     |   4 +
  apps/server/src/ws.ts                         |  14 +
  packages/contracts/src/rpc.ts                 |  37 ++
- 12 files changed, 1751 insertions(+), 25 deletions(-)
+ 13 files changed, 1756 insertions(+), 25 deletions(-)
  create mode 100644 apps/server/src/directPush/ApnsTransport.ts
  create mode 100644 apps/server/src/directPush/DirectPush.test.ts
  create mode 100644 apps/server/src/directPush/DirectPush.ts
@@ -1674,8 +1675,31 @@ index 17940b8371..e95b4d9a1a 100644
    [WS_METHODS.scheduledTasksSubscribe]: "scheduledTasks",
    [WS_METHODS.scheduledTasksUpsert]: "scheduledTasks",
    [WS_METHODS.scheduledTasksSetEnabled]: "scheduledTasks",
+diff --git a/apps/server/src/orchestration-v2/ProjectionStore.ts b/apps/server/src/orchestration-v2/ProjectionStore.ts
+index 795e409ad2..d8d4769b26 100644
+--- a/apps/server/src/orchestration-v2/ProjectionStore.ts
++++ b/apps/server/src/orchestration-v2/ProjectionStore.ts
+@@ -1001,6 +1001,8 @@ export type AgentAwarenessThread = ProjectThreadAwarenessV2Input["thread"] &
+   Pick<
+     OrchestrationV2ThreadShell,
+     | "projectId"
++    // Fork: direct push marks agent-opened threads (directPush/).
++    | "openedByThreadId"
+     | "latestRunCompletedAt"
+     | "archivedAt"
+     | "activeRunId"
+@@ -7102,6 +7104,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+             Effect.map((state): AgentAwarenessThread => ({
+               id: state.thread.id,
+               projectId: state.thread.projectId,
++              ...(state.thread.openedByThreadId === undefined
++                ? {}
++                : { openedByThreadId: state.thread.openedByThreadId }),
+               archivedAt: state.thread.archivedAt,
+               activeRunId: state.activeRunId,
+               latestRunId: state.latestRunId,
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.test.ts b/apps/server/src/relay/AgentAwarenessRelay.test.ts
-index 87838fd5a5..03aca1ae12 100644
+index 8747ad7e3d..e6ccdef462 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.test.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.test.ts
 @@ -35,6 +35,7 @@ import {
@@ -1686,15 +1710,15 @@ index 87838fd5a5..03aca1ae12 100644
  import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
  import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
  import * as SqlitePersistence from "../persistence/Sqlite.ts";
-@@ -144,6 +145,7 @@ const makeTestRelay = Effect.fnUntraced(function* (
-     readonly linked?: boolean;
+@@ -145,6 +146,7 @@ const makeTestRelay = Effect.fnUntraced(function* (
      readonly readShell?: (threadId: ThreadId) => Effect.Effect<OrchestrationV2ThreadShell | null>;
      readonly domainEvents?: Stream.Stream<OrchestrationV2DomainEvent>;
+     readonly catchUpThreads?: ReadonlyArray<OrchestrationV2ThreadShell>;
 +    readonly directPush?: DirectPush.DirectPush["Service"];
    } = {},
  ) {
    const values = new Map<string, Uint8Array>(
-@@ -289,6 +291,10 @@ const makeTestRelay = Effect.fnUntraced(function* (
+@@ -296,6 +298,10 @@ const makeTestRelay = Effect.fnUntraced(function* (
      }),
      Effect.provideService(FetchHttpClient.Fetch, fetch),
      Effect.provide(NodeCrypto.layer),
@@ -1705,7 +1729,7 @@ index 87838fd5a5..03aca1ae12 100644
    );
    return { relay, secrets, secretReads, currentShell, shellReads, publications, catchUp };
  });
-@@ -341,6 +347,67 @@ describe("AgentAwarenessRelay", () => {
+@@ -348,6 +354,67 @@ describe("AgentAwarenessRelay", () => {
      }),
    );
  
@@ -1774,7 +1798,7 @@ index 87838fd5a5..03aca1ae12 100644
      Effect.gen(function* () {
        const { relay, currentShell, publications } = yield* makeTestRelay();
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.ts b/apps/server/src/relay/AgentAwarenessRelay.ts
-index 6a235911d4..251dfb8f0c 100644
+index 6e9175862e..55fd6aa848 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.ts
 @@ -47,6 +47,7 @@ import {
