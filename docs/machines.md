@@ -13,6 +13,25 @@ run the same patches.
   (one at a time) and returns at once, since its server step waits for that agent's thread too: do
   not wait on it in that turn, check `journalctl --user -u t3code-customize-fleet` later
   (`--foreground` runs it inline). On a Mac it runs inline and says not to wait on it.
+- **Fleet keeps each checkout on git.** It works on the main checkout's path on every machine
+  (`~/Devops/Personal/t3code-customize-tt`, `checkout_root`), also when it runs from a git worktree,
+  and never creates a missing checkout. It never copies files into a machine's git checkout: there it
+  runs `git fetch` (or sends `origin/main` as a `git bundle` over SSH when that machine cannot reach
+  GitHub) and fast-forwards `main` to `origin/main`. Files an older fleet copied in (identical to
+  `origin/main`) are reset to it; untracked files `origin/main` does not have (a checkout's own
+  installed skills) stay and do not count. A change that differs from `origin/main` (an untracked
+  file included), local commits or another branch stop that machine (`left its checkout alone: ...`)
+  and stay as they are: commit, push or discard them there, then rerun fleet. Each Mac ends on
+  `## main...origin/main` with nothing changed, so its hourly `pull_latest` keeps working. A fleet run from a branch or a dirty
+  checkout still moves the machines to `origin/main` and says so.
+- **A Mac updates through its LaunchAgent.** Over SSH fleet turns `autoupdate on`, then starts that
+  LaunchAgent once (`launchctl kickstart gui/<uid>/com.github.t3code-customize.update`, after a run
+  that holds it or the checkout has finished, up to `--wait-lock` minutes), prints the new lines of
+  `~/.cache/t3code-customize/logs/autoupdate.log` and reports the run's exit code. The run lives in
+  the login session, so on the MacBook Pro the iOS build it may start can sign: from an SSH session
+  codesign fails with `errSecInternalComponent` after the whole build. `ios` itself stops at once when
+  `security show-keychain-info` fails (any SSH session) and names that kickstart. `--force` and
+  `--fix` first rebuild directly over SSH; that path never builds iOS.
 - **Never interrupt a running thread.** Nothing in this tool quits or relaunches the Mac app. A
   T3 server restarts only in `server` and `server-off`, once per run, and only while it is idle:
   `busy_threads` finds no live work in `~/.t3/userdata/statev2.sqlite`, by the rules the server

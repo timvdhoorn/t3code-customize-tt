@@ -242,6 +242,8 @@ OPERATIONAL_CODE = frozenset({
     'Deferred', 'PortHandedOff', 'MergedButStuck', 'say', 'step', 'notify', 'tool_log', 'lock_path',
     'release_checkout_lock', 'lock_holder', 'acquire_lock', 'interactive', 'inside_t3_agent',
     'this_machine', 'ssh_target', 'remote', 'repo_files', 'remote_identity', 'sync_repo',
+    'remote_python', 'git_sync_snippet', 'remote_git_sync', 'sync_decision', 'send_bundle', 'copy_repo',
+    'agent_run_snippet', 'agent_run_command', 'keychain_reachable', 'checkout_root',
     'fleet_command', 'autoupdate_command', 'detach_fleet', 'cmd_fleet', 'identity', 'cmd_identity',
     'busy_threads', 'wait_until_idle', 'restart_owed',
     'restart_service', 'stage_t3_update', 'restart_lock', 'mark_staged', 'discard_staged',
@@ -2083,12 +2085,25 @@ def port_command(machine, target, version):
             '--wait-lock', str(PORT_FLEET_WAIT)]
 
 
+def checkout_root():
+    """This repo's main checkout. Run from a git worktree, REPO is a path only this machine has; the
+    main checkout's path is the one every machine shares (fleet once copied a worktree onto the Macs
+    and pointed their LaunchAgents at it)."""
+    if (REPO / '.git').is_file():
+        common = subprocess.run(['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'], cwd=REPO,
+                                capture_output=True, text=True)
+        if common.returncode == 0 and common.stdout.strip():
+            return Path(common.stdout.strip()).parent
+    return REPO
+
+
 def repo_path():
     """This repo's path for the porter: relative to HOME when it lives there, else absolute."""
+    root = checkout_root()
     try:
-        return str(REPO.relative_to(HOME))
+        return str(root.relative_to(HOME))
     except ValueError:
-        return str(REPO)
+        return str(root)
 
 
 def remote_port_line(machine, target, version, path):
@@ -3460,21 +3475,142 @@ def remote_identity(alias, probe):
 
 
 PATCH_FOLDERS = ('patches', 'patches-port', 'patches-tt', 'patches-ios')
+# The branch every machine's checkout follows; fleet moves it to this, never to a branch it ran from.
+SYNC_REF = 'origin/main'
 
 
-def sync_repo(alias, path, wanted, say_as):
-    """Make the machine's copy of this repo match ours: wait for Syncthing, else copy the files."""
-    probe = f'python3 "$HOME"/{shlex.quote(path)}/{NAME} identity 2>/dev/null'
-    deadline = time.time() + 180
-    while True:
-        out = remote_identity(alias, probe)
-        if out == wanted:
-            return
-        if time.time() > deadline or not out:
-            break
-        say_as('waiting for Syncthing to bring the repo over...')
-        time.sleep(15)
-    say_as('copying the repo files over SSH...')
+def remote_python(alias, code, *args, **kwargs):
+    """Run a self-contained Python snippet on the machine (its system python3, 3.9 on a Mac), so it
+    works whatever version of this script the machine's checkout holds."""
+    line = 'python3 - ' + ' '.join(shlex.quote(str(a)) for a in args)
+    return remote(alias, line, input=code, capture_output=True, text=True, **kwargs)
+
+
+def git_sync_snippet():
+    """Runs on the machine: brings SYNC_REF there (fetch, or the bundle fleet sent), optionally moves
+    the checkout, and prints what sync_decision needs as one JSON line. Arguments: path under $HOME,
+    mode (fetch, bundle <file under $HOME>, ff <head> <target>, reset <head> <target>)."""
+    return r'''
+import json, os, subprocess, sys, tempfile
+path = os.path.join(os.path.expanduser('~'), sys.argv[1])
+mode, rest = sys.argv[2], sys.argv[3:]
+ref = %(ref)r
+def git(*args, **kwargs):
+    return subprocess.run(['git', '-C', path] + list(args), capture_output=True, text=True, **kwargs)
+facts = {'exists': os.path.isdir(path), 'repo': os.path.exists(os.path.join(path, '.git'))}
+if facts['repo']:
+    if mode == 'fetch':
+        try:
+            fetched = git('fetch', '--quiet', 'origin', timeout=180)
+            if fetched.returncode:
+                facts['fetchError'] = (fetched.stderr.strip() or 'git fetch failed').splitlines()[-1]
+        except subprocess.TimeoutExpired:
+            facts['fetchError'] = 'git fetch timed out'
+    elif mode == 'bundle':
+        bundle = os.path.join(os.path.expanduser('~'), rest[0])
+        fetched = git('fetch', '--quiet', bundle, 'refs/remotes/%(ref)s:refs/remotes/%(ref)s')
+        os.remove(bundle)
+        if fetched.returncode:
+            facts['error'] = 'could not fetch the bundle: ' + (fetched.stderr.strip() or '?').splitlines()[-1]
+    elif mode in ('ff', 'reset'):
+        head, target = rest
+        if git('rev-parse', 'HEAD').stdout.strip() != head:
+            facts['error'] = 'its checkout moved while fleet looked at it'
+        else:
+            moved = (git('merge', '--ff-only', '--quiet', target) if mode == 'ff'
+                     else git('reset', '--hard', '--quiet', target))
+            if moved.returncode:
+                facts['error'] = 'git %%s failed: %%s' %% (mode, (moved.stderr.strip() or '?').splitlines()[-1])
+    facts['branch'] = git('symbolic-ref', '--short', '-q', 'HEAD').stdout.strip()
+    facts['head'] = git('rev-parse', 'HEAD').stdout.strip()
+    facts['target'] = git('rev-parse', '--verify', '-q', ref + '^{commit}').stdout.strip()
+    facts['ancestor'] = bool(facts['target']) and git('merge-base', '--is-ancestor', facts['head'],
+                                                      facts['target']).returncode == 0
+    status = git('status', '--porcelain=v1', '-z', '--untracked-files=all', '--no-renames').stdout
+    entries = [entry for entry in status.split('\0') if len(entry) > 3]
+    facts['dirty'] = sorted({entry[3:] for entry in entries})
+    untracked = {entry[3:] for entry in entries if entry.startswith('??')}
+    facts['differing'], facts['extra'] = [], []
+    if facts['dirty'] and facts['target']:
+        # The working tree (untracked files and deletions included) against the target, in an index of
+        # its own, so the checkout's own index is untouched.
+        handle, index = tempfile.mkstemp()
+        os.close(handle)
+        env = dict(os.environ, GIT_INDEX_FILE=index)
+        try:
+            git('read-tree', facts['target'], env=env)
+            git('add', '-A', env=env)
+            listed = git('diff', '--cached', '--name-status', '-z', '--no-renames', facts['target'], env=env)
+            fields = [field for field in listed.stdout.split('\0') if field]
+            changes = list(zip(fields[0::2], fields[1::2]))
+            facts['differing'] = sorted(name for _, name in changes)
+            # Untracked files the target does not have (a checkout's own installed skills): git keeps
+            # them through a fast-forward or reset, so they neither block nor get touched.
+            facts['extra'] = sorted(name for kind, name in changes if kind == 'A' and name in untracked)
+        finally:
+            os.remove(index)
+print(json.dumps(facts))
+''' % {'ref': SYNC_REF}
+
+
+def remote_git_sync(alias, path, *mode, **kwargs):
+    done = remote_python(alias, git_sync_snippet(), path, *mode, **kwargs)
+    lines = done.stdout.strip().splitlines()
+    try:
+        return json.loads(lines[-1])
+    except (IndexError, ValueError):
+        raise Stop('could not read its checkout: ' + (done.stderr.strip() or 'no answer')[:300])
+
+
+def sync_decision(facts):
+    """What fleet does with a machine's checkout of this repo (facts from git_sync_snippet):
+    'copy' (no git there: copy the files), 'current', 'ff' (clean and behind), 'reset' (every changed
+    file already equals SYNC_REF, as an older fleet's file copy left it) or 'refuse' (local work that
+    differs from SYNC_REF, another branch or local commits: never discarded). Untracked files SYNC_REF
+    does not have ('extra') stay where they are and count for nothing. Returns (action, detail)."""
+    if not facts.get('exists', True):
+        return 'refuse', 'it has no checkout of this repo there (clone it, see "A new machine" in README.md)'
+    if not facts.get('repo'):
+        return 'copy', 'no git checkout there'
+    if facts.get('error'):
+        return 'refuse', facts['error']
+    if not facts.get('target'):
+        return 'refuse', f'it has no {SYNC_REF}' + (f" ({facts['fetchError']})" if facts.get('fetchError') else '')
+    if facts.get('branch') != 'main':
+        return 'refuse', 'its checkout is on ' + (facts.get('branch') or 'a detached HEAD') + ', not main'
+    if not facts.get('ancestor'):
+        return 'refuse', f'its main has commits that are not on {SYNC_REF}'
+    dirty = sorted(set(facts.get('dirty') or []) - set(facts.get('extra') or []))
+    real = sorted(set(dirty) & set(facts.get('differing') or []))
+    if real:
+        return 'refuse', (f'local changes that differ from {SYNC_REF}: ' + ', '.join(real[:5])
+                          + (f' and {len(real) - 5} more' if len(real) > 5 else ''))
+    if dirty:
+        return 'reset', f'{len(dirty)} changed or untracked files already match {SYNC_REF}'
+    if facts.get('head') == facts.get('target'):
+        return 'current', f'already at {SYNC_REF}'
+    return 'ff', f"fast-forward {facts['head'][:7]}..{facts['target'][:7]}"
+
+
+def send_bundle(alias, path):
+    """Bring our SYNC_REF to the machine as a git bundle when it cannot fetch it itself, so its
+    checkout still moves through git."""
+    with tempfile.TemporaryDirectory() as folder:
+        bundle = Path(folder) / 'sync.bundle'
+        made = subprocess.run(['git', 'bundle', 'create', str(bundle), SYNC_REF], cwd=REPO,
+                              capture_output=True, text=True)
+        if made.returncode:
+            raise Stop('could not fetch there, and no bundle here: ' + made.stderr.strip()[:200])
+        name = f'.t3code-customize-sync-{os.getpid()}.bundle'
+        with bundle.open('rb') as data:
+            sent = remote(alias, f'cat > "$HOME"/{name}', stdin=data, capture_output=True)
+    if sent.returncode:
+        raise Stop('could not send the bundle over SSH')
+    return remote_git_sync(alias, path, 'bundle', name)
+
+
+def copy_repo(alias, path, probe, wanted):
+    """The old way, for a machine without a git checkout: copy the tracked files over SSH."""
     # No AppleDouble files from a Mac in the copy.
     xattrs = ['--no-xattrs', '--no-mac-metadata'] if MAC else []
     pack = subprocess.Popen(['tar', *xattrs, '-C', str(REPO), '-cf', '-', *repo_files()], stdout=subprocess.PIPE,
@@ -3490,7 +3626,119 @@ def sync_repo(alias, path, wanted, say_as):
         raise Stop('could not bring the repo over: ' + (unpack.stderr.strip() or 'files still differ'))
 
 
-FLEET_STATUS = {0: 'ok', 3: 'needs a port (see docs/porting.md)', 4: 'deferred: threads busy'}
+def sync_repo(alias, path, wanted, say_as):
+    """Move the machine's checkout of this repo to SYNC_REF through git: fetch there (or send a
+    bundle), then fast-forward, so its own pulls keep working. Real local changes stop it."""
+    probe = f'python3 "$HOME"/{shlex.quote(path)}/{NAME} identity 2>/dev/null'
+    facts = remote_git_sync(alias, path, 'fetch')
+    if facts.get('repo') and facts.get('fetchError'):
+        say_as(f"git fetch failed there ({facts['fetchError']}); sending {SYNC_REF} as a git bundle over SSH...")
+        facts = send_bundle(alias, path)
+    action, detail = sync_decision(facts)
+    if action == 'copy':
+        say_as('no git checkout there; copying the repo files over SSH...')
+        copy_repo(alias, path, probe, wanted)
+        return
+    if action == 'refuse':
+        raise Stop(f'left its checkout alone: {detail}. Commit, push or discard that there, then rerun fleet.')
+    if action in ('ff', 'reset'):
+        say_as(f'moving its checkout to {SYNC_REF}: {detail}...')
+        after = remote_git_sync(alias, path, action, facts['head'], facts['target'])
+        if after.get('error') or after.get('head') != facts['target'] or set(after.get('dirty') or []) - set(
+                after.get('extra') or []):
+            raise Stop('could not move its checkout: ' + (after.get('error') or 'it is still not clean at '
+                                                          + SYNC_REF))
+    if remote_identity(alias, probe) != wanted:
+        say_as(f'note: it now runs {SYNC_REF}, which differs from the checkout fleet runs from.')
+
+
+def agent_run_snippet():
+    """Runs on a Mac: waits until the autoupdate LaunchAgent is idle and the checkout lock is free (up
+    to the minutes given), starts the agent once with launchctl kickstart, prints its new lines of
+    autoupdate.log as they come and exits with the run's exit code (5: still busy). The run then
+    lives in the login session, where Xcode can reach the keychain to sign an iOS build.
+    Arguments: label, log and lock (under $HOME), minutes."""
+    return r'''
+import fcntl, os, re, subprocess, sys, time
+home = os.path.expanduser('~')
+label, log, lock, minutes = sys.argv[1], os.path.join(home, sys.argv[2]), os.path.join(home, sys.argv[3]), float(sys.argv[4])
+service = 'gui/%d/%s' % (os.getuid(), label)
+def job():
+    out = subprocess.run(['launchctl', 'print', service], capture_output=True, text=True)
+    if out.returncode:
+        return None, None
+    state = re.search(r'^\tstate = (\S+)', out.stdout, re.M)
+    code = re.search(r'^\tlast exit code = (-?\d+)', out.stdout, re.M)
+    return (state.group(1) if state else '?'), (int(code.group(1)) if code else None)
+offset = [os.path.getsize(log) if os.path.exists(log) else 0]
+def tail():
+    if not os.path.exists(log):
+        return
+    if os.path.getsize(log) < offset[0]:
+        offset[0] = 0
+    with open(log, 'rb') as f:
+        f.seek(offset[0])
+        data = f.read()
+    offset[0] += len(data)
+    sys.stdout.write(data.decode('utf-8', 'replace'))
+    sys.stdout.flush()
+def lock_free():
+    try:
+        handle = open(lock, 'a')
+    except OSError:
+        return True
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        return True
+    except OSError:
+        return False
+    finally:
+        handle.close()
+state, _ = job()
+if state is None:
+    print('the autoupdate LaunchAgent %s is not loaded' % label)
+    sys.exit(1)
+deadline = time.time() + minutes * 60
+said = False
+while state == 'running' or not lock_free():
+    if not said:
+        print('waiting for the run that holds the checkout to finish...')
+        sys.stdout.flush()
+        said = True
+    if time.time() > deadline:
+        print('still busy after %d minutes; its next run picks the change up' % minutes)
+        sys.exit(5)
+    time.sleep(10)
+    tail()
+    state, _ = job()
+tail()
+started = subprocess.run(['launchctl', 'kickstart', service], capture_output=True, text=True)
+if started.returncode:
+    print('launchctl kickstart %s failed: %s' % (service, started.stderr.strip()))
+    sys.exit(1)
+begun, seen = time.time(), False
+while True:
+    time.sleep(5)
+    tail()
+    state, code = job()
+    if state == 'running':
+        seen = True
+    elif seen or time.time() - begun > 60:
+        break
+tail()
+sys.exit(code if code is not None else 1)
+'''
+
+
+def agent_run_command(wait_lock):
+    """The shell line that runs agent_run_snippet on a Mac (its arguments, relative to $HOME)."""
+    logs = '.cache/t3code-customize'
+    return ['python3', '-', AUTOUPDATE_LABEL, logs + '/logs/autoupdate.log', logs + '/lock', str(wait_lock)]
+
+
+FLEET_STATUS = {0: 'ok', 3: 'needs a port (see docs/porting.md)', 4: 'deferred: threads busy',
+                5: 'busy: another run holds the checkout'}
 
 
 def fleet_command(machine, args):
@@ -3553,7 +3801,9 @@ def cmd_fleet(args):
     if not machines:
         raise Stop(f'No machines in {MACHINES}.')
     me = this_machine(machines)
-    path = str(REPO.relative_to(HOME))
+    path = repo_path()
+    if path.startswith('/'):
+        raise Stop(f'{checkout_root()} is not under your home folder; fleet finds the checkout there on every machine.')
     wanted = identity()
     printing = threading.Lock()
     results = {}
@@ -3571,6 +3821,13 @@ def cmd_fleet(args):
                 def start(command):
                     return subprocess.Popen([sys.executable, str(REPO / NAME), *command], stdin=subprocess.DEVNULL,
                                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+                def start_snippet(argv, code):
+                    process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                               stderr=subprocess.STDOUT, text=True, cwd=str(HOME))
+                    process.stdin.write(code)
+                    process.stdin.close()
+                    return process
             else:
                 alias = ssh_target(machine)
                 if not alias:
@@ -3583,6 +3840,15 @@ def cmd_fleet(args):
                                              'exec "$SHELL" -lc ' + shlex.quote(line)], stdin=subprocess.DEVNULL,
                                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
+                def start_snippet(argv, code):
+                    process = subprocess.Popen(['ssh', '-o', 'BatchMode=yes', '-o', 'ServerAliveInterval=30', alias,
+                                                'exec "$SHELL" -lc ' + shlex.quote(shlex.join(argv))],
+                                               stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                               stderr=subprocess.STDOUT, text=True)
+                    process.stdin.write(code)
+                    process.stdin.close()
+                    return process
+
             def follow(process):
                 last = ''
                 for line in process.stdout:
@@ -3591,10 +3857,24 @@ def cmd_fleet(args):
                         say_as(last)
                 return process.wait(), last
 
-            code, last = follow(start(command))
+            if machine['kind'] == 'mac':
+                # A Mac updates through its autoupdate LaunchAgent, in the login session: an iOS build
+                # the run starts signs with the keychain, which an SSH session cannot reach.
+                code, last = 0, ''
+                if args.force or args.fix:
+                    # The agent's run takes neither; this direct rebuild never builds iOS.
+                    code, last = follow(start(command))
+                auto_code, auto_last = follow(start(autoupdate_command(machine)))
+                if not auto_code and not code:
+                    say_as('running the update through its autoupdate LaunchAgent...')
+                    code, agent_last = follow(start_snippet(agent_run_command(getattr(args, 'wait_lock', 30)),
+                                                            agent_run_snippet()))
+                    last = agent_last or last
+            else:
+                code, last = follow(start(command))
+                # Every machine keeps itself current from now on (see docs/machines.md).
+                auto_code, auto_last = follow(start(autoupdate_command(machine)))
             status = FLEET_STATUS.get(code, f'failed ({code})')
-            # Every machine keeps itself current from now on (see docs/machines.md).
-            auto_code, auto_last = follow(start(autoupdate_command(machine)))
             if auto_code:
                 status, last = f'{status}, autoupdate failed ({auto_code})', auto_last
             results[name] = (status, last)
@@ -3830,6 +4110,16 @@ def ios_recipe_hash():
         WITH_IOS = previous
 
 
+def keychain_reachable(run=subprocess.run):
+    """True when this session can use the login keychain, which codesign needs for the iOS app. An
+    SSH session cannot (security answers 36, "User interaction is not allowed"); a Terminal or the
+    autoupdate LaunchAgent in the login session can."""
+    try:
+        return run(['security', 'show-keychain-info'], capture_output=True, text=True).returncode == 0
+    except OSError:
+        return False
+
+
 def cmd_ios(args):
     """Build the patched iOS app for the nightly installed on this Mac and upload it to TestFlight."""
     global WITH_IOS
@@ -3839,6 +4129,12 @@ def cmd_ios(args):
     for tool in ('xcodebuild', 'pod', 'asccli'):
         if not shutil.which(tool):
             raise Stop(f'{tool} is required (asccli: brew install asccli; pod: brew install cocoapods).')
+    if not keychain_reachable():
+        raise Stop('This session cannot reach the login keychain, so Xcode could not sign the iOS app'
+                   ' (errSecInternalComponent, after a build of a quarter of an hour). An SSH session never'
+                   ' can. Run it in the login session instead: launchctl kickstart'
+                   f' gui/{os.getuid()}/{AUTOUPDATE_LABEL} (its run builds iOS when the nightly changed;'
+                   f' fleet starts it that way), or {NAME} ios in Terminal on this Mac.')
     config = ios_config()
     if not args.no_pull and not args.resume:
         pull_latest()

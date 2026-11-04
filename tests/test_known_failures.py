@@ -191,6 +191,25 @@ class KnownFailuresTest(unittest.TestCase):
         timed = 'it("slow", async () => {\n  await run();\n}, 10_000);\n'
         self.assertEqual(customize.test_source(timed, 'slow'), [timed.rstrip('\n')])
 
+    def test_an_empty_list_tolerates_nothing_and_reports_nothing(self):
+        self.known.write_text(json.dumps({'comment': 'none listed', 'failures': []}))
+        self.assertEqual(customize.known_failures(), [])
+        passed, failing, printed = self.run_step(report([(KNOWN, 'failed'), (OTHER, 'passed')]))
+        self.assertFalse(passed)
+        self.assertEqual(failing, [FILE])
+        self.assertNotIn('known upstream failure', printed)
+        passed, _, _ = self.run_step(report([(KNOWN, 'passed'), (OTHER, 'passed')]), code=0)
+        self.assertTrue(passed)
+        self.assertFalse(self.seen.exists())
+        out = io.StringIO()
+        with patch('sys.stdout', out):
+            customize.report_known_failures()
+        self.assertEqual(out.getvalue(), '')
+
+    def test_the_repo_list_parses(self):
+        with patch.object(customize, 'KNOWN_FAILURES', ROOT / 'known-upstream-failures.json'):
+            self.assertIsInstance(customize.known_failures(), list)
+
     def test_the_list_is_part_of_the_recipe(self):
         before = customize.recipe_hash()
         self.known.write_text(json.dumps({'failures': []}))

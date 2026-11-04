@@ -75,6 +75,7 @@ REVIEWED_REACHED = {
     'port_pending': 'finds a published port for a nightly',
     'porter_machine': 'which machine ports',
     'publish_port': 'commits and opens the port PR',
+    'keychain_reachable': 'stops an iOS build early in a session that cannot sign; produces nothing',
 }
 
 
