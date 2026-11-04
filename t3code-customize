@@ -852,14 +852,20 @@ def install_dependencies(env, log):
 
 
 def typechecker(log=None):
-    """Upstream typechecks with tsc-rs, which has the Effect diagnostics built in and checks the
-    packages about 3x faster in half the memory of tsc; nightlies from before it switched only have tsc."""
-    if any((SOURCE / 'node_modules' / '.bin').glob('tsc-rs*')):
-        return 'tsc-rs'
+    """The typecheck command, as upstream runs it. Since #31028 every package typechecks with
+    `effect-tsgo tsrs` (Effect's patched Rust TypeScript; no `typescript` package is installed).
+    Before that upstream used tsc-rs, which has the Effect diagnostics built in and checks the
+    packages about 3x faster in half the memory of tsc; older nightlies only have tsc."""
+    bin_dir = SOURCE / 'node_modules' / '.bin'
+    script = load(SOURCE / 'apps' / 'server' / 'package.json', {}).get('scripts', {}).get('typecheck', '')
+    if script.startswith('effect-tsgo tsrs') and any(bin_dir.glob('effect-tsgo*')):
+        return ['effect-tsgo', 'tsrs']
+    if any(bin_dir.glob('tsc-rs*')):
+        return ['tsc-rs']
     if log:
         log.write('tsc-rs is not installed in this checkout; typechecking with tsc.\n')
         log.flush()
-    return 'tsc'
+    return ['tsc']
 
 
 def check_spec():
@@ -1127,10 +1133,12 @@ def checks(env, log, target, force=False):
     if WITH_IOS:
         desktop_stack_checks(env, log, target)
     step('Testing the patches...')
-    # Upstream's `prepare` patches tsc with the Effect diagnostics (globalDateInEffect and
-    # friends) and its CI typechecks with them; --ignore-scripts skips that, so a checkout
+    tsc = typechecker(log)
+    # Upstream's `prepare` once patched tsc with the Effect diagnostics (globalDateInEffect and
+    # friends) and its CI typechecked with them; --ignore-scripts skips that, so a checkout
     # someone once installed without it checked more strictly than the rest. Patch every time.
-    if any((SOURCE / 'node_modules' / '.bin').glob('effect-tsgo*')):
+    # `effect-tsgo tsrs` carries those diagnostics itself and there is no tsc to patch.
+    if tsc != ['effect-tsgo', 'tsrs'] and any((SOURCE / 'node_modules' / '.bin').glob('effect-tsgo*')):
         run(['effect-tsgo', 'patch'], cwd=SOURCE, env=env, log=log)
     # Upstream runs *.browser.test.* files in its app's "browser" project (Playwright
     # Chromium); from the root they land in the node pool and fail. Run them per app.
@@ -1148,8 +1156,7 @@ def checks(env, log, target, force=False):
     browsers = CACHE / 'ms-playwright'
     if by_app:
         install_playwright_browser(env, browsers, SOURCE / next(iter(by_app)), log)
-    tsc = typechecker(log)
-    steps += [(f'typecheck {p}', [tsc, '--noEmit', '-p', p + '/tsconfig.json'], SOURCE) for p in spec['typecheck']]
+    steps += [(f'typecheck {p}', [*tsc, '--noEmit', '-p', p + '/tsconfig.json'], SOURCE) for p in spec['typecheck']]
     # Upstream's lint holds rules tests and typechecks miss, such as no-hermes-unsupported-apis
     # (Array#toSorted crashes the iOS app at render). Lint what the patches add or change.
     changed = [f for f in git('diff', '--name-only', '--diff-filter=AM', target + '..HEAD').split()
