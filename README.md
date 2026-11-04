@@ -210,9 +210,10 @@ t3code-customize fleet                 update every machine at once
 t3code-customize fleet --only devbox1  just one
 ```
 
-It runs from any machine on the list. Each other machine first gets this repo's files
-(Syncthing usually brings them; otherwise they are copied over SSH), then runs `update`
-(Mac) or `server` (Linux) in its login shell. A summary shows per machine: ok, needs a
+It runs from any machine on the list. Each other machine's checkout first moves to
+`origin/main` through git (fetch and fast-forward; it stops on local changes instead of
+overwriting them), then a Mac runs `update` through its `autoupdate` LaunchAgent (the login
+session, where an iOS build can sign) and a Linux server runs `server` in its login shell. A summary shows per machine: ok, needs a
 port, or failed. Run it after every change to this repo; the background updaters on each
 machine pick changes up on their own within the hour (Mac) or night (server).
 
