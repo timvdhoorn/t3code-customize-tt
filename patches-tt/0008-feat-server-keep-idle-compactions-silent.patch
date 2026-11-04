@@ -8,9 +8,10 @@ Upstream's idle compaction (#21682) sends /compact as a visible turn, which can 
  .../src/orchestration-v2/IdleCompaction.ts    | 61 +++++++++++++-
  .../IdleCompactionReadState.test.ts           | 79 +++++++++++++++++++
  .../orchestration-v2/IdleCompactionService.ts | 35 +++++++-
+ .../src/orchestration-v2/ProjectionStore.ts   |  3 +
  .../src/relay/AgentAwarenessRelay.test.ts     | 48 ++++++++++-
  apps/server/src/relay/AgentAwarenessRelay.ts  | 17 ++++
- 5 files changed, 234 insertions(+), 6 deletions(-)
+ 6 files changed, 237 insertions(+), 6 deletions(-)
  create mode 100644 apps/server/src/orchestration-v2/IdleCompactionReadState.test.ts
 
 diff --git a/apps/server/src/orchestration-v2/IdleCompaction.ts b/apps/server/src/orchestration-v2/IdleCompaction.ts
@@ -244,8 +245,29 @@ index c7035de4ec..fa308683d7 100644
            : Effect.void,
        ),
      );
+diff --git a/apps/server/src/orchestration-v2/ProjectionStore.ts b/apps/server/src/orchestration-v2/ProjectionStore.ts
+index d8d4769b26..6bde24ed29 100644
+--- a/apps/server/src/orchestration-v2/ProjectionStore.ts
++++ b/apps/server/src/orchestration-v2/ProjectionStore.ts
+@@ -1008,6 +1008,8 @@ export type AgentAwarenessThread = ProjectThreadAwarenessV2Input["thread"] &
+     | "activeRunId"
+     | "latestRunId"
+     | "hasActionableProposedPlan"
++    // Fork: the relay skips idle compactions only on threads that are not settled.
++    | "settledAt"
+   >;
+ 
+ type ShellThreadRow = {
+@@ -7115,6 +7117,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+               lineage: state.thread.lineage,
+               modelSelection: state.thread.modelSelection,
+               settledOverride: state.thread.settledOverride,
++              settledAt: state.thread.settledAt,
+               updatedAt: state.updatedAt,
+               status: state.latestRunStatus,
+               activityRunStatus: state.activityRunStatus,
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.test.ts b/apps/server/src/relay/AgentAwarenessRelay.test.ts
-index 03aca1ae12..d10297d7c4 100644
+index e6ccdef462..0f37191d1c 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.test.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.test.ts
 @@ -6,6 +6,7 @@ import {
@@ -265,9 +287,9 @@ index 03aca1ae12..d10297d7c4 100644
 +      runIds?: ReadonlyArray<RunId>,
 +    ) => ReadonlyArray<OrchestrationV2Run>;
      readonly domainEvents?: Stream.Stream<OrchestrationV2DomainEvent>;
+     readonly catchUpThreads?: ReadonlyArray<OrchestrationV2ThreadShell>;
      readonly directPush?: DirectPush.DirectPush["Service"];
-   } = {},
-@@ -205,7 +210,13 @@ const makeTestRelay = Effect.fnUntraced(function* (
+@@ -212,7 +217,13 @@ const makeTestRelay = Effect.fnUntraced(function* (
      getTimelinePage: () => Effect.die("Unused timeline read"),
      getMessageCount: () => Effect.die("unused message count"),
      getTurnItem: () => Effect.die("unused turn item read"),
@@ -282,7 +304,7 @@ index 03aca1ae12..d10297d7c4 100644
      getThreadProjection: unused,
      getCheckpointContext: unused,
      getThreadSnapshot: unused,
-@@ -368,6 +379,41 @@ describe("AgentAwarenessRelay", () => {
+@@ -375,6 +386,41 @@ describe("AgentAwarenessRelay", () => {
      }),
    );
  
@@ -325,7 +347,7 @@ index 03aca1ae12..d10297d7c4 100644
      Effect.gen(function* () {
        const direct: Array<boolean | undefined> = [];
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.ts b/apps/server/src/relay/AgentAwarenessRelay.ts
-index 251dfb8f0c..3675fc33c8 100644
+index 55fd6aa848..2236934a20 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.ts
 @@ -49,6 +49,7 @@ import {
@@ -339,7 +361,7 @@ index 251dfb8f0c..3675fc33c8 100644
 @@ -543,6 +544,22 @@ export const make = Effect.gen(function* () {
  
      // Read only this thread; full shell reads would make each activity event scale with all threads.
-     const threadShell = yield* threads.getThreadShell(threadId);
+     const threadShell = (yield* threads.getAgentAwarenessSnapshot(threadId)).threads[0] ?? null;
 +    // Fork: an idle compaction is housekeeping, so it neither starts nor ends
 +    // a card or alert; the last published state stands. Archiving and
 +    // settling still publish, so the card can clear.
