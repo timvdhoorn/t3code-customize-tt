@@ -23,14 +23,17 @@ guide line, context-menu collapse and a summary stub.
  .../src/orchestration-v2/runtimeLayer.test.ts |  20 +
  .../Sidebar.childThreads.browser.test.tsx     | 180 +++++
  .../components/Sidebar.childThreads.test.ts   | 214 +++++
- .../src/components/Sidebar.childThreads.tsx   | 746 ++++++++++++++++++
+ .../src/components/Sidebar.childThreads.tsx   | 747 ++++++++++++++++++
  .../src/components/Sidebar.families.test.ts   | 575 ++++++++++++++
  apps/web/src/components/Sidebar.families.ts   | 426 ++++++++++
+ apps/web/src/components/Sidebar.logic.test.ts |  34 +
+ apps/web/src/components/Sidebar.logic.ts      |  16 +-
  apps/web/src/components/Sidebar.tsx           |  93 ++-
  .../components/sidebar/SidebarThreadRow.tsx   |  41 +-
  .../components/threadActionMenu.logic.test.ts |  15 +
  .../src/components/threadActionMenu.logic.ts  |  13 +
  apps/web/src/contextMenuFallback.ts           |   7 +
+ apps/web/src/test-fixtures.ts                 |   4 +-
  packages/client-runtime/package.json          |   4 +
  .../src/state/childThreadSummary.test.ts      | 161 ++++
  .../src/state/childThreadSummary.ts           | 195 +++++
@@ -41,7 +44,7 @@ guide line, context-menu collapse and a summary stub.
  .../src/state/threadCommands.ts               |  14 +-
  .../src/state/threadShell.test.ts             |  37 +
  packages/contracts/src/orchestrationV2.ts     |  25 +
- 32 files changed, 3098 insertions(+), 50 deletions(-)
+ 35 files changed, 3147 insertions(+), 56 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.childThreads.browser.test.tsx
  create mode 100644 apps/web/src/components/Sidebar.childThreads.test.ts
  create mode 100644 apps/web/src/components/Sidebar.childThreads.tsx
@@ -1117,10 +1120,10 @@ index 0000000000..b03e96b8b5
 +});
 diff --git a/apps/web/src/components/Sidebar.childThreads.tsx b/apps/web/src/components/Sidebar.childThreads.tsx
 new file mode 100644
-index 0000000000..1336e944e6
+index 0000000000..79a647be08
 --- /dev/null
 +++ b/apps/web/src/components/Sidebar.childThreads.tsx
-@@ -0,0 +1,746 @@
+@@ -0,0 +1,747 @@
 +// Child threads in the sidebar (patches-tt/0003). Family rules live in Sidebar.families.ts;
 +// this module holds the sidebar's state and rendering so Sidebar.tsx only calls into it.
 +import type { EnvironmentServerConfig } from "@t3tools/client-runtime/connection";
@@ -1657,7 +1660,8 @@ index 0000000000..1336e944e6
 +    className: "text-warning-foreground",
 +  },
 +  failed: { label: "Failed", icon: "failed", className: "text-error-foreground" },
-+  new: { label: "New", icon: "new", className: "text-info-foreground" },
++  // Green like done: an unseen result is finished work, not a call to act; the dot marks unseen.
++  new: { label: "New", icon: "new", className: "text-success-foreground" },
 +  working: { label: "Working", icon: "working", className: "text-info-foreground" },
 +  done: { label: "Done", icon: "done", className: "text-success-foreground" },
 +  settled: { label: "Settled", icon: "done", className: "text-muted-foreground/60" },
@@ -2880,6 +2884,97 @@ index 0000000000..ec6adb8b89
 +    ...details,
 +  ].join(", ");
 +}
+diff --git a/apps/web/src/components/Sidebar.logic.test.ts b/apps/web/src/components/Sidebar.logic.test.ts
+index 3e2e8be2ce..f307b5b66f 100644
+--- a/apps/web/src/components/Sidebar.logic.test.ts
++++ b/apps/web/src/components/Sidebar.logic.test.ts
+@@ -141,10 +141,12 @@ describe("sidebar thread lineage helpers", () => {
+   it("maps an open subagent to its nearest visible ancestor's sidebar row", () => {
+     const environmentId = EnvironmentId.make("environment-row");
+     const otherEnvironmentId = EnvironmentId.make("environment-other");
++    // Provider-native subagents (Claude's Agent tool): no row of their own.
+     const subagentOf = (id: string, parentId: ThreadId, environment = environmentId) =>
+       makeThreadFixture({
+         id: ThreadId.make(id),
+         environmentId: environment,
++        creationSource: "provider",
+         lineage: {
+           rootThreadId: parentId,
+           parentThreadId: parentId,
+@@ -177,6 +179,38 @@ describe("sidebar thread lineage helpers", () => {
+     const loopB = subagentOf("thread-loop-b", loopA.id);
+     expect(resolveSidebarRowThreadId(loopA.id, environmentId, [loopA, loopB])).toBe(loopA.id);
+   });
++
++  it("keeps an open delegated worker on its own row, which the sidebar lists under its delegator", () => {
++    const environmentId = EnvironmentId.make("environment-row");
++    const root = makeThreadFixture({ id: ThreadId.make("thread-root"), environmentId });
++    const worker = {
++      ...makeThreadFixture({
++        id: ThreadId.make("thread-worker"),
++        environmentId,
++        lineage: {
++          rootThreadId: root.id,
++          parentThreadId: root.id,
++          relationshipToParent: "subagent",
++        },
++      }),
++      delegatedByThreadId: root.id,
++    };
++    const workerSubagent = makeThreadFixture({
++      id: ThreadId.make("thread-worker-subagent"),
++      environmentId,
++      creationSource: "provider",
++      lineage: {
++        rootThreadId: root.id,
++        parentThreadId: worker.id,
++        relationshipToParent: "subagent",
++      },
++    });
++    const threads = [root, worker, workerSubagent];
++
++    expect(resolveSidebarRowThreadId(worker.id, environmentId, threads)).toBe(worker.id);
++    // The worker's own provider subagent has no row, so the worker's row stands in for it.
++    expect(resolveSidebarRowThreadId(workerSubagent.id, environmentId, threads)).toBe(worker.id);
++  });
+ });
+ 
+ function makeLatestRun(overrides?: {
+diff --git a/apps/web/src/components/Sidebar.logic.ts b/apps/web/src/components/Sidebar.logic.ts
+index c20789e2a9..51088a9d50 100644
+--- a/apps/web/src/components/Sidebar.logic.ts
++++ b/apps/web/src/components/Sidebar.logic.ts
+@@ -591,19 +591,25 @@ export function isSidebarHiddenThread(thread: Pick<SidebarThreadSummary, "lineag
+   return !isListedThreadLineage(thread.lineage);
+ }
+ 
+-// Subagent and side-chat threads have no sidebar row, so an open one is represented by
+-// its nearest listed ancestor. A broken chain (missing parent, cycle,
+-// other environment) resolves to the thread itself, which then matches no row.
++// Subagent and side-chat threads have no row, so an open one maps to its nearest listed
++// ancestor; a delegated worker has its own row under its delegator, so the walk stops there.
++// A broken chain (missing parent, cycle, other environment) resolves to the thread itself.
+ export function resolveSidebarRowThreadId(
+   threadId: ThreadId,
+   environmentId: EnvironmentId,
+-  threads: readonly Pick<SidebarThreadSummary, "id" | "environmentId" | "lineage">[],
++  threads: readonly (Pick<SidebarThreadSummary, "id" | "environmentId" | "lineage"> & {
++    readonly delegatedByThreadId?: ThreadId | undefined;
++  })[],
+ ): ThreadId {
+   const findThread = (id: ThreadId) =>
+     threads.find((thread) => thread.id === id && thread.environmentId === environmentId);
+   const visited = new Set<ThreadId>();
+   let thread = findThread(threadId);
+-  while (thread !== undefined && isSidebarHiddenThread(thread)) {
++  while (
++    thread !== undefined &&
++    isSidebarHiddenThread(thread) &&
++    thread.delegatedByThreadId === undefined
++  ) {
+     if (thread.lineage.parentThreadId === null || visited.has(thread.id)) return threadId;
+     visited.add(thread.id);
+     thread = findThread(thread.lineage.parentThreadId);
 diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
 index 18aa27709e..360e5d316e 100644
 --- a/apps/web/src/components/Sidebar.tsx
@@ -3273,6 +3368,28 @@ index a3e760ddc5..c5b5ae6bff 100644
    "folder-tree": [
      {
        tag: "path",
+diff --git a/apps/web/src/test-fixtures.ts b/apps/web/src/test-fixtures.ts
+index 494d95caa8..38edb1bd7f 100644
+--- a/apps/web/src/test-fixtures.ts
++++ b/apps/web/src/test-fixtures.ts
+@@ -18,6 +18,8 @@ import type { ChatMessage, Thread } from "./types";
+ const DEFAULT_TIMESTAMP = "2026-01-01T00:00:00.000Z";
+ 
+ export type ThreadFixtureOverrides = Partial<Thread> & {
++  // "provider" makes a subagent fixture provider-native (no delegatedByThreadId).
++  readonly creationSource?: "web" | "provider";
+   readonly messages?: ReadonlyArray<ChatMessage>;
+   readonly proposedPlans?: ReadonlyArray<unknown>;
+ };
+@@ -110,7 +112,7 @@ export function makeThreadFixture(overrides: ThreadFixtureOverrides = {}): Threa
+     },
+     forkedFrom: overrides.forkedFrom ?? null,
+     createdBy: "user",
+-    creationSource: "web",
++    creationSource: overrides.creationSource ?? "web",
+     latestRunId: overrides.latestRun?.runId ?? null,
+     activeRunId: overrides.runtime?.activeRunId ?? null,
+     status: overrides.runtime?.status ?? "idle",
 diff --git a/packages/client-runtime/package.json b/packages/client-runtime/package.json
 index 6fd4550d93..5d2909b28f 100644
 --- a/packages/client-runtime/package.json
