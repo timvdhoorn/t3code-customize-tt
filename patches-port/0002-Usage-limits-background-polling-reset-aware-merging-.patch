@@ -27,7 +27,7 @@ Subject: [PATCH 2/5] Usage limits: background polling, reset-aware merging and
  19 files changed, 1784 insertions(+), 100 deletions(-)
 
 diff --git a/apps/server/src/provider/CodexProvider.ts b/apps/server/src/provider/CodexProvider.ts
-index ed9e3d0cde..72cb87ef0e 100644
+index 2d546b36a9..d71c3df7a5 100644
 --- a/apps/server/src/provider/CodexProvider.ts
 +++ b/apps/server/src/provider/CodexProvider.ts
 @@ -59,6 +59,7 @@ const RATE_LIMITS_PROBE_TIMEOUT_MS = 3_000;
@@ -38,7 +38,7 @@ index ed9e3d0cde..72cb87ef0e 100644
        readonly snapshot: CodexRateLimitSnapshot;
        readonly rateLimitsByLimitId?:
          | Readonly<Record<string, CodexRateLimitSnapshot>>
-@@ -581,15 +582,20 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
+@@ -580,15 +581,20 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
              deadlineMs,
              RATE_LIMITS_PROBE_TIMEOUT_MS,
            ).pipe(
@@ -68,7 +68,7 @@ index ed9e3d0cde..72cb87ef0e 100644
              ),
              Effect.catch((error) =>
                Effect.logDebug("Codex rate-limit read failed.", { cause: error }).pipe(
-@@ -856,7 +862,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
+@@ -855,7 +861,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
              snapshot: snapshot.rateLimits.snapshot,
              rateLimitsByLimitId: snapshot.rateLimits.rateLimitsByLimitId,
              resetCredits: snapshot.rateLimits.resetCredits,
@@ -116,7 +116,7 @@ index c0a9c5698d..3520fdf50e 100644
          resolveMaintenance().pipe(
            Effect.flatMap((maintenanceCapabilities) =>
 diff --git a/apps/server/src/provider/Drivers/CodexDriver.ts b/apps/server/src/provider/Drivers/CodexDriver.ts
-index c34aa00a19..40f975319c 100644
+index 871ce9ed6e..451e5f320d 100644
 --- a/apps/server/src/provider/Drivers/CodexDriver.ts
 +++ b/apps/server/src/provider/Drivers/CodexDriver.ts
 @@ -1,4 +1,8 @@
@@ -128,8 +128,8 @@ index c34aa00a19..40f975319c 100644
 +} from "@t3tools/contracts";
  import * as Digest from "effect/crypto/Digest";
  import * as SecureRandom from "effect/crypto/SecureRandom";
- import * as Effect from "effect/Effect";
-@@ -201,6 +205,7 @@ export const CodexDriver: ProviderDriver<
+ import type * as Signature from "effect/crypto/Signature";
+@@ -203,6 +207,7 @@ export const CodexDriver: ProviderDriver<
        ),
      );
  
@@ -137,7 +137,7 @@ index c34aa00a19..40f975319c 100644
      const orchestrationAdapter = yield* createCodexAdapterV2(
        {
          instanceId,
-@@ -213,6 +218,14 @@ export const CodexDriver: ProviderDriver<
+@@ -215,6 +220,14 @@ export const CodexDriver: ProviderDriver<
        {
          onUsageLimits: (update) => snapshot.applyUsageLimits(update),
          compatibility: installation.compatibility,
@@ -152,7 +152,7 @@ index c34aa00a19..40f975319c 100644
        },
      ).pipe(
        Effect.mapError(
-@@ -254,6 +267,13 @@ export const CodexDriver: ProviderDriver<
+@@ -256,6 +269,13 @@ export const CodexDriver: ProviderDriver<
            (draft, catalog) => stampIdentity(applyCodexModelCatalog(draft, catalog)),
          ),
        checkProvider,

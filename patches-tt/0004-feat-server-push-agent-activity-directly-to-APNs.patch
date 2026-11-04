@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: timvdhoorn <timvdhoorn@gmail.com>
 Date: Thu, 15 Oct 2026 20:29:15 +0200
-Subject: [PATCH 04/11] feat(server): push agent activity directly to APNs
+Subject: [PATCH 04/12] feat(server): push agent activity directly to APNs
 
 A server with an APNs auth key in its secret store (direct-push-apns) sends
 agent notifications and Live Activity updates to APNs itself, for an app
@@ -1699,10 +1699,10 @@ index 795e409ad2..d8d4769b26 100644
                activeRunId: state.activeRunId,
                latestRunId: state.latestRunId,
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.test.ts b/apps/server/src/relay/AgentAwarenessRelay.test.ts
-index 8747ad7e3d..e6ccdef462 100644
+index f7edcc869f..c15166deaf 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.test.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.test.ts
-@@ -35,6 +35,7 @@ import {
+@@ -36,6 +36,7 @@ import {
    RELAY_ISSUER_SECRET,
    RELAY_URL_SECRET,
  } from "../cloud/config.ts";
@@ -1710,7 +1710,7 @@ index 8747ad7e3d..e6ccdef462 100644
  import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
  import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
  import * as SqlitePersistence from "../persistence/Sqlite.ts";
-@@ -145,6 +146,7 @@ const makeTestRelay = Effect.fnUntraced(function* (
+@@ -146,6 +147,7 @@ const makeTestRelay = Effect.fnUntraced(function* (
      readonly readShell?: (threadId: ThreadId) => Effect.Effect<OrchestrationV2ThreadShell | null>;
      readonly domainEvents?: Stream.Stream<OrchestrationV2DomainEvent>;
      readonly catchUpThreads?: ReadonlyArray<OrchestrationV2ThreadShell>;
@@ -1718,7 +1718,7 @@ index 8747ad7e3d..e6ccdef462 100644
    } = {},
  ) {
    const values = new Map<string, Uint8Array>(
-@@ -296,6 +298,10 @@ const makeTestRelay = Effect.fnUntraced(function* (
+@@ -298,6 +300,10 @@ const makeTestRelay = Effect.fnUntraced(function* (
      }),
      Effect.provideService(FetchHttpClient.Fetch, fetch),
      Effect.provide(NodeCrypto.layer),
@@ -1729,7 +1729,7 @@ index 8747ad7e3d..e6ccdef462 100644
    );
    return { relay, secrets, secretReads, currentShell, shellReads, publications, catchUp };
  });
-@@ -348,6 +354,67 @@ describe("AgentAwarenessRelay", () => {
+@@ -350,6 +356,67 @@ describe("AgentAwarenessRelay", () => {
      }),
    );
  
@@ -1798,18 +1798,18 @@ index 8747ad7e3d..e6ccdef462 100644
      Effect.gen(function* () {
        const { relay, currentShell, publications } = yield* makeTestRelay();
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.ts b/apps/server/src/relay/AgentAwarenessRelay.ts
-index 6e9175862e..55fd6aa848 100644
+index 2523fea9f2..77b9d6ab7c 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.ts
-@@ -47,6 +47,7 @@ import {
+@@ -43,6 +43,7 @@ import {
    RELAY_URL_SECRET,
  } from "../cloud/config.ts";
- import { getOrCreateEnvironmentKeyPairFromSecretStore } from "../cloud/environmentKeys.ts";
+ import { EnvironmentSigningKey } from "../cloud/environmentKeys.ts";
 +import * as DirectPush from "../directPush/DirectPush.ts";
  import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
  import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
  import * as ProjectService from "../project/ProjectService.ts";
-@@ -383,6 +384,12 @@ export const make = Effect.gen(function* () {
+@@ -368,6 +369,12 @@ export const make = Effect.gen(function* () {
    const startedAt = (yield* DateTime.now).epochMilliseconds;
    const catchUpRequests = yield* Queue.dropping<void>(1);
    const publishedStateByThreadRef = yield* Ref.make(new Map<ThreadId, string>());
@@ -1822,7 +1822,7 @@ index 6e9175862e..55fd6aa848 100644
  
    const readSecretString = (name: string) =>
      secrets
-@@ -447,8 +454,9 @@ export const make = Effect.gen(function* () {
+@@ -432,8 +439,9 @@ export const make = Effect.gen(function* () {
    });
  
    const publishThreadUnsafe = Effect.fn("publishThreadUnsafe")(function* (threadId: ThreadId) {
@@ -1833,7 +1833,7 @@ index 6e9175862e..55fd6aa848 100644
        yield* cancelPublishRetries;
        yield* resetPublishedConnection;
        yield* Effect.logDebug("agent activity publish skipped; publication disabled", {
-@@ -456,8 +464,8 @@ export const make = Effect.gen(function* () {
+@@ -441,8 +449,8 @@ export const make = Effect.gen(function* () {
        });
        return;
      }
@@ -1844,7 +1844,7 @@ index 6e9175862e..55fd6aa848 100644
        yield* cancelPublishRetries;
        yield* resetPublishedConnection;
        yield* Effect.logDebug("agent activity publish skipped; relay link credentials unavailable", {
-@@ -466,9 +474,10 @@ export const make = Effect.gen(function* () {
+@@ -451,9 +459,10 @@ export const make = Effect.gen(function* () {
        return;
      }
      if (
@@ -1858,7 +1858,7 @@ index 6e9175862e..55fd6aa848 100644
      ) {
        yield* resetPublishedConnection;
        publishedRelayConfig = relayConfig;
-@@ -479,7 +488,16 @@ export const make = Effect.gen(function* () {
+@@ -464,7 +473,16 @@ export const make = Effect.gen(function* () {
        readonly projectId: string | null;
        readonly state: RelayAgentActivityState | null;
        readonly reason: string;
@@ -1875,7 +1875,7 @@ index 6e9175862e..55fd6aa848 100644
        if (cachedRelayClient === undefined) {
          cachedRelayClient = yield* makeRelayClient(relayConfig);
        }
-@@ -618,6 +636,7 @@ export const make = Effect.gen(function* () {
+@@ -602,6 +620,7 @@ export const make = Effect.gen(function* () {
            projectId: unsettled.projectId,
            state: completion,
            reason: unsettled.reason,
@@ -1883,7 +1883,7 @@ index 6e9175862e..55fd6aa848 100644
          }).pipe(withRelayClientTracing);
          heldCompletions.delete(threadId);
          publishConfirmDeadlines.set(threadId, nowMs + 5_000);
-@@ -649,6 +668,7 @@ export const make = Effect.gen(function* () {
+@@ -633,6 +652,7 @@ export const make = Effect.gen(function* () {
        projectId: snapshot.projectId,
        state: snapshot.state,
        reason: snapshot.reason,
@@ -1891,7 +1891,7 @@ index 6e9175862e..55fd6aa848 100644
      }).pipe(withRelayClientTracing);
      publishConfirmDeadlines.delete(threadId);
      heldCompletions.delete(threadId);
-@@ -714,24 +734,33 @@ export const make = Effect.gen(function* () {
+@@ -698,24 +718,33 @@ export const make = Effect.gen(function* () {
    });
  
    const publishActiveThreadsUnsafe = Effect.gen(function* () {
@@ -1944,10 +1944,10 @@ index 6e9175862e..55fd6aa848 100644
      const environmentId = yield* serverEnvironment.getEnvironmentId;
      const projectSnapshot = yield* projects.snapshot;
 diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
-index 395afcf566..d43abc6063 100644
+index 53f53db72c..bf4f268450 100644
 --- a/apps/server/src/server.ts
 +++ b/apps/server/src/server.ts
-@@ -94,6 +94,7 @@ import * as Keybindings from "./keybindings.ts";
+@@ -96,6 +96,7 @@ import * as Keybindings from "./keybindings.ts";
  import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
  import * as ServerOwnership from "./serverOwnership.ts";
  import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
@@ -1955,10 +1955,10 @@ index 395afcf566..d43abc6063 100644
  import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
  import * as ServerSettings from "./serverSettings.ts";
  import * as ManagedLimits from "./policy/managedLimits.ts";
-@@ -719,6 +720,9 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
-   Layer.provideMerge(CodexManagedTokenBroker.layer),
+@@ -722,6 +723,9 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
    Layer.provideMerge(layerServerEnvironment),
    Layer.provideMerge(layerAuth),
+   Layer.provideMerge(Layer.mergeAll(AssetSigner.layer, EnvironmentKeys.layer)),
 +  // One direct-push instance: the activity publisher feeds it and the
 +  // registration RPCs read the same in-memory activity.
 +  Layer.provideMerge(DirectPush.layer),

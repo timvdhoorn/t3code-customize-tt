@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: timvdhoorn <timvdhoorn@gmail.com>
 Date: Thu, 22 Oct 2026 19:11:45 +0000
-Subject: [PATCH 08/11] feat(server): keep idle compactions silent
+Subject: [PATCH 08/12] feat(server): keep idle compactions silent
 
 Upstream's idle compaction (#21682) sends /compact as a visible turn, which can push an alert or Live Activity and mark a read thread unread. The relay and direct push now skip a thread whose latest run is an idle compaction (settling and archiving still publish), and a finished compaction moves the read mark only when the thread was already read.
 ---
@@ -267,7 +267,7 @@ index d8d4769b26..6bde24ed29 100644
                status: state.latestRunStatus,
                activityRunStatus: state.activityRunStatus,
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.test.ts b/apps/server/src/relay/AgentAwarenessRelay.test.ts
-index e6ccdef462..0f37191d1c 100644
+index c15166deaf..364d811fb4 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.test.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.test.ts
 @@ -6,6 +6,7 @@ import {
@@ -278,7 +278,7 @@ index e6ccdef462..0f37191d1c 100644
    type OrchestrationV2ThreadShell,
    type OrchestrationV2TurnItem,
    ProjectId,
-@@ -144,6 +145,10 @@ const makeTestRelay = Effect.fnUntraced(function* (
+@@ -145,6 +146,10 @@ const makeTestRelay = Effect.fnUntraced(function* (
      readonly failSecretRead?: (name: string) => boolean;
      readonly linked?: boolean;
      readonly readShell?: (threadId: ThreadId) => Effect.Effect<OrchestrationV2ThreadShell | null>;
@@ -289,7 +289,7 @@ index e6ccdef462..0f37191d1c 100644
      readonly domainEvents?: Stream.Stream<OrchestrationV2DomainEvent>;
      readonly catchUpThreads?: ReadonlyArray<OrchestrationV2ThreadShell>;
      readonly directPush?: DirectPush.DirectPush["Service"];
-@@ -212,7 +217,13 @@ const makeTestRelay = Effect.fnUntraced(function* (
+@@ -213,7 +218,13 @@ const makeTestRelay = Effect.fnUntraced(function* (
      getTimelinePage: () => Effect.die("Unused timeline read"),
      getMessageCount: () => Effect.die("unused message count"),
      getTurnItem: () => Effect.die("unused turn item read"),
@@ -304,7 +304,7 @@ index e6ccdef462..0f37191d1c 100644
      getThreadProjection: unused,
      getCheckpointContext: unused,
      getThreadSnapshot: unused,
-@@ -375,6 +386,41 @@ describe("AgentAwarenessRelay", () => {
+@@ -377,6 +388,41 @@ describe("AgentAwarenessRelay", () => {
      }),
    );
  
@@ -347,18 +347,18 @@ index e6ccdef462..0f37191d1c 100644
      Effect.gen(function* () {
        const direct: Array<boolean | undefined> = [];
 diff --git a/apps/server/src/relay/AgentAwarenessRelay.ts b/apps/server/src/relay/AgentAwarenessRelay.ts
-index 55fd6aa848..2236934a20 100644
+index 77b9d6ab7c..2334b08271 100644
 --- a/apps/server/src/relay/AgentAwarenessRelay.ts
 +++ b/apps/server/src/relay/AgentAwarenessRelay.ts
-@@ -49,6 +49,7 @@ import {
- import { getOrCreateEnvironmentKeyPairFromSecretStore } from "../cloud/environmentKeys.ts";
+@@ -45,6 +45,7 @@ import {
+ import { EnvironmentSigningKey } from "../cloud/environmentKeys.ts";
  import * as DirectPush from "../directPush/DirectPush.ts";
  import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 +import { isIdleCompactionRun } from "../orchestration-v2/IdleCompaction.ts";
  import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
  import * as ProjectService from "../project/ProjectService.ts";
  import { forkParked } from "../serverActivation.ts";
-@@ -543,6 +544,22 @@ export const make = Effect.gen(function* () {
+@@ -527,6 +528,22 @@ export const make = Effect.gen(function* () {
  
      // Read only this thread; full shell reads would make each activity event scale with all threads.
      const threadShell = (yield* threads.getAgentAwarenessSnapshot(threadId)).threads[0] ?? null;
