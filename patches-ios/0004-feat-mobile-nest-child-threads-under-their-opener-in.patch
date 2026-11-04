@@ -10,7 +10,7 @@ Subject: [PATCH 4/8] feat(mobile): nest child threads under their opener in
  apps/mobile/src/features/home/HomeScreen.tsx  |  52 ++
  .../features/home/thread-swipe-actions.tsx    |  32 +-
  .../threads/ThreadNavigationSidebar.tsx       |  66 +-
- .../features/threads/thread-list-v2-items.tsx | 466 +++++++++++-
+ .../features/threads/thread-list-v2-items.tsx | 467 +++++++++++-
  .../src/features/threads/threadListV2.test.ts | 388 ++++++++++
  .../src/features/threads/threadListV2.ts      | 719 ++++++++++++++----
  .../use-thread-list-v2-shelf-preferences.ts   |  70 ++
@@ -25,7 +25,7 @@ Subject: [PATCH 4/8] feat(mobile): nest child threads under their opener in
  .../src/state/childThreadFamilies.ts          | 462 +++++++++++
  .../src/state/threadShell.test.ts             |  37 +
  .../client-runtime/src/state/threadShell.ts   |  24 +
- 20 files changed, 2769 insertions(+), 635 deletions(-)
+ 20 files changed, 2770 insertions(+), 635 deletions(-)
  create mode 100644 packages/client-runtime/src/state/childThreadFamilies.test.ts
  create mode 100644 packages/client-runtime/src/state/childThreadFamilies.ts
 
@@ -445,7 +445,7 @@ index f03f8296ce..1b8f40e10c 100644
              onPress={() => {
                olderSettledShelf.retry();
 diff --git a/apps/mobile/src/features/threads/thread-list-v2-items.tsx b/apps/mobile/src/features/threads/thread-list-v2-items.tsx
-index 84e9494759..600d13686f 100644
+index 84e9494759..832c225e98 100644
 --- a/apps/mobile/src/features/threads/thread-list-v2-items.tsx
 +++ b/apps/mobile/src/features/threads/thread-list-v2-items.tsx
 @@ -25,6 +25,14 @@ import {
@@ -479,7 +479,7 @@ index 84e9494759..600d13686f 100644
    type ThreadListV2Status,
  } from "./threadListV2";
  import { QueuedMessageIcon } from "./queued-message-icon";
-@@ -139,6 +147,95 @@ const DONE_STATUS_LABEL: StatusLabel = {
+@@ -139,6 +147,96 @@ const DONE_STATUS_LABEL: StatusLabel = {
    iconTintClassName: "accent-adaptive-emerald-700-300",
  };
  
@@ -492,11 +492,12 @@ index 84e9494759..600d13686f 100644
 +    iconTintClassName: "accent-warning-foreground",
 +  },
 +  failed: STATUS_LABEL_BY_STATUS.failed!,
++  // Green like done: an unseen result is finished work, not a call to act; the dot marks unseen.
 +  new: {
 +    label: "New",
 +    icon: "circle.fill",
-+    className: "text-adaptive-sky-600-400",
-+    iconTintClassName: "accent-adaptive-sky-600-400",
++    className: DONE_STATUS_LABEL.className,
++    iconTintClassName: DONE_STATUS_LABEL.iconTintClassName,
 +  },
 +  working: STATUS_LABEL_BY_STATUS.working!,
 +  done: DONE_STATUS_LABEL,
@@ -575,7 +576,7 @@ index 84e9494759..600d13686f 100644
  function ThreadListV2Duration(props: { readonly startedAt: string | null }) {
    const startedAtMs = Date.parse(props.startedAt ?? "");
    const nowMs = useVisibleSecondClock(Number.isFinite(startedAtMs));
-@@ -298,11 +395,180 @@ export const ThreadListV2SettledShelfHeader = memo(function ThreadListV2SettledS
+@@ -298,11 +396,180 @@ export const ThreadListV2SettledShelfHeader = memo(function ThreadListV2SettledS
    return <ThreadListV2ShelfHeader {...props} kind="settled" />;
  });
  
@@ -756,7 +757,7 @@ index 84e9494759..600d13686f 100644
    readonly onPress: () => void;
  }) {
    const label =
-@@ -315,9 +581,7 @@ export const ThreadListV2ShowMoreRow = memo(function ThreadListV2ShowMoreRow(pro
+@@ -315,9 +582,7 @@ export const ThreadListV2ShowMoreRow = memo(function ThreadListV2ShowMoreRow(pro
      <Pressable
        accessibilityRole="button"
        accessibilityLabel={
@@ -767,7 +768,7 @@ index 84e9494759..600d13686f 100644
        }
        disabled={props.state === "loading"}
        onPress={props.onPress}
-@@ -669,6 +933,17 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -669,6 +934,17 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
    ) => void;
    readonly canMoveUp?: boolean;
    readonly canMoveDown?: boolean;
@@ -785,7 +786,7 @@ index 84e9494759..600d13686f 100644
    readonly onSwipeableWillOpen: (methods: SwipeableMethods) => void;
    readonly onSwipeableClose: (methods: SwipeableMethods) => void;
    readonly activationKey?: string;
-@@ -832,7 +1107,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -832,7 +1108,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
    );
    const arrangementMenuItems = useMemo<MenuAction[]>(
      () => [
@@ -794,7 +795,7 @@ index 84e9494759..600d13686f 100644
          ? [
              { id: "arrange", title: "Arrange threads…", image: "line.3.horizontal" },
              {
-@@ -861,6 +1136,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -861,6 +1137,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
        props.canMoveDown,
        props.canMoveUp,
        props.reorderSupported,
@@ -802,7 +803,7 @@ index 84e9494759..600d13686f 100644
        props.pinningSupported,
        thread.pinnedAt,
      ],
-@@ -971,9 +1247,28 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -971,9 +1248,28 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
      ],
      [arrangementMenuItems, titleMenuItems],
    );
@@ -831,7 +832,7 @@ index 84e9494759..600d13686f 100644
        if (nativeEvent.event === "settle") handleSettle();
        if (nativeEvent.event === "unsettle") handleUnsettle();
        if (nativeEvent.event === "unsnooze") handleUnsnooze();
-@@ -1022,6 +1317,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1022,6 +1318,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
      },
      [
        onNewThreadOnBranch,
@@ -840,7 +841,7 @@ index 84e9494759..600d13686f 100644
        thread,
        handleArchive,
        handleDelete,
-@@ -1348,8 +1645,122 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1348,8 +1646,122 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
      cardContent
    );
  
@@ -964,7 +965,7 @@ index 84e9494759..600d13686f 100644
        <RowPressable
          key={`${thread.environmentId}:${thread.id}`}
          interactionClassName={rowAppearance.interactionClassName}
-@@ -1458,8 +1869,39 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1458,8 +1870,39 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
        </RowPressable>
      );
  
@@ -1006,7 +1007,7 @@ index 84e9494759..600d13686f 100644
  
    return (
      <View collapsable={false}>
-@@ -1470,8 +1912,10 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1470,8 +1913,10 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
          dormant={dormant}
          threadKey={`${thread.environmentId}:${thread.id}`}
          backgroundColor={rowAppearance.swipeBackgroundColor}
@@ -1019,7 +1020,7 @@ index 84e9494759..600d13686f 100644
          enableTrackpadSwipe
          fullSwipeAction="primary"
          fullSwipeWidth={props.fullSwipeWidth ?? windowWidth - 32}
-@@ -1498,6 +1942,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1498,6 +1943,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
                  : []),
                { id: "copy-thread", title: "Copy thread", image: "text.bubble" },
                { id: "copy-thread-id", title: "Copy thread ID", image: "doc.on.doc" },
@@ -1027,7 +1028,7 @@ index 84e9494759..600d13686f 100644
                ...(snoozedRow
                  ? snoozedMenuActions
                  : !props.settlementSupported
-@@ -1515,6 +1960,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1515,6 +1961,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
            </Menu>
          )}
        </ThreadSwipeable>
@@ -2576,7 +2577,7 @@ index 1625998fdc..629a3c7271 100644
    return useAtomValue(ref === null ? EMPTY_PROJECT_ATOM : environmentProjects.projectAtom(ref));
  }
 diff --git a/apps/web/src/components/Sidebar.childThreads.tsx b/apps/web/src/components/Sidebar.childThreads.tsx
-index 1336e944e6..8a0765c286 100644
+index 79a647be08..22b653f59c 100644
 --- a/apps/web/src/components/Sidebar.childThreads.tsx
 +++ b/apps/web/src/components/Sidebar.childThreads.tsx
 @@ -1,4 +1,4 @@
