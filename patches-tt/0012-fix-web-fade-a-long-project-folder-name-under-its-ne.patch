@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: timvdhoorn <timvdhoorn@gmail.com>
+Date: Wed, 4 Nov 2026 09:48:15 +0100
+Subject: [PATCH 12/12] fix(web): fade a long project folder name under its
+ new-thread action
+
+In the boring sidebar the new-thread action is absolutely positioned left of
+the chevron and shows on hover, on focus and always on touch. A long project
+name ran under it, so the pencil icon was drawn over the truncated text.
+Fade the name's end whenever the action shows, the same mask the thread rows
+use, so the name ends before the action.
+---
+ ...idebarProjectFolderHeader.browser.test.tsx | 110 ++++++++++++++++++
+ .../sidebar/SidebarProjectFolderHeader.tsx    |   8 +-
+ 2 files changed, 117 insertions(+), 1 deletion(-)
+ create mode 100644 apps/web/src/components/sidebar/SidebarProjectFolderHeader.browser.test.tsx
+
+diff --git a/apps/web/src/components/sidebar/SidebarProjectFolderHeader.browser.test.tsx b/apps/web/src/components/sidebar/SidebarProjectFolderHeader.browser.test.tsx
+new file mode 100644
+index 0000000000..fbe4124dca
+--- /dev/null
++++ b/apps/web/src/components/sidebar/SidebarProjectFolderHeader.browser.test.tsx
+@@ -0,0 +1,110 @@
++import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
++import { describe, expect, it } from "vite-plus/test";
++import { page, userEvent } from "vite-plus/test/browser";
++
++import "~/index.css";
++
++import { render } from "../../../test/render";
++import { TooltipProvider } from "../ui/tooltip";
++import { SidebarProjectFolderHeader } from "./SidebarProjectFolderHeader";
++
++const LONG_NAME = "Northwind-warehouse-label-printing-integration";
++
++const GROUP = {
++  projectKey: "env:project",
++  displayName: LONG_NAME,
++  environmentId: "env",
++  workspaceRoot: "/projects/northwind",
++  projectIcon: { kind: "monogram", text: "NW", color: "purple" },
++} as unknown as Parameters<typeof SidebarProjectFolderHeader>[0]["group"];
++
++const HIDDEN = [
++  {
++    environmentId: "env",
++    id: "a",
++    runtime: { status: "running" },
++    hasPendingApprovals: false,
++    hasPendingUserInput: false,
++    lastVisitedAt: null,
++    updatedAt: "2026-10-01T09:00:00.000Z",
++  },
++] as unknown as EnvironmentThreadShell[];
++
++const noop = () => {};
++
++async function renderHeader(width: number, collapsed: boolean) {
++  await page.viewport(width, 800);
++  return render(
++    <TooltipProvider delay={150} closeDelay={0}>
++      <div data-testid="sidebar" className="w-72 max-w-full bg-sidebar p-2 text-sidebar-foreground">
++        <ul className="flex flex-col gap-px">
++          <SidebarProjectFolderHeader
++            group={GROUP}
++            collapsed={collapsed}
++            hiddenThreads={collapsed ? HIDDEN : []}
++            onToggle={noop}
++            onNewThread={noop}
++            onContextMenu={noop}
++          />
++        </ul>
++      </div>
++    </TooltipProvider>,
++  );
++}
++
++const folder = () => document.querySelector<HTMLElement>('[data-testid="sidebar-project-folder"]')!;
++const nameOf = () => folder().querySelector<HTMLElement>('[data-slot="sidebar-folder-name"]')!;
++const newThread = () => folder().querySelector<HTMLElement>("[data-sidebar-action-for]")!;
++
++/** Where the name stops being visible: its box end, or where its right mask turns clear. */
++function visibleNameEnd() {
++  const name = nameOf();
++  const box = name.getBoundingClientRect();
++  const style = getComputedStyle(name);
++  if (style.maskImage === "none") return box.right;
++  const clearFrom = Number.parseFloat(style.getPropertyValue("--tw-mask-right-to-position"));
++  expect(clearFrom).toBeGreaterThan(0);
++  return box.left + (box.width * clearFrom) / 100;
++}
++
++function expectNameEndsBeforeAction() {
++  // The name truncates: it is long enough to reach the action.
++  expect(nameOf().scrollWidth).toBeGreaterThan(nameOf().clientWidth);
++  // macOS fonts render wider than Linux; keep a few pixels of margin.
++  expect(visibleNameEnd()).toBeLessThanOrEqual(newThread().getBoundingClientRect().left - 2);
++}
++
++describe("boring sidebar project folder header", () => {
++  it.each([
++    { width: 390, collapsed: false },
++    { width: 1280, collapsed: false },
++    { width: 390, collapsed: true },
++    { width: 1280, collapsed: true },
++  ] as const)(
++    "at $width px (collapsed: $collapsed) a long name ends before the new-thread action",
++    async ({ width, collapsed }) => {
++      await using screen = await renderHeader(width, collapsed);
++      await expect.element(screen.getByText(LONG_NAME)).toBeVisible();
++
++      // At rest the action is hidden and the name keeps its full width.
++      expect(getComputedStyle(newThread().parentElement!).opacity).toBe("0");
++      expect(getComputedStyle(nameOf()).maskImage).toBe("none");
++
++      await userEvent.hover(folder());
++      expect(getComputedStyle(newThread().parentElement!).opacity).toBe("1");
++      await page.screenshot({
++        path: `__screenshots__/folder-header-${collapsed ? "collapsed" : "open"}-${width}-hover.png`,
++        element: screen.getByTestId("sidebar"),
++      });
++      expectNameEndsBeforeAction();
++
++      // Keyboard focus on the action shows it without a hover.
++      await userEvent.unhover(folder());
++      await userEvent.tab();
++      await userEvent.tab();
++      expect(document.activeElement).toBe(newThread());
++      expect(getComputedStyle(newThread().parentElement!).opacity).toBe("1");
++      expectNameEndsBeforeAction();
++    },
++  );
++});
+diff --git a/apps/web/src/components/sidebar/SidebarProjectFolderHeader.tsx b/apps/web/src/components/sidebar/SidebarProjectFolderHeader.tsx
+index 38b1e53bf0..14926bce9f 100644
+--- a/apps/web/src/components/sidebar/SidebarProjectFolderHeader.tsx
++++ b/apps/web/src/components/sidebar/SidebarProjectFolderHeader.tsx
+@@ -76,7 +76,13 @@ export const SidebarProjectFolderHeader = memo(function SidebarProjectFolderHead
+         className="flex h-8 w-full cursor-pointer items-center gap-2.5 rounded-(--control-radius) px-(--sidebar-row-content-inset) text-left outline-none hover:bg-sidebar-row-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+       >
+         <ProjectFavicon project={group} className="size-4 shrink-0" />
+-        <span className="min-w-0 flex-1 truncate text-sm font-medium text-sidebar-foreground/90">
++        {/* The new-thread action overlays the name's end whenever it shows; fade the name
++            under it, like the thread rows. At the narrowest sidebar the clear last 20% is
++            wider than the action's overlap. */}
++        <span
++          data-slot="sidebar-folder-name"
++          className="min-w-0 flex-1 truncate text-sm font-medium text-sidebar-foreground/90 group-hover/project-folder:mask-r-from-70% group-hover/project-folder:mask-r-to-80% group-has-[[data-sidebar-action-for]:focus]/project-folder:mask-r-from-70% group-has-[[data-sidebar-action-for]:focus]/project-folder:mask-r-to-80% pointer-coarse:mask-r-from-70% pointer-coarse:mask-r-to-80%"
++        >
+           {group.displayName}
+         </span>
+         {dot ? (
