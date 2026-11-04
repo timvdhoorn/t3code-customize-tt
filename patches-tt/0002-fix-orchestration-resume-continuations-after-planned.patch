@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jake Leventhal <jakeleventhal@me.com>
 Date: Thu, 15 Oct 2026 13:05:36 +0200
-Subject: [PATCH 02/10] fix(orchestration): resume continuations after planned
+Subject: [PATCH 02/11] fix(orchestration): resume continuations after planned
  worktree handoffs
 
 Port of pingdotgg/t3code#15203 (head 3430a29a65cf) until it is merged upstream. Fixes #15136.
@@ -28,7 +28,7 @@ closes ingestion.
  15 files changed, 1122 insertions(+), 241 deletions(-)
 
 diff --git a/apps/server/src/mcp/WorktreeMcpService.test.ts b/apps/server/src/mcp/WorktreeMcpService.test.ts
-index 51c86f3e3a..1c0ed0d9ad 100644
+index 90cf3c7f84..753f7dbbb5 100644
 --- a/apps/server/src/mcp/WorktreeMcpService.test.ts
 +++ b/apps/server/src/mcp/WorktreeMcpService.test.ts
 @@ -4,7 +4,10 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -50,7 +50,7 @@ index 51c86f3e3a..1c0ed0d9ad 100644
  import * as Deferred from "effect/Deferred";
  import * as Effect from "effect/Effect";
  import * as Exit from "effect/Exit";
-@@ -27,6 +31,7 @@ import * as ServerConfig from "../config.ts";
+@@ -28,6 +32,7 @@ import * as ServerConfig from "../config.ts";
  import {
    OrchestratorDispatchError,
    OrchestratorProjectionError,
@@ -58,7 +58,7 @@ index 51c86f3e3a..1c0ed0d9ad 100644
  } from "../orchestration-v2/Orchestrator.ts";
  import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
  import * as ProjectService from "../project/ProjectService.ts";
-@@ -104,7 +109,7 @@ interface HarnessOptions {
+@@ -106,7 +111,7 @@ interface HarnessOptions {
    readonly threadAttachedOnRecheck?: boolean;
    readonly threadArchivedOnRecheck?: boolean;
    readonly threadReadFailsOnRecheck?: boolean;
@@ -67,7 +67,7 @@ index 51c86f3e3a..1c0ed0d9ad 100644
    readonly projectMissing?: boolean;
    readonly projectReadFails?: boolean;
    readonly existingBranchWorktreePath?: string | null;
-@@ -119,7 +124,7 @@ interface HarnessOptions {
+@@ -122,7 +127,7 @@ interface HarnessOptions {
  const makeHarness = (options: HarnessOptions = {}) => {
    const thread = options.thread === undefined ? {} : options.thread;
    const scope = makeScope(options.capabilities ?? new Set(["preview", "worktree"]));
@@ -76,7 +76,7 @@ index 51c86f3e3a..1c0ed0d9ad 100644
      (options.dispatchGate ?? Effect.void).pipe(
        Effect.andThen(
          options.dispatchInterrupts
-@@ -128,7 +133,45 @@ const makeHarness = (options: HarnessOptions = {}) => {
+@@ -131,7 +136,45 @@ const makeHarness = (options: HarnessOptions = {}) => {
              ? Effect.die(new Error("dispatch defect"))
              : options.dispatchFails
                ? (Effect.fail("simulated dispatch failure") as never)
@@ -123,7 +123,7 @@ index 51c86f3e3a..1c0ed0d9ad 100644
        ),
      ),
    );
-@@ -176,22 +219,9 @@ const makeHarness = (options: HarnessOptions = {}) => {
+@@ -179,22 +222,9 @@ const makeHarness = (options: HarnessOptions = {}) => {
        ? Effect.succeed(makeProjection(thread))
        : Effect.fail(new OrchestratorProjectionError({ threadId: id }));
    });
@@ -149,7 +149,7 @@ index 51c86f3e3a..1c0ed0d9ad 100644
    const getById = vi.fn((id: ProjectId) =>
      options.projectReadFails
        ? (Effect.fail("simulated project read failure") as never)
-@@ -372,19 +402,68 @@ const runStatus = (harness: ReturnType<typeof makeHarness>) =>
+@@ -398,19 +428,68 @@ const runStatus = (harness: ReturnType<typeof makeHarness>) =>
  const decodeHandoffInput = Schema.decodeUnknownEffect(WorktreeMcpHandoffInput);
  
  describe("t3_worktree_handoff", () => {
@@ -224,7 +224,7 @@ index 51c86f3e3a..1c0ed0d9ad 100644
    it.effect("does not queue a continuation when the thread update fails", () => {
      const harness = makeHarness({ dispatchFails: true });
      return Effect.gen(function* () {
-@@ -588,6 +667,9 @@ describe("t3_worktree_handoff", () => {
+@@ -623,6 +702,9 @@ describe("t3_worktree_handoff", () => {
        const gate = yield* Deferred.make<void>();
        const harness = makeHarness({ dispatchGate: Deferred.await(gate) });
  
@@ -234,7 +234,7 @@ index 51c86f3e3a..1c0ed0d9ad 100644
        const fiber = yield* Effect.forkChild(
          runHandoff(harness, {
            branch: "feature/interrupted",
-@@ -602,7 +684,14 @@ describe("t3_worktree_handoff", () => {
+@@ -637,7 +719,14 @@ describe("t3_worktree_handoff", () => {
        yield* Fiber.join(interruption);
  
        expect(harness.dispatch).toHaveBeenCalledTimes(1);
@@ -251,10 +251,10 @@ index 51c86f3e3a..1c0ed0d9ad 100644
      }),
    );
 diff --git a/apps/server/src/mcp/WorktreeMcpService.ts b/apps/server/src/mcp/WorktreeMcpService.ts
-index 8a2231f6e4..a0ef941dbd 100644
+index 0ee45bb7f8..a514c8d1c2 100644
 --- a/apps/server/src/mcp/WorktreeMcpService.ts
 +++ b/apps/server/src/mcp/WorktreeMcpService.ts
-@@ -130,7 +130,6 @@ const make = Effect.gen(function* () {
+@@ -147,7 +147,6 @@ const make = Effect.gen(function* () {
            );
          return {
            commandId: CommandId.make(part("command", "worktree-handoff")),
@@ -262,7 +262,7 @@ index 8a2231f6e4..a0ef941dbd 100644
            continuationMessageId: MessageId.make(part("message", "worktree-continuation")),
          };
        }),
-@@ -275,7 +274,7 @@ const make = Effect.gen(function* () {
+@@ -293,7 +292,7 @@ const make = Effect.gen(function* () {
                `Thread '${scope.thread.threadId}' was archived while the worktree was being created; the handoff was rolled back.`,
              );
            }
@@ -271,7 +271,7 @@ index 8a2231f6e4..a0ef941dbd 100644
              .dispatch({
                type: "thread.metadata.update",
                commandId: ids.commandId,
-@@ -283,6 +282,14 @@ const make = Effect.gen(function* () {
+@@ -301,6 +300,14 @@ const make = Effect.gen(function* () {
                branch: worktree.worktree.refName,
                worktreePath,
                expectedWorktreePath: null,
@@ -286,7 +286,7 @@ index 8a2231f6e4..a0ef941dbd 100644
              })
              .pipe(
                Effect.catchCause((cause) =>
-@@ -303,33 +310,14 @@ const make = Effect.gen(function* () {
+@@ -321,33 +328,14 @@ const make = Effect.gen(function* () {
            ),
          );
  
@@ -353,10 +353,10 @@ index c5b5ea9b38..443e58615f 100644
                    ? {}
                    : { revokeMcpCredential: effect.request.revokeMcpCredential }),
 diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
-index 59b708f5ba..06a2cba3a6 100644
+index f20ca8bdc9..a405797c5d 100644
 --- a/apps/server/src/orchestration-v2/Orchestrator.ts
 +++ b/apps/server/src/orchestration-v2/Orchestrator.ts
-@@ -3158,6 +3158,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -3223,6 +3223,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
          cause: `Thread ${command.threadId} branch changed before the metadata update could be applied.`,
        });
      }
@@ -383,7 +383,7 @@ index 59b708f5ba..06a2cba3a6 100644
      if (command.type === "thread.metadata.update" && command.expectedEmpty === true) {
        const records = yield* projectionStore
          .getThreadRecords(command.threadId, ["runs"])
-@@ -4179,6 +4199,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -4245,6 +4265,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                            ? "Runtime mode changed."
                            : "Provider or model selection changed.",
                  // Terminal detaches revoke MCP credentials; reattachments need other detach reasons to preserve them.
@@ -393,7 +393,7 @@ index 59b708f5ba..06a2cba3a6 100644
                  ...(command.type === "thread.archive" ? { revokeMcpCredential: true } : {}),
                },
              } satisfies PendingOrchestrationEffectV2;
-@@ -5391,6 +5414,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -5457,6 +5480,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
      command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
      effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
@@ -401,7 +401,7 @@ index 59b708f5ba..06a2cba3a6 100644
    ) {
      let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
      if (command.manualContinuationOfRunId !== undefined) {
-@@ -5461,10 +5485,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -5527,10 +5551,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
        const source = projection.runs.find((run) => run.id === command.restartContinuationOfRunId);
        if (
          !source ||
@@ -417,7 +417,7 @@ index 59b708f5ba..06a2cba3a6 100644
          projection.thread.archivedAt !== null ||
          projection.thread.deletedAt !== null ||
          projection.thread.providerInstanceId !== source.providerInstanceId ||
-@@ -5477,6 +5502,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -5543,6 +5568,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
          ) ||
          (yield* stopReachedRun(command, command.threadId, source.id))
        ) {
@@ -431,7 +431,7 @@ index 59b708f5ba..06a2cba3a6 100644
          // Preserve the current row so stale automatic deliveries receive an
          // accepted receipt without changing work or repeatedly retrying.
          yield* emit(
-@@ -13168,7 +13200,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -13209,7 +13241,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
        case "thread.active.reorder":
        case "thread.tag.set":
        case "thread.mark-unread":
@@ -439,7 +439,7 @@ index 59b708f5ba..06a2cba3a6 100644
        case "thread.pull-request.link":
        case "thread.pull-request.unlink":
        case "thread.pull-request-link.sync":
-@@ -13181,6 +13212,34 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -13222,6 +13253,34 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
        case "provider.switch":
          yield* dispatchThreadMutation(command, events, effects);
          break;
@@ -1935,7 +1935,7 @@ index 746ff0f844..48507aee25 100644
          layerCheckpointServiceProvided,
          layerEventSinkProvided,
 diff --git a/docs/internals/overview.md b/docs/internals/overview.md
-index 9e5cf6c9d8..2a5c5f7cc4 100644
+index f24e3625d9..48e02d1617 100644
 --- a/docs/internals/overview.md
 +++ b/docs/internals/overview.md
 @@ -58,6 +58,10 @@ therefore means the intent committed, not that the provider, checkpoint, or othe
@@ -1946,11 +1946,11 @@ index 9e5cf6c9d8..2a5c5f7cc4 100644
 +The detach can execute immediately after commit; queuing the continuation afterward could let a
 +delegated child publish its result before its follow-up work exists.
 +
- Persisted events must remain decodable on replay. Changing a schema affects old environments at
- startup as well as live RPC traffic. Compatibility work must account for stored history, not just
- what the newest client sends.
+ The event log only keeps what live readers need: about a day of history for reconnect replay and
+ command-id retries.
+ [ProjectionMaintenance](../../apps/server/src/orchestration-v2/ProjectionMaintenance.ts) deletes
 diff --git a/docs/user/composer.md b/docs/user/composer.md
-index a3e06c9aed..183b580b93 100644
+index aa670e0b4d..2beb6c6526 100644
 --- a/docs/user/composer.md
 +++ b/docs/user/composer.md
 @@ -66,6 +66,10 @@ If your **Send shortcut** requires `Cmd+Enter` or `Ctrl+Enter`, that shortcut us
@@ -1980,10 +1980,10 @@ index 769a31daa9..8a054d175a 100644
      expectedEmpty: Schema.optional(Schema.Boolean),
      limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecoveryUpdate)),
 diff --git a/packages/provider-core/src/server/ProviderAdapter.ts b/packages/provider-core/src/server/ProviderAdapter.ts
-index 9d83da489b..41832004e1 100644
+index f9f55ec131..41a245ceff 100644
 --- a/packages/provider-core/src/server/ProviderAdapter.ts
 +++ b/packages/provider-core/src/server/ProviderAdapter.ts
-@@ -390,6 +390,15 @@ const ProviderAdapterFailureReason = Schema.Literals([
+@@ -408,6 +408,15 @@ const ProviderAdapterFailureReason = Schema.Literals([
    "attachment_unreadable",
  ]);
  export type ProviderAdapterFailureReason = typeof ProviderAdapterFailureReason.Type;
@@ -1999,7 +1999,7 @@ index 9d83da489b..41832004e1 100644
  
  export class ProviderAdapterProtocolError extends Schema.TaggedError<ProviderAdapterProtocolError>()(
    "ProviderAdapterProtocolError",
-@@ -422,6 +431,7 @@ export const ProviderAdapterV2Error = Schema.Union([
+@@ -441,6 +450,7 @@ export const ProviderAdapterV2Error = Schema.Union([
    ProviderAdapterInterruptTimeoutError,
    ProviderAdapterRuntimeRequestResponseError,
    ProviderAdapterEventStreamError,
@@ -2007,7 +2007,7 @@ index 9d83da489b..41832004e1 100644
    ProviderAdapterProtocolError,
  ]);
  export type ProviderAdapterV2Error = typeof ProviderAdapterV2Error.Type;
-@@ -579,8 +589,10 @@ export interface ProviderAdapterV2SessionRuntime {
+@@ -598,8 +608,10 @@ export interface ProviderAdapterV2SessionRuntime {
    readonly providerSessionId: ProviderSessionId;
    readonly providerSession: OrchestrationV2ProviderSession;
    readonly events: Stream.Stream<ProviderAdapterV2Event, ProviderAdapterV2Error>;
