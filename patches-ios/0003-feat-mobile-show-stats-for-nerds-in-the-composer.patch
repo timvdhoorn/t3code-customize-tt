@@ -19,17 +19,16 @@ Subject: [PATCH 3/9] feat(mobile): show stats for nerds in the composer
  apps/mobile/src/state/use-composer-stats.ts   |  66 ++
  .../src/state/use-thread-composer-state.ts    |  40 ++
  apps/web/src/components/ChatView.tsx          |  59 +-
- apps/web/src/components/chat/ChatComposer.tsx |   2 +-
  .../components/chat/ComposerStats.logic.ts    | 307 +-------
- .../web/src/components/chat/ComposerStats.tsx |  58 +-
- .../components/chat/ContextWindowMeter.tsx    |   5 +-
- apps/web/src/lib/contextWindow.ts             | 195 +----
- packages/client-runtime/package.json          |   8 +
+ .../web/src/components/chat/ComposerStats.tsx |  59 +-
+ .../components/chat/ContextWindowMeter.tsx    |   6 +-
+ apps/web/src/lib/contextWindow.ts             |  16 +-
+ packages/client-runtime/package.json          |   4 +
  .../src/state/composerStats.test.ts           | 668 ++++++++++++++++++
  .../client-runtime/src/state/composerStats.ts | 433 ++++++++++++
- .../src/state/contextWindow.test.ts           | 158 +++++
- .../client-runtime/src/state/contextWindow.ts | 194 +++++
- 25 files changed, 2724 insertions(+), 596 deletions(-)
+ .../src/state/contextWindow.test.ts           |  18 +-
+ .../client-runtime/src/state/contextWindow.ts |  16 +
+ 24 files changed, 2400 insertions(+), 419 deletions(-)
  create mode 100644 apps/mobile/src/features/threads/ComposerStats.tsx
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.test.ts
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.ts
@@ -37,8 +36,6 @@ Subject: [PATCH 3/9] feat(mobile): show stats for nerds in the composer
  create mode 100644 apps/mobile/src/state/use-composer-stats.ts
  create mode 100644 packages/client-runtime/src/state/composerStats.test.ts
  create mode 100644 packages/client-runtime/src/state/composerStats.ts
- create mode 100644 packages/client-runtime/src/state/contextWindow.test.ts
- create mode 100644 packages/client-runtime/src/state/contextWindow.ts
 
 diff --git a/apps/mobile/src/features/settings/SettingsFollowUpRouteScreen.tsx b/apps/mobile/src/features/settings/SettingsFollowUpRouteScreen.tsx
 index 29b47a9ddd..bf8932f18e 100644
@@ -83,7 +80,7 @@ index 29b47a9ddd..bf8932f18e 100644
    );
  
 diff --git a/apps/mobile/src/features/settings/settings-search.ts b/apps/mobile/src/features/settings/settings-search.ts
-index c11a89a7c3..b56301bc24 100644
+index 9dcaf7b6bf..bc80e758e6 100644
 --- a/apps/mobile/src/features/settings/settings-search.ts
 +++ b/apps/mobile/src/features/settings/settings-search.ts
 @@ -56,7 +56,14 @@ const SETTINGS_SEARCH_TERMS = {
@@ -1248,10 +1245,10 @@ index f6f928a15f..ed95f5f142 100644
      mocks.setPreferencesJson(JSON.stringify({ baseFontSize: 15 }), 10);
      await mocks.setItemAsync(
 diff --git a/apps/mobile/src/persistence/mobile-preferences.ts b/apps/mobile/src/persistence/mobile-preferences.ts
-index 43ac75e185..4f147667d9 100644
+index 3760ae10c3..e6b596ba1e 100644
 --- a/apps/mobile/src/persistence/mobile-preferences.ts
 +++ b/apps/mobile/src/persistence/mobile-preferences.ts
-@@ -118,6 +118,8 @@ export interface Preferences {
+@@ -119,6 +119,8 @@ export interface Preferences {
    readonly workingShelfEnabled?: boolean;
    readonly useLastProjectForNewThreads?: boolean;
    readonly lastThreadProject?: typeof ThreadProject.Type;
@@ -1260,7 +1257,7 @@ index 43ac75e185..4f147667d9 100644
    readonly modelFavorites?: ReadonlyArray<{
      readonly provider: ProviderInstanceId;
      readonly model: string;
-@@ -198,6 +200,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
+@@ -201,6 +203,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
      workingShelfEnabled?: boolean;
      useLastProjectForNewThreads?: boolean;
      lastThreadProject?: typeof ThreadProject.Type;
@@ -1268,7 +1265,7 @@ index 43ac75e185..4f147667d9 100644
      modelFavorites?: Preferences["modelFavorites"];
      threadListSettledShelfExpanded?: boolean;
      threadListSnoozedShelfExpanded?: boolean;
-@@ -330,6 +333,9 @@ function sanitizePreferences(parsed: Preferences): Preferences {
+@@ -333,6 +336,9 @@ function sanitizePreferences(parsed: Preferences): Preferences {
    if (isThreadProject(parsed.lastThreadProject)) {
      preferences.lastThreadProject = parsed.lastThreadProject;
    }
@@ -1412,10 +1409,10 @@ index 0000000000..3cc2cb612f
 +  }, [enabled, projection, environmentId, serverConfig, instanceId]);
 +}
 diff --git a/apps/mobile/src/state/use-thread-composer-state.ts b/apps/mobile/src/state/use-thread-composer-state.ts
-index 700d15213f..4916186664 100644
+index 336226cce8..0fc9559fc8 100644
 --- a/apps/mobile/src/state/use-thread-composer-state.ts
 +++ b/apps/mobile/src/state/use-thread-composer-state.ts
-@@ -701,6 +701,45 @@ export function useThreadComposerState() {
+@@ -725,6 +725,45 @@ export function useThreadComposerState() {
      return messageId;
    };
  
@@ -1461,7 +1458,7 @@ index 700d15213f..4916186664 100644
    const onChangeDraftMessage = (value: string) => {
      if (!selectedThreadShell) {
        return;
-@@ -774,6 +813,7 @@ export function useThreadComposerState() {
+@@ -798,6 +837,7 @@ export function useThreadComposerState() {
      onNativePasteText,
      onRemoveDraftImage,
      onSendMessage,
@@ -1470,7 +1467,7 @@ index 700d15213f..4916186664 100644
    };
  }
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index 1bf78a82ec..942bbf8f89 100644
+index 953d3c5e11..991c3e0621 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
 @@ -316,7 +316,7 @@ import { useRightPanelSurfaceClose } from "../hooks/useRightPanelSurfaceClose";
@@ -1481,8 +1478,8 @@ index 1bf78a82ec..942bbf8f89 100644
 +import { composerCompactDisabledReason, deriveComposerStats } from "./chat/ComposerStats.logic";
  import { ComposerSurface } from "./chat/ComposerSurface";
  import { resolveThreadSyncPhase } from "../threadSync";
- import {
-@@ -1481,45 +1481,11 @@ export default function ChatView(props: ChatViewProps) {
+ import { hasAvailableCompactionProvider } from "./chat/ContextWindowMeter.logic";
+@@ -1479,45 +1479,11 @@ export default function ChatView(props: ChatViewProps) {
      activeProviderStatus?.displayName?.trim() || activeProviderStatus?.instanceId || "";
    const composerStats = (() => {
      if (!settings.statsForNerdsEnabled) return null;
@@ -1532,7 +1529,7 @@ index 1bf78a82ec..942bbf8f89 100644
    })();
    const pendingBackgroundTasks = deriveThreadPendingBackgroundTasks(serverProjection);
    const activeWorkStartedAt =
-@@ -3882,15 +3848,12 @@ export default function ChatView(props: ChatViewProps) {
+@@ -3881,15 +3847,12 @@ export default function ChatView(props: ChatViewProps) {
                            {...composerStats}
                            onCompact={() => composerRef.current?.compactContext()}
                            compactDisabled={compactDisabled}
@@ -1554,21 +1551,8 @@ index 1bf78a82ec..942bbf8f89 100644
                            isCompacting={isCompacting}
                            subscriptionSwitch={{
                              providers: providerStatuses,
-diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
-index 25b7f5ce6f..95fa71d953 100644
---- a/apps/web/src/components/chat/ChatComposer.tsx
-+++ b/apps/web/src/components/chat/ChatComposer.tsx
-@@ -252,7 +252,7 @@ import {
-   resolveComposerDispatchMode,
-   type ComposerDispatchMode,
- } from "@t3tools/client-runtime/state/composer-dispatch";
--import { deriveLatestContextWindowSnapshot } from "../../lib/contextWindow";
-+import { deriveLatestContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
- import {
-   resolveProviderSkillsForCwd,
-   resolveProviderSlashCommandsForCwd,
 diff --git a/apps/web/src/components/chat/ComposerStats.logic.ts b/apps/web/src/components/chat/ComposerStats.logic.ts
-index e6bf0e8125..f9196990b5 100644
+index 5f88749c98..f9196990b5 100644
 --- a/apps/web/src/components/chat/ComposerStats.logic.ts
 +++ b/apps/web/src/components/chat/ComposerStats.logic.ts
 @@ -1,306 +1 @@
@@ -1581,7 +1565,7 @@ index e6bf0e8125..f9196990b5 100644
 -  TurnTokenUsage,
 -} from "@t3tools/contracts";
 -import * as DateTime from "effect/DateTime";
--import type { ContextWindowSnapshot } from "~/lib/contextWindow";
+-import type { ContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
 -
 -/** Provider turn ordinals are scoped to a provider thread; children have their own nodes. */
 -export function selectComposerStatsTurns(projection: {
@@ -1880,14 +1864,15 @@ index e6bf0e8125..f9196990b5 100644
 -}
 +export * from "@t3tools/client-runtime/state/composer-stats";
 diff --git a/apps/web/src/components/chat/ComposerStats.tsx b/apps/web/src/components/chat/ComposerStats.tsx
-index addedb3328..88b4d74a65 100644
+index 7e73a42eb9..88b4d74a65 100644
 --- a/apps/web/src/components/chat/ComposerStats.tsx
 +++ b/apps/web/src/components/chat/ComposerStats.tsx
-@@ -11,7 +11,10 @@ import { formatResetsIn } from "@t3tools/shared/usageLimits";
+@@ -11,8 +11,10 @@ import { formatResetsIn } from "@t3tools/shared/usageLimits";
  import * as DateTime from "effect/DateTime";
  import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
  
--import { type ContextWindowSnapshot, formatContextWindowTokens } from "~/lib/contextWindow";
+-import type { ContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
+-import { formatContextWindowTokens } from "~/lib/contextWindow";
 +import {
 +  type ContextWindowSnapshot,
 +  formatContextWindowTokens,
@@ -1895,7 +1880,7 @@ index addedb3328..88b4d74a65 100644
  import { Button } from "../ui/button";
  import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
  import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
-@@ -19,15 +22,20 @@ import { composerFloatingLayerProps } from "./composerEventScope";
+@@ -20,15 +22,20 @@ import { composerFloatingLayerProps } from "./composerEventScope";
  import {
    COMPOSER_STATS_CLOCK_MS,
    composerLimitDisplay,
@@ -1918,7 +1903,7 @@ index addedb3328..88b4d74a65 100644
  import { recommendSubscriptionSwitch } from "./SubscriptionSwitch.logic";
  
  function ElapsedTime({ turn }: { turn: OrchestrationV2ProviderTurn }) {
-@@ -69,12 +77,6 @@ function ContextBar({ percentage }: { percentage: number }) {
+@@ -70,12 +77,6 @@ function ContextBar({ percentage }: { percentage: number }) {
    );
  }
  
@@ -1931,7 +1916,7 @@ index addedb3328..88b4d74a65 100644
  const TONE_TEXT: Record<Tone, string> = {
    normal: "text-foreground/80",
    warning: "text-warning",
-@@ -128,36 +130,6 @@ function Meter({
+@@ -129,36 +130,6 @@ function Meter({
    );
  }
  
@@ -1968,7 +1953,7 @@ index addedb3328..88b4d74a65 100644
  /** Ages and reset countdowns share the summary clock while the popover is open. */
  function UsageLimitRows({
    windows,
-@@ -391,14 +363,10 @@ export function ComposerStats({
+@@ -392,14 +363,10 @@ export function ComposerStats({
      compactDisabled
    )
      return null;
@@ -1986,12 +1971,13 @@ index addedb3328..88b4d74a65 100644
    // keeps elapsed time in the details popover.
    if (turn !== null && (hasElapsed || hasTokens || rateText !== null)) {
 diff --git a/apps/web/src/components/chat/ContextWindowMeter.tsx b/apps/web/src/components/chat/ContextWindowMeter.tsx
-index e7f4042f53..bba073eb57 100644
+index 9f2c2dbc91..bba073eb57 100644
 --- a/apps/web/src/components/chat/ContextWindowMeter.tsx
 +++ b/apps/web/src/components/chat/ContextWindowMeter.tsx
-@@ -1,5 +1,8 @@
+@@ -1,6 +1,8 @@
  import { Button } from "../ui/button";
--import { type ContextWindowSnapshot, formatContextWindowTokens } from "~/lib/contextWindow";
+-import type { ContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
+-import { formatContextWindowTokens } from "~/lib/contextWindow";
 +import {
 +  type ContextWindowSnapshot,
 +  formatContextWindowTokens,
@@ -2000,189 +1986,10 @@ index e7f4042f53..bba073eb57 100644
  import {
    formatContextWindowCompactionMessage,
 diff --git a/apps/web/src/lib/contextWindow.ts b/apps/web/src/lib/contextWindow.ts
-index ff9ef9318c..b4e8bb5647 100644
+index 1cf3eee799..b4e8bb5647 100644
 --- a/apps/web/src/lib/contextWindow.ts
 +++ b/apps/web/src/lib/contextWindow.ts
-@@ -1,194 +1 @@
--import type { ThreadStructure, ThreadStructureTurnItem } from "@t3tools/client-runtime/state/shell";
--import type {
--  OrchestrationV2ProviderTurn,
--  OrchestrationV2ProviderTurnTokenUsage,
--  OrchestrationV2ProviderThread,
--  ThreadTokenUsageSnapshot,
--} from "@t3tools/contracts";
--import * as DateTime from "effect/DateTime";
--
--function asFiniteNumber(value: unknown): number | null {
--  return typeof value === "number" && Number.isFinite(value) ? value : null;
--}
--
--type NullableContextWindowUsage = {
--  readonly [Key in keyof ThreadTokenUsageSnapshot]: undefined extends ThreadTokenUsageSnapshot[Key]
--    ? Exclude<ThreadTokenUsageSnapshot[Key], undefined> | null
--    : ThreadTokenUsageSnapshot[Key];
--};
--
--export type ContextWindowSnapshot = NullableContextWindowUsage & {
--  readonly remainingTokens: number | null;
--  readonly usedPercentage: number | null;
--  readonly remainingPercentage: number | null;
--  readonly updatedAt: string;
--};
--
--/** Newest report by timestamp; snapshots order turns by provider thread. */
--export function latestProviderTurnTokenUsage(
--  turns: ReadonlyArray<Pick<OrchestrationV2ProviderTurn, "tokenUsage">>,
--  projection?: Pick<ThreadStructure, "thread" | "contextTransfers"> | null,
--  providerThread?: Pick<OrchestrationV2ProviderThread, "contextUsage"> | null,
--): OrchestrationV2ProviderTurnTokenUsage | null {
--  let latest: OrchestrationV2ProviderTurnTokenUsage | null = null;
--  for (const { tokenUsage } of turns) {
--    if (tokenUsage === undefined) continue;
--    // Ties go to the later entry, since live upserts append.
--    if (latest === null || Date.parse(tokenUsage.updatedAt) >= Date.parse(latest.updatedAt)) {
--      latest = tokenUsage;
--    }
--  }
--  if (latest !== null || projection == null || providerThread?.contextUsage != null) return latest;
--  const forkedFrom = projection.thread.forkedFrom;
--  if (forkedFrom?.type !== "run") return null;
--  return (
--    projection.contextTransfers.find(
--      (transfer) =>
--        transfer.type === "fork" &&
--        transfer.targetThreadId === projection.thread.id &&
--        transfer.sourceThreadId === forkedFrom.threadId &&
--        transfer.sourcePoint.runId === forkedFrom.runId &&
--        transfer.sourceProviderInstanceId === projection.thread.modelSelection.instanceId &&
--        (transfer.status === "pending" || transfer.resolution?.strategy === "native_fork"),
--    )?.sourceTokenUsage ?? null
--  );
--}
--
--export function deriveLatestContextWindowSnapshot(
--  entries: ReadonlyArray<{
--    readonly item: ThreadStructureTurnItem;
--  }>,
--  liveUsage?: OrchestrationV2ProviderTurnTokenUsage | null,
--  providerThread?: Pick<OrchestrationV2ProviderThread, "contextUsage" | "updatedAt"> | null,
--): ContextWindowSnapshot | null {
--  if (liveUsage != null) {
--    const usedTokens = Math.max(0, liveUsage.usedTokens);
--    const maxTokens = liveUsage.maxTokens ?? null;
--    const usedPercentage =
--      maxTokens !== null && maxTokens > 0 ? Math.min(100, (usedTokens / maxTokens) * 100) : null;
--    const remainingTokens =
--      maxTokens !== null ? Math.max(0, Math.round(maxTokens - usedTokens)) : null;
--    const remainingPercentage = usedPercentage !== null ? Math.max(0, 100 - usedPercentage) : null;
--    return {
--      usedTokens,
--      totalProcessedTokens: null,
--      maxTokens,
--      remainingTokens,
--      usedPercentage,
--      remainingPercentage,
--      inputTokens: liveUsage.inputTokens ?? null,
--      cachedInputTokens: liveUsage.cachedInputTokens ?? null,
--      outputTokens: liveUsage.outputTokens ?? null,
--      reasoningOutputTokens: liveUsage.reasoningOutputTokens ?? null,
--      lastUsedTokens: null,
--      lastInputTokens: null,
--      lastCachedInputTokens: null,
--      lastOutputTokens: null,
--      lastReasoningOutputTokens: null,
--      toolUses: null,
--      durationMs: null,
--      compactsAutomatically: providerThread?.contextUsage?.compactsAutomatically ?? null,
--      autoCompactThreshold:
--        liveUsage.autoCompactThreshold ??
--        providerThread?.contextUsage?.autoCompactThreshold ??
--        null,
--      cost: null,
--      updatedAt: liveUsage.updatedAt,
--    };
--  }
--  const providerUsage = providerThread?.contextUsage;
--  const providerUsageUpdatedAt = providerThread?.updatedAt;
--  if (
--    providerUsage !== null &&
--    providerUsage !== undefined &&
--    providerUsageUpdatedAt !== undefined
--  ) {
--    const maxTokens = asFiniteNumber(providerUsage.maxTokens);
--    const usedTokens = providerUsage.usedTokens;
--    const usedPercentage =
--      maxTokens !== null && maxTokens > 0 ? Math.min(100, (usedTokens / maxTokens) * 100) : null;
--    return {
--      usedTokens,
--      totalProcessedTokens: asFiniteNumber(providerUsage.totalProcessedTokens),
--      maxTokens,
--      remainingTokens: maxTokens === null ? null : Math.max(0, Math.round(maxTokens - usedTokens)),
--      usedPercentage,
--      remainingPercentage: usedPercentage === null ? null : Math.max(0, 100 - usedPercentage),
--      inputTokens: asFiniteNumber(providerUsage.inputTokens),
--      cachedInputTokens: asFiniteNumber(providerUsage.cachedInputTokens),
--      outputTokens: asFiniteNumber(providerUsage.outputTokens),
--      reasoningOutputTokens: asFiniteNumber(providerUsage.reasoningOutputTokens),
--      lastUsedTokens: asFiniteNumber(providerUsage.lastUsedTokens),
--      lastInputTokens: asFiniteNumber(providerUsage.lastInputTokens),
--      lastCachedInputTokens: asFiniteNumber(providerUsage.lastCachedInputTokens),
--      lastOutputTokens: asFiniteNumber(providerUsage.lastOutputTokens),
--      lastReasoningOutputTokens: asFiniteNumber(providerUsage.lastReasoningOutputTokens),
--      toolUses: asFiniteNumber(providerUsage.toolUses),
--      durationMs: asFiniteNumber(providerUsage.durationMs),
--      compactsAutomatically: providerUsage.compactsAutomatically ?? null,
--      cost: providerUsage.cost ?? null,
--      autoCompactThreshold: providerUsage.autoCompactThreshold ?? null,
--      updatedAt: DateTime.formatIso(providerUsageUpdatedAt),
--    };
--  }
--  for (let index = entries.length - 1; index >= 0; index -= 1) {
--    const entry = entries[index];
--    if (!entry || entry.item.type !== "compaction" || entry.item.status !== "completed") {
--      continue;
--    }
--    const payload = entry.item;
--    const usedTokens = asFiniteNumber(payload.afterTokenCount);
--    if (usedTokens === null || usedTokens < 0) {
--      continue;
--    }
--
--    const maxTokens = null;
--    const usedPercentage =
--      maxTokens !== null && maxTokens > 0 ? Math.min(100, (usedTokens / maxTokens) * 100) : null;
--    const remainingTokens =
--      maxTokens !== null ? Math.max(0, Math.round(maxTokens - usedTokens)) : null;
--    const remainingPercentage = usedPercentage !== null ? Math.max(0, 100 - usedPercentage) : null;
--
--    return {
--      usedTokens,
--      totalProcessedTokens: null,
--      maxTokens,
--      remainingTokens,
--      usedPercentage,
--      remainingPercentage,
--      inputTokens: null,
--      cachedInputTokens: null,
--      outputTokens: null,
--      reasoningOutputTokens: null,
--      lastUsedTokens: null,
--      lastInputTokens: null,
--      lastCachedInputTokens: null,
--      lastOutputTokens: null,
--      lastReasoningOutputTokens: null,
--      toolUses: null,
--      durationMs: null,
--      compactsAutomatically: null,
--      autoCompactThreshold: null,
--      cost: null,
--      updatedAt: DateTime.formatIso(payload.completedAt ?? payload.updatedAt),
--    };
--  }
--
--  return null;
--}
--
+@@ -1,15 +1 @@
 -export function formatContextWindowTokens(value: number | null): string {
 -  if (value === null || !Number.isFinite(value)) {
 -    return "0";
@@ -2200,17 +2007,13 @@ index ff9ef9318c..b4e8bb5647 100644
 -}
 +export * from "@t3tools/client-runtime/state/context-window";
 diff --git a/packages/client-runtime/package.json b/packages/client-runtime/package.json
-index 13fcedabdd..da6787533a 100644
+index 2ecbfc74ea..fa71c60d7e 100644
 --- a/packages/client-runtime/package.json
 +++ b/packages/client-runtime/package.json
-@@ -143,6 +143,14 @@
+@@ -143,6 +143,10 @@
        "types": "./src/relay/index.ts",
        "default": "./src/relay/index.ts"
      },
-+    "./state/context-window": {
-+      "types": "./src/state/contextWindow.ts",
-+      "default": "./src/state/contextWindow.ts"
-+    },
 +    "./state/composer-stats": {
 +      "types": "./src/state/composerStats.ts",
 +      "default": "./src/state/composerStats.ts"
@@ -3332,78 +3135,24 @@ index 0000000000..64949ac445
 +  };
 +}
 diff --git a/packages/client-runtime/src/state/contextWindow.test.ts b/packages/client-runtime/src/state/contextWindow.test.ts
-new file mode 100644
-index 0000000000..45a882ab47
---- /dev/null
+index 3f1a4d3d41..a108b13f40 100644
+--- a/packages/client-runtime/src/state/contextWindow.test.ts
 +++ b/packages/client-runtime/src/state/contextWindow.test.ts
-@@ -0,0 +1,158 @@
-+import { describe, expect, it } from "vite-plus/test";
-+import * as DateTime from "effect/DateTime";
-+import {
-+  deriveLatestContextWindowSnapshot,
-+  formatContextWindowTokens,
-+  latestProviderTurnTokenUsage,
-+} from "./contextWindow.ts";
+@@ -14,7 +14,7 @@ import {
+ import * as DateTime from "effect/DateTime";
+ import { describe, expect, it } from "vite-plus/test";
+ 
+-import { shouldCompactBeforeSend } from "./contextWindow.ts";
++import { formatContextWindowTokens, shouldCompactBeforeSend } from "./contextWindow.ts";
+ import type { ThreadStructure } from "./models.ts";
+ import { v2Projection } from "./orchestrationV2TestFixtures.ts";
+ 
+@@ -262,3 +262,19 @@ describe("shouldCompactBeforeSend", () => {
+     );
+   });
+ });
 +
-+describe("V2 context window presentation", () => {
-+  it("uses retained compaction token data when available", () => {
-+    const entries = [
-+      {
-+        item: {
-+          id: "compaction-1" as never,
-+          threadId: "thread-1" as never,
-+          runId: null,
-+          nodeId: null,
-+          providerThreadId: null,
-+          providerTurnId: null,
-+          nativeItemRef: null,
-+          parentItemId: null,
-+          ordinal: 1,
-+          status: "completed",
-+          title: null,
-+          startedAt: DateTime.makeUnsafe("2026-06-19T23:59:00.000Z"),
-+          completedAt: DateTime.makeUnsafe("2026-06-20T00:00:00.000Z"),
-+          updatedAt: DateTime.makeUnsafe("2026-06-20T00:00:00.000Z"),
-+          type: "compaction",
-+          driver: null,
-+          beforeTokenCount: 10_000,
-+          afterTokenCount: 2_000,
-+        },
-+      },
-+    ] as const;
-+    const snapshot = deriveLatestContextWindowSnapshot(entries);
-+    expect(snapshot?.updatedAt).toBe("2026-06-20T00:00:00.000Z");
-+    for (const status of ["running", "failed"] as const) {
-+      expect(
-+        deriveLatestContextWindowSnapshot(
-+          entries.map((entry) => ({ item: { ...entry.item, status } })),
-+        ),
-+      ).toBeNull();
-+    }
-+    expect(snapshot?.usedTokens).toBe(2_000);
-+    expect(snapshot?.totalProcessedTokens).toBeNull();
-+    expect(snapshot?.compactsAutomatically).toBeNull();
-+  });
-+
-+  it("prefers current provider usage and preserves ACP cost", () => {
-+    const snapshot = deriveLatestContextWindowSnapshot([], undefined, {
-+      contextUsage: {
-+        usedTokens: 2_500,
-+        maxTokens: 10_000,
-+        cost: { amount: 0.42, currency: "USD" },
-+      },
-+      updatedAt: DateTime.makeUnsafe("2026-08-23T00:00:00.000Z"),
-+    });
-+
-+    expect(snapshot).toMatchObject({
-+      usedTokens: 2_500,
-+      maxTokens: 10_000,
-+      remainingTokens: 7_500,
-+      usedPercentage: 25,
-+      cost: { amount: 0.42, currency: "USD" },
-+    });
-+  });
-+
++describe("formatContextWindowTokens", () => {
 +  it("formats compact token values", () => {
 +    expect(formatContextWindowTokens(1_500)).toBe("1.5k");
 +  });
@@ -3418,267 +3167,14 @@ index 0000000000..45a882ab47
 +    expect(formatContextWindowTokens(tokens)).toBe(expected);
 +  });
 +});
-+
-+describe("live provider-turn usage (#8144)", () => {
-+  it("prefers the provider's live report over compaction items", () => {
-+    const snapshot = deriveLatestContextWindowSnapshot([], {
-+      usedTokens: 42_000,
-+      maxTokens: 200_000,
-+      inputTokens: 40_000,
-+      outputTokens: 2_000,
-+      updatedAt: "2026-08-27T00:00:00.000Z",
-+    });
-+    expect(snapshot).not.toBeNull();
-+    expect(snapshot?.usedTokens).toBe(42_000);
-+    expect(snapshot?.maxTokens).toBe(200_000);
-+    expect(snapshot?.remainingTokens).toBe(158_000);
-+    expect(snapshot?.usedPercentage).toBe(21);
-+  });
-+
-+  it("handles a report without a known context window", () => {
-+    const snapshot = deriveLatestContextWindowSnapshot([], {
-+      usedTokens: 42_000,
-+      updatedAt: "2026-08-27T00:00:00.000Z",
-+    });
-+    expect(snapshot?.maxTokens).toBeNull();
-+    expect(snapshot?.usedPercentage).toBeNull();
-+  });
-+});
-+
-+describe("latestProviderTurnTokenUsage", () => {
-+  it("picks the newest report, not the last turn in snapshot order", () => {
-+    const usage = (usedTokens: number, updatedAt: string) => ({
-+      tokenUsage: { usedTokens, updatedAt },
-+    });
-+    // Snapshots sort by provider thread id, so an older thread can come last.
-+    const latest = latestProviderTurnTokenUsage([
-+      usage(300_000, "2026-06-20T12:00:00.000Z"),
-+      {},
-+      usage(90_000, "2026-06-20T09:00:00.000Z"),
-+    ]);
-+    expect(latest?.usedTokens).toBe(300_000);
-+  });
-+});
-+
-+describe("compaction policy metadata", () => {
-+  it("preserves reported policy alongside newer turn occupancy", () => {
-+    const snapshot = deriveLatestContextWindowSnapshot(
-+      [],
-+      {
-+        usedTokens: 360_000,
-+        maxTokens: 1_000_000,
-+        updatedAt: "2026-10-10T12:00:00.000Z",
-+      },
-+      {
-+        contextUsage: {
-+          usedTokens: 300_000,
-+          autoCompactThreshold: 400_000,
-+          compactsAutomatically: true,
-+        },
-+        updatedAt: DateTime.makeUnsafe("2026-10-10T11:00:00.000Z"),
-+      },
-+    );
-+    expect(snapshot).toMatchObject({
-+      usedTokens: 360_000,
-+      usedPercentage: 36,
-+      autoCompactThreshold: 400_000,
-+      compactsAutomatically: true,
-+    });
-+  });
-+
-+  it("does not assume automatic compaction from a usage report", () => {
-+    expect(
-+      deriveLatestContextWindowSnapshot([], {
-+        usedTokens: 42_000,
-+        updatedAt: "2026-10-10T12:00:00.000Z",
-+      }),
-+    ).toMatchObject({ compactsAutomatically: null, autoCompactThreshold: null });
-+  });
-+});
 diff --git a/packages/client-runtime/src/state/contextWindow.ts b/packages/client-runtime/src/state/contextWindow.ts
-new file mode 100644
-index 0000000000..45319b8b13
---- /dev/null
+index b3b48ff260..436c5752a3 100644
+--- a/packages/client-runtime/src/state/contextWindow.ts
 +++ b/packages/client-runtime/src/state/contextWindow.ts
-@@ -0,0 +1,194 @@
-+import type { ThreadStructure, ThreadStructureTurnItem } from "./shell.ts";
-+import type {
-+  OrchestrationV2ProviderTurn,
-+  OrchestrationV2ProviderTurnTokenUsage,
-+  OrchestrationV2ProviderThread,
-+  ThreadTokenUsageSnapshot,
-+} from "@t3tools/contracts";
-+import * as DateTime from "effect/DateTime";
-+
-+function asFiniteNumber(value: unknown): number | null {
-+  return typeof value === "number" && Number.isFinite(value) ? value : null;
-+}
-+
-+type NullableContextWindowUsage = {
-+  readonly [Key in keyof ThreadTokenUsageSnapshot]: undefined extends ThreadTokenUsageSnapshot[Key]
-+    ? Exclude<ThreadTokenUsageSnapshot[Key], undefined> | null
-+    : ThreadTokenUsageSnapshot[Key];
-+};
-+
-+export type ContextWindowSnapshot = NullableContextWindowUsage & {
-+  readonly remainingTokens: number | null;
-+  readonly usedPercentage: number | null;
-+  readonly remainingPercentage: number | null;
-+  readonly updatedAt: string;
-+};
-+
-+/** Newest report by timestamp; snapshots order turns by provider thread. */
-+export function latestProviderTurnTokenUsage(
-+  turns: ReadonlyArray<Pick<OrchestrationV2ProviderTurn, "tokenUsage">>,
-+  projection?: Pick<ThreadStructure, "thread" | "contextTransfers"> | null,
-+  providerThread?: Pick<OrchestrationV2ProviderThread, "contextUsage"> | null,
-+): OrchestrationV2ProviderTurnTokenUsage | null {
-+  let latest: OrchestrationV2ProviderTurnTokenUsage | null = null;
-+  for (const { tokenUsage } of turns) {
-+    if (tokenUsage === undefined) continue;
-+    // Ties go to the later entry, since live upserts append.
-+    if (latest === null || Date.parse(tokenUsage.updatedAt) >= Date.parse(latest.updatedAt)) {
-+      latest = tokenUsage;
-+    }
-+  }
-+  if (latest !== null || projection == null || providerThread?.contextUsage != null) return latest;
-+  const forkedFrom = projection.thread.forkedFrom;
-+  if (forkedFrom?.type !== "run") return null;
-+  return (
-+    projection.contextTransfers.find(
-+      (transfer) =>
-+        transfer.type === "fork" &&
-+        transfer.targetThreadId === projection.thread.id &&
-+        transfer.sourceThreadId === forkedFrom.threadId &&
-+        transfer.sourcePoint.runId === forkedFrom.runId &&
-+        transfer.sourceProviderInstanceId === projection.thread.modelSelection.instanceId &&
-+        (transfer.status === "pending" || transfer.resolution?.strategy === "native_fork"),
-+    )?.sourceTokenUsage ?? null
-+  );
-+}
-+
-+export function deriveLatestContextWindowSnapshot(
-+  entries: ReadonlyArray<{
-+    readonly item: ThreadStructureTurnItem;
-+  }>,
-+  liveUsage?: OrchestrationV2ProviderTurnTokenUsage | null,
-+  providerThread?: Pick<OrchestrationV2ProviderThread, "contextUsage" | "updatedAt"> | null,
-+): ContextWindowSnapshot | null {
-+  if (liveUsage != null) {
-+    const usedTokens = Math.max(0, liveUsage.usedTokens);
-+    const maxTokens = liveUsage.maxTokens ?? null;
-+    const usedPercentage =
-+      maxTokens !== null && maxTokens > 0 ? Math.min(100, (usedTokens / maxTokens) * 100) : null;
-+    const remainingTokens =
-+      maxTokens !== null ? Math.max(0, Math.round(maxTokens - usedTokens)) : null;
-+    const remainingPercentage = usedPercentage !== null ? Math.max(0, 100 - usedPercentage) : null;
-+    return {
-+      usedTokens,
-+      totalProcessedTokens: null,
-+      maxTokens,
-+      remainingTokens,
-+      usedPercentage,
-+      remainingPercentage,
-+      inputTokens: liveUsage.inputTokens ?? null,
-+      cachedInputTokens: liveUsage.cachedInputTokens ?? null,
-+      outputTokens: liveUsage.outputTokens ?? null,
-+      reasoningOutputTokens: liveUsage.reasoningOutputTokens ?? null,
-+      lastUsedTokens: null,
-+      lastInputTokens: null,
-+      lastCachedInputTokens: null,
-+      lastOutputTokens: null,
-+      lastReasoningOutputTokens: null,
-+      toolUses: null,
-+      durationMs: null,
-+      compactsAutomatically: providerThread?.contextUsage?.compactsAutomatically ?? null,
-+      autoCompactThreshold:
-+        liveUsage.autoCompactThreshold ??
-+        providerThread?.contextUsage?.autoCompactThreshold ??
-+        null,
-+      cost: null,
-+      updatedAt: liveUsage.updatedAt,
-+    };
-+  }
-+  const providerUsage = providerThread?.contextUsage;
-+  const providerUsageUpdatedAt = providerThread?.updatedAt;
-+  if (
-+    providerUsage !== null &&
-+    providerUsage !== undefined &&
-+    providerUsageUpdatedAt !== undefined
-+  ) {
-+    const maxTokens = asFiniteNumber(providerUsage.maxTokens);
-+    const usedTokens = providerUsage.usedTokens;
-+    const usedPercentage =
-+      maxTokens !== null && maxTokens > 0 ? Math.min(100, (usedTokens / maxTokens) * 100) : null;
-+    return {
-+      usedTokens,
-+      totalProcessedTokens: asFiniteNumber(providerUsage.totalProcessedTokens),
-+      maxTokens,
-+      remainingTokens: maxTokens === null ? null : Math.max(0, Math.round(maxTokens - usedTokens)),
-+      usedPercentage,
-+      remainingPercentage: usedPercentage === null ? null : Math.max(0, 100 - usedPercentage),
-+      inputTokens: asFiniteNumber(providerUsage.inputTokens),
-+      cachedInputTokens: asFiniteNumber(providerUsage.cachedInputTokens),
-+      outputTokens: asFiniteNumber(providerUsage.outputTokens),
-+      reasoningOutputTokens: asFiniteNumber(providerUsage.reasoningOutputTokens),
-+      lastUsedTokens: asFiniteNumber(providerUsage.lastUsedTokens),
-+      lastInputTokens: asFiniteNumber(providerUsage.lastInputTokens),
-+      lastCachedInputTokens: asFiniteNumber(providerUsage.lastCachedInputTokens),
-+      lastOutputTokens: asFiniteNumber(providerUsage.lastOutputTokens),
-+      lastReasoningOutputTokens: asFiniteNumber(providerUsage.lastReasoningOutputTokens),
-+      toolUses: asFiniteNumber(providerUsage.toolUses),
-+      durationMs: asFiniteNumber(providerUsage.durationMs),
-+      compactsAutomatically: providerUsage.compactsAutomatically ?? null,
-+      cost: providerUsage.cost ?? null,
-+      autoCompactThreshold: providerUsage.autoCompactThreshold ?? null,
-+      updatedAt: DateTime.formatIso(providerUsageUpdatedAt),
-+    };
-+  }
-+  for (let index = entries.length - 1; index >= 0; index -= 1) {
-+    const entry = entries[index];
-+    if (!entry || entry.item.type !== "compaction" || entry.item.status !== "completed") {
-+      continue;
-+    }
-+    const payload = entry.item;
-+    const usedTokens = asFiniteNumber(payload.afterTokenCount);
-+    if (usedTokens === null || usedTokens < 0) {
-+      continue;
-+    }
-+
-+    const maxTokens = null;
-+    const usedPercentage =
-+      maxTokens !== null && maxTokens > 0 ? Math.min(100, (usedTokens / maxTokens) * 100) : null;
-+    const remainingTokens =
-+      maxTokens !== null ? Math.max(0, Math.round(maxTokens - usedTokens)) : null;
-+    const remainingPercentage = usedPercentage !== null ? Math.max(0, 100 - usedPercentage) : null;
-+
-+    return {
-+      usedTokens,
-+      totalProcessedTokens: null,
-+      maxTokens,
-+      remainingTokens,
-+      usedPercentage,
-+      remainingPercentage,
-+      inputTokens: null,
-+      cachedInputTokens: null,
-+      outputTokens: null,
-+      reasoningOutputTokens: null,
-+      lastUsedTokens: null,
-+      lastInputTokens: null,
-+      lastCachedInputTokens: null,
-+      lastOutputTokens: null,
-+      lastReasoningOutputTokens: null,
-+      toolUses: null,
-+      durationMs: null,
-+      compactsAutomatically: null,
-+      autoCompactThreshold: null,
-+      cost: null,
-+      updatedAt: DateTime.formatIso(payload.completedAt ?? payload.updatedAt),
-+    };
-+  }
-+
-+  return null;
-+}
+@@ -320,3 +320,19 @@ export function shouldCompactBeforeSend(input: {
+     })
+   );
+ }
 +
 +export function formatContextWindowTokens(value: number | null): string {
 +  if (value === null || !Number.isFinite(value)) {
