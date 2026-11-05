@@ -22,12 +22,12 @@ guide line, context-menu collapse and a summary stub.
  .../ThreadSettlementService.ts                |  83 +-
  .../src/orchestration-v2/runtimeLayer.test.ts |  20 +
  .../Sidebar.childThreads.browser.test.tsx     | 180 +++++
- .../components/Sidebar.childThreads.test.ts   | 214 +++++
- .../src/components/Sidebar.childThreads.tsx   | 747 ++++++++++++++++++
+ .../components/Sidebar.childThreads.test.ts   | 252 ++++++
+ .../src/components/Sidebar.childThreads.tsx   | 749 ++++++++++++++++++
  .../src/components/Sidebar.families.test.ts   | 584 ++++++++++++++
  apps/web/src/components/Sidebar.families.ts   | 431 ++++++++++
  apps/web/src/components/Sidebar.logic.test.ts |  34 +
- apps/web/src/components/Sidebar.logic.ts      |  16 +-
+ apps/web/src/components/Sidebar.logic.ts      |  21 +-
  apps/web/src/components/Sidebar.tsx           |  93 ++-
  .../components/sidebar/SidebarThreadRow.tsx   |  41 +-
  .../components/threadActionMenu.logic.test.ts |  15 +
@@ -44,7 +44,7 @@ guide line, context-menu collapse and a summary stub.
  .../src/state/threadCommands.ts               |  14 +-
  .../src/state/threadShell.test.ts             |  37 +
  packages/contracts/src/orchestrationV2.ts     |  25 +
- 35 files changed, 3162 insertions(+), 56 deletions(-)
+ 35 files changed, 3206 insertions(+), 57 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.childThreads.browser.test.tsx
  create mode 100644 apps/web/src/components/Sidebar.childThreads.test.ts
  create mode 100644 apps/web/src/components/Sidebar.childThreads.tsx
@@ -900,10 +900,10 @@ index 0000000000..7279f1a5fd
 +);
 diff --git a/apps/web/src/components/Sidebar.childThreads.test.ts b/apps/web/src/components/Sidebar.childThreads.test.ts
 new file mode 100644
-index 0000000000..b03e96b8b5
+index 0000000000..c6a0d3fd8a
 --- /dev/null
 +++ b/apps/web/src/components/Sidebar.childThreads.test.ts
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,252 @@
 +import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 +import { describe, expect, it } from "vite-plus/test";
 +
@@ -911,7 +911,9 @@ index 0000000000..b03e96b8b5
 +  buildSidebarChildThreadSections,
 +  pageSidebarSettledFamilies,
 +  placeSidebarChildThreads,
++  sidebarChildRowStatusOf,
 +} from "./Sidebar.childThreads";
++import { resolveThreadStatusPill } from "./Sidebar.logic";
 +
 +const thread = (
 +  id: string,
@@ -1118,12 +1120,48 @@ index 0000000000..b03e96b8b5
 +    expect(settled).toEqual([]);
 +  });
 +});
++
++describe("sidebarChildRowStatusOf", () => {
++  it("colors new and done children in the green of the Completed status", () => {
++    const completed = resolveThreadStatusPill({
++      thread: {
++        hasActionableProposedPlan: false,
++        hasPendingApprovals: false,
++        hasPendingUserInput: false,
++        interactionMode: "default",
++        latestRun: {
++          runId: "turn-1" as never,
++          status: "completed",
++          assistantMessageId: null,
++          requestedAt: "2026-03-09T10:00:00.000Z",
++          startedAt: "2026-03-09T10:00:00.000Z",
++          completedAt: "2026-03-09T10:05:00.000Z",
++        },
++        lastVisitedAt: "2026-03-09T10:04:00.000Z",
++        runtime: {
++          status: "completed",
++          providerName: "Codex",
++          providerInstanceId: "codex" as never,
++          activeRunId: null,
++          lastError: null,
++          updatedAt: "2026-03-09T10:05:00.000Z",
++        },
++      },
++    });
++    expect(completed?.label).toBe("Completed");
++    for (const kind of ["new", "done"] as const) {
++      expect(sidebarChildRowStatusOf({ kind, topStatus: null }).className).toBe(
++        completed?.colorClass,
++      );
++    }
++  });
++});
 diff --git a/apps/web/src/components/Sidebar.childThreads.tsx b/apps/web/src/components/Sidebar.childThreads.tsx
 new file mode 100644
-index 0000000000..79a647be08
+index 0000000000..214ea34bd6
 --- /dev/null
 +++ b/apps/web/src/components/Sidebar.childThreads.tsx
-@@ -0,0 +1,747 @@
+@@ -0,0 +1,749 @@
 +// Child threads in the sidebar (patches-tt/0003). Family rules live in Sidebar.families.ts;
 +// this module holds the sidebar's state and rendering so Sidebar.tsx only calls into it.
 +import type { EnvironmentServerConfig } from "@t3tools/client-runtime/connection";
@@ -1178,6 +1216,7 @@ index 0000000000..79a647be08
 +  type SidebarThreadFamily,
 +} from "./Sidebar.families";
 +import {
++  COMPLETED_STATUS_COLOR_CLASS,
 +  hasUnseenCompletion,
 +  resolveSidebarThreadStatus,
 +  resolveThreadLastVisitedAt,
@@ -1660,10 +1699,11 @@ index 0000000000..79a647be08
 +    className: "text-warning-foreground",
 +  },
 +  failed: { label: "Failed", icon: "failed", className: "text-error-foreground" },
-+  // Green like done: an unseen result is finished work, not a call to act; the dot marks unseen.
-+  new: { label: "New", icon: "new", className: "text-success-foreground" },
++  // Completed's green, like done: an unseen result is finished work, not a call to act; the dot
++  // marks unseen.
++  new: { label: "New", icon: "new", className: COMPLETED_STATUS_COLOR_CLASS },
 +  working: { label: "Working", icon: "working", className: "text-info-foreground" },
-+  done: { label: "Done", icon: "done", className: "text-success-foreground" },
++  done: { label: "Done", icon: "done", className: COMPLETED_STATUS_COLOR_CLASS },
 +  settled: { label: "Settled", icon: "done", className: "text-muted-foreground/60" },
 +};
 +
@@ -2955,7 +2995,7 @@ index 9e7489a0ff..b8b7e4c00c 100644
  
  function makeLatestRun(overrides?: {
 diff --git a/apps/web/src/components/Sidebar.logic.ts b/apps/web/src/components/Sidebar.logic.ts
-index e2c6a60fc3..cc7ead0105 100644
+index e2c6a60fc3..2c56d527e9 100644
 --- a/apps/web/src/components/Sidebar.logic.ts
 +++ b/apps/web/src/components/Sidebar.logic.ts
 @@ -567,19 +567,25 @@ export function isSidebarHiddenThread(thread: Pick<SidebarThreadSummary, "lineag
@@ -2989,6 +3029,25 @@ index e2c6a60fc3..cc7ead0105 100644
      if (thread.lineage.parentThreadId === null || visited.has(thread.id)) return threadId;
      visited.add(thread.id);
      thread = findThread(thread.lineage.parentThreadId);
+@@ -1088,6 +1094,9 @@ export function resolveWorkingStartedAt(
+   return resolveThreadWorkingStartedAt(thread);
+ }
+ 
++/** The Completed status green; nested child threads reuse it for new and done. */
++export const COMPLETED_STATUS_COLOR_CLASS = "text-emerald-600 dark:text-emerald-300/90";
++
+ export function resolveThreadStatusPill(input: {
+   thread: ThreadStatusInput;
+ }): ThreadStatusPill | null {
+@@ -1183,7 +1192,7 @@ export function resolveThreadStatusPill(input: {
+   if (hasUnseenCompletion(thread)) {
+     return {
+       label: "Completed",
+-      colorClass: "text-emerald-600 dark:text-emerald-300/90",
++      colorClass: COMPLETED_STATUS_COLOR_CLASS,
+       dotClass: "bg-emerald-500 dark:bg-emerald-300/90",
+       pulse: false,
+     };
 diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
 index a82da0bf5f..82d59d1cdb 100644
 --- a/apps/web/src/components/Sidebar.tsx
