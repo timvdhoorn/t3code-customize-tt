@@ -2753,9 +2753,10 @@ def stage_t3_update():
     return False
 
 
-def contains(folder, marker):
+def contains(folder, marker, scripts_only=True):
+    """Whether a script in folder (or, with scripts_only=False, any file) holds marker."""
     return any(marker in path.read_bytes() for path in folder.rglob('*')
-               if path.suffix in ('.js', '.mjs', '.cjs') and path.is_file())
+               if path.is_file() and (not scripts_only or path.suffix in ('.js', '.mjs', '.cjs')))
 
 
 def sea_node_version(source):
@@ -2785,8 +2786,11 @@ def build_server(env, version, config, log):
         sea_bin = exact_node(sea_version, log)
         exe_env = dict(env, PATH=os.pathsep.join([str(sea_bin), env['PATH']]), VP_NODE_VERSION=sea_version)
         run([str(sea_bin / 'node'), 'scripts/cli.ts', 'build-exe'], cwd=SOURCE / 'apps/server', env=exe_env, log=log)
-    for folder, marker in (('apps/server/dist/client', b'statsForNerds'), ('apps/server/dist-exe', b'claude_observed')):
-        if not contains(SOURCE / folder, marker):
+    # Since nightly 4262 dist-exe holds the server code only inside the executable (bin.mjs is a
+    # loader), so the executable counts too.
+    for folder, marker, scripts_only in (('apps/server/dist/client', b'statsForNerds', True),
+                                         ('apps/server/dist-exe', b'claude_observed', False)):
+        if not contains(SOURCE / folder, marker, scripts_only):
             raise Stop(f'The build in {folder} is missing the patches (no {marker.decode()}).')
 
 
