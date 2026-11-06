@@ -871,3 +871,14 @@ class IosAfterUpdateTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class BuildMarkerTest(unittest.TestCase):
+    def test_server_marker_counts_inside_the_executable(self):
+        # Since nightly 4262 dist-exe holds a loader bin.mjs and the server code only in the executable.
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / 'bin.mjs').write_bytes(b'import * as NodeSea from "node:sea";')
+            (folder / 't3').write_bytes(b'\x7fELF ... claude_observed ...')
+            self.assertFalse(customize.contains(folder, b'claude_observed'))
+            self.assertTrue(customize.contains(folder, b'claude_observed', scripts_only=False))
