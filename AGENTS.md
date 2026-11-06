@@ -95,7 +95,7 @@ personal data. Name where a secret lives (a 1Password item, a path under
 - **A fork change** (what each own patch and each tool addition must keep doing, its files and its
   check; the check after every update): [docs/fork-changes.md](docs/fork-changes.md). A new own patch
   or tool behaviour adds its row there.
-- **Machines** (which machine updates how, the porter, the idle gate that never interrupts a running
+- **Machines** (which machine updates how, ports without an agent, the idle gate that never interrupts a running
   thread, the standing grant for unattended ports, `fleet` after every pushed change):
   [docs/machines.md](docs/machines.md).
 - **Asked to update** ("update", "zijn er updates", "update alles"):

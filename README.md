@@ -136,12 +136,9 @@ Merino for light and dark. The iOS app ships the same theme as a built-in card.
 The label next to the T3 logo shows which customized build you run (the first characters of the recipe in `status`; hover it for the build time). Settings > General > About and the macOS About panel show it too.
 
 When a nightly changes code the patches touch, you get a notification and T3 Code stays stock.
-With a porter in `machines.json` (the machine with `"fix"`, here devbox1) the Mac hands the port to
-it and notifies "port running on devbox1"; the porter runs `t3code-customize port`, one agent session
-for every stage and the checks, opens a PR and, under the standing grant in
-[docs/machines.md](docs/machines.md#unattended-ports), merges it and runs `t3code-customize fleet`.
-Without a porter, ask a coding agent in this repo to port the patches ([docs/porting.md](docs/porting.md)),
-or turn on `autoupdate on --fix claude` so Claude Code ports them on this machine.
+In this fork no run ports unattended: start a thread in this repo on devbox1 and port the patches
+with that agent ([docs/porting.md](docs/porting.md)). `autoupdate on --fix claude` would let Claude
+Code port them unattended; the fork leaves it off.
 
 ## iOS app (TestFlight)
 
@@ -201,8 +198,8 @@ so it runs stock until the rebuild, which `autoupdate on` starts as soon as T3 s
 
 `machines.json` lists every machine that runs T3 with these patches: `kind` is `mac` (app
 plus its built-in server) or `server` (headless Linux), `hostname` is how a machine
-recognizes itself, `ssh` the aliases to try from the others, `fix` the agent of the one machine
-that ports (the porter, see [docs/machines.md](docs/machines.md)) and `ios` the Mac that builds the
+recognizes itself, `ssh` the aliases to try from the others, `fix` (unused in this fork) the agent of a
+machine that ports unattended and `ios` the Mac that builds the
 iOS app.
 
 ```sh
@@ -258,7 +255,7 @@ t3code-customize status      show what the next launch opens
 t3code-customize autoupdate  macOS and server: keep everything up to date in the background
 t3code-customize server      Linux T3 server: build the patches into the server the service runs
 t3code-customize fleet       update every machine in machines.json
-t3code-customize port        port every patch layer onto a nightly (one agent session; the porter)
+t3code-customize port        port every patch layer onto a nightly (with --fix, one agent session)
 t3code-customize continue    after resolving a conflict: finish that stage, apply the next
 t3code-customize checks      run the tests, typechecks and lint of the applied patches
 t3code-customize ios         macOS: build the patched iOS app and upload it to TestFlight

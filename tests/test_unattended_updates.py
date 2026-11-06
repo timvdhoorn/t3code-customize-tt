@@ -781,10 +781,11 @@ class FleetCommandTest(unittest.TestCase):
 
     def test_autoupdate_uses_each_machines_own_settings(self):
         machines = {m['name']: m for m in customize.load(customize.MACHINES)['machines']}
-        # devbox1 is the porter (16 cores, idle); the MacBook Pro builds iOS and hands ports over.
-        self.assertEqual(customize.autoupdate_command(machines['devbox1']), ['autoupdate', 'on', '--fix', 'claude'])
+        # No machine ports unattended (Tim, 2026-11-06); the MacBook Pro builds iOS.
+        self.assertEqual(customize.autoupdate_command(machines['devbox1']), ['autoupdate', 'on'])
         self.assertEqual(customize.autoupdate_command(machines['mbp']), ['autoupdate', 'on', '--ios'])
-        self.assertEqual(customize.porter_machine(list(machines.values()))['name'], 'devbox1')
+        self.assertIsNone(customize.porter_machine(list(machines.values())))
+        self.assertEqual(customize.autoupdate_command({'name': 'x', 'fix': 'claude'}), ['autoupdate', 'on', '--fix', 'claude'])
         self.assertEqual(customize.autoupdate_command(machines['mba']), ['autoupdate', 'on'])
 
 

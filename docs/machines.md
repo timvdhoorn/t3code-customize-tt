@@ -67,29 +67,20 @@ run the same patches.
     overlay, and the next launcher start loads it (opened before that, it opens stock and starts the
     rebuild). On the MacBook Pro (`"ios": true`) the same run then builds the iOS app for the new
     nightly and uploads it to TestFlight. When the patches do not fit the new nightly, the run
-    hands the port to the porter (see "The porter" below) and stays on its current build. A re-signed copy at `~/Applications/T3 Code (Customized).app`
+    notifies Tim and stays on its current build (see "Ports" below). A re-signed copy at `~/Applications/T3 Code (Customized).app`
     from older versions of this tool ran with `T3CODE_DISABLE_AUTO_UPDATE=true`, so it never
     updated; `install_mac_launcher` removes it, and none may remain.
-  - devbox1: the `autoupdate` timer at 04:30 runs `server --t3-update --fix claude`: `t3 update`
+  - devbox1: the `autoupdate` timer at 04:30 runs `server --t3-update`: `t3 update`
     stages the newest `t3@nightly` (a no-op when it already runs it), the customized server is built
-    for it, and the one restart waits for idle as above. When the patches break there, devbox1 ports
-    them itself (it is the porter).
-- **The porter.** One machine ports: the one with `"fix"` in `machines.json`, devbox1 (16 cores,
-  idle, with `.git`, `gh` and `claude`). The MacBook Pro ran out of memory on checks (61 min for
-  one typecheck under swap), so the Macs never run an agent. An unattended run on another machine
-  that hits a conflict or failing check aborts its own rebase or `git am`, starts
-  `port --commit <nightly> --version <v> --fix claude --background` on the porter over SSH
-  (detached, in the systemd unit `t3code-customize-port-<commit>`; a second start while it runs is a
-  no-op, and the porter's lock serialises it with its own runs), notifies "port running on devbox1",
-  and leaves its checkout clean and its app untouched. It does not hand the same nightly over again
-  for 12 hours, and while the patches stay the same its hourly runs stop before they touch the
-  checkout; an unreachable porter is notified once per 12 hours. The porter's own unattended runs
-  (`server --fix claude` at 04:30) hand their port to `port` too, so every port carries all three
-  layers. A port that waits for review (`ports.json`, or an open `port/nightly-<version>` PR) is not
-  ported again by any run. When the one agent session leaves a port unfinished, its run cleans the
-  checkout, records `failed` in `ports.json` and notifies. `port` applies all three layers, runs one agent session through every stage and the
-  checks (`docs/porting.md`), then publishes as below. The Mac's next hourly run picks the merged port
-  up through `pull_latest`.
+    for it, and the one restart waits for idle as above. When the patches break there, it notifies
+    and keeps its current build.
+- **Ports.** No machine ports unattended and no run starts an agent (Tim's decision, 2026-11-06:
+  the unattended agent ports kept failing). No machine in `machines.json` has `"fix"`, so no run
+  hands a port off, and `fleet` turns `autoupdate on` without `--fix`. A run that hits a conflict or
+  failing check aborts its rebase or `git am`, notifies, and leaves its checkout clean and its app
+  untouched. Tim then starts a thread in this repo on devbox1 (16 cores; the MacBook Pro ran out of
+  memory on checks) and ports with that agent, per `.agents/playbooks/update.md` and
+  `docs/porting.md`; the port goes through a normal PR.
 - **A nightly older than the patches** (the Mac still on the nightly before a port merged) builds
   with the patch set from git history made for exactly that nightly, or waits for the app update
   and exits 0. It never leaves a stopped rebase or `git am`; an unattended run that finds one an
@@ -104,6 +95,8 @@ run the same patches.
 - Python must stay compatible with macOS's system Python 3.9.
 
 ## Unattended ports
+
+Unused since 2026-11-06 (see "Ports" above): it applies only if `--fix` is passed again by hand.
 
 Tim's standing grant (retro of 2026-10-16): when `--fix <agent>` ported the patches without him,
 `publish_port` commits the port to the branch `port/nightly-<version>`, pushes it and opens a PR
