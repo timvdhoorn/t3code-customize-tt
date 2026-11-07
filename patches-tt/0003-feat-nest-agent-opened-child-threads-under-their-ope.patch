@@ -9,13 +9,16 @@ t3_thread_launch and create_threads) and renders families like Claude.app:
 a child nests under its opener only within the same inbox section, with a
 guide line, context-menu collapse and a summary stub.
 ---
- apps/server/src/mcp/OrchestratorMcpService.ts |   1 +
- .../src/mcp/toolkits/project/handlers.test.ts |  79 +-
- .../src/mcp/toolkits/project/handlers.ts      |   1 +
- .../src/orchestration-v2/Orchestrator.ts      |  11 +-
+ .../src/mcp/OrchestratorMcpService.test.ts    |  97 +++
+ apps/server/src/mcp/OrchestratorMcpService.ts |   2 +
+ .../src/mcp/toolkits/orchestrator/tools.ts    |   2 +-
+ .../src/mcp/toolkits/project/handlers.test.ts |  87 +-
+ .../src/mcp/toolkits/project/handlers.ts      |   6 +
+ apps/server/src/mcp/toolkits/project/tools.ts |   8 +-
+ .../src/orchestration-v2/Orchestrator.ts      |  14 +-
  .../src/orchestration-v2/ProjectionStore.ts   |  21 +
- .../ThreadLaunchService.test.ts               |  19 +
- .../orchestration-v2/ThreadLaunchService.ts   |   5 +
+ .../ThreadLaunchService.test.ts               |  42 +
+ .../orchestration-v2/ThreadLaunchService.ts   |   8 +
  .../ThreadManagementService.test.ts           |   9 +-
  .../ThreadManagementService.ts                |   2 +
  .../ThreadSettlementService.test.ts           | 134 +++
@@ -46,8 +49,9 @@ guide line, context-menu collapse and a summary stub.
  .../src/state/threadCommands.test.ts          |   6 +-
  .../src/state/threadCommands.ts               |  14 +-
  .../src/state/threadShell.test.ts             |  37 +
- packages/contracts/src/orchestrationV2.ts     |  30 +
- 38 files changed, 3435 insertions(+), 69 deletions(-)
+ packages/contracts/src/orchestrationV2.ts     |  32 +
+ packages/contracts/src/orchestratorMcp.ts     |   6 +
+ 42 files changed, 3591 insertions(+), 71 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.childThreads.browser.test.tsx
  create mode 100644 apps/web/src/components/Sidebar.childThreads.test.ts
  create mode 100644 apps/web/src/components/Sidebar.childThreads.tsx
@@ -56,20 +60,142 @@ guide line, context-menu collapse and a summary stub.
  create mode 100644 packages/client-runtime/src/state/childThreadSummary.test.ts
  create mode 100644 packages/client-runtime/src/state/childThreadSummary.ts
 
+diff --git a/apps/server/src/mcp/OrchestratorMcpService.test.ts b/apps/server/src/mcp/OrchestratorMcpService.test.ts
+index f52ac95174..55556f6b9f 100644
+--- a/apps/server/src/mcp/OrchestratorMcpService.test.ts
++++ b/apps/server/src/mcp/OrchestratorMcpService.test.ts
+@@ -2231,6 +2231,103 @@ describe("OrchestratorMcpService provider resolution", () => {
+       ),
+   );
+ 
++  it.live("create_threads nests a thread under its opener unless it asks for a main thread", () =>
++    Effect.scoped(
++      Effect.gen(function* () {
++        const driver = ProviderDriverKind.make("codex");
++        const cwd = yield* checkpointWorkspace("mcp-create-main-thread");
++        const layerRegistry = ProviderAdapterRegistry.layerFromAdapters([
++          {
++            instanceId: codexInstanceId,
++            driver,
++            getCapabilities: () => Effect.succeed(CodexProviderCapabilitiesV2),
++            planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" as const }),
++            openSession: () =>
++              Effect.die("These tests exercise committed commands before provider execution."),
++          },
++        ]);
++        const layerDatabase = SqlitePersistence.layerMemory;
++        const layerOrchestrator = ProviderReplayHarness.layerWithRegistry(
++          { name: "mcp-create-main-thread", runtimePolicyOverride: { cwd } },
++          layerRegistry,
++          { databaseLayer: layerDatabase, runEffectWorker: false },
++        );
++        const layerSettings = ServerSettings.layerTest({
++          providerInstances: { [codexInstanceId]: { driver: "codex", enabled: true } },
++        });
++        const layerThreads = ThreadManagementService.layer.pipe(
++          Layer.provideMerge(layerOrchestrator),
++          Layer.provide(
++            LegacyV1ThreadImporter.layer.pipe(
++              Layer.provide(layerOrchestrator),
++              Layer.provide(layerDatabase),
++            ),
++          ),
++          Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
++          Layer.provideMerge(layerSettings),
++        );
++        const layerTest = layerOrchestratorService.pipe(
++          Layer.provideMerge(layerThreads),
++          Layer.provide(
++            Layer.mergeAll(
++              NodeServices.layer,
++              NodeCrypto.layer,
++              layerRegistry,
++              layerSettings,
++              providerRegistryLayer([
++                providerSnapshot({ instanceId: codexInstanceId, driver, model: "gpt-5.4" }),
++              ]),
++              Layer.mock(ProjectService.ProjectService)({}),
++              Layer.mock(SecretRequests.SecretRequests)({}),
++              Layer.mock(RemoteDelegation.RemoteDelegation)({}),
++              Layer.mock(ScheduledTaskService.ScheduledTaskService)({}),
++            ),
++          ),
++        );
++        yield* Effect.gen(function* () {
++          const orchestrator = yield* Orchestrator.OrchestratorV2;
++          const service = yield* OrchestratorMcpService.OrchestratorMcpService;
++          yield* orchestrator.dispatch({
++            type: "thread.create",
++            createdBy: "user",
++            creationSource: "web",
++            commandId: CommandId.make("parent:create"),
++            threadId: parentThreadId,
++            projectId,
++            title: "MCP parent",
++            modelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
++            runtimeMode: "full-access",
++            interactionMode: "default",
++            branch: null,
++            worktreePath: cwd,
++          });
++          yield* orchestrator.dispatch({
++            type: "message.dispatch",
++            createdBy: "user",
++            creationSource: "web",
++            commandId: CommandId.make("parent:start"),
++            threadId: parentThreadId,
++            messageId: MessageId.make("parent:message"),
++            text: "Create threads.",
++            attachments: [],
++            dispatchMode: { type: "start_immediately" },
++          });
++          const created = yield* service.createThreads(scope, {
++            threads: [{ title: "Nested child" }, { title: "Second main", mainThread: true }],
++            clientRequestId: "create-main-thread",
++          });
++          const [nested, main] = yield* Effect.forEach(created.threads, (thread) =>
++            orchestrator.getThreadProjection(thread.threadId),
++          );
++          assert.equal(nested?.thread.openedByThreadId, parentThreadId);
++          assert.isUndefined(nested?.thread.detachedFromOpener);
++          assert.equal(main?.thread.openedByThreadId, parentThreadId);
++          assert.equal(main?.thread.detachedFromOpener, true);
++        }).pipe(Effect.provide(layerTest));
++      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
++    ),
++  );
++
+   it.effect(
+     "inherits an available parent instance for driver-only targets and otherwise selects a healthy peer",
+     () =>
 diff --git a/apps/server/src/mcp/OrchestratorMcpService.ts b/apps/server/src/mcp/OrchestratorMcpService.ts
-index 9d15408483..d4caef983d 100644
+index 9d15408483..549f4e2e3c 100644
 --- a/apps/server/src/mcp/OrchestratorMcpService.ts
 +++ b/apps/server/src/mcp/OrchestratorMcpService.ts
-@@ -2891,6 +2891,7 @@ const make = Effect.gen(function* () {
+@@ -2891,6 +2891,8 @@ const make = Effect.gen(function* () {
                    ...(parent.thread.linkOrigin === undefined
                      ? {}
                      : { linkOrigin: parent.thread.linkOrigin }),
 +                  openedByThreadId: parent.thread.id,
++                  ...(request.mainThread === true ? { detachFromOpener: true as const } : {}),
                  })
                  .pipe(
                    Effect.mapError((error) =>
+diff --git a/apps/server/src/mcp/toolkits/orchestrator/tools.ts b/apps/server/src/mcp/toolkits/orchestrator/tools.ts
+index f0affbf6de..e4d96a3be1 100644
+--- a/apps/server/src/mcp/toolkits/orchestrator/tools.ts
++++ b/apps/server/src/mcp/toolkits/orchestrator/tools.ts
+@@ -211,7 +211,7 @@ const RequestSecretTool = Tool.make("request_secret", {
+ 
+ const CreateThreadsTool = Tool.make("create_threads", {
+   description:
+-    "Create new top-level threads in this checkout. Not delegation. One thread or its own worktree: `t3_thread_launch`. Project, branch, and worktree inherit.",
++    "Create new threads in this checkout, nested under yours as children; `mainThread: true` per thread only when the user asks for a main thread. Not delegation. One thread or its own worktree: `t3_thread_launch`. Project, branch, and worktree inherit.",
+   parameters: OrchestratorMcpCreateThreadsInput,
+   success: OrchestratorMcpCreateThreadsResult,
+   failure: OrchestratorMcpFailure,
 diff --git a/apps/server/src/mcp/toolkits/project/handlers.test.ts b/apps/server/src/mcp/toolkits/project/handlers.test.ts
-index 2ecbde990d..18286bb6f0 100644
+index 2ecbde990d..c5dda76122 100644
 --- a/apps/server/src/mcp/toolkits/project/handlers.test.ts
 +++ b/apps/server/src/mcp/toolkits/project/handlers.test.ts
 @@ -6,11 +6,11 @@ import {
@@ -85,7 +211,7 @@ index 2ecbde990d..18286bb6f0 100644
  } from "@t3tools/contracts";
  import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
  import * as NodeServices from "@effect/platform-node/NodeServices";
-@@ -40,6 +40,82 @@ import * as McpToolAccess from "../../McpToolAccess.ts";
+@@ -40,6 +40,90 @@ import * as McpToolAccess from "../../McpToolAccess.ts";
  import * as ProjectHandlers from "./handlers.ts";
  import { ProjectToolkit } from "./tools.ts";
  
@@ -108,6 +234,7 @@ index 2ecbde990d..18286bb6f0 100644
 +    } as OrchestrationV2ThreadShell;
 +    let launchedSender: ThreadId | undefined;
 +    let launchedOpener: ThreadId | undefined;
++    let launchedDetached: boolean | undefined;
 +    const layerDependencies = Layer.mergeAll(
 +      Layer.mock(ProviderRegistry.ProviderRegistry)({ getProviders: Effect.succeed([]) }),
 +      ServerSettings.layerTest(),
@@ -131,6 +258,7 @@ index 2ecbde990d..18286bb6f0 100644
 +        launch: (input) => {
 +          launchedSender = input.initialMessage?.senderThreadId;
 +          launchedOpener = input.openedByThreadId;
++          launchedDetached = input.detachFromOpener;
 +          return Effect.succeed({
 +            threadId: input.threadId,
 +            projection: {
@@ -162,13 +290,19 @@ index 2ecbde990d..18286bb6f0 100644
 +    expect(result.at(-1)?.result).toMatchObject({ projectId, modelSelection });
 +    expect(launchedSender).toBe(sourceThreadId);
 +    expect(launchedOpener).toBe(sourceThreadId);
++    expect(launchedDetached).toBeUndefined();
++    yield* toolkit
++      .handle("t3_thread_launch", { title: "Second lead", mainThread: true })
++      .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(layerDependencies));
++    expect(launchedOpener).toBe(sourceThreadId);
++    expect(launchedDetached).toBe(true);
 +  }),
 +);
 +
  const clientLaunchHarness = (input: {
    readonly runtimeModeCeiling: RuntimeMode;
    readonly defaultRuntimeMode?: RuntimeMode;
-@@ -225,6 +301,7 @@ it.effect(
+@@ -225,6 +309,7 @@ it.effect(
        });
        expect(belowCeiling.launched[0]?.runtimeMode).toBe("approval-required");
        expect(belowCeiling.launched[0]?.initialMessage?.senderThreadId).toBeUndefined();
@@ -177,32 +311,66 @@ index 2ecbde990d..18286bb6f0 100644
        const aboveCeiling = yield* launchWith("auto-accept-edits", "full-access", {
          title: "Fix",
 diff --git a/apps/server/src/mcp/toolkits/project/handlers.ts b/apps/server/src/mcp/toolkits/project/handlers.ts
-index 667b878e68..09ca56e1b8 100644
+index 667b878e68..582fc8a73c 100644
 --- a/apps/server/src/mcp/toolkits/project/handlers.ts
 +++ b/apps/server/src/mcp/toolkits/project/handlers.ts
-@@ -244,6 +244,7 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
+@@ -244,6 +244,12 @@ export const layer = McpToolAccess.toLayer(ProjectToolkit, {
                    attachments,
                  },
                }),
-+          ...(caller === undefined ? {} : { openedByThreadId: caller.id }),
++          ...(caller === undefined
++            ? {}
++            : {
++                openedByThreadId: caller.id,
++                ...(input.mainThread === true ? { detachFromOpener: true } : {}),
++              }),
            createdBy: "agent",
            creationSource: "mcp",
            ...(linkOrigin === undefined ? {} : { linkOrigin }),
+diff --git a/apps/server/src/mcp/toolkits/project/tools.ts b/apps/server/src/mcp/toolkits/project/tools.ts
+index 56799959f6..87ce91dd77 100644
+--- a/apps/server/src/mcp/toolkits/project/tools.ts
++++ b/apps/server/src/mcp/toolkits/project/tools.ts
+@@ -124,7 +124,7 @@ const ProjectCloneTool = Tool.make("t3_project_clone", {
+ const ThreadLaunchTool = Tool.make("t3_thread_launch", {
+   ...shared,
+   description:
+-    "Create one new top-level thread, bound to its workspace before the agent starts. Task in `message`. Omit `projectId`, model and modes to inherit yours (outside a thread, pass `projectId` or `scratch`); modes cannot exceed yours. After an error or lost reply, retry with the same `clientRequestId`. Follow it with `t3_thread_read` or `t3_thread_wait`. Mention it with its `link`.",
++    "Create one new thread, bound to its workspace before the agent starts. From a thread it nests under yours as a child; `mainThread: true` only when the user asks for a main thread. Task in `message`. Omit `projectId`, model and modes to inherit yours (outside a thread, pass `projectId` or `scratch`); modes cannot exceed yours. After an error or lost reply, retry with the same `clientRequestId`. Follow it with `t3_thread_read` or `t3_thread_wait`. Mention it with its `link`.",
+   parameters: Schema.Struct({
+     environmentId: OrchestratorMcpEnvironmentTarget,
+     projectId: Schema.optional(ProjectId),
+@@ -135,6 +135,12 @@ const ThreadLaunchTool = Tool.make("t3_thread_launch", {
+       }),
+     ),
+     title: TrimmedNonEmptyString,
++    mainThread: Schema.optional(
++      Schema.Boolean.annotate({
++        description:
++          "true: a main thread in its own sidebar section, not a child under you. Only when the user asks for a main thread.",
++      }),
++    ),
+     modelSelection: Schema.optional(ModelSelection),
+     runtimeMode: Schema.optional(RuntimeMode),
+     interactionMode: Schema.optional(ProviderInteractionMode),
 diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
-index 13cc76608f..185db0f094 100644
+index 13cc76608f..3500bd9bae 100644
 --- a/apps/server/src/orchestration-v2/Orchestrator.ts
 +++ b/apps/server/src/orchestration-v2/Orchestrator.ts
-@@ -2968,6 +2968,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -2968,6 +2968,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
          relationshipToParent: null,
          rootThreadId: command.threadId,
        },
 +      ...(command.openedByThreadId === undefined
 +        ? {}
-+        : { openedByThreadId: command.openedByThreadId }),
++        : {
++            openedByThreadId: command.openedByThreadId,
++            ...(command.detachFromOpener === true ? { detachedFromOpener: true as const } : {}),
++          }),
        forkedFrom: null,
        createdAt: now,
        updatedAt: now,
-@@ -3720,8 +3723,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -3720,8 +3726,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
            const wasPinned = thread.pinnedAt != null;
            const alreadySettled =
              thread.settledOverride === "settled" && thread.settledAt !== null && !wasPinned;
@@ -216,7 +384,7 @@ index 13cc76608f..185db0f094 100644
              settledOverride: "settled",
              settledAt: alreadySettled ? thread.settledAt : (command.settledAt ?? now),
              pullRequests: thread.pullRequests?.map((link) => withPullRequestWatch(link, undefined)),
-@@ -3908,6 +3915,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -3908,6 +3918,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                        : []),
                    ],
                  }),
@@ -224,7 +392,7 @@ index 13cc76608f..185db0f094 100644
              ...(command.regenerateTitle === true
                ? { titleRegeneration: { requestId: command.commandId, startedAt: now } }
                : command.regenerateTitle === false || command.title !== undefined
-@@ -13430,6 +13438,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -13430,6 +13441,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
              type: "thread.settle",
              commandId: command.commandId,
              threadId: command.threadId,
@@ -293,10 +461,10 @@ index df42f54163..7eff102382 100644
                    latestRunId,
                    latestRunRequestedAt:
 diff --git a/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts b/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
-index 23b46afcec..e3974c7ca2 100644
+index 23b46afcec..1ddf110b01 100644
 --- a/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
 +++ b/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
-@@ -539,6 +539,25 @@ it.effect("retains automation and sender attribution while a message waits in th
+@@ -539,6 +539,48 @@ it.effect("retains automation and sender attribution while a message waits in th
    }).pipe(Effect.provide(harness.layer));
  });
  
@@ -316,6 +484,29 @@ index 23b46afcec..e3974c7ca2 100644
 +    assert.equal(projection.thread.openedByThreadId, openedByThreadId);
 +    const shell = yield* threads.getThreadShell(launched.threadId);
 +    assert.equal(shell?.openedByThreadId, openedByThreadId);
++    assert.isUndefined(shell?.detachedFromOpener);
++  }).pipe(Effect.provide(harness.layer));
++});
++
++it.effect("launches a main thread already detached from its opener", () => {
++  const harness = makeHarness();
++  return Effect.gen(function* () {
++    const launches = yield* ThreadLaunch.ThreadLaunchService;
++    const threads = yield* ThreadManagement.ThreadManagementService;
++    const openedByThreadId = ThreadId.make("thread:launcher");
++    const launched = yield* launches.launch({
++      ...launchInput({ command: "command:main-thread", thread: "thread:main-thread" }),
++      openedByThreadId,
++      detachFromOpener: true,
++      createdBy: "agent",
++      creationSource: "mcp",
++    });
++    const projection = yield* threads.getThreadProjection(launched.threadId);
++    assert.equal(projection.thread.openedByThreadId, openedByThreadId);
++    assert.equal(projection.thread.detachedFromOpener, true);
++    const shell = yield* threads.getThreadShell(launched.threadId);
++    assert.equal(shell?.openedByThreadId, openedByThreadId);
++    assert.equal(shell?.detachedFromOpener, true);
 +  }).pipe(Effect.provide(harness.layer));
 +});
 +
@@ -323,25 +514,28 @@ index 23b46afcec..e3974c7ca2 100644
    Effect.gen(function* () {
      const setupCount = yield* Ref.make(0);
 diff --git a/apps/server/src/orchestration-v2/ThreadLaunchService.ts b/apps/server/src/orchestration-v2/ThreadLaunchService.ts
-index 7e7829ba94..924e700bbe 100644
+index 7e7829ba94..678cb470a3 100644
 --- a/apps/server/src/orchestration-v2/ThreadLaunchService.ts
 +++ b/apps/server/src/orchestration-v2/ThreadLaunchService.ts
-@@ -89,6 +89,8 @@ export interface ThreadLaunchInput {
+@@ -89,6 +89,10 @@ export interface ThreadLaunchInput {
    readonly interactionMode: ProviderInteractionMode;
    readonly workspaceStrategy: ThreadLaunchWorkspaceStrategy;
    readonly initialMessage?: ThreadLaunchInitialMessage;
 +  /** Thread whose agent launched this one, recorded on the new thread. */
 +  readonly openedByThreadId?: ThreadId;
++  /** Lists the new thread as a main thread, not nested under `openedByThreadId`. */
++  readonly detachFromOpener?: boolean;
    readonly importedNativeThread?: {
      readonly ref: {
        readonly driver: ProviderDriverKind;
-@@ -941,6 +943,9 @@ const make = Effect.gen(function* () {
+@@ -941,6 +945,10 @@ const make = Effect.gen(function* () {
                  interactionMode: input.interactionMode,
                  branch: initialBranch,
                  worktreePath: initialWorktreePath,
 +                ...(input.openedByThreadId === undefined
 +                  ? {}
 +                  : { openedByThreadId: input.openedByThreadId }),
++                ...(input.detachFromOpener === true ? { detachFromOpener: true as const } : {}),
                  ...(input.importedNativeThread === undefined
                    ? {}
                    : { importedNativeThread: input.importedNativeThread }),
@@ -4399,7 +4593,7 @@ index 3960757562..236a466081 100644
      const { registry, threads, snapshotAtom } = makeHarness();
      const root = v2ThreadShell;
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
-index 3af7412fe5..f6e5237def 100644
+index 3af7412fe5..9189714917 100644
 --- a/packages/contracts/src/orchestrationV2.ts
 +++ b/packages/contracts/src/orchestrationV2.ts
 @@ -460,6 +460,15 @@ export const OrchestrationV2AppThread = Schema.Struct({
@@ -4455,15 +4649,17 @@ index 3af7412fe5..f6e5237def 100644
    limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecovery)),
    pinnedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
    autoSettleDisabledAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
-@@ -2942,6 +2967,7 @@ export const OrchestrationV2Command = Schema.Union([
+@@ -2942,6 +2967,9 @@ export const OrchestrationV2Command = Schema.Union([
      linkOrigin: Schema.optional(OrchestrationV2LinkOrigin),
      /** Only the server sets this, with `linkOrigin`, for a linked environment's delegated task. */
      delegatedFrom: Schema.optional(OrchestrationV2DelegatedFrom),
 +    openedByThreadId: Schema.optional(ThreadId),
++    /** With `openedByThreadId`: list the thread as a main thread from creation, as "Make main thread". */
++    detachFromOpener: Schema.optional(Schema.Literal(true)),
      importedNativeThread: Schema.optional(
        Schema.Struct({
          ref: Schema.Struct({
-@@ -2987,6 +3013,8 @@ export const OrchestrationV2Command = Schema.Union([
+@@ -2987,6 +3015,8 @@ export const OrchestrationV2Command = Schema.Union([
      threadId: ThreadId,
      expectedLatestRunId: Schema.optional(RunId),
      settledAt: Schema.optional(Schema.DateTimeUtc),
@@ -4472,7 +4668,7 @@ index 3af7412fe5..f6e5237def 100644
    }),
    /** Rejects changes since snapshotAt or any explicit settled override to preserve user actions. */
    Schema.Struct({
-@@ -3084,6 +3112,8 @@ export const OrchestrationV2Command = Schema.Union([
+@@ -3084,6 +3114,8 @@ export const OrchestrationV2Command = Schema.Union([
      limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecoveryUpdate)),
      /** Link (object) or unlink (null) a pull request; absent leaves it unchanged. */
      linkedPullRequest: Schema.optional(Schema.NullOr(ThreadLinkedPullRequest)),
@@ -4481,3 +4677,20 @@ index 3af7412fe5..f6e5237def 100644
    }),
    Schema.Struct({
      type: Schema.Literal("thread.pull-request.link"),
+diff --git a/packages/contracts/src/orchestratorMcp.ts b/packages/contracts/src/orchestratorMcp.ts
+index c73bbd48e2..44ddbef8d1 100644
+--- a/packages/contracts/src/orchestratorMcp.ts
++++ b/packages/contracts/src/orchestratorMcp.ts
+@@ -264,6 +264,12 @@ export const OrchestratorMcpCreateThreadRequest = Schema.Struct({
+   target: Schema.optional(OrchestratorMcpTarget),
+   runtimeMode: Schema.optional(OrchestratorMcpRuntimeMode),
+   interactionMode: Schema.optional(OrchestratorMcpInteractionMode),
++  mainThread: Schema.optional(
++    Schema.Boolean.annotate({
++      description:
++        "true: a main thread in its own sidebar section, not a child under you. Only when the user asks for a main thread.",
++    }),
++  ),
+ });
+ export type OrchestratorMcpCreateThreadRequest = typeof OrchestratorMcpCreateThreadRequest.Type;
+ 
