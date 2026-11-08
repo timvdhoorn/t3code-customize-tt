@@ -17,6 +17,7 @@ guide line, context-menu collapse and a summary stub.
  apps/server/src/mcp/toolkits/project/tools.ts |   8 +-
  .../src/orchestration-v2/Orchestrator.ts      |  14 +-
  .../src/orchestration-v2/ProjectionStore.ts   |  21 +
+ .../SubagentProjection.test.ts                |  25 +
  .../ThreadLaunchService.test.ts               |  42 +
  .../orchestration-v2/ThreadLaunchService.ts   |   8 +
  .../ThreadManagementService.test.ts           |   9 +-
@@ -29,8 +30,8 @@ guide line, context-menu collapse and a summary stub.
  .../src/components/Sidebar.childThreads.tsx   | 766 ++++++++++++++++++
  .../src/components/Sidebar.families.test.ts   | 584 +++++++++++++
  apps/web/src/components/Sidebar.families.ts   | 431 ++++++++++
- apps/web/src/components/Sidebar.logic.test.ts |  57 ++
- apps/web/src/components/Sidebar.logic.ts      |  34 +-
+ apps/web/src/components/Sidebar.logic.test.ts |  77 ++
+ apps/web/src/components/Sidebar.logic.ts      |  36 +-
  apps/web/src/components/Sidebar.tsx           | 115 ++-
  .../components/sidebar/SidebarThreadRow.tsx   |  41 +-
  .../components/threadActionMenu.logic.test.ts |  23 +
@@ -51,7 +52,8 @@ guide line, context-menu collapse and a summary stub.
  .../src/state/threadShell.test.ts             |  37 +
  packages/contracts/src/orchestrationV2.ts     |  32 +
  packages/contracts/src/orchestratorMcp.ts     |   6 +
- 42 files changed, 3826 insertions(+), 75 deletions(-)
+ .../src/server/subagentProjection.ts          |   9 +-
+ 44 files changed, 3881 insertions(+), 76 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.childThreads.browser.test.tsx
  create mode 100644 apps/web/src/components/Sidebar.childThreads.test.ts
  create mode 100644 apps/web/src/components/Sidebar.childThreads.tsx
@@ -460,6 +462,42 @@ index b88bf5b226..172beff2ae 100644
                    status,
                    latestRunId,
                    latestRunRequestedAt:
+diff --git a/apps/server/src/orchestration-v2/SubagentProjection.test.ts b/apps/server/src/orchestration-v2/SubagentProjection.test.ts
+index ae8f7e09d2..4aa6a294c9 100644
+--- a/apps/server/src/orchestration-v2/SubagentProjection.test.ts
++++ b/apps/server/src/orchestration-v2/SubagentProjection.test.ts
+@@ -125,6 +125,31 @@ it("keeps a subagent child awake when its parent thread is snoozed", () => {
+   });
+ });
+ 
++it("a subagent child does not inherit its parent's opener or main-thread state", () => {
++  // Fork: an agent-opened main thread delegates; its worker nests under it, not as a main thread.
++  const parentThread: OrchestrationV2AppThread = {
++    ...makeParentThread(),
++    openedByThreadId: ThreadId.make("thread:subagent-parent-opener"),
++    detachedFromOpener: true,
++  };
++  const childThread = makeSubagentChildThread({
++    parentThread,
++    childThreadId,
++    parentNodeId: NodeId.make("node:subagent-parent"),
++    activeProviderThreadId: null,
++    providerInstanceId: childProviderInstanceId,
++    modelSelection: childModelSelection,
++    title: "Worker",
++    now: childCreatedAt,
++    createdBy: "agent",
++    creationSource: "mcp",
++  });
++
++  assert.notProperty(childThread, "openedByThreadId");
++  assert.notProperty(childThread, "detachedFromOpener");
++  assert.equal(childThread.lineage.parentThreadId, parentThreadId);
++});
++
+ it.effect.each(["provider", "mcp"] as const)(
+   "a %s child does not inherit parent settlement protections and settles once idle",
+   (creationSource) =>
 diff --git a/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts b/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
 index 23b46afcec..1ddf110b01 100644
 --- a/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
@@ -3515,7 +3553,7 @@ index 0000000000..9cb8f6ca26
 +  ].join(", ");
 +}
 diff --git a/apps/web/src/components/Sidebar.logic.test.ts b/apps/web/src/components/Sidebar.logic.test.ts
-index 9e7489a0ff..f82a83f567 100644
+index 9e7489a0ff..740594d55f 100644
 --- a/apps/web/src/components/Sidebar.logic.test.ts
 +++ b/apps/web/src/components/Sidebar.logic.test.ts
 @@ -10,6 +10,7 @@ import {
@@ -3539,7 +3577,7 @@ index 9e7489a0ff..f82a83f567 100644
          lineage: {
            rootThreadId: parentId,
            parentThreadId: parentId,
-@@ -175,6 +178,60 @@ describe("sidebar thread lineage helpers", () => {
+@@ -175,6 +178,80 @@ describe("sidebar thread lineage helpers", () => {
      const loopB = subagentOf("thread-loop-b", loopA.id);
      expect(resolveSidebarRowThreadId(loopA.id, environmentId, [loopA, loopB])).toBe(loopA.id);
    });
@@ -3597,11 +3635,31 @@ index 9e7489a0ff..f82a83f567 100644
 +    const visible = filterSidebarV2VisibleThreads([root, nested, detached], null, new Set());
 +    expect(visible.map((thread) => thread.id)).toEqual([root.id, detached.id]);
 +  });
++
++  it("never lists a provider-native subagent, even one marked as a main thread", () => {
++    const environmentId = EnvironmentId.make("environment-row");
++    const root = makeThreadFixture({ id: ThreadId.make("thread-root"), environmentId });
++    const subagent = {
++      ...makeThreadFixture({
++        id: ThreadId.make("thread-native-subagent"),
++        environmentId,
++        creationSource: "provider",
++        lineage: {
++          rootThreadId: root.id,
++          parentThreadId: root.id,
++          relationshipToParent: "subagent",
++        },
++      }),
++      detachedFromOpener: true as const,
++    };
++    const visible = filterSidebarV2VisibleThreads([root, subagent], null, new Set());
++    expect(visible.map((thread) => thread.id)).toEqual([root.id]);
++  });
  });
  
  function makeLatestRun(overrides?: {
 diff --git a/apps/web/src/components/Sidebar.logic.ts b/apps/web/src/components/Sidebar.logic.ts
-index e2c6a60fc3..e7daa3f94f 100644
+index e2c6a60fc3..5bd8b6fa06 100644
 --- a/apps/web/src/components/Sidebar.logic.ts
 +++ b/apps/web/src/components/Sidebar.logic.ts
 @@ -567,19 +567,25 @@ export function isSidebarHiddenThread(thread: Pick<SidebarThreadSummary, "lineag
@@ -3635,15 +3693,16 @@ index e2c6a60fc3..e7daa3f94f 100644
      if (thread.lineage.parentThreadId === null || visited.has(thread.id)) return threadId;
      visited.add(thread.id);
      thread = findThread(thread.lineage.parentThreadId);
-@@ -594,6 +600,7 @@ export function resolveSidebarRowThreadId(
+@@ -594,6 +600,8 @@ export function resolveSidebarRowThreadId(
  export function filterSidebarV2VisibleThreads<
    T extends Pick<SidebarThreadSummary, "archivedAt" | "environmentId" | "id" | "lineage"> & {
      projectId: string;
 +    readonly detachedFromOpener?: true | undefined;
++    readonly delegatedByThreadId?: ThreadId | undefined;
    },
  >(
    threads: readonly T[],
-@@ -603,11 +610,13 @@ export function filterSidebarV2VisibleThreads<
+@@ -603,11 +611,14 @@ export function filterSidebarV2VisibleThreads<
    return threads.filter(
      (thread) =>
        thread.archivedAt === null &&
@@ -3652,8 +3711,9 @@ index e2c6a60fc3..e7daa3f94f 100644
 -        thread.lineage,
 -        delegatedUnderParent,
 -      ) &&
-+      // Fork: a child the user made a main thread lists like any other.
-+      (thread.detachedFromOpener === true ||
++      // Fork: a worker the user made a main thread lists like any other. A provider-native
++      // subagent never lists, as upstream.
++      ((thread.detachedFromOpener === true && thread.delegatedByThreadId !== undefined) ||
 +        !isShownUnderParent(
 +          { environmentId: thread.environmentId, threadId: thread.id },
 +          thread.lineage,
@@ -3662,7 +3722,7 @@ index e2c6a60fc3..e7daa3f94f 100644
        (scopedProjectKeys === null ||
          scopedProjectKeys.has(`${thread.environmentId}:${thread.projectId}`)),
    );
-@@ -1088,6 +1097,9 @@ export function resolveWorkingStartedAt(
+@@ -1088,6 +1099,9 @@ export function resolveWorkingStartedAt(
    return resolveThreadWorkingStartedAt(thread);
  }
  
@@ -3672,7 +3732,7 @@ index e2c6a60fc3..e7daa3f94f 100644
  export function resolveThreadStatusPill(input: {
    thread: ThreadStatusInput;
  }): ThreadStatusPill | null {
-@@ -1183,7 +1195,7 @@ export function resolveThreadStatusPill(input: {
+@@ -1183,7 +1197,7 @@ export function resolveThreadStatusPill(input: {
    if (hasUnseenCompletion(thread)) {
      return {
        label: "Completed",
@@ -4962,3 +5022,24 @@ index c73bbd48e2..44ddbef8d1 100644
  });
  export type OrchestratorMcpCreateThreadRequest = typeof OrchestratorMcpCreateThreadRequest.Type;
  
+diff --git a/packages/provider-core/src/server/subagentProjection.ts b/packages/provider-core/src/server/subagentProjection.ts
+index dbd929192e..0b48a578eb 100644
+--- a/packages/provider-core/src/server/subagentProjection.ts
++++ b/packages/provider-core/src/server/subagentProjection.ts
+@@ -61,8 +61,15 @@ export function makeSubagentChildThread(input: {
+   readonly createdBy: OrchestrationV2Actor;
+   readonly creationSource: OrchestrationV2CreationSource;
+ }): OrchestrationV2AppThread {
++  // Fork: who opened the parent, and whether it was made a main thread, belong to the
++  // parent. A subagent nests under its parent through its lineage instead.
++  const {
++    openedByThreadId: _openedByThreadId,
++    detachedFromOpener: _detachedFromOpener,
++    ...parentThread
++  } = input.parentThread;
+   return {
+-    ...input.parentThread,
++    ...parentThread,
+     createdBy: input.createdBy,
+     creationSource: input.creationSource,
+     id: input.childThreadId,
