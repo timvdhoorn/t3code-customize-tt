@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: timvdhoorn <timvdhoorn@gmail.com>
 Date: Thu, 15 Oct 2026 20:35:43 +0200
-Subject: [PATCH 05/10] feat(mobile): register push tokens directly with paired
+Subject: [PATCH 5/9] feat(mobile): register push tokens directly with paired
  servers
 
 Custom-identity iOS builds register their APNs device token, Live Activity token and notification preferences with every paired T3 server instead of T3's relay, whose APNs key cannot push to another bundle id. The official build keeps the relay path.
@@ -13,8 +13,8 @@ Custom-identity iOS builds register their APNs device token, Live Activity token
  .../features/agent-awareness/capabilities.ts  |   6 +
  .../directPushSnapshot.test.ts                |  56 ++++++
  .../agent-awareness/directPushSnapshot.ts     |  36 ++++
- .../remoteRegistration.test.ts                |  84 ++++++++
- .../agent-awareness/remoteRegistration.ts     | 118 +++++++++++-
+ .../remoteRegistration.test.ts                |  82 ++++++++
+ .../agent-awareness/remoteRegistration.ts     | 120 +++++++++++-
  ...ctPushSettingsNotificationsRouteScreen.tsx | 181 ++++++++++++++++++
  .../SettingsNotificationsRouteScreen.tsx      |   6 +-
  .../features/settings/SettingsRouteScreen.tsx |  24 ++-
@@ -45,10 +45,10 @@ index 7662434a48..5c5f940522 100644
  
    it("requires a valid team ID with a custom bundle identifier", async () => {
 diff --git a/apps/mobile/app.config.ts b/apps/mobile/app.config.ts
-index 893f392f89..96033c4eab 100644
+index 41d1066b1c..e9c48b5018 100644
 --- a/apps/mobile/app.config.ts
 +++ b/apps/mobile/app.config.ts
-@@ -511,6 +511,10 @@ const config: ExpoConfig = {
+@@ -518,6 +518,10 @@ const config: ExpoConfig = {
        process.env.T3CODE_FEATURE_SECRETS?.trim().toLowerCase() ?? "",
      ),
      iosPersonalTeamBuild: isIosPersonalTeamBuild,
@@ -315,22 +315,13 @@ index 0000000000..396f51a24c
 +  return { aggregate };
 +}
 diff --git a/apps/mobile/src/features/agent-awareness/remoteRegistration.test.ts b/apps/mobile/src/features/agent-awareness/remoteRegistration.test.ts
-index e9f5a3b1e5..6c1c95c7bc 100644
+index 9085f98058..c40f3fc972 100644
 --- a/apps/mobile/src/features/agent-awareness/remoteRegistration.test.ts
 +++ b/apps/mobile/src/features/agent-awareness/remoteRegistration.test.ts
-@@ -14,6 +14,8 @@ import { Cookies, FetchHttpClient, HttpClientRequest, HttpClientResponse } from
- import { ManagedRelay } from "@t3tools/client-runtime/relay";
- 
- import { verifyDpopProof } from "@t3tools/shared/dpop";
-+import { loadPreferences } from "../../persistence/imperative";
-+import type { Preferences } from "../../persistence/mobile-preferences";
- import * as Dpop from "../cloud/dpop";
- import * as ManagedRelayLayer from "../cloud/managedRelayLayer";
- import {
-@@ -26,9 +28,11 @@ import { makeRelayDeviceRegistrationRequest } from "./registrationPayload";
- import {
+@@ -32,9 +32,11 @@ import {
    __resetAgentAwarenessRemoteRegistrationForTest,
    getAgentAwarenessRegistrationStatus,
+   refreshActiveLiveActivityRemoteRegistration,
 +  refreshAgentAwarenessDirectRegistration,
    refreshAgentAwarenessRegistration,
    registerLiveActivityPushToken,
@@ -339,10 +330,10 @@ index e9f5a3b1e5..6c1c95c7bc 100644
    setAgentAwarenessRelayTokenProvider,
    updateAgentAwarenessRegistrationPreferences,
    type AgentAwarenessRegistrationError,
-@@ -728,4 +732,84 @@ describe("makeRelayDeviceRegistrationRequest", () => {
-       }).pipe(Effect.provide(layerRelayTest));
-     },
-   );
+@@ -1088,4 +1090,84 @@ describe("makeRelayDeviceRegistrationRequest", () => {
+       }),
+     );
+   });
 +
 +  describe("direct server push", () => {
 +    function directTransport(accepted = 1) {
@@ -425,10 +416,10 @@ index e9f5a3b1e5..6c1c95c7bc 100644
 +  });
  });
 diff --git a/apps/mobile/src/features/agent-awareness/remoteRegistration.ts b/apps/mobile/src/features/agent-awareness/remoteRegistration.ts
-index 437a00be9e..eef2c2c19f 100644
+index ec712608fa..05f1e25820 100644
 --- a/apps/mobile/src/features/agent-awareness/remoteRegistration.ts
 +++ b/apps/mobile/src/features/agent-awareness/remoteRegistration.ts
-@@ -63,6 +63,9 @@ const AgentAwarenessOperation = Schema.Literals([
+@@ -65,6 +65,9 @@ const AgentAwarenessOperation = Schema.Literals([
    "load-live-activity-prime-preferences",
    "prime-live-activity",
    "load-registration-record",
@@ -438,7 +429,7 @@ index 437a00be9e..eef2c2c19f 100644
  ]);
  
  export class AgentAwarenessOperationError extends Schema.TaggedError<AgentAwarenessOperationError>()(
-@@ -118,6 +121,7 @@ export function subscribeAgentAwarenessRegistrationStatus(listener: () => void):
+@@ -123,6 +126,7 @@ export function subscribeAgentAwarenessRegistrationStatus(listener: () => void):
    };
  }
  let activeLiveActivityRegistrationRetry: ReturnType<typeof setTimeout> | null = null;
@@ -446,7 +437,7 @@ index 437a00be9e..eef2c2c19f 100644
  let relayTokenProvider: (() => Promise<string | null>) | null = null;
  let relayTokenProviderIdentity: string | null = null;
  let deviceRegistrationGeneration = 0;
-@@ -162,6 +166,64 @@ function canRegisterPushNotifications(): boolean {
+@@ -167,6 +171,64 @@ function canRegisterPushNotifications(): boolean {
    return Platform.OS === "ios" || Platform.OS === "android";
  }
  
@@ -511,7 +502,7 @@ index 437a00be9e..eef2c2c19f 100644
  function shouldRegisterAgentAwarenessDeviceForProvider(
    previousIdentity: string | null,
    identity: string | undefined,
-@@ -173,6 +235,7 @@ export function setAgentAwarenessRelayTokenProvider(
+@@ -178,6 +240,7 @@ export function setAgentAwarenessRelayTokenProvider(
    provider: (() => Promise<string | null>) | null,
    identity?: string,
  ): void {
@@ -519,7 +510,7 @@ index 437a00be9e..eef2c2c19f 100644
    const isExistingIdentity =
      provider !== null &&
      !shouldRegisterAgentAwarenessDeviceForProvider(relayTokenProviderIdentity, identity);
-@@ -224,6 +287,7 @@ export function setAgentAwarenessRelayTokenProvider(
+@@ -233,6 +296,7 @@ export function setAgentAwarenessRelayTokenProvider(
  
  // Provider remounts retain a valid relay registration; teardown must preserve it and lock-screen activities.
  export function releaseAgentAwarenessRelayTokenProvider(): void {
@@ -527,7 +518,7 @@ index 437a00be9e..eef2c2c19f 100644
    relayTokenProvider = null;
    relayTokenProviderIdentity = null;
    deviceRegistrationGeneration++;
-@@ -331,6 +395,18 @@ const registerDeviceWithRelay = Effect.fn("remoteRegistration.registerDeviceWith
+@@ -364,6 +428,18 @@ const registerDeviceWithRelay = Effect.fn("remoteRegistration.registerDeviceWith
    if (expectedGeneration !== deviceRegistrationGeneration) {
      return;
    }
@@ -546,7 +537,7 @@ index 437a00be9e..eef2c2c19f 100644
    const relayConfig = readRelayConfig();
    if (!relayConfig) {
      setRegistrationStatus("unknown");
-@@ -437,7 +513,7 @@ export function armAgentAwarenessLiveActivityForLocalWork(input: {
+@@ -470,7 +546,7 @@ export function armAgentAwarenessLiveActivityForLocalWork(input: {
    readonly threadTitle: string;
    readonly projectTitle: string;
  }): void {
@@ -555,7 +546,7 @@ index 437a00be9e..eef2c2c19f 100644
      return;
    }
    if (!environmentPublishesAgentActivity(input.environmentId)) {
-@@ -502,6 +578,17 @@ const readAgentActivitySnapshot: () => Effect.Effect<
+@@ -535,6 +611,17 @@ const readAgentActivitySnapshot: () => Effect.Effect<
    ManagedRelay.ManagedRelayClient
  > = Effect.fn("remoteRegistration.readAgentActivitySnapshot")(
    function* () {
@@ -573,7 +564,7 @@ index 437a00be9e..eef2c2c19f 100644
      if (!readRelayConfig()) return null;
      const token = yield* relayToken("read-live-activity-registration-relay-token");
      if (!token) {
-@@ -522,6 +609,14 @@ const registerLiveActivityWithRelay = Effect.fn("remoteRegistration.registerLive
+@@ -555,6 +642,14 @@ const registerLiveActivityWithRelay = Effect.fn("remoteRegistration.registerLive
    function* (
      body: RelayLiveActivityRegistrationRequest,
    ): Effect.fn.Return<boolean, AgentAwarenessRegistrationError, ManagedRelay.ManagedRelayClient> {
@@ -588,7 +579,7 @@ index 437a00be9e..eef2c2c19f 100644
      if (!readRelayConfig()) return false;
      const token = yield* relayToken("read-live-activity-registration-relay-token");
      if (!token) {
-@@ -537,6 +632,13 @@ const registerLiveActivityWithRelay = Effect.fn("remoteRegistration.registerLive
+@@ -570,6 +665,13 @@ const registerLiveActivityWithRelay = Effect.fn("remoteRegistration.registerLive
    },
  );
  
@@ -602,7 +593,7 @@ index 437a00be9e..eef2c2c19f 100644
  function logRegistrationError(context: string, error: unknown): void {
    if (!__DEV__) {
      return;
-@@ -611,9 +713,14 @@ function startPendingDeviceRegistration(): void {
+@@ -644,9 +746,14 @@ function startPendingDeviceRegistration(): void {
    })();
  }
  
@@ -618,7 +609,7 @@ index 437a00be9e..eef2c2c19f 100644
      !registrationAddsInformation(activeDeviceRegistration.input, input)
    ) {
      return;
-@@ -803,6 +910,7 @@ export function __resetAgentAwarenessRemoteRegistrationForTest(): void {
+@@ -849,6 +956,7 @@ export function __resetAgentAwarenessRemoteRegistrationForTest(): void {
      clearTimeout(activeLiveActivityRegistrationRetry);
      activeLiveActivityRegistrationRetry = null;
    }
@@ -626,7 +617,7 @@ index 437a00be9e..eef2c2c19f 100644
    relayTokenProvider = null;
    relayTokenProviderIdentity = null;
    deviceRegistrationGeneration++;
-@@ -920,7 +1028,7 @@ const registerLiveActivityPushTokenValue = Effect.fn(
+@@ -967,7 +1075,7 @@ const registerLiveActivityPushTokenValue = Effect.fn(
  });
  
  function scheduleActiveLiveActivityRegistrationRetry(): void {
@@ -635,12 +626,8 @@ index 437a00be9e..eef2c2c19f 100644
      return;
    }
  
-@@ -933,10 +1041,10 @@ function scheduleActiveLiveActivityRegistrationRetry(): void {
-   }, REMOTE_ACTIVITY_REGISTRATION_RETRY_MS);
- }
- 
--const refreshActiveLiveActivityRemoteRegistration = Effect.fn(
-+export const refreshActiveLiveActivityRemoteRegistration = Effect.fn(
+@@ -983,7 +1091,7 @@ function scheduleActiveLiveActivityRegistrationRetry(): void {
+ export const refreshActiveLiveActivityRemoteRegistration = Effect.fn(
    "remoteRegistration.refreshActiveLiveActivityRemoteRegistration",
  )(function* (): Effect.fn.Return<void, never, ManagedRelay.ManagedRelayClient> {
 -  if (!canRegisterRemoteLiveActivities() || !relayTokenProvider) {
@@ -648,6 +635,18 @@ index 437a00be9e..eef2c2c19f 100644
      return;
    }
  
+@@ -992,8 +1100,10 @@ export const refreshActiveLiveActivityRemoteRegistration = Effect.fn(
+   // account changed or a newer read started, so a stale result is never
+   // shown or primed.
+   const generation = deviceRegistrationGeneration;
++  // Direct push (patches-ios) needs no Clerk session, so its transport counts as signed in.
+   const isCurrentAccount = () =>
+-    relayTokenProvider !== null && deviceRegistrationGeneration === generation;
++    (directTransport !== null || relayTokenProvider !== null) &&
++    deviceRegistrationGeneration === generation;
+   let read = 0;
+   const isNewestRead = () => isCurrentAccount() && read === widgetSnapshotReads;
+   const refreshWidget = Effect.gen(function* () {
 diff --git a/apps/mobile/src/features/settings/DirectPushSettingsNotificationsRouteScreen.tsx b/apps/mobile/src/features/settings/DirectPushSettingsNotificationsRouteScreen.tsx
 new file mode 100644
 index 0000000000..d0cf0bf7d9
@@ -867,7 +866,7 @@ index cabe229f9a..f7b7da19f2 100644
      return (
        <SettingsScreen title="Notifications">
 diff --git a/apps/mobile/src/features/settings/SettingsRouteScreen.tsx b/apps/mobile/src/features/settings/SettingsRouteScreen.tsx
-index a0e24692e1..73c42d78a6 100644
+index a4177bfdd3..c2ef798542 100644
 --- a/apps/mobile/src/features/settings/SettingsRouteScreen.tsx
 +++ b/apps/mobile/src/features/settings/SettingsRouteScreen.tsx
 @@ -22,6 +22,7 @@ import { useNativeColumnLayoutMetrics } from "../../native/native-layout-metrics
