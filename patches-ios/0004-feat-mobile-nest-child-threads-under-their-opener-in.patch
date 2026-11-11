@@ -11,7 +11,7 @@ Subject: [PATCH 4/9] feat(mobile): nest child threads under their opener in
  .../features/home/thread-swipe-actions.tsx    |  32 +-
  .../src/features/home/useThreadListActions.ts |  18 +
  .../threads/ThreadNavigationSidebar.tsx       |  97 +-
- .../features/threads/thread-list-v2-items.tsx | 633 ++++++++++++-
+ .../features/threads/thread-list-v2-items.tsx | 647 ++++++++++++-
  .../src/features/threads/threadListV2.test.ts | 564 ++++++++++++
  .../src/features/threads/threadListV2.ts      | 857 ++++++++++++++----
  .../use-thread-list-v2-shelf-preferences.ts   | 123 +++
@@ -26,7 +26,7 @@ Subject: [PATCH 4/9] feat(mobile): nest child threads under their opener in
  .../src/state/childThreadFamilies.ts          | 431 +++++++++
  .../src/state/threadShell.test.ts             |  37 +
  .../client-runtime/src/state/threadShell.ts   |  24 +
- 21 files changed, 3294 insertions(+), 612 deletions(-)
+ 21 files changed, 3308 insertions(+), 612 deletions(-)
  create mode 100644 packages/client-runtime/src/state/childThreadFamilies.test.ts
  create mode 100644 packages/client-runtime/src/state/childThreadFamilies.ts
 
@@ -618,7 +618,7 @@ index 6d724ac3b0..fb09eb903e 100644
              onPress={() => {
                olderSettledShelf.retry();
 diff --git a/apps/mobile/src/features/threads/thread-list-v2-items.tsx b/apps/mobile/src/features/threads/thread-list-v2-items.tsx
-index d724d8056e..b144d84a9e 100644
+index d724d8056e..2abdb7a9fe 100644
 --- a/apps/mobile/src/features/threads/thread-list-v2-items.tsx
 +++ b/apps/mobile/src/features/threads/thread-list-v2-items.tsx
 @@ -25,7 +25,22 @@ import {
@@ -671,7 +671,7 @@ index d724d8056e..b144d84a9e 100644
    type ThreadListV2Status,
  } from "./threadListV2";
  import { QueuedMessageIcon } from "./queued-message-icon";
-@@ -145,6 +163,206 @@ const DONE_STATUS_LABEL: StatusLabel = {
+@@ -145,6 +163,220 @@ const DONE_STATUS_LABEL: StatusLabel = {
    iconTintClassName: "accent-adaptive-emerald-700-300",
  };
  
@@ -743,7 +743,14 @@ index d724d8056e..b144d84a9e 100644
 +  );
 +}
 +
-+const WORKER_CHIPS_HIT_SLOP = { top: 14, bottom: 14, left: 8, right: 8 } as const;
++// About 44pt tall: the chips are 16pt. The menu's native button covers the menu's content
++// frame and takes every tap there, so the trigger itself grows: padding on it, cancelled by
++// negative margin on the menu, keeps the chips in place (a hitSlop cannot reach the button).
++const WORKER_CHIPS_TOUCH_INSET = { horizontal: 8, vertical: 14 } as const;
++const WORKER_CHIPS_MENU_STYLE = {
++  marginHorizontal: -WORKER_CHIPS_TOUCH_INSET.horizontal,
++  marginVertical: -WORKER_CHIPS_TOUCH_INSET.vertical,
++} as const;
 +
 +const workerKeyOf = (thread: EnvironmentThreadShell) => `${thread.environmentId}:${thread.id}`;
 +
@@ -832,24 +839,31 @@ index d724d8056e..b144d84a9e 100644
 +    [onMakeMainThread, onSelectThread, setShownAsSubthread, workers],
 +  );
 +  return (
-+    <Menu actions={actions} onPressAction={handleAction}>
-+      <Pressable
-+        // About 44pt tall: the chips are 16pt.
-+        hitSlop={WORKER_CHIPS_HIT_SLOP}
-+        className="flex-row items-center gap-1"
-+        accessibilityRole="button"
-+        accessibilityLabel={`${workers.label} for ${props.parentTitle}`}
-+        accessibilityHint="Lists the agents and opens one."
-+        testID="thread-row-delegated-workers"
-+        // Handle long-press so opening the iOS row menu cannot also open the list on release.
-+        onLongPress={() => undefined}
-+        style={({ pressed }) => ({ opacity: pressed ? 0.6 : 1 })}
-+      >
-+        {workers.chips.map((chip) => (
-+          <ChildThreadChipView key={chip.kind} chip={chip} sidebar={props.sidebar} />
-+        ))}
-+      </Pressable>
-+    </Menu>
++    // The menu's native tap-to-open button lies over the chips, so React Native hit-tests a tap
++    // to the menu, never to the Pressable below. Claim that touch here: unclaimed, it reaches
++    // the row, which opens the parent thread and closes the menu that just opened.
++    <View onStartShouldSetResponder={() => true}>
++      <Menu actions={actions} onPressAction={handleAction} style={WORKER_CHIPS_MENU_STYLE}>
++        <Pressable
++          className="flex-row items-center gap-1"
++          accessibilityRole="button"
++          accessibilityLabel={`${workers.label} for ${props.parentTitle}`}
++          accessibilityHint="Lists the agents and opens one."
++          testID="thread-row-delegated-workers"
++          // Handle long-press so opening the iOS row menu cannot also open the list on release.
++          onLongPress={() => undefined}
++          style={({ pressed }) => ({
++            opacity: pressed ? 0.6 : 1,
++            paddingHorizontal: WORKER_CHIPS_TOUCH_INSET.horizontal,
++            paddingVertical: WORKER_CHIPS_TOUCH_INSET.vertical,
++          })}
++        >
++          {workers.chips.map((chip) => (
++            <ChildThreadChipView key={chip.kind} chip={chip} sidebar={props.sidebar} />
++          ))}
++        </Pressable>
++      </Menu>
++    </View>
 +  );
 +}
 +
@@ -878,7 +892,7 @@ index d724d8056e..b144d84a9e 100644
  // DM Sans has no tabular figures, so a ticking timer in it reflows the row every second.
  const TABULAR_DURATION_STYLE = {
    fontFamily: Platform.OS === "ios" ? "System" : "sans-serif",
-@@ -321,11 +539,180 @@ export const ThreadListV2SettledShelfHeader = memo(function ThreadListV2SettledS
+@@ -321,11 +553,180 @@ export const ThreadListV2SettledShelfHeader = memo(function ThreadListV2SettledS
    return <ThreadListV2ShelfHeader {...props} kind="settled" />;
  });
  
@@ -1059,7 +1073,7 @@ index d724d8056e..b144d84a9e 100644
    readonly onPress: () => void;
  }) {
    const label =
-@@ -338,9 +725,7 @@ export const ThreadListV2ShowMoreRow = memo(function ThreadListV2ShowMoreRow(pro
+@@ -338,9 +739,7 @@ export const ThreadListV2ShowMoreRow = memo(function ThreadListV2ShowMoreRow(pro
      <Pressable
        accessibilityRole="button"
        accessibilityLabel={
@@ -1070,7 +1084,7 @@ index d724d8056e..b144d84a9e 100644
        }
        disabled={props.state === "loading"}
        onPress={props.onPress}
-@@ -671,6 +1056,13 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -671,6 +1070,13 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
    readonly onNewThreadOnBranch: (thread: EnvironmentThreadShell) => void;
    readonly onRenameThread: (thread: EnvironmentThreadShell) => void;
    readonly onRegenerateThreadTitle: (thread: EnvironmentThreadShell) => void;
@@ -1084,7 +1098,7 @@ index d724d8056e..b144d84a9e 100644
    readonly onSettleThread: (thread: EnvironmentThreadShell) => Promise<boolean>;
    readonly onSnoozeThread: (thread: EnvironmentThreadShell, snoozedUntil: string) => void;
    readonly onUnsnoozeThread: (thread: EnvironmentThreadShell) => void;
-@@ -692,6 +1084,17 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -692,6 +1098,17 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
    ) => void;
    readonly canMoveUp?: boolean;
    readonly canMoveDown?: boolean;
@@ -1102,7 +1116,7 @@ index d724d8056e..b144d84a9e 100644
    readonly onSwipeableWillOpen: (methods: SwipeableMethods) => void;
    readonly onSwipeableClose: (methods: SwipeableMethods) => void;
    readonly activationKey?: string;
-@@ -718,6 +1121,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -718,6 +1135,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
      onDeleteThread,
      onRenameThread,
      onRegenerateThreadTitle,
@@ -1110,7 +1124,7 @@ index d724d8056e..b144d84a9e 100644
      onNewThreadOnBranch,
      onSettleThread,
      onSnoozeThread,
-@@ -863,7 +1267,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -863,7 +1281,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
    );
    const reorderMenuItems = useMemo<MenuAction[]>(
      () =>
@@ -1119,7 +1133,7 @@ index d724d8056e..b144d84a9e 100644
          ? [
              { id: "arrange", title: "Arrange threads…", image: "line.3.horizontal" },
              {
-@@ -880,7 +1284,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -880,7 +1298,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
              } satisfies MenuAction,
            ]
          : [],
@@ -1128,7 +1142,7 @@ index d724d8056e..b144d84a9e 100644
    );
    const pinMenuItems = useMemo<MenuAction[]>(
      () =>
-@@ -939,6 +1343,34 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -939,6 +1357,34 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
      ],
      [canTurnIntoProject, props.titleRegenerationSupported, thread.runtime, isRegeneratingTitle],
    );
@@ -1163,7 +1177,7 @@ index d724d8056e..b144d84a9e 100644
    const menuActions = useMemo<MenuAction[]>(() => {
      const nested = Platform.OS === "ios";
      const direct: MenuAction[] = [
-@@ -953,6 +1385,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -953,6 +1399,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
          : []),
        { id: "copy-thread", title: "Copy thread", image: "text.bubble" },
        { id: "copy-thread-id", title: "Copy thread ID", image: "doc.on.doc" },
@@ -1171,7 +1185,7 @@ index d724d8056e..b144d84a9e 100644
      ];
      if (snoozedRow) {
        return layoutThreadListV2RowMenuActions({
-@@ -1014,6 +1447,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1014,6 +1461,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
    }, [
      autoSettleMenuItems,
      canUnsettle,
@@ -1179,7 +1193,7 @@ index d724d8056e..b144d84a9e 100644
      pinMenuItems,
      props.settlementSupported,
      reorderMenuItems,
-@@ -1026,6 +1460,9 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1026,6 +1474,9 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
    const handleMenuAction = useCallback(
      ({ nativeEvent }: { readonly nativeEvent: { readonly event: string } }) => {
        if (nativeEvent.event === "new-thread-on-branch") onNewThreadOnBranch(thread);
@@ -1189,7 +1203,7 @@ index d724d8056e..b144d84a9e 100644
        if (nativeEvent.event === "settle") handleSettle();
        if (nativeEvent.event === "unsettle") handleUnsettle();
        if (nativeEvent.event === "unsnooze") handleUnsnooze();
-@@ -1039,6 +1476,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1039,6 +1490,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
        if (nativeEvent.event === "archive") handleArchive();
        if (nativeEvent.event === "rename") handleRename();
        if (nativeEvent.event === "regenerate-title") handleRegenerateTitle();
@@ -1198,7 +1212,7 @@ index d724d8056e..b144d84a9e 100644
        if (nativeEvent.event === "turn-into-project") void turnThreadIntoProject(thread);
        if (nativeEvent.event === "copy-thread") {
          const target = threadChipCopyTarget(
-@@ -1074,6 +1513,10 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1074,6 +1527,10 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
      },
      [
        onNewThreadOnBranch,
@@ -1209,7 +1223,7 @@ index d724d8056e..b144d84a9e 100644
        thread,
        handleArchive,
        handleDelete,
-@@ -1154,6 +1597,21 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1154,6 +1611,21 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
        ? `Opens the thread. Swipe left to ${primaryAction.label.toLowerCase()}.`
        : `Opens the thread. Swipe left for ${primaryAction.label.toLowerCase()} and snooze actions.`;
  
@@ -1231,7 +1245,7 @@ index d724d8056e..b144d84a9e 100644
    const titleTextInset = props.project ? projectIconSize + 8 : 0;
    const cardContent = (
      <>
-@@ -1332,6 +1790,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1332,6 +1804,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
          ) : (
            <View className="flex-1" />
          )}
@@ -1239,7 +1253,7 @@ index d724d8056e..b144d84a9e 100644
          {pr ? (
            <Pressable
              // Padding cancelled by negative margin grows the touch target into
-@@ -1420,8 +1879,123 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1420,8 +1893,123 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
      cardContent
    );
  
@@ -1364,7 +1378,7 @@ index d724d8056e..b144d84a9e 100644
        <RowPressable
          key={`${thread.environmentId}:${thread.id}`}
          interactionClassName={rowAppearance.interactionClassName}
-@@ -1524,6 +2098,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1524,6 +2112,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
                />
              ) : null}
            </View>
@@ -1372,7 +1386,7 @@ index d724d8056e..b144d84a9e 100644
            {props.hasQueuedMessages ? <QueuedMessageIcon selected={selected} /> : null}
            <Text
              className={cn(
-@@ -1544,8 +2119,39 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1544,8 +2133,39 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
        </RowPressable>
      );
  
@@ -1414,7 +1428,7 @@ index d724d8056e..b144d84a9e 100644
  
    return (
      <View collapsable={false}>
-@@ -1556,8 +2162,10 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1556,8 +2176,10 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
          dormant={dormant}
          threadKey={`${thread.environmentId}:${thread.id}`}
          backgroundColor={rowAppearance.swipeBackgroundColor}
@@ -1427,7 +1441,7 @@ index d724d8056e..b144d84a9e 100644
          enableTrackpadSwipe
          fullSwipeAction="primary"
          fullSwipeWidth={props.fullSwipeWidth ?? windowWidth - 32}
-@@ -1576,6 +2184,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1576,6 +2198,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
            </Menu>
          )}
        </ThreadSwipeable>
