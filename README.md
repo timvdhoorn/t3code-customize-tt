@@ -34,7 +34,8 @@ Everything else is stock T3 Code, including T3 Connect.
 
 Install T3 Code **Nightly** first. You need Git, Python **3.9+**, an internet
 connection and at least approximately **6 GB** of free space. If Node is older
-than 24, the tool downloads a private, checksum-verified Node 24 for the host.
+than 24, the tool downloads a private, checksum-verified Node 24 for the host. The patch checks and the
+server executable run on the exact Node upstream pins instead (also downloaded once, never the system Node).
 The first build takes approximately 5 to 15 minutes, depending on the machine.
 
 ### Windows (PowerShell)

@@ -32,6 +32,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import uuid
 from urllib.parse import unquote, urlparse
 import zipfile
 
@@ -566,10 +567,15 @@ def download_node(version):
     folder = CACHE / 'node'
     folder.mkdir(parents=True, exist_ok=True)
     archive = folder / (name + extension)
-    urllib.request.urlretrieve(base + archive.name, archive)
-    if sha256(archive) != sums.get(archive.name):
-        archive.unlink()
-        raise Stop('The Node download did not match its published checksum.')
+    # A unique temporary name, so two first-time downloads of the same Node never write one file.
+    download = folder / f'{archive.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.part'
+    try:
+        urllib.request.urlretrieve(base + archive.name, download)
+        if sha256(download) != sums.get(archive.name):
+            raise Stop('The Node download did not match its published checksum.')
+        os.replace(download, archive)
+    finally:
+        download.unlink(missing_ok=True)
     if extension == '.zip':
         with zipfile.ZipFile(archive) as bundle:
             for entry in bundle.namelist():
@@ -579,7 +585,7 @@ def download_node(version):
             bundle.extractall(folder)
     else:
         extract_tar(archive, folder)
-    archive.unlink()
+    archive.unlink(missing_ok=True)
     return node_bin(folder / name)
 
 
@@ -954,6 +960,49 @@ def test_full_name(assertion):
     return ' > '.join(list(assertion.get('ancestorTitles') or []) + [assertion.get('title', '')])
 
 
+def scan_js_line(line, stack, in_block):
+    """Carry the lexical state of a JS/TS line to the next: (stack, in_block). The stack holds 'T' for a
+    template literal's text and '{' for a brace inside its `${}` code, so an empty stack with no open
+    block comment means plain code. Strings, `//` and `/* */` comments are skipped; regex literals are not."""
+    stack = list(stack)
+    i, n = 0, len(line)
+    while i < n:
+        c = line[i]
+        if in_block:
+            end = line.find('*/', i)
+            if end < 0:
+                break
+            in_block, i = False, end + 2
+        elif stack and stack[-1] == 'T':
+            if c == '\\':
+                i += 2
+                continue
+            if c == '`':
+                stack.pop()
+            elif line.startswith('${', i):
+                stack.append('{')
+                i += 1
+            i += 1
+        elif c in '"\'':
+            i += 1
+            while i < n and line[i] != c:
+                i += 2 if line[i] == '\\' else 1
+            i += 1
+        elif line.startswith('//', i):
+            break
+        elif line.startswith('/*', i):
+            in_block, i = True, i + 2
+        else:
+            if c == '`':
+                stack.append('T')
+            elif c == '{' and stack:
+                stack.append('{')
+            elif c == '}' and stack:
+                stack.pop()
+            i += 1
+    return stack, in_block
+
+
 def test_source(text, title):
     """The source of every it()/test() case named title (start line to its closing line at the same
     indentation), or None when the case is not found."""
@@ -970,7 +1019,15 @@ def test_source(text, title):
         # expression (`it.effect("x", () =>`) closes with `);` instead.
         brace = '' if line.rstrip().endswith('=>') else r'\}'
         closer = re.compile(re.escape(indent) + brace + r'(?:,[^`]*)?\);?\s*$')
-        end = next((i for i in range(number + 1, len(lines)) if closer.match(lines[i])), None)
+        # A line that starts inside a template literal (at any `${}` depth) or a block comment is text,
+        # not the closer, however much it looks like one.
+        end, state = None, ([], False)
+        state = scan_js_line(line, *state)
+        for i in range(number + 1, len(lines)):
+            if not state[0] and not state[1] and closer.match(lines[i]):
+                end = i
+                break
+            state = scan_js_line(lines[i], *state)
         if end is None:
             return None
         cases.append('\n'.join(lines[number:end + 1]))
@@ -1135,6 +1192,7 @@ def checks(env, log, target, force=False):
     if WITH_IOS:
         desktop_stack_checks(env, log, target)
     step('Testing the patches...')
+    env = upstream_node_env(env, log)
     tsc = typechecker(log)
     # Upstream's `prepare` once patched tsc with the Effect diagnostics (globalDateInEffect and
     # friends) and its CI typechecked with them; --ignore-scripts skips that, so a checkout
@@ -1179,7 +1237,7 @@ def checks(env, log, target, force=False):
             failures.append(f'{name}: ' + (', '.join(failing[:10]) or 'failed'))
 
     with tempfile.TemporaryDirectory(prefix='t3code-checks-home-', dir=tmp) as home:
-        check_env = dict(os.environ if env is None else env, HOME=home, TMPDIR=str(tmp),
+        check_env = dict(env, HOME=home, TMPDIR=str(tmp),
                          PLAYWRIGHT_BROWSERS_PATH=str(browsers))
         for name, args, cwd in steps:
             started = time.time()
@@ -2764,11 +2822,39 @@ def contains(folder, marker, scripts_only=True):
 def sea_node_version(source):
     """The exact Node the server executable embeds: SEA_NODE_VERSION in older nightlies, the root
     package.json's engines.node since upstream #23165 pinned that instead."""
-    pinned = re.search(r'SEA_NODE_VERSION\s*=\s*"([\d.]+)"', (source / 'apps/server/vite.config.ts').read_text())
-    if pinned:
-        return pinned.group(1)
-    engine = json.loads((source / 'package.json').read_text()).get('engines', {}).get('node', '')
+    try:
+        pinned = re.search(r'SEA_NODE_VERSION\s*=\s*"([\d.]+)"', (source / 'apps/server/vite.config.ts').read_text())
+        if pinned:
+            return pinned.group(1)
+    except OSError:
+        pass
+    try:
+        engine = json.loads((source / 'package.json').read_text()).get('engines', {}).get('node', '')
+    except (OSError, ValueError):
+        return None
     return engine if re.fullmatch(r'\d+\.\d+\.\d+', engine) else None
+
+
+def upstream_node_env(env, log):
+    """env with the Node upstream pins in front of PATH (and VP_NODE_VERSION set), so the patch tests
+    and typechecks run where upstream's CI runs them: the system Node can lack APIs the tests use
+    (StatementSync.stat on Node 24). Stops when that Node cannot be had; never falls back to the system Node."""
+    version = sea_node_version(SOURCE)
+    if not version:
+        raise Stop('Neither apps/server/vite.config.ts (SEA_NODE_VERSION) nor package.json (engines.node) pins an exact'
+                   f' Node, so the checks cannot run on the Node upstream uses. Update upstream_node_env in {NAME}.')
+    try:
+        folder = exact_node(version, log)
+    except Stop:
+        raise
+    except Exception as error:
+        raise Stop(f'Could not get Node {version}, the version upstream pins, for the checks ({error}). The checks do'
+                   ' not fall back to the system Node; fix the network connection and run them again.')
+    env = dict(os.environ if env is None else env)
+    env['PATH'] = os.pathsep.join([str(folder), env.get('PATH', '')])
+    env['VP_NODE_VERSION'] = version
+    log.write(f'Checks run on Node {version} (upstream pin) from {folder}.\n')
+    return env
 
 
 def build_server(env, version, config, log):
