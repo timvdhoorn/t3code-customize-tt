@@ -138,7 +138,7 @@ an entry exactly by file and full name, its file has no load error and no case i
 no suite or hook failed in the step (`Failed Suites` in vitest's output: a throwing `beforeAll`
 skips the tests under it), and the test is upstream's: the case's own source (its `it(`/`test(`
 line to its closer at the same indentation: `});`, `}, 10_000);`, or `);` for an expression-bodied case; lines inside a
-template literal never count as the closer) is identical
+template literal (strings and comments skipped) never count as the closer) is identical
 at the nightly commit and at HEAD, so a patch that edits the test voids the entry. Any other failure,
 an unhandled error or a non-zero exit without a parsable report still fails. Each tolerated test
 prints `pass (known upstream failure: <name>)`.

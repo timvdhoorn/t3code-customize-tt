@@ -198,6 +198,32 @@ class KnownFailuresTest(unittest.TestCase):
         weakened = case.replace('  expect(other()).toBe(2);\n', '')
         self.assertNotEqual(customize.test_source(case, 'top'), customize.test_source(weakened, 'top'))
 
+    def assert_whole_case(self, before, body='  expect(1).toBe(1);\n'):
+        """A multi-line template holding a closer lookalike after `before`: the case runs to its real end."""
+        case = f'it("top", () => {{\n{before}\n  const t = `\nx\n}});\n`;\n{body}}});'
+        self.assertEqual(customize.test_source(case + '\nit("next", () => {});\n', 'top'), [case])
+
+    def test_a_backtick_in_a_string_or_comment_is_not_a_template(self):
+        self.assert_whole_case('  const fence = "```";')
+        self.assert_whole_case("  const tick = '`';")
+        self.assert_whole_case('  // a stray ` in a comment')
+        self.assert_whole_case('  /* a stray ` in a\n     block comment */')
+
+    def test_a_template_after_a_backtick_string_still_hides_its_closer_lookalike(self):
+        self.assert_whole_case('  const q = "`";')
+
+    def test_a_nested_template_across_lines_hides_closer_lookalikes(self):
+        self.assert_whole_case('  const n = `x ${f(`\ninner`\n)} y`;')
+        case = 'it("top", () => {\n  const n = `a ${f(`b\n});\n`)} c`;\n  expect(n).toBe(1);\n});'
+        self.assertEqual(customize.test_source(case, 'top'), [case])
+
+    def test_an_escaped_backslash_before_the_closing_backtick_ends_the_template(self):
+        self.assert_whole_case('  const a = `a\\\\`;')
+
+    def test_a_valid_case_with_a_fence_string_is_found(self):
+        case = 'it("top", () => {\n  codeEditor("const a = 1\\n```");\n  expect(1).toBe(1);\n});'
+        self.assertEqual(customize.test_source(case + '\nit("next", () => {});\n', 'top'), [case])
+
     def test_an_expression_bodied_case_ends_at_its_closing_paren(self):
         case = ('  it.effect("window", () =>\n    Effect.gen(function* () {\n      yield* run();\n'
                 '    }),\n  );')
