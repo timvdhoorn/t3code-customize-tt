@@ -33,11 +33,10 @@ guide line, context-menu collapse and a summary stub.
  apps/web/src/components/Sidebar.logic.test.ts |   45 +
  apps/web/src/components/Sidebar.logic.ts      |   49 +-
  apps/web/src/components/Sidebar.tsx           |  147 ++-
- ...hreadRelationshipsControl.browser.test.tsx |    5 +
- ...lationshipsControl.opened.browser.test.tsx |  232 ++++
- .../chat/ThreadRelationshipsControl.tsx       |  163 ++-
- .../components/sidebar/RelativeTimeLabel.tsx  |   17 +
- .../components/sidebar/SidebarThreadRow.tsx   |  117 +-
+ ...hreadRelationshipsControl.browser.test.tsx |    9 +
+ ...lationshipsControl.opened.browser.test.tsx |  247 ++++
+ .../chat/ThreadRelationshipsControl.tsx       |  157 ++-
+ .../components/sidebar/SidebarThreadRow.tsx   |   99 +-
  .../SidebarThreadRow.workers.browser.test.tsx |  329 +++++
  .../components/threadActionMenu.logic.test.ts |   23 +
  .../src/components/threadActionMenu.logic.ts  |   19 +
@@ -46,8 +45,8 @@ guide line, context-menu collapse and a summary stub.
  apps/web/src/hooks/useNowMinuteMs.ts          |   14 +
  apps/web/src/hooks/useThreadActionMenu.ts     |   10 +
  apps/web/src/lib/sidebarTree.ts               |   17 +-
- apps/web/src/state/openedThreads.test.ts      |   98 ++
- apps/web/src/state/openedThreads.ts           |  109 ++
+ apps/web/src/state/openedThreads.test.ts      |  109 ++
+ apps/web/src/state/openedThreads.ts           |  105 ++
  apps/web/src/test-fixtures.ts                 |    4 +-
  packages/client-runtime/package.json          |    4 +
  .../src/operations/commands.test.ts           |   23 +
@@ -63,14 +62,13 @@ guide line, context-menu collapse and a summary stub.
  packages/contracts/src/orchestrationV2.ts     |   32 +
  packages/contracts/src/orchestratorMcp.ts     |    6 +
  .../src/server/subagentProjection.ts          |    9 +-
- 54 files changed, 5546 insertions(+), 117 deletions(-)
+ 53 files changed, 5548 insertions(+), 100 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.childThreads.browser.test.tsx
  create mode 100644 apps/web/src/components/Sidebar.childThreads.test.ts
  create mode 100644 apps/web/src/components/Sidebar.childThreads.tsx
  create mode 100644 apps/web/src/components/Sidebar.families.test.ts
  create mode 100644 apps/web/src/components/Sidebar.families.ts
  create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.opened.browser.test.tsx
- create mode 100644 apps/web/src/components/sidebar/RelativeTimeLabel.tsx
  create mode 100644 apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx
  create mode 100644 apps/web/src/hooks/useNowMinuteMs.test.ts
  create mode 100644 apps/web/src/hooks/useNowMinuteMs.ts
@@ -4464,10 +4462,10 @@ index 2b1a840393..a9d57a5633 100644
                        </li>
                      ) : null}
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.browser.test.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.browser.test.tsx
-index 9679f42569..3717e416a9 100644
+index 9679f42569..b4f99c4eaf 100644
 --- a/apps/web/src/components/chat/ThreadRelationshipsControl.browser.test.tsx
 +++ b/apps/web/src/components/chat/ThreadRelationshipsControl.browser.test.tsx
-@@ -40,6 +40,11 @@ vi.mock(import("../../state/entities"), () => ({
+@@ -40,6 +40,15 @@ vi.mock(import("../../state/entities"), () => ({
    useHiddenThreadKeys: (() => new Set()) as never,
    useAnyEnvironmentHiding: (() => false) as never,
  }));
@@ -4476,21 +4474,26 @@ index 9679f42569..3717e416a9 100644
 +  useOpenedThreadShells: (() => []) as never,
 +  useOpenerThreadShell: (() => null) as never,
 +}));
++// Lineage borrows the sidebar's age label; its module needs more of the entities mocked above.
++vi.mock(import("../sidebar/SidebarThreadRow"), () => ({
++  RelativeTimeLabel: (() => null) as never,
++}));
  vi.mock(import("../../state/environments"), () => ({
    useEnvironment: (() => null) as never,
    useEnvironmentProviders: (() => new Map()) as never,
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.opened.browser.test.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.opened.browser.test.tsx
 new file mode 100644
-index 0000000000..3cec28e757
+index 0000000000..10cdc29b25
 --- /dev/null
 +++ b/apps/web/src/components/chat/ThreadRelationshipsControl.opened.browser.test.tsx
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,247 @@
 +import type { ReactElement, ReactNode } from "react";
 +import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 +import * as DateTime from "effect/DateTime";
 +import { expect, it, vi } from "vite-plus/test";
 +import "~/index.css";
 +import { act, fakeTimers, render } from "../../../test/render";
++import { makeThreadProjectionFixture } from "../../test-fixtures";
 +const state = vi.hoisted(() => ({
 +  projection: null as unknown,
 +  shells: [] as Array<Record<string, unknown>>,
@@ -4511,8 +4514,12 @@ index 0000000000..3cec28e757
 +  const actual = await original();
 +  return {
 +    ...actual,
-+    useOpenedThreadShells: ((ref: { threadId: ThreadId }) =>
-+      actual.selectOpenedThreadShells(ref.threadId, state.shells as never)) as never,
++    useOpenedThreadShells: ((ref: { environmentId: EnvironmentId; threadId: ThreadId }) =>
++      actual.selectOpenedThreadShells(
++        ref.environmentId,
++        ref.threadId,
++        state.shells as never,
++      )) as never,
 +    useOpenerThreadShell: ((ref: { threadId: ThreadId } | null) =>
 +      ref === null
 +        ? null
@@ -4564,6 +4571,14 @@ index 0000000000..3cec28e757
 +  const created = ago(input.createdMinutesAgo ?? 300);
 +  const ran = input.ranMinutesAgo === undefined ? null : ago(input.ranMinutesAgo);
 +  return {
++    // A complete shell, so presentThreadShell can read it as the sidebar does.
++    ...makeThreadProjectionFixture().thread,
++    activeRunId: null,
++    pendingRuntimeRequest: null,
++    latestVisibleMessage: null,
++    hasActionableProposedPlan: false,
++    itemCount: 0,
++    visibleItemCount: 0,
 +    id: input.id,
 +    title: input.title,
 +    projectId: "project",
@@ -4699,7 +4714,9 @@ index 0000000000..3cec28e757
 +    await using screen = await render(panel("w1"));
 +    const { container } = screen;
 +    const row = rowButton(container, "Orchestrate the port");
-+    expect(row?.getAttribute("aria-label")).toBe("Orchestrate the port, opener, Done");
++    await expect
++      .element(screen.getByRole("button", { name: /^Orchestrate the port opener Done, 2h$/ }))
++      .toBeInTheDocument();
 +    expect(row && text(row)).toBe("Orchestrate the port opener Done, 2h");
 +    await act(async () => row!.click());
 +    expect(state.navigate).toHaveBeenCalledWith({
@@ -4718,7 +4735,7 @@ index 0000000000..3cec28e757
 +  expect(text(screen.container)).not.toContain("Orchestrate the port");
 +});
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
-index 102d9734de..75398c5dc4 100644
+index 102d9734de..520d82f47c 100644
 --- a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
 +++ b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
 @@ -48,6 +48,7 @@ import {
@@ -4747,7 +4764,7 @@ index 102d9734de..75398c5dc4 100644
 +  useOpenedThreadShells,
 +  useOpenerThreadShell,
 +} from "../../state/openedThreads";
-+import { RelativeTimeLabel } from "../sidebar/RelativeTimeLabel";
++import { RelativeTimeLabel } from "../sidebar/SidebarThreadRow";
  import { serverEnvironment } from "../../state/server";
  import {
    applyProviderInstanceSettings,
@@ -4801,7 +4818,7 @@ index 102d9734de..75398c5dc4 100644
            <span className={cn(THREAD_DETAILS_PANEL_LABEL_CLASS, "min-w-0 flex-1 truncate")}>
              {props.label}
            </span>
-@@ -330,6 +353,75 @@ function RemoteSubagentRow(props: {
+@@ -330,6 +353,69 @@ function RemoteSubagentRow(props: {
    );
  }
  
@@ -4828,13 +4845,7 @@ index 102d9734de..75398c5dc4 100644
 +        <TooltipTrigger
 +          delay={200}
 +          render={
-+            <ThreadDetailsControl
-+              size="sm"
-+              variant="ghost"
-+              part="row"
-+              aria-label={isOpener ? `${thread.title}, opener, ${statusLabel}` : undefined}
-+              onClick={props.onOpen}
-+            />
++            <ThreadDetailsControl size="sm" variant="ghost" part="row" onClick={props.onOpen} />
 +          }
 +        >
 +          <ThreadRelationshipIcon
@@ -4877,7 +4888,7 @@ index 102d9734de..75398c5dc4 100644
  /**
   * The thread on a linked environment whose agent delegated this one. It opens
   * there when this client is connected to that environment.
-@@ -429,6 +521,11 @@ export function ThreadRelationshipsPanel(props: {
+@@ -429,6 +515,11 @@ export function ThreadRelationshipsPanel(props: {
        ? scopeThreadRef(props.environmentId, parentShell.id)
        : null;
    const parentProjection = useThreadProjection(parentRef)?.projection;
@@ -4889,7 +4900,7 @@ index 102d9734de..75398c5dc4 100644
    const navigate = useNavigate();
    const mergeBack = useAtomCommand(threadEnvironment.mergeBack);
    const stopSession = useAtomCommand(threadEnvironment.stopSession);
-@@ -541,6 +638,26 @@ export function ThreadRelationshipsPanel(props: {
+@@ -541,6 +632,26 @@ export function ThreadRelationshipsPanel(props: {
        Object.hasOwn(resolvedThreadTitles, threadId),
    );
    const canDetach = projection ? canDetachThreadProviderSession(projection) : false;
@@ -4916,7 +4927,7 @@ index 102d9734de..75398c5dc4 100644
  
    const {
      related = [],
-@@ -563,11 +680,19 @@ export function ThreadRelationshipsPanel(props: {
+@@ -563,11 +674,19 @@ export function ThreadRelationshipsPanel(props: {
    const groups: ReadonlyArray<{
      id: string;
      label: string | null;
@@ -4936,7 +4947,7 @@ index 102d9734de..75398c5dc4 100644
      {
        id: "previous",
        label: "Previous agents",
-@@ -578,7 +703,9 @@ export function ThreadRelationshipsPanel(props: {
+@@ -578,7 +697,9 @@ export function ThreadRelationshipsPanel(props: {
    const runningCount =
      (projection?.subagents.filter(
        (agent) => agent.childThreadId === null && agent.status === "running",
@@ -4947,7 +4958,7 @@ index 102d9734de..75398c5dc4 100644
  
    // A linked environment's agent may have delegated this thread from there.
    const delegatedFrom = currentThread?.delegatedFrom;
-@@ -591,6 +718,8 @@ export function ThreadRelationshipsPanel(props: {
+@@ -591,6 +712,8 @@ export function ThreadRelationshipsPanel(props: {
        runningCount > 0 ||
        remoteActive.length > 0 ||
        remotePrevious.length > 0 ||
@@ -4956,7 +4967,7 @@ index 102d9734de..75398c5dc4 100644
        delegatedFrom !== undefined ||
        // Disconnect lives in this heading, so a thread with only side chats still shows it.
        (canDetach && sideChats.length > 0));
-@@ -953,6 +1082,8 @@ export function ThreadRelationshipsPanel(props: {
+@@ -953,6 +1076,8 @@ export function ThreadRelationshipsPanel(props: {
              related.length > 0 ||
              active.length > 0 ||
              remoteActive.length > 0 ||
@@ -4965,7 +4976,7 @@ index 102d9734de..75398c5dc4 100644
              delegatedFrom !== undefined
            }
            data-thread-relationships-panel
-@@ -990,11 +1121,29 @@ export function ThreadRelationshipsPanel(props: {
+@@ -990,11 +1115,29 @@ export function ThreadRelationshipsPanel(props: {
                />
              </ThreadLineageRowList>
            )}
@@ -4989,55 +5000,17 @@ index 102d9734de..75398c5dc4 100644
 +                      key={row.opened.id}
 +                      thread={row.opened}
 +                      relation="opened"
-+                      ageTimestamp={openedThreadActivityAt(row.opened)}
++                      ageTimestamp={openedThreadActivityAt(ref.environmentId, row.opened)}
 +                      onOpen={() => openThread(row.opened.id)}
 +                    />
 +                  ) : "remote" in row ? (
                      <RemoteSubagentRow
                        key={row.remote.id}
                        agent={row.remote}
-diff --git a/apps/web/src/components/sidebar/RelativeTimeLabel.tsx b/apps/web/src/components/sidebar/RelativeTimeLabel.tsx
-new file mode 100644
-index 0000000000..96d1b74cc4
---- /dev/null
-+++ b/apps/web/src/components/sidebar/RelativeTimeLabel.tsx
-@@ -0,0 +1,17 @@
-+import { useNowMinuteMs } from "../../hooks/useNowMinuteMs";
-+import { formatRelativeTimeLabel } from "../../timestampFormat";
-+
-+/** "5m" and "now", the sidebar's short form of a relative time. */
-+export function compactSidebarTimeLabel(label: string): string {
-+  if (label === "just now") return "now";
-+  return label.endsWith(" ago") ? label.slice(0, -4) : label;
-+}
-+
-+// Subscribes to the minute tick itself, so only the label re-renders each
-+// minute. The minute is passed as the clock so it is the formatter's input.
-+export function RelativeTimeLabel(props: { timestamp: string | null }) {
-+  const nowMs = useNowMinuteMs();
-+  return props.timestamp === null
-+    ? null
-+    : compactSidebarTimeLabel(formatRelativeTimeLabel(props.timestamp, nowMs));
-+}
 diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
-index 3a50e76d06..fc9fe3a042 100644
+index 3a50e76d06..8cb15e0000 100644
 --- a/apps/web/src/components/sidebar/SidebarThreadRow.tsx
 +++ b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
-@@ -68,12 +68,12 @@ import { useRightPanelStore } from "../../rightPanelStore";
- import { useOpenPrLink } from "../../lib/openPullRequestLink";
- import { useUiStateStore } from "../../uiStateStore";
- import { useThreadSelectionStore } from "../../threadSelectionStore";
--import { useNowMinute } from "../../hooks/useNowMinute";
- import { useNowSecond } from "../../hooks/useNowSecond";
- import { vcsEnvironment, vcsBranchRevalidation } from "../../state/vcs";
- import { useEnvironmentQuery } from "../../state/query";
- import { readEnvironmentScope, useEnvironmentScope } from "../../state/session";
--import { formatRelativeTimeLabel, parseTimestampDate } from "../../timestampFormat";
-+import { parseTimestampDate } from "../../timestampFormat";
-+import { RelativeTimeLabel } from "./RelativeTimeLabel";
- import type { SidebarThreadSummary } from "../../types";
- import type { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
- import { cn } from "~/lib/utils";
 @@ -107,6 +107,17 @@ import {
  import { pickSnoozePreset, resolveSnoozePresets, type SnoozePreset } from "../Sidebar.snooze";
  import { useThreadShell } from "../../state/entities";
@@ -5056,30 +5029,16 @@ index 3a50e76d06..fc9fe3a042 100644
  import { ThreadSearchMatchExcerpt } from "../ThreadSearchMatch";
  import { makeWorkspaceFileDropHandlers } from "../chat/workspaceFileDrop";
  import { ProviderInstanceIcon } from "../chat/ProviderInstanceIcon";
-@@ -134,22 +145,6 @@ export type SidebarProviderEntry = Pick<
-   | "acpRegistryIconUrl"
-   | "models"
- >;
--function compactSidebarTimeLabel(label: string): string {
--  if (label === "just now") return "now";
--  return label.endsWith(" ago") ? label.slice(0, -4) : label;
--}
--
--// Subscribes to the minute tick itself, so only the label re-renders each
--// minute. The minute is passed as the clock so it is the formatter's input.
+@@ -141,7 +152,7 @@ function compactSidebarTimeLabel(label: string): string {
+ 
+ // Subscribes to the minute tick itself, so only the label re-renders each
+ // minute. The minute is passed as the clock so it is the formatter's input.
 -function RelativeTimeLabel(props: { timestamp: string | null }) {
--  const nowMinute = useNowMinute();
--  return props.timestamp === null
--    ? null
--    : compactSidebarTimeLabel(
--        formatRelativeTimeLabel(props.timestamp, Date.parse(`${nowMinute}:00.000Z`)),
--      );
--}
--
- function JumpHintBadge(props: { label: string }) {
-   return (
-     <Kbd aria-hidden data-jump-hint>
-@@ -483,6 +478,14 @@ export function SortableThreadRow(
++export function RelativeTimeLabel(props: { timestamp: string | null }) {
+   const nowMinute = useNowMinute();
+   return props.timestamp === null
+     ? null
+@@ -483,6 +494,14 @@ export function SortableThreadRow(
    // Keyed by variant so a card/slim switch remounts the row.
    return <SidebarThreadRow key={rowProps.variant} {...rowProps} thread={thread} sortable={bag} />;
  }
@@ -5094,7 +5053,7 @@ index 3a50e76d06..fc9fe3a042 100644
  export type SidebarSweepAction = "settle" | "unsettle" | "unsnooze";
  const dropVerbBadge: Record<SidebarDropVerb, ReactNode> = {
    pin: (
-@@ -539,6 +542,8 @@ type SidebarThreadRowProps = {
+@@ -539,6 +558,8 @@ type SidebarThreadRowProps = {
    // "folder-multiline" adds the card's branch and PR line under it.
    variant: "card" | "slim" | "folder" | "folder-multiline";
    navigationParent?: string | undefined;
@@ -5103,7 +5062,7 @@ index 3a50e76d06..fc9fe3a042 100644
    variantAction: SidebarSweepAction;
    settlementSupported: boolean;
    snoozeSupported: boolean;
-@@ -587,6 +592,9 @@ type SidebarThreadRowProps = {
+@@ -587,6 +608,9 @@ type SidebarThreadRowProps = {
    onUnpin: (threadRef: ScopedThreadRef) => void;
    onAcknowledgeWoke: (threadRef: ScopedThreadRef, visitedAt: string) => void;
    onFileDropThreads?: ((threadRef: ScopedThreadRef, files: File[]) => void) | undefined;
@@ -5113,7 +5072,7 @@ index 3a50e76d06..fc9fe3a042 100644
  };
  
  // Mounted only while renaming, so each rename starts uncommitted.
-@@ -659,7 +667,10 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -659,7 +683,10 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
    const canOperateThread = useEnvironmentScope(thread.environmentId, AuthOrchestrationOperateScope);
    const { leaseLiveStatus, rowRef: leaseRowRef } = useSidebarRowSubscriptionLease(props.isActive);
    const { revealRef } = props;
@@ -5124,7 +5083,7 @@ index 3a50e76d06..fc9fe3a042 100644
      if (row !== null) revealRef?.(row, threadKey);
      return leaseRowRef(row);
    };
-@@ -789,6 +800,26 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -789,6 +816,26 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                          }
                        : null;
    const isWokeStatus = topStatus?.icon === "woke";
@@ -5151,7 +5110,7 @@ index 3a50e76d06..fc9fe3a042 100644
  
    const branchMismatch = resolveLocalCheckoutBranchMismatch({
      effectiveEnvMode: thread.worktreePath === null ? "local" : "worktree",
-@@ -1008,12 +1039,16 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1008,12 +1055,16 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
        </span>
      ) : null;
  
@@ -5169,7 +5128,7 @@ index 3a50e76d06..fc9fe3a042 100644
  
    const title = isRenaming ? (
      <ThreadRenameInput
-@@ -1142,8 +1177,27 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1142,8 +1193,27 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
        </span>
      ) : null;
    const diff = latestRunDiff(thread);
@@ -5197,7 +5156,7 @@ index 3a50e76d06..fc9fe3a042 100644
      !thread.branch &&
      !showsScratchMachine &&
      prBadge === null &&
-@@ -1154,9 +1208,11 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1154,9 +1224,11 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
        {thread.branch ? (
          <>
            <ThreadWorktreeIndicator thread={thread} />
@@ -5210,7 +5169,7 @@ index 3a50e76d06..fc9fe3a042 100644
          </>
        ) : showsScratchMachine ? (
          <>
-@@ -1165,10 +1221,17 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1165,10 +1237,17 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
              kind={props.environmentMachine}
              className="size-3 shrink-0"
            />
@@ -5230,7 +5189,7 @@ index 3a50e76d06..fc9fe3a042 100644
        )}
        {terminalStatusIcon}
        {prBadge}
-@@ -1211,6 +1274,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1211,6 +1290,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
          className={cn(
            "list-none [content-visibility:auto] [contain-intrinsic-size:auto_--spacing(9)]",
            metaLine !== null && multiline && "[contain-intrinsic-size:auto_--spacing(13.5)]",
@@ -5238,7 +5197,7 @@ index 3a50e76d06..fc9fe3a042 100644
            sortable?.isDragging && "relative z-20",
          )}
        >
-@@ -1234,6 +1298,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1234,6 +1314,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                      : "flex h-9 items-center gap-2.5 px-2.5",
                    // Lines titles up with the folder name, past its chevron and icon.
                    inFolder && "ps-9",
@@ -5246,7 +5205,7 @@ index 3a50e76d06..fc9fe3a042 100644
                  )}
                  onClick={handleClick}
                  onDoubleClick={handleDoubleClick}
-@@ -1245,7 +1310,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1245,7 +1326,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
              {/* `contents` keeps one-line rows a single flex row. */}
              <div className={multiline ? "flex h-6 min-w-0 items-center gap-2.5" : "contents"}>
                {accessibleTitle}
@@ -5255,7 +5214,7 @@ index 3a50e76d06..fc9fe3a042 100644
                  <span
                    className={cn(
                      "flex shrink-0 items-center transition-opacity",
-@@ -1258,8 +1323,11 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1258,8 +1339,11 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                    ) : null}
                  </span>
                )}
@@ -5267,7 +5226,7 @@ index 3a50e76d06..fc9fe3a042 100644
                {multiline ? titleLineIcons : null}
                {pinIndicator}
                {multiline ? null : terminalStatusIcon}
-@@ -1395,6 +1463,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1395,6 +1479,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
            </TooltipTrigger>
            {detailsTooltip}
          </Tooltip>
@@ -5275,7 +5234,7 @@ index 3a50e76d06..fc9fe3a042 100644
        </li>
      );
    }
-@@ -1407,6 +1476,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1407,6 +1492,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
        className={cn(
          "list-none py-0.5 [content-visibility:auto] [contain-intrinsic-size:auto_78px]",
          metaLineEmpty && "[contain-intrinsic-size:auto_58px]",
@@ -5283,7 +5242,7 @@ index 3a50e76d06..fc9fe3a042 100644
          sortable?.isDragging && "relative z-20",
        )}
      >
-@@ -1597,6 +1667,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1597,6 +1683,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
          </TooltipTrigger>
          {detailsTooltip}
        </Tooltip>
@@ -5841,11 +5800,11 @@ index 7a6183b5e4..9e2f5dd143 100644
      if (index < 0) return;
 diff --git a/apps/web/src/state/openedThreads.test.ts b/apps/web/src/state/openedThreads.test.ts
 new file mode 100644
-index 0000000000..cdda338f4a
+index 0000000000..5fcdfb4982
 --- /dev/null
 +++ b/apps/web/src/state/openedThreads.test.ts
-@@ -0,0 +1,98 @@
-+import { ThreadId } from "@t3tools/contracts";
+@@ -0,0 +1,109 @@
++import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 +import * as DateTime from "effect/DateTime";
 +import { describe, expect, it } from "vite-plus/test";
 +
@@ -5854,10 +5813,20 @@ index 0000000000..cdda338f4a
 +  selectOpenedThreadShells,
 +  selectOpenerThreadShell,
 +} from "./openedThreads";
++import { makeThreadProjectionFixture } from "../test-fixtures";
 +
++const env = EnvironmentId.make("test");
 +const at = (iso: string) => DateTime.makeUnsafe(iso);
 +const thread = (id: string, extra: Record<string, unknown> = {}) =>
 +  ({
++    // A complete shell, so presentThreadShell can read it as the sidebar does.
++    ...makeThreadProjectionFixture().thread,
++    activeRunId: null,
++    pendingRuntimeRequest: null,
++    latestVisibleMessage: null,
++    hasActionableProposedPlan: false,
++    itemCount: 0,
++    visibleItemCount: 0,
 +    id: ThreadId.make(id),
 +    projectId: "project",
 +    title: id,
@@ -5888,7 +5857,7 @@ index 0000000000..cdda338f4a
 +describe("selectOpenedThreadShells", () => {
 +  it("keeps the live threads this thread opened, main threads included, most recently active first", () => {
 +    const opener = ThreadId.make("opener");
-+    const ids = selectOpenedThreadShells(opener, [
++    const ids = selectOpenedThreadShells(env, opener, [
 +      thread("opener"),
 +      // Created last, but its run ended before the others ran.
 +      thread("newest", {
@@ -5913,14 +5882,15 @@ index 0000000000..cdda338f4a
 +
 +describe("openedThreadActivityAt", () => {
 +  it("dates a thread as its sidebar row does: latest user message or run, else last update", () => {
-+    expect(openedThreadActivityAt(thread("idle", { updatedAt: at("2026-11-11T10:05:00Z") }))).toBe(
-+      "2026-11-11T10:05:00.000Z",
-+    );
-+    expect(openedThreadActivityAt(thread("ran", ran("2026-11-11T10:20:00Z")))).toBe(
++    expect(
++      openedThreadActivityAt(env, thread("idle", { updatedAt: at("2026-11-11T10:05:00Z") })),
++    ).toBe("2026-11-11T10:05:00.000Z");
++    expect(openedThreadActivityAt(env, thread("ran", ran("2026-11-11T10:20:00Z")))).toBe(
 +      "2026-11-11T10:20:00.000Z",
 +    );
 +    expect(
 +      openedThreadActivityAt(
++        env,
 +        thread("asked", {
 +          ...ran("2026-11-11T10:20:00Z"),
 +          latestUserMessageAt: at("2026-11-11T10:30:00Z"),
@@ -5945,10 +5915,10 @@ index 0000000000..cdda338f4a
 +});
 diff --git a/apps/web/src/state/openedThreads.ts b/apps/web/src/state/openedThreads.ts
 new file mode 100644
-index 0000000000..ac58f8e181
+index 0000000000..c7ff30687f
 --- /dev/null
 +++ b/apps/web/src/state/openedThreads.ts
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,105 @@
 +import { useAtomValue } from "@effect/atom-react";
 +import {
 +  arrayElementsEqual,
@@ -5956,36 +5926,30 @@ index 0000000000..ac58f8e181
 +  threadKey,
 +} from "@t3tools/client-runtime/state/entities";
 +import { resolveThreadActivityTimestamp } from "@t3tools/client-runtime/state/thread-sort";
-+import type { OrchestrationV2ThreadShell, ScopedThreadRef, ThreadId } from "@t3tools/contracts";
-+import * as DateTime from "effect/DateTime";
++import { presentThreadShell } from "@t3tools/client-runtime/state/models";
++import type {
++  EnvironmentId,
++  OrchestrationV2ThreadShell,
++  ScopedThreadRef,
++  ThreadId,
++} from "@t3tools/contracts";
 +import { Atom } from "effect/reactivity";
 +
 +import { environmentThreadShells } from "./threads";
 +
 +/**
-+ * When the thread last did something, as the sidebar dates a row (its latest user message or
-+ * run, else its last update), so a Lineage row reads the same age as the thread's sidebar row.
++ * When the thread last did something, as the sidebar dates its row, so a Lineage row reads the
++ * same age as the thread's sidebar row.
 + */
-+export function openedThreadActivityAt(thread: OrchestrationV2ThreadShell): string | null {
-+  const iso = (value: DateTime.Utc | null | undefined) =>
-+    value ? DateTime.formatIso(value) : null;
-+  // The fields of the sidebar's thread model that resolveThreadActivityTimestamp reads.
-+  return resolveThreadActivityTimestamp({
-+    latestUserMessageAt: iso(thread.latestUserMessageAt),
-+    latestRun:
-+      thread.latestRunId === null
-+        ? null
-+        : {
-+            requestedAt: iso(thread.latestRunRequestedAt),
-+            startedAt: iso(thread.latestRunStartedAt),
-+            completedAt: iso(thread.latestRunCompletedAt),
-+          },
-+    updatedAt: DateTime.formatIso(thread.updatedAt),
-+  } as Parameters<typeof resolveThreadActivityTimestamp>[0]);
++export function openedThreadActivityAt(
++  environmentId: EnvironmentId,
++  thread: OrchestrationV2ThreadShell,
++): string | null {
++  return resolveThreadActivityTimestamp(presentThreadShell(environmentId, thread));
 +}
 +
-+const activityMillis = (thread: OrchestrationV2ThreadShell) => {
-+  const timestamp = openedThreadActivityAt(thread);
++const activityMillis = (environmentId: EnvironmentId, thread: OrchestrationV2ThreadShell) => {
++  const timestamp = openedThreadActivityAt(environmentId, thread);
 +  return timestamp === null ? 0 : Date.parse(timestamp);
 +};
 +
@@ -5995,6 +5959,7 @@ index 0000000000..ac58f8e181
 + * made a main thread keeps its opener, so it stays listed; archived and deleted threads drop out.
 + */
 +export function selectOpenedThreadShells(
++  environmentId: EnvironmentId,
 +  threadId: ThreadId,
 +  threads: ReadonlyArray<OrchestrationV2ThreadShell>,
 +): ReadonlyArray<OrchestrationV2ThreadShell> {
@@ -6006,7 +5971,7 @@ index 0000000000..ac58f8e181
 +        thread.archivedAt === null &&
 +        thread.deletedAt === null,
 +    )
-+    .map((thread) => ({ thread, at: activityMillis(thread) }))
++    .map((thread) => ({ thread, at: activityMillis(environmentId, thread) }))
 +    .toSorted((left, right) => right.at - left.at)
 +    .map(({ thread }) => thread);
 +}
@@ -6025,6 +5990,7 @@ index 0000000000..ac58f8e181
 +  let previous: ReadonlyArray<OrchestrationV2ThreadShell> = [];
 +  return Atom.make((get) => {
 +    const next = selectOpenedThreadShells(
++      ref.environmentId,
 +      ref.threadId,
 +      get(environmentThreadShells.environmentThreadsAtom(ref.environmentId)),
 +    );
