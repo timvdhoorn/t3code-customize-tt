@@ -40,6 +40,10 @@ class Sandbox(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        # The fake source pins no Node; tests/test_checks_node.py covers the pin itself.
+        patcher = patch.object(customize, 'upstream_node_env', lambda env, log: env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         root = Path(self.tmp.name)
         self.source, self.recipe, self.cache = root / 'source', root / 'recipe', root / 'cache'
         for folder in (self.source, self.recipe, self.cache):

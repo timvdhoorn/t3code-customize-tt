@@ -191,6 +191,13 @@ class KnownFailuresTest(unittest.TestCase):
         timed = 'it("slow", async () => {\n  await run();\n}, 10_000);\n'
         self.assertEqual(customize.test_source(timed, 'slow'), [timed.rstrip('\n')])
 
+    def test_a_closer_lookalike_inside_a_template_literal_does_not_end_the_case(self):
+        case = ('it("top", () => {\n  const sql = `\nselect 1\n});\n`;\n  expect(run(sql)).toBe(1);\n'
+                '  expect(other()).toBe(2);\n});')
+        self.assertEqual(customize.test_source(case + '\nit("next", () => {});\n', 'top'), [case])
+        weakened = case.replace('  expect(other()).toBe(2);\n', '')
+        self.assertNotEqual(customize.test_source(case, 'top'), customize.test_source(weakened, 'top'))
+
     def test_an_expression_bodied_case_ends_at_its_closing_paren(self):
         case = ('  it.effect("window", () =>\n    Effect.gen(function* () {\n      yield* run();\n'
                 '    }),\n  );')

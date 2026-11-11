@@ -970,7 +970,16 @@ def test_source(text, title):
         # expression (`it.effect("x", () =>`) closes with `);` instead.
         brace = '' if line.rstrip().endswith('=>') else r'\}'
         closer = re.compile(re.escape(indent) + brace + r'(?:,[^`]*)?\);?\s*$')
-        end = next((i for i in range(number + 1, len(lines)) if closer.match(lines[i])), None)
+        # A line inside a template literal (an odd number of backticks so far) is text, not the
+        # closer, however much it looks like one.
+        end = None
+        inside = len(re.findall(r'(?<!\\)`', line)) % 2 == 1
+        for i in range(number + 1, len(lines)):
+            if not inside and closer.match(lines[i]):
+                end = i
+                break
+            if len(re.findall(r'(?<!\\)`', lines[i])) % 2 == 1:
+                inside = not inside
         if end is None:
             return None
         cases.append('\n'.join(lines[number:end + 1]))
@@ -1135,6 +1144,7 @@ def checks(env, log, target, force=False):
     if WITH_IOS:
         desktop_stack_checks(env, log, target)
     step('Testing the patches...')
+    env = upstream_node_env(env, log)
     tsc = typechecker(log)
     # Upstream's `prepare` once patched tsc with the Effect diagnostics (globalDateInEffect and
     # friends) and its CI typechecked with them; --ignore-scripts skips that, so a checkout
@@ -1179,7 +1189,7 @@ def checks(env, log, target, force=False):
             failures.append(f'{name}: ' + (', '.join(failing[:10]) or 'failed'))
 
     with tempfile.TemporaryDirectory(prefix='t3code-checks-home-', dir=tmp) as home:
-        check_env = dict(os.environ if env is None else env, HOME=home, TMPDIR=str(tmp),
+        check_env = dict(env, HOME=home, TMPDIR=str(tmp),
                          PLAYWRIGHT_BROWSERS_PATH=str(browsers))
         for name, args, cwd in steps:
             started = time.time()
@@ -2764,11 +2774,39 @@ def contains(folder, marker, scripts_only=True):
 def sea_node_version(source):
     """The exact Node the server executable embeds: SEA_NODE_VERSION in older nightlies, the root
     package.json's engines.node since upstream #23165 pinned that instead."""
-    pinned = re.search(r'SEA_NODE_VERSION\s*=\s*"([\d.]+)"', (source / 'apps/server/vite.config.ts').read_text())
-    if pinned:
-        return pinned.group(1)
-    engine = json.loads((source / 'package.json').read_text()).get('engines', {}).get('node', '')
+    try:
+        pinned = re.search(r'SEA_NODE_VERSION\s*=\s*"([\d.]+)"', (source / 'apps/server/vite.config.ts').read_text())
+        if pinned:
+            return pinned.group(1)
+    except OSError:
+        pass
+    try:
+        engine = json.loads((source / 'package.json').read_text()).get('engines', {}).get('node', '')
+    except (OSError, ValueError):
+        return None
     return engine if re.fullmatch(r'\d+\.\d+\.\d+', engine) else None
+
+
+def upstream_node_env(env, log):
+    """env with the Node upstream pins in front of PATH (and VP_NODE_VERSION set), so the patch tests
+    and typechecks run where upstream's CI runs them: the system Node can lack APIs the tests use
+    (StatementSync.stat on Node 24). Stops when that Node cannot be had; never falls back to the system Node."""
+    version = sea_node_version(SOURCE)
+    if not version:
+        raise Stop('Neither apps/server/vite.config.ts (SEA_NODE_VERSION) nor package.json (engines.node) pins an exact'
+                   f' Node, so the checks cannot run on the Node upstream uses. Update upstream_node_env in {NAME}.')
+    try:
+        folder = exact_node(version, log)
+    except Stop:
+        raise
+    except Exception as error:
+        raise Stop(f'Could not get Node {version}, the version upstream pins, for the checks ({error}). The checks do'
+                   ' not fall back to the system Node; fix the network connection and run them again.')
+    env = dict(os.environ if env is None else env)
+    env['PATH'] = os.pathsep.join([str(folder), env.get('PATH', '')])
+    env['VP_NODE_VERSION'] = version
+    log.write(f'Checks run on Node {version} (upstream pin) from {folder}.\n')
+    return env
 
 
 def build_server(env, version, config, log):
