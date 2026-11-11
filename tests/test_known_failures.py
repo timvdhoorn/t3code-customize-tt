@@ -191,6 +191,12 @@ class KnownFailuresTest(unittest.TestCase):
         timed = 'it("slow", async () => {\n  await run();\n}, 10_000);\n'
         self.assertEqual(customize.test_source(timed, 'slow'), [timed.rstrip('\n')])
 
+    def test_an_expression_bodied_case_ends_at_its_closing_paren(self):
+        case = ('  it.effect("window", () =>\n    Effect.gen(function* () {\n      yield* run();\n'
+                '    }),\n  );')
+        text = case + '\n\n  it.effect("next", () => Effect.void);\n'
+        self.assertEqual(customize.test_source(text, 'window'), [case])
+
     def test_an_empty_list_tolerates_nothing_and_reports_nothing(self):
         self.known.write_text(json.dumps({'comment': 'none listed', 'failures': []}))
         self.assertEqual(customize.known_failures(), [])
