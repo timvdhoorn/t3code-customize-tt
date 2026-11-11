@@ -33,6 +33,9 @@ guide line, context-menu collapse and a summary stub.
  apps/web/src/components/Sidebar.logic.test.ts |   45 +
  apps/web/src/components/Sidebar.logic.ts      |   49 +-
  apps/web/src/components/Sidebar.tsx           |  147 ++-
+ ...hreadRelationshipsControl.browser.test.tsx |    5 +
+ ...lationshipsControl.opened.browser.test.tsx |  168 +++
+ .../chat/ThreadRelationshipsControl.tsx       |  139 ++-
  .../components/sidebar/SidebarThreadRow.tsx   |   97 +-
  .../SidebarThreadRow.workers.browser.test.tsx |  329 +++++
  .../components/threadActionMenu.logic.test.ts |   23 +
@@ -40,6 +43,8 @@ guide line, context-menu collapse and a summary stub.
  apps/web/src/contextMenuFallback.ts           |   11 +
  apps/web/src/hooks/useThreadActionMenu.ts     |   10 +
  apps/web/src/lib/sidebarTree.ts               |   17 +-
+ apps/web/src/state/openedThreads.test.ts      |   53 +
+ apps/web/src/state/openedThreads.ts           |   88 ++
  apps/web/src/test-fixtures.ts                 |    4 +-
  packages/client-runtime/package.json          |    4 +
  .../src/operations/commands.test.ts           |   23 +
@@ -55,13 +60,16 @@ guide line, context-menu collapse and a summary stub.
  packages/contracts/src/orchestrationV2.ts     |   32 +
  packages/contracts/src/orchestratorMcp.ts     |    6 +
  .../src/server/subagentProjection.ts          |    9 +-
- 46 files changed, 4897 insertions(+), 92 deletions(-)
+ 51 files changed, 5344 insertions(+), 98 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.childThreads.browser.test.tsx
  create mode 100644 apps/web/src/components/Sidebar.childThreads.test.ts
  create mode 100644 apps/web/src/components/Sidebar.childThreads.tsx
  create mode 100644 apps/web/src/components/Sidebar.families.test.ts
  create mode 100644 apps/web/src/components/Sidebar.families.ts
+ create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.opened.browser.test.tsx
  create mode 100644 apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx
+ create mode 100644 apps/web/src/state/openedThreads.test.ts
+ create mode 100644 apps/web/src/state/openedThreads.ts
  create mode 100644 packages/client-runtime/src/state/childThreadSummary.test.ts
  create mode 100644 packages/client-runtime/src/state/childThreadSummary.ts
 
@@ -4449,6 +4457,444 @@ index 2b1a840393..a9d57a5633 100644
                          </button>
                        </li>
                      ) : null}
+diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.browser.test.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.browser.test.tsx
+index 9679f42569..3717e416a9 100644
+--- a/apps/web/src/components/chat/ThreadRelationshipsControl.browser.test.tsx
++++ b/apps/web/src/components/chat/ThreadRelationshipsControl.browser.test.tsx
+@@ -40,6 +40,11 @@ vi.mock(import("../../state/entities"), () => ({
+   useHiddenThreadKeys: (() => new Set()) as never,
+   useAnyEnvironmentHiding: (() => false) as never,
+ }));
++vi.mock(import("../../state/openedThreads"), async (original) => ({
++  ...(await original()),
++  useOpenedThreadShells: (() => []) as never,
++  useOpenerThreadShell: (() => null) as never,
++}));
+ vi.mock(import("../../state/environments"), () => ({
+   useEnvironment: (() => null) as never,
+   useEnvironmentProviders: (() => new Map()) as never,
+diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.opened.browser.test.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.opened.browser.test.tsx
+new file mode 100644
+index 0000000000..2af61f4773
+--- /dev/null
++++ b/apps/web/src/components/chat/ThreadRelationshipsControl.opened.browser.test.tsx
+@@ -0,0 +1,168 @@
++import type { ReactElement, ReactNode } from "react";
++import { EnvironmentId, ThreadId } from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++import { expect, it, vi } from "vite-plus/test";
++import "~/index.css";
++import { act, render } from "../../../test/render";
++const state = vi.hoisted(() => ({
++  projection: null as unknown,
++  shells: [] as Array<Record<string, unknown>>,
++  navigate: vi.fn(),
++}));
++vi.mock(import("@tanstack/react-router"), async (original) => ({
++  ...(await original()),
++  useNavigate: (() => state.navigate) as never,
++}));
++vi.mock(import("../../state/entities"), async (original) => ({
++  ...(await original()),
++  useThreadProjection: ((ref: { threadId: string } | null) =>
++    ref === null ? null : { projection: state.projection }) as never,
++  useThreadRelationshipShells: (() => []) as never,
++  useProjects: (() => []) as never,
++}));
++vi.mock(import("../../state/openedThreads"), async (original) => {
++  const actual = await original();
++  return {
++    ...actual,
++    useOpenedThreadShells: ((ref: { threadId: ThreadId }) =>
++      actual.selectOpenedThreadShells(ref.threadId, state.shells as never)) as never,
++    useOpenerThreadShell: ((ref: { threadId: string } | null) =>
++      ref === null
++        ? null
++        : (state.shells.find((thread) => thread.id === ref.threadId) ?? null)) as never,
++  };
++});
++vi.mock(import("../../state/environments"), async (original) => ({
++  ...(await original()),
++  useEnvironmentProviders: (() => new Map()) as never,
++}));
++vi.mock(import("../../lib/archivedThreadsState"), async (original) => ({
++  ...(await original()),
++  useArchivedThreadSnapshots: (() => ({ snapshots: [] })) as never,
++}));
++vi.mock(import("../ui/tooltip"), async () => {
++  const { cloneElement } = await import("react");
++  return {
++    Tooltip: (({ children }: { children: ReactNode }) => children) as never,
++    TooltipTrigger: (({ render, children }: { render: ReactElement; children: ReactNode }) =>
++      cloneElement(render, {}, children)) as never,
++    TooltipPopup: (() => null) as never,
++  };
++});
++import { ThreadRelationshipsPanel } from "./ThreadRelationshipsControl";
++
++const at = (iso: string) => DateTime.makeUnsafe(iso);
++const shell = (input: {
++  id: string;
++  title: string;
++  openedBy?: string;
++  createdAt?: string;
++  archived?: boolean;
++  detached?: boolean;
++  status?: string;
++}) => ({
++  id: input.id,
++  title: input.title,
++  projectId: "project",
++  lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: input.id },
++  forkedFrom: null,
++  ...(input.openedBy ? { openedByThreadId: input.openedBy } : {}),
++  ...(input.detached ? { detachedFromOpener: true } : {}),
++  status: input.status ?? "completed",
++  activityRunStatus: null,
++  createdAt: at(input.createdAt ?? "2026-11-11T10:00:00Z"),
++  updatedAt: at(input.createdAt ?? "2026-11-11T10:00:00Z"),
++  latestRunRequestedAt: null,
++  latestRunStartedAt: null,
++  latestRunCompletedAt: null,
++  archivedAt: input.archived ? at("2026-11-11T11:00:00Z") : null,
++  deletedAt: null,
++});
++const projectionOf = (thread: ReturnType<typeof shell>) => ({
++  thread: { ...thread, activeProviderThreadId: null },
++  runs: [],
++  providerThreads: [],
++  providerSessions: [],
++  contextTransfers: [],
++  subagents: [],
++});
++const panel = (threadId: string) => (
++  <ThreadRelationshipsPanel
++    environmentId={EnvironmentId.make("test")}
++    threadId={ThreadId.make(threadId)}
++    showLineage
++    showSideChats
++  />
++);
++const rowButton = (container: HTMLElement, title: string) =>
++  [...container.querySelectorAll("button")].find((button) => button.textContent?.includes(title));
++// Joins the rendered text nodes with spaces, as a reader moving through the rows hears them.
++function text(element: Element) {
++  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
++  const parts: string[] = [];
++  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
++    parts.push(node.textContent ?? "");
++  }
++  return parts.join(" ").replace(/\s+/g, " ").trim();
++}
++
++it("lists the threads an agent opened under Opened, newest first, and opens one on click", async () => {
++  const opener = shell({ id: "opener", title: "Orchestrate the port" });
++  state.shells = [
++    opener,
++    shell({
++      id: "w1",
++      title: "W: port 0003",
++      openedBy: "opener",
++      createdAt: "2026-11-11T10:05:00Z",
++    }),
++    shell({
++      id: "main",
++      title: "Made a main thread",
++      openedBy: "opener",
++      detached: true,
++      status: "running",
++      createdAt: "2026-11-11T10:10:00Z",
++    }),
++    shell({ id: "gone", title: "Archived worker", openedBy: "opener", archived: true }),
++    shell({ id: "other", title: "Someone else's thread", openedBy: "elsewhere" }),
++  ];
++  state.projection = projectionOf(opener);
++  state.navigate.mockClear();
++  await using screen = await render(panel("opener"));
++  const { container } = screen;
++  const group = [...container.querySelectorAll("button[aria-expanded]")].find(
++    (button) => text(button) === "Opened",
++  );
++  expect(group?.getAttribute("aria-expanded")).toBe("true");
++  const rows = [...container.querySelectorAll("ul[aria-label='Related threads'] li")].map(text);
++  expect(rows).toHaveLength(2);
++  expect(rows[0]).toMatch(/^Made a main thread thread Running,/);
++  expect(rows[1]).toMatch(/^W: port 0003 thread Done,/);
++  expect(text(container)).not.toContain("Archived worker");
++  expect(text(container)).not.toContain("Someone else's thread");
++  await act(async () => rowButton(container, "W: port 0003")!.click());
++  expect(state.navigate).toHaveBeenCalledWith({
++    to: "/$environmentId/$threadId",
++    params: { environmentId: "test", threadId: "w1" },
++  });
++});
++
++it("shows a launched thread's opener as opened by, also once it is a main thread", async () => {
++  const opener = shell({ id: "opener", title: "Orchestrate the port" });
++  for (const detached of [false, true]) {
++    const launched = shell({ id: "w1", title: "W: port 0003", openedBy: "opener", detached });
++    state.shells = [opener, launched];
++    state.projection = projectionOf(launched);
++    state.navigate.mockClear();
++    await using screen = await render(panel("w1"));
++    const { container } = screen;
++    const row = rowButton(container, "Orchestrate the port");
++    expect(row && text(row)).toMatch(/^opened by Orchestrate the port Done,/);
++    await act(async () => row!.click());
++    expect(state.navigate).toHaveBeenCalledWith({
++      to: "/$environmentId/$threadId",
++      params: { environmentId: "test", threadId: "opener" },
++    });
++  }
++});
+diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
+index 102d9734de..f170a17925 100644
+--- a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
++++ b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
+@@ -48,6 +48,7 @@ import {
+   ArrowRightIcon,
+   BotIcon,
+   ChevronDownIcon,
++  CornerDownRightIcon,
+   CornerLeftUpIcon,
+   GitForkIcon,
+   MessagesSquareIcon,
+@@ -56,7 +57,7 @@ import {
+   SquareIcon,
+   UnplugIcon,
+ } from "lucide-react";
+-import { useRef, useState, type ReactNode } from "react";
++import { useRef, useState, type ComponentType, type ReactNode } from "react";
+ 
+ import { useArchivedThreadSnapshots } from "../../lib/archivedThreadsState";
+ import { buildThreadRouteParams } from "../../threadRoutes";
+@@ -69,6 +70,13 @@ import {
+   useAnyEnvironmentHiding,
+ } from "../../state/entities";
+ import { useEnvironment, useEnvironmentProviders } from "../../state/environments";
++import {
++  openedThreadActivityAt,
++  useOpenedThreadShells,
++  useOpenerThreadShell,
++} from "../../state/openedThreads";
++import { useNowMinute } from "../../hooks/useNowMinute";
++import { formatRelativeTimeLabel } from "../../timestampFormat";
+ import { serverEnvironment } from "../../state/server";
+ import {
+   applyProviderInstanceSettings,
+@@ -140,17 +148,32 @@ type RemoteSubagent = OrchestrationV2Subagent & {
+   readonly remoteChild: OrchestrationV2RemoteTaskChild;
+ };
+ 
+-/** A task delegated to a linked environment has no thread here, so it gets its own row kind. */
+-type LineageRow = ThreadRelationshipWalkRow | { readonly remote: RemoteSubagent };
++/**
++ * A task delegated to a linked environment has no thread here, so it gets its own row kind,
++ * as does a thread an agent here opened with T3 tools (`openedByThreadId`), which the
++ * relationship graph does not know.
++ */
++type LineageRow =
++  | ThreadRelationshipWalkRow
++  | { readonly remote: RemoteSubagent }
++  | { readonly opened: OrchestrationV2ThreadShell };
++
++const openedThreadStatus = (thread: OrchestrationV2ThreadShell) =>
++  thread.activityRunStatus ?? thread.status;
+ 
+ const lineageRowStatus = (row: LineageRow) =>
+-  "remote" in row ? row.remote.status : row.edge.status;
++  "remote" in row
++    ? row.remote.status
++    : "opened" in row
++      ? openedThreadStatus(row.opened)
++      : row.edge.status;
+ 
+ const isFinishedAgentStatus = (status: string | null | undefined) =>
+   ["completed", "failed", "error", "cancelled", "interrupted", "idle"].includes(status ?? "");
+ 
+ function ThreadLineageGroup<Row extends LineageRow>(props: {
+   readonly label: string | null;
++  readonly icon?: ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
+   readonly rows: ReadonlyArray<Row>;
+   readonly expanded: boolean;
+   readonly children: (rows: ReadonlyArray<Row>) => ReactNode;
+@@ -163,11 +186,12 @@ function ThreadLineageGroup<Row extends LineageRow>(props: {
+     return status === "failed" || status === "error";
+   }).length;
+   if (props.rows.length === 0) return null;
++  const GroupIcon = props.icon ?? BotIcon;
+   return (
+     <div>
+       {props.label ? (
+         <ThreadDetailsControl aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>
+-          <BotIcon aria-hidden className={THREAD_DETAILS_PANEL_ICON_CLASS} />
++          <GroupIcon aria-hidden className={THREAD_DETAILS_PANEL_ICON_CLASS} />
+           <span className={cn(THREAD_DETAILS_PANEL_LABEL_CLASS, "min-w-0 flex-1 truncate")}>
+             {props.label}
+           </span>
+@@ -334,6 +358,71 @@ function RemoteSubagentRow(props: {
+  * The thread on a linked environment whose agent delegated this one. It opens
+  * there when this client is connected to that environment.
+  */
++/** "5m", as the sidebar shows a thread's age; re-renders on the minute tick only. */
++function OpenedThreadAge(props: { readonly timestamp: string }) {
++  const nowMinute = useNowMinute();
++  return formatRelativeTimeLabel(props.timestamp, Date.parse(`${nowMinute}:00.000Z`)).replace(
++    / ago$/,
++    "",
++  );
++}
++
++/**
++ * A thread an agent opened with `t3_thread_launch` or `create_threads`, or, from the launched
++ * thread's side, the thread whose agent opened it. Same row as the other Lineage rows.
++ */
++function OpenedThreadRow(props: {
++  readonly thread: OrchestrationV2ThreadShell;
++  readonly relation: "opened" | "opened by";
++  readonly onOpen: () => void;
++}) {
++  const { thread } = props;
++  const status = openedThreadStatus(thread);
++  return (
++    <li className="group relative flex h-8 items-center rounded-lg">
++      <Tooltip>
++        <TooltipTrigger
++          delay={200}
++          render={
++            <ThreadDetailsControl size="sm" variant="ghost" part="row" onClick={props.onOpen} />
++          }
++        >
++          <ThreadRelationshipIcon
++            fallbackIcon={props.relation === "opened" ? CornerDownRightIcon : CornerLeftUpIcon}
++            status={status}
++          />
++          <span className="flex min-w-0 flex-1 items-baseline gap-1.5">
++            {props.relation === "opened by" ? (
++              <span className="shrink-0 text-2xs font-normal text-muted-foreground">opened by</span>
++            ) : null}
++            <span className="min-w-0 truncate text-left text-sm font-medium leading-4 text-foreground/85">
++              {thread.title}
++            </span>
++            {props.relation === "opened" ? (
++              <span className="shrink-0 text-2xs font-normal text-muted-foreground">thread</span>
++            ) : null}
++          </span>
++          <ArrowRightIcon className="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
++          <span className="shrink-0 text-2xs tabular-nums text-muted-foreground">
++            <span className="sr-only">{`${threadRelationshipStatusLabel(status)}, `}</span>
++            <OpenedThreadAge timestamp={openedThreadActivityAt(thread)} />
++          </span>
++        </TooltipTrigger>
++        <TooltipPopup side="left">
++          <LineageTooltipContent
++            title={thread.title}
++            hint={
++              props.relation === "opened"
++                ? "Open the thread this agent opened"
++                : "Open the thread whose agent opened this one"
++            }
++          />
++        </TooltipPopup>
++      </Tooltip>
++    </li>
++  );
++}
++
+ function DelegatedFromRow(props: {
+   readonly delegatedFrom: OrchestrationV2DelegatedFrom;
+   readonly fallbackLabel: string | undefined;
+@@ -429,6 +518,11 @@ export function ThreadRelationshipsPanel(props: {
+       ? scopeThreadRef(props.environmentId, parentShell.id)
+       : null;
+   const parentProjection = useThreadProjection(parentRef)?.projection;
++  const openedShells = useOpenedThreadShells(ref);
++  const openerThreadId = currentThread?.openedByThreadId ?? null;
++  const loadedOpener = useOpenerThreadShell(
++    openerThreadId === null ? null : scopeThreadRef(props.environmentId, openerThreadId),
++  );
+   const navigate = useNavigate();
+   const mergeBack = useAtomCommand(threadEnvironment.mergeBack);
+   const stopSession = useAtomCommand(threadEnvironment.stopSession);
+@@ -541,6 +635,17 @@ export function ThreadRelationshipsPanel(props: {
+       Object.hasOwn(resolvedThreadTitles, threadId),
+   );
+   const canDetach = projection ? canDetachThreadProviderSession(projection) : false;
++  // Threads an agent here opened, unless the graph already lists them (a fork, a worker).
++  const opened = openedShells
++    .filter(
++      (thread) =>
++        !isHiddenRelation(thread.id) && !relationshipRows.some((row) => row.threadId === thread.id),
++    )
++    .map((thread) => ({ opened: thread }));
++  const openerShell =
++    openerThreadId === null || isHiddenRelation(openerThreadId)
++      ? null
++      : (loadedOpener ?? archivedShells?.find((thread) => thread.id === openerThreadId) ?? null);
+ 
+   const {
+     related = [],
+@@ -563,11 +668,13 @@ export function ThreadRelationshipsPanel(props: {
+   const groups: ReadonlyArray<{
+     id: string;
+     label: string | null;
++    icon?: typeof CornerDownRightIcon;
+     rows: ReadonlyArray<LineageRow>;
+     expanded: boolean;
+   }> = [
+     { id: "related", label: null, rows: related, expanded: true },
+     { id: "active", label: null, rows: [...active, ...remoteActive], expanded: true },
++    { id: "opened", label: "Opened", icon: CornerDownRightIcon, rows: opened, expanded: true },
+     {
+       id: "previous",
+       label: "Previous agents",
+@@ -591,6 +698,8 @@ export function ThreadRelationshipsPanel(props: {
+       runningCount > 0 ||
+       remoteActive.length > 0 ||
+       remotePrevious.length > 0 ||
++      opened.length > 0 ||
++      openerShell !== null ||
+       delegatedFrom !== undefined ||
+       // Disconnect lives in this heading, so a thread with only side chats still shows it.
+       (canDetach && sideChats.length > 0));
+@@ -953,6 +1062,8 @@ export function ThreadRelationshipsPanel(props: {
+             related.length > 0 ||
+             active.length > 0 ||
+             remoteActive.length > 0 ||
++            opened.length > 0 ||
++            openerShell !== null ||
+             delegatedFrom !== undefined
+           }
+           data-thread-relationships-panel
+@@ -990,11 +1101,27 @@ export function ThreadRelationshipsPanel(props: {
+               />
+             </ThreadLineageRowList>
+           )}
++          {openerShell === null ? null : (
++            <ThreadLineageRowList hiddenCount={0} onShowMore={() => {}}>
++              <OpenedThreadRow
++                thread={openerShell}
++                relation="opened by"
++                onOpen={() => openThread(openerShell.id)}
++              />
++            </ThreadLineageRowList>
++          )}
+           {groups.map((group) => (
+             <ThreadLineageGroup key={`${scopedThreadKey(ref)}:${group.id}`} {...group}>
+               {(visibleRows) =>
+                 visibleRows.map((row) =>
+-                  "remote" in row ? (
++                  "opened" in row ? (
++                    <OpenedThreadRow
++                      key={row.opened.id}
++                      thread={row.opened}
++                      relation="opened"
++                      onOpen={() => openThread(row.opened.id)}
++                    />
++                  ) : "remote" in row ? (
+                     <RemoteSubagentRow
+                       key={row.remote.id}
+                       agent={row.remote}
 diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
 index 3a50e76d06..6bd1184a3c 100644
 --- a/apps/web/src/components/sidebar/SidebarThreadRow.tsx
@@ -5189,6 +5635,159 @@ index 7a6183b5e4..9e2f5dd143 100644
      const rows = visibleRows();
      const index = rows.indexOf(row);
      if (index < 0) return;
+diff --git a/apps/web/src/state/openedThreads.test.ts b/apps/web/src/state/openedThreads.test.ts
+new file mode 100644
+index 0000000000..5711e3f19f
+--- /dev/null
++++ b/apps/web/src/state/openedThreads.test.ts
+@@ -0,0 +1,53 @@
++import { ThreadId } from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++import { describe, expect, it } from "vite-plus/test";
++
++import { openedThreadActivityAt, selectOpenedThreadShells } from "./openedThreads";
++
++const at = (iso: string) => DateTime.makeUnsafe(iso);
++const thread = (id: string, extra: Record<string, unknown> = {}) =>
++  ({
++    id: ThreadId.make(id),
++    createdAt: at("2026-11-11T10:00:00Z"),
++    archivedAt: null,
++    deletedAt: null,
++    latestRunRequestedAt: null,
++    latestRunStartedAt: null,
++    latestRunCompletedAt: null,
++    ...extra,
++  }) as never;
++
++describe("selectOpenedThreadShells", () => {
++  it("keeps the live threads this thread opened, main threads included, newest first", () => {
++    const opener = ThreadId.make("opener");
++    const ids = selectOpenedThreadShells(opener, [
++      thread("opener"),
++      thread("older", { openedByThreadId: opener }),
++      thread("newer", { openedByThreadId: opener, createdAt: at("2026-11-11T11:00:00Z") }),
++      thread("main", {
++        openedByThreadId: opener,
++        detachedFromOpener: true,
++        createdAt: at("2026-11-11T10:30:00Z"),
++      }),
++      thread("archived", { openedByThreadId: opener, archivedAt: at("2026-11-11T12:00:00Z") }),
++      thread("deleted", { openedByThreadId: opener, deletedAt: at("2026-11-11T12:00:00Z") }),
++      thread("foreign", { openedByThreadId: ThreadId.make("elsewhere") }),
++      thread("flat"),
++    ]).map((entry) => entry.id);
++    expect(ids).toEqual(["newer", "main", "older"]);
++  });
++});
++
++describe("openedThreadActivityAt", () => {
++  it("dates a thread by its latest run, else its creation", () => {
++    expect(openedThreadActivityAt(thread("idle"))).toBe("2026-11-11T10:00:00.000Z");
++    expect(
++      openedThreadActivityAt(
++        thread("ran", {
++          latestRunRequestedAt: at("2026-11-11T10:05:00Z"),
++          latestRunCompletedAt: at("2026-11-11T10:20:00Z"),
++        }),
++      ),
++    ).toBe("2026-11-11T10:20:00.000Z");
++  });
++});
+diff --git a/apps/web/src/state/openedThreads.ts b/apps/web/src/state/openedThreads.ts
+new file mode 100644
+index 0000000000..18a9385f43
+--- /dev/null
++++ b/apps/web/src/state/openedThreads.ts
+@@ -0,0 +1,88 @@
++import { useAtomValue } from "@effect/atom-react";
++import {
++  arrayElementsEqual,
++  parseThreadKey,
++  threadKey,
++} from "@t3tools/client-runtime/state/entities";
++import type { OrchestrationV2ThreadShell, ScopedThreadRef, ThreadId } from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++import { Atom } from "effect/reactivity";
++
++import { environmentThreadShells } from "./threads";
++
++const createdAtMillis = (thread: OrchestrationV2ThreadShell) =>
++  DateTime.isDateTime(thread.createdAt) ? DateTime.toEpochMillis(thread.createdAt) : 0;
++
++/**
++ * The threads an agent in `threadId` opened with `t3_thread_launch` or `create_threads`
++ * (`openedByThreadId`), newest first. A thread made a main thread keeps its opener, so it
++ * stays listed; archived and deleted threads drop out.
++ */
++export function selectOpenedThreadShells(
++  threadId: ThreadId,
++  threads: ReadonlyArray<OrchestrationV2ThreadShell>,
++): ReadonlyArray<OrchestrationV2ThreadShell> {
++  return threads
++    .filter(
++      (thread) =>
++        thread.openedByThreadId === threadId &&
++        thread.id !== threadId &&
++        thread.archivedAt === null &&
++        thread.deletedAt === null,
++    )
++    .toSorted((left, right) => createdAtMillis(right) - createdAtMillis(left));
++}
++
++/** When the thread last did something, for the age a Lineage row shows. */
++export function openedThreadActivityAt(thread: OrchestrationV2ThreadShell): string {
++  let latest = thread.createdAt;
++  for (const candidate of [
++    thread.latestRunRequestedAt,
++    thread.latestRunStartedAt,
++    thread.latestRunCompletedAt,
++  ]) {
++    if (candidate && DateTime.toEpochMillis(candidate) > DateTime.toEpochMillis(latest)) {
++      latest = candidate;
++    }
++  }
++  return DateTime.formatIso(latest);
++}
++
++const openedThreadShellsAtomFamily = Atom.family((key: string) => {
++  const ref = parseThreadKey(key);
++  let previous: ReadonlyArray<OrchestrationV2ThreadShell> = [];
++  return Atom.make((get) => {
++    const next = selectOpenedThreadShells(
++      ref.threadId,
++      get(environmentThreadShells.environmentThreadsAtom(ref.environmentId)),
++    );
++    if (arrayElementsEqual(previous, next)) return previous;
++    previous = next;
++    return next;
++  }).pipe(Atom.withLabel(`web-opened-thread-shells:${key}`));
++});
++
++export function useOpenedThreadShells(
++  ref: ScopedThreadRef,
++): ReadonlyArray<OrchestrationV2ThreadShell> {
++  return useAtomValue(openedThreadShellsAtomFamily(threadKey(ref)));
++}
++
++const threadShellAtomFamily = Atom.family((key: string) => {
++  const ref = parseThreadKey(key);
++  return Atom.make(
++    (get) =>
++      get(environmentThreadShells.environmentThreadsAtom(ref.environmentId)).find(
++        (thread) => thread.id === ref.threadId,
++      ) ?? null,
++  ).pipe(Atom.withLabel(`web-opener-thread-shell:${key}`));
++});
++
++const NO_THREAD_SHELL = Atom.make(null as OrchestrationV2ThreadShell | null);
++
++/** The thread whose agent opened this one, while this client has it loaded. */
++export function useOpenerThreadShell(
++  ref: ScopedThreadRef | null,
++): OrchestrationV2ThreadShell | null {
++  return useAtomValue(ref === null ? NO_THREAD_SHELL : threadShellAtomFamily(threadKey(ref)));
++}
 diff --git a/apps/web/src/test-fixtures.ts b/apps/web/src/test-fixtures.ts
 index 494d95caa8..38edb1bd7f 100644
 --- a/apps/web/src/test-fixtures.ts
