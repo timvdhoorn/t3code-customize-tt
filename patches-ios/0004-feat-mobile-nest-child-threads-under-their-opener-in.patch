@@ -6,7 +6,7 @@ Subject: [PATCH 4/9] feat(mobile): nest child threads under their opener in
 
 ---
  .../src/components/ui/AppSymbol.android.tsx   |   2 +
- .../src/features/home/HomeRouteScreen.tsx     |   7 +-
+ .../src/features/home/HomeRouteScreen.tsx     |   4 +-
  apps/mobile/src/features/home/HomeScreen.tsx  |  66 +-
  .../features/home/thread-swipe-actions.tsx    |  32 +-
  .../src/features/home/useThreadListActions.ts |  18 +
@@ -26,7 +26,7 @@ Subject: [PATCH 4/9] feat(mobile): nest child threads under their opener in
  .../src/state/childThreadFamilies.ts          | 431 +++++++++
  .../src/state/threadShell.test.ts             |  37 +
  .../client-runtime/src/state/threadShell.ts   |  24 +
- 21 files changed, 3294 insertions(+), 615 deletions(-)
+ 21 files changed, 3294 insertions(+), 612 deletions(-)
  create mode 100644 packages/client-runtime/src/state/childThreadFamilies.test.ts
  create mode 100644 packages/client-runtime/src/state/childThreadFamilies.ts
 
@@ -51,22 +51,19 @@ index 7aaeac5544..d8aeb76a89 100644
    house: IconHome,
    "info.circle": IconInfoCircle,
 diff --git a/apps/mobile/src/features/home/HomeRouteScreen.tsx b/apps/mobile/src/features/home/HomeRouteScreen.tsx
-index f1b163461b..9c63a8a832 100644
+index a2db3d14d4..3ccd274de0 100644
 --- a/apps/mobile/src/features/home/HomeRouteScreen.tsx
 +++ b/apps/mobile/src/features/home/HomeRouteScreen.tsx
-@@ -46,10 +46,7 @@ export function HomeRouteScreen() {
-   const projects = useProjects();
+@@ -47,7 +47,7 @@ export function HomeRouteScreen() {
    // Stop rebuilding the streaming thread list while Thread covers Home.
    const visible = useHomeRouteVisible();
--  const threads = useAtomValueWhileVisible(
--    environmentThreadShells.navigationThreadShellsAtom,
--    visible,
--  );
-+  const threads = useAtomValueWhileVisible(environmentThreadShells.rosterThreadShellsAtom, visible);
+   const threads = useLaunchingThreads(
+-    useAtomValueWhileVisible(environmentThreadShells.navigationThreadShellsAtom, visible),
++    useAtomValueWhileVisible(environmentThreadShells.rosterThreadShellsAtom, visible),
+   );
    const { environments: workspaceEnvironments, state: catalogState } = useWorkspaceState();
    const { savedConnectionsById } = useSavedRemoteConnections();
-   const navigation = useNavigation();
-@@ -96,6 +93,7 @@ export function HomeRouteScreen() {
+@@ -95,6 +95,7 @@ export function HomeRouteScreen() {
      moveThread,
      renameThread,
      regenerateThreadTitle,
@@ -74,7 +71,7 @@ index f1b163461b..9c63a8a832 100644
      unsettleThread,
    } = useThreadListActions();
    const pendingTasks = usePendingNewTasks();
-@@ -205,6 +203,7 @@ export function HomeRouteScreen() {
+@@ -204,6 +205,7 @@ export function HomeRouteScreen() {
            onMoveThread={moveThread}
            onRenameThread={renameThread}
            onRegenerateThreadTitle={regenerateThreadTitle}
@@ -384,7 +381,7 @@ index 3893569c68..2083a3db31 100644
  }
  
 diff --git a/apps/mobile/src/features/threads/ThreadNavigationSidebar.tsx b/apps/mobile/src/features/threads/ThreadNavigationSidebar.tsx
-index 3d0253e2d3..378b1301b6 100644
+index 6d724ac3b0..fb09eb903e 100644
 --- a/apps/mobile/src/features/threads/ThreadNavigationSidebar.tsx
 +++ b/apps/mobile/src/features/threads/ThreadNavigationSidebar.tsx
 @@ -17,7 +17,8 @@ import { threadSearchMatchKey } from "@t3tools/client-runtime/state/thread-searc
@@ -412,7 +409,7 @@ index 3d0253e2d3..378b1301b6 100644
  import { useThreadListNow } from "./use-thread-list-now";
  import { usePendingThreadOrder } from "../../state/thread-order";
  import { threadListEnvironmentsAtom } from "../../state/presentation";
-@@ -50,6 +54,7 @@ import { useFabScroll } from "../home/FabScrollContext";
+@@ -54,6 +58,7 @@ import { useFabScroll } from "../home/FabScrollContext";
  import { WorkspaceListHeader } from "../layout/workspace/WorkspaceListHeader";
  import { WorkspaceSidebarColumn } from "../layout/workspace/WorkspaceSidebarColumn";
  import {
@@ -420,7 +417,7 @@ index 3d0253e2d3..378b1301b6 100644
    ThreadListV2PendingRow,
    ThreadListV2Row,
    ThreadListV2SettledShelfHeader,
-@@ -62,10 +67,12 @@ import type { ThreadPrPresentation } from "../../state/thread-pr-presentation";
+@@ -66,10 +71,12 @@ import type { ThreadPrPresentation } from "../../state/thread-pr-presentation";
  import { ThreadPrDemandProvider } from "../../state/thread-pr-demand";
  import {
    isThreadListV2ListItem,
@@ -433,7 +430,7 @@ index 3d0253e2d3..378b1301b6 100644
  } from "./threadListV2";
  import { useSelectWorkspaceDetail } from "../layout/workspace/useSelectWorkspaceDetail";
  import { NativeScrollView } from "../../native/NativeScrollViewMarker";
-@@ -77,6 +84,7 @@ type SidebarListItem =
+@@ -81,6 +88,7 @@ type SidebarListItem =
        readonly key: string;
        readonly hiddenCount: number;
        readonly state?: "loading" | "failed";
@@ -441,7 +438,7 @@ index 3d0253e2d3..378b1301b6 100644
      };
  
  interface ThreadNavigationSidebarProps {
-@@ -116,7 +124,16 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -120,7 +128,16 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
    const insets = useSafeAreaInsets();
    const { fabClearance, fabSize } = useAndroidControlSizing();
    const projects = useProjects();
@@ -459,15 +456,15 @@ index 3d0253e2d3..378b1301b6 100644
    const { environments: workspaceEnvironments, state: catalogState } = useWorkspaceState();
    const { savedConnectionsById } = useSavedRemoteConnections();
    const openSwipeableRef = useRef<SwipeableMethods | null>(null);
-@@ -134,6 +151,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -138,6 +155,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
      moveThread,
      renameThread,
      regenerateThreadTitle,
 +    makeMainThread,
    } = useThreadListActions();
    const pendingTasks = usePendingNewTasks();
-   const activeNewTask = useActiveNewTask();
-@@ -238,6 +256,11 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+   const launchingThreads = useLaunchingThreads(threads);
+@@ -243,6 +261,11 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
      snoozedShelfExpanded,
      workingShelfEnabled,
      workingShelfExpanded,
@@ -479,7 +476,7 @@ index 3d0253e2d3..378b1301b6 100644
      toggleSettledShelf,
      toggleSnoozedShelf,
      toggleWorkingShelf,
-@@ -258,11 +281,28 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -263,11 +286,28 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
    } = listEnvironments;
    const resolveProviderInstance = useThreadRowProviderInstanceResolver(providersByEnvironmentId);
    const pendingOrder = usePendingThreadOrder();
@@ -506,9 +503,9 @@ index 3d0253e2d3..378b1301b6 100644
      olderSettledShelf,
 +    subthreadKeys: threadListSubthreadKeys,
    } = useThreadListV2({
-     threads,
+     threads: launchingThreads,
      pendingTasks,
-@@ -283,6 +323,8 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -288,6 +328,8 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
      workingShelfExpanded,
      snoozedShelfExpanded,
      settledShelfExpanded,
@@ -517,7 +514,7 @@ index 3d0253e2d3..378b1301b6 100644
      selectedThreadKey: props.selectedThreadKey ?? null,
    });
    const listItems: readonly SidebarListItem[] =
-@@ -293,6 +335,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -298,6 +340,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
              type: "v2-show-more",
              key: "v2-show-more",
              hiddenCount: threadListV2Layout.hiddenSettledCount,
@@ -525,7 +522,7 @@ index 3d0253e2d3..378b1301b6 100644
              ...(olderSettledShelf.loading
                ? { state: "loading" as const }
                : olderSettledShelf.failed
-@@ -346,7 +389,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -351,7 +394,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
    // Recycle equality needs project/search data for titles and favicons; keep the minute clock on items to limit updates.
    const listExtraData = {
      activeNewTask,
@@ -534,7 +531,7 @@ index 3d0253e2d3..378b1301b6 100644
      projectByKey,
      projectTitleByProjectKey,
      savedConnectionsById,
-@@ -360,7 +403,11 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -365,7 +408,11 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
        return threadListV2ListItemsAreEqual(previous, item);
      }
      if (previous.type === "v2-show-more" && item.type === "v2-show-more") {
@@ -547,7 +544,7 @@ index 3d0253e2d3..378b1301b6 100644
      }
      return false;
    };
-@@ -401,6 +448,29 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -406,6 +453,29 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
            />
          );
        }
@@ -577,7 +574,7 @@ index 3d0253e2d3..378b1301b6 100644
        case "v2-thread": {
          const thread = item.item.thread;
          const scopeKey = scopedProjectKey(thread.environmentId, thread.projectId);
-@@ -441,8 +511,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -446,8 +516,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
              searchQuery={threadSearch.query}
              pane="sidebar"
              selected={
@@ -587,7 +584,7 @@ index 3d0253e2d3..378b1301b6 100644
              }
              fullSwipeWidth={props.width - 20}
              onSelectThread={handleSelectThread}
-@@ -451,6 +520,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -456,6 +525,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
              onArchiveThread={archiveThread}
              onRenameThread={renameThread}
              onRegenerateThreadTitle={regenerateThreadTitle}
@@ -595,7 +592,7 @@ index 3d0253e2d3..378b1301b6 100644
              titleRegenerationSupported={titleRegenerationEnvironmentIds.has(thread.environmentId)}
              settlementSupported={settlementEnvironmentIds.has(thread.environmentId)}
              onSettleThread={settleThread}
-@@ -465,6 +535,16 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -470,6 +540,16 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
              }
              canMoveUp={item.canMoveUp}
              canMoveDown={item.canMoveDown}
@@ -612,7 +609,7 @@ index 3d0253e2d3..378b1301b6 100644
              onSnoozeThread={snoozeThread}
              onUnsnoozeThread={unsnoozeThread}
              onUnsettleThread={unsettleThread}
-@@ -513,6 +593,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -518,6 +598,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
            <ThreadListV2ShowMoreRow
              pane="sidebar"
              hiddenCount={item.hiddenCount}
@@ -1439,17 +1436,16 @@ index d724d8056e..b144d84a9e 100644
    );
  });
 diff --git a/apps/mobile/src/features/threads/threadListV2.test.ts b/apps/mobile/src/features/threads/threadListV2.test.ts
-index 786f1ce229..dc2f5d9ed4 100644
+index c848e063e2..d3c5988404 100644
 --- a/apps/mobile/src/features/threads/threadListV2.test.ts
 +++ b/apps/mobile/src/features/threads/threadListV2.test.ts
-@@ -41,11 +41,14 @@ import {
+@@ -41,10 +41,13 @@ import {
    resolveThreadListV2SwipeActions,
    resolveThreadListV2SnoozePresets,
    resolveThreadListV2Status,
 +  resolveThreadListV2RowKey,
 +  isThreadListV2ListItem,
    resolveThreadListV2WokeAt,
-   sortThreadsForListV2,
    threadListV2ListItemsAreEqual,
    threadHasUnseenCompletion,
    type ThreadListV2ListItem,
@@ -1457,7 +1453,7 @@ index 786f1ce229..dc2f5d9ed4 100644
  } from "./threadListV2";
  
  const environmentId = EnvironmentId.make("environment-1");
-@@ -1826,3 +1829,564 @@ describe("queued messages keep a settled thread active", () => {
+@@ -1814,3 +1817,564 @@ describe("queued messages keep a settled thread active", () => {
      expect(layout.settledCount).toBe(1);
    });
  });
@@ -2023,7 +2019,7 @@ index 786f1ce229..dc2f5d9ed4 100644
 +  });
 +});
 diff --git a/apps/mobile/src/features/threads/threadListV2.ts b/apps/mobile/src/features/threads/threadListV2.ts
-index 3245c1c281..c84deb7a14 100644
+index 7854f9d7fd..25ee8d11e7 100644
 --- a/apps/mobile/src/features/threads/threadListV2.ts
 +++ b/apps/mobile/src/features/threads/threadListV2.ts
 @@ -16,6 +16,36 @@ import {
@@ -2063,7 +2059,7 @@ index 3245c1c281..c84deb7a14 100644
  import {
    createInboxReturnTracker,
    isThreadWorking,
-@@ -313,6 +343,193 @@ export function sortThreadsForListV2<
+@@ -313,6 +343,193 @@ function sortThreadsForListV2<
    return sortActiveThreadsByOrderKey(threads);
  }
  
@@ -3885,10 +3881,10 @@ index 59570d8e8c..c36543a6f6 100644
 +// the mobile thread list nest threads the same way.
 +export * from "@t3tools/client-runtime/state/thread-families";
 diff --git a/packages/client-runtime/package.json b/packages/client-runtime/package.json
-index 3be6ab7a94..a8779d890a 100644
+index fa927e5016..7caede9b05 100644
 --- a/packages/client-runtime/package.json
 +++ b/packages/client-runtime/package.json
-@@ -347,6 +347,10 @@
+@@ -351,6 +351,10 @@
        "types": "./src/state/threadSort.ts",
        "default": "./src/state/threadSort.ts"
      },
