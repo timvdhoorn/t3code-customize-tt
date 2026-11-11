@@ -10,25 +10,25 @@ The PR's last commit also ends the run's open root items, such as the
 t3_worktree_handoff call itself, as interrupted when the planned detach
 closes ingestion.
 ---
- .../server/src/mcp/WorktreeMcpService.test.ts | 141 +++++-
+ .../server/src/mcp/WorktreeMcpService.test.ts | 135 +++++-
  apps/server/src/mcp/WorktreeMcpService.ts     |  46 +-
  .../src/orchestration-v2/EffectOutbox.ts      |   1 +
  .../src/orchestration-v2/EffectWorker.ts      |   1 +
- .../src/orchestration-v2/Orchestrator.ts      |  69 ++-
+ .../src/orchestration-v2/Orchestrator.ts      |  61 ++-
  .../ProviderSessionManager.test.ts            |  20 +-
  .../ProviderSessionManager.ts                 |  82 ++--
- .../RunExecutionService.test.ts               | 410 ++++++++++------
- .../orchestration-v2/RunExecutionService.ts   | 119 ++++-
+ .../RunExecutionService.test.ts               | 424 ++++++++++------
+ .../orchestration-v2/RunExecutionService.ts   | 116 ++++-
  .../SelectionRestart.integration.test.ts      | 456 +++++++++++++++++-
  .../testkit/ProviderReplayHarness.ts          |   3 +-
  docs/internals/overview.md                    |   4 +
- docs/user/composer.md                         |   4 +
+ docs/user/composer.md                         |   3 +
  packages/contracts/src/orchestrationV2.ts     |   4 +
  .../src/server/ProviderAdapter.ts             |  16 +-
- 15 files changed, 1129 insertions(+), 247 deletions(-)
+ 15 files changed, 1127 insertions(+), 245 deletions(-)
 
 diff --git a/apps/server/src/mcp/WorktreeMcpService.test.ts b/apps/server/src/mcp/WorktreeMcpService.test.ts
-index 90cf3c7f84..753f7dbbb5 100644
+index 90cf3c7f84..269a84b3bd 100644
 --- a/apps/server/src/mcp/WorktreeMcpService.test.ts
 +++ b/apps/server/src/mcp/WorktreeMcpService.test.ts
 @@ -4,7 +4,10 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -149,7 +149,7 @@ index 90cf3c7f84..753f7dbbb5 100644
    const getById = vi.fn((id: ProjectId) =>
      options.projectReadFails
        ? (Effect.fail("simulated project read failure") as never)
-@@ -398,19 +428,68 @@ const runStatus = (harness: ReturnType<typeof makeHarness>) =>
+@@ -398,19 +428,67 @@ const runStatus = (harness: ReturnType<typeof makeHarness>) =>
  const decodeHandoffInput = Schema.decodeUnknownEffect(WorktreeMcpHandoffInput);
  
  describe("t3_worktree_handoff", () => {
@@ -178,7 +178,6 @@ index 90cf3c7f84..753f7dbbb5 100644
 +        }),
 +      );
 +      expect(harness.sendToThread).not.toHaveBeenCalled();
-+      // The continuation must be durably queued before anything slower runs.
 +      expect(harness.dispatch.mock.invocationCallOrder[0]).toBeLessThan(
 +        harness.runForThread.mock.invocationCallOrder[0]!,
 +      );
@@ -224,17 +223,7 @@ index 90cf3c7f84..753f7dbbb5 100644
    it.effect("does not queue a continuation when the thread update fails", () => {
      const harness = makeHarness({ dispatchFails: true });
      return Effect.gen(function* () {
-@@ -623,6 +702,9 @@ describe("t3_worktree_handoff", () => {
-       const gate = yield* Deferred.make<void>();
-       const harness = makeHarness({ dispatchGate: Deferred.await(gate) });
- 
-+      // Interrupt arrives while the metadata dispatch is in flight; the
-+      // binding-plus-continuation section must run to completion anyway so the
-+      // atomic binding and continuation commit survives the pending interruption.
-       const fiber = yield* Effect.forkChild(
-         runHandoff(harness, {
-           branch: "feature/interrupted",
-@@ -637,7 +719,14 @@ describe("t3_worktree_handoff", () => {
+@@ -637,7 +715,12 @@ describe("t3_worktree_handoff", () => {
        yield* Fiber.join(interruption);
  
        expect(harness.dispatch).toHaveBeenCalledTimes(1);
@@ -245,8 +234,6 @@ index 90cf3c7f84..753f7dbbb5 100644
 +        }),
 +      );
 +      expect(harness.sendToThread).not.toHaveBeenCalled();
-+      // The setup script must also survive the pending interrupt; otherwise
-+      // the continuation run starts in a worktree that was never set up.
        expect(harness.runForThread).toHaveBeenCalledTimes(1);
      }),
    );
@@ -353,10 +340,10 @@ index c5b5ea9b38..443e58615f 100644
                    ? {}
                    : { revokeMcpCredential: effect.request.revokeMcpCredential }),
 diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
-index 3607e72722..f53bd9e43b 100644
+index 3157f55cac..4705781a3b 100644
 --- a/apps/server/src/orchestration-v2/Orchestrator.ts
 +++ b/apps/server/src/orchestration-v2/Orchestrator.ts
-@@ -3570,6 +3570,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -3572,6 +3572,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
          cause: `Thread ${command.threadId} branch changed before the metadata update could be applied.`,
        });
      }
@@ -383,7 +370,7 @@ index 3607e72722..f53bd9e43b 100644
      if (command.type === "thread.metadata.update" && command.expectedEmpty === true) {
        const records = yield* projectionStore
          .getThreadRecords(command.threadId, ["runs"])
-@@ -4618,6 +4638,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -4621,6 +4641,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                            ? "Runtime mode changed."
                            : "Provider or model selection changed.",
                  // Terminal detaches revoke MCP credentials; reattachments need other detach reasons to preserve them.
@@ -393,7 +380,7 @@ index 3607e72722..f53bd9e43b 100644
                  ...(command.type === "thread.archive" ? { revokeMcpCredential: true } : {}),
                },
              } satisfies PendingOrchestrationEffectV2;
-@@ -5847,6 +5870,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -5850,6 +5873,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
      command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
      effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
@@ -401,23 +388,15 @@ index 3607e72722..f53bd9e43b 100644
    ) {
      let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
      if (command.manualContinuationOfRunId !== undefined) {
-@@ -5917,10 +5941,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
-       const source = projection.runs.find((run) => run.id === command.restartContinuationOfRunId);
+@@ -5921,6 +5945,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
        if (
          !source ||
--        !(
--          isRestartContinuationSource(source, projection.providerTurns) ||
--          continuationFailedBeforePrompt(source, projection.providerTurns)
--        ) ||
-+        (!(source.id === worktreeContinuationOfRunId && isActiveRun(source)) &&
-+          !(
-+            isRestartContinuationSource(source, projection.providerTurns) ||
-+            continuationFailedBeforePrompt(source, projection.providerTurns)
-+          )) ||
-         projection.thread.archivedAt !== null ||
-         projection.thread.deletedAt !== null ||
-         projection.thread.providerInstanceId !== source.providerInstanceId ||
-@@ -5933,6 +5958,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+         !(
++          (source.id === worktreeContinuationOfRunId && isActiveRun(source)) ||
+           isRestartContinuationSource(source, projection.providerTurns) ||
+           continuationFailedBeforePrompt(source, projection.providerTurns)
+         ) ||
+@@ -5936,6 +5961,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
          ) ||
          (yield* stopReachedRun(command, command.threadId, source.id))
        ) {
@@ -431,7 +410,7 @@ index 3607e72722..f53bd9e43b 100644
          // Preserve the current row so stale automatic deliveries receive an
          // accepted receipt without changing work or repeatedly retrying.
          yield* emit(
-@@ -13625,7 +13657,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -13594,7 +13626,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
        case "thread.active.reorder":
        case "thread.tag.set":
        case "thread.mark-unread":
@@ -439,7 +418,7 @@ index 3607e72722..f53bd9e43b 100644
        case "thread.pull-request.link":
        case "thread.pull-request.unlink":
        case "thread.pull-request-link.sync":
-@@ -13638,6 +13669,34 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -13607,6 +13638,34 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
        case "provider.switch":
          yield* dispatchThreadMutation(command, events, effects);
          break;
@@ -753,7 +732,7 @@ index 0fb31e81a0..a997404928 100644
                detached.value.attachedThreadIds.size === 0 &&
                !detached.value.supportsMultipleProviderThreads
 diff --git a/apps/server/src/orchestration-v2/RunExecutionService.test.ts b/apps/server/src/orchestration-v2/RunExecutionService.test.ts
-index e25b4c7ab5..1dd594f17a 100644
+index e25b4c7ab5..e532e99374 100644
 --- a/apps/server/src/orchestration-v2/RunExecutionService.test.ts
 +++ b/apps/server/src/orchestration-v2/RunExecutionService.test.ts
 @@ -2266,98 +2266,99 @@ it.effect(
@@ -944,7 +923,7 @@ index e25b4c7ab5..1dd594f17a 100644
              startTurn: () => Effect.void,
            } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
            run: {
-@@ -2715,6 +2716,126 @@ it.effect("does not refresh pull requests for auxiliary or stale provider termin
+@@ -2715,6 +2716,127 @@ it.effect("does not refresh pull requests for auxiliary or stale provider termin
    }),
  );
  
@@ -957,6 +936,7 @@ index e25b4c7ab5..1dd594f17a 100644
 +    const { ingested, observed } = yield* captureRootRunTermination({
 +      key,
 +      shouldFinalizeRun: () => Effect.succeed(true),
++      readAhead: true,
 +      events: (ids) =>
 +        Stream.concat(
 +          Stream.fromIterable([
@@ -1071,7 +1051,16 @@ index e25b4c7ab5..1dd594f17a 100644
  it.effect("refreshes pull requests after a provider stream exits with an error", () =>
    Effect.gen(function* () {
      const { written, observed } = yield* captureRootRunTermination({
-@@ -3219,6 +3340,7 @@ function captureRootRunTermination(input: {
+@@ -3206,6 +3328,8 @@ function captureRootRunTermination(input: {
+   readonly afterStart?: (
+     closed: Deferred.Deferred<void>,
+   ) => Effect.Effect<void, never, PreviewAgentActivity.PreviewAgentActivity>;
++  // Pull the whole provider stream before processing, as the commit batcher may read ahead.
++  readonly readAhead?: boolean;
+ }) {
+   return Effect.gen(function* () {
+     const ids = backgroundScenarioIds(input.key);
+@@ -3219,6 +3343,7 @@ function captureRootRunTermination(input: {
      });
      const writtenItems = yield* Ref.make<ReadonlyArray<OrchestrationV2TurnItem>>([]);
      const finalEvents = yield* Ref.make<ReadonlyArray<OrchestrationV2DomainEvent>>([]);
@@ -1079,7 +1068,25 @@ index e25b4c7ab5..1dd594f17a 100644
      const observed = yield* Ref.make<ReadonlyArray<string>>([]);
      const submittedEffects = yield* Ref.make<ReadonlyArray<PendingOrchestrationEffectV2>>([]);
      const committedEffects = yield* Ref.make<ReadonlyArray<PendingOrchestrationEffectV2>>([]);
-@@ -3280,7 +3402,10 @@ function captureRootRunTermination(input: {
+@@ -3246,6 +3371,17 @@ function captureRootRunTermination(input: {
+           Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
+           layerTurnItemPositionsTest,
+           mockEventSink({
++            ...(input.readAhead
++              ? {
++                  consumeProviderEvents: (source, process, after) =>
++                    Effect.gen(function* () {
++                      for (const event of yield* Stream.runCollect(source)) {
++                        yield* process(event);
++                        if (yield* after) return;
++                      }
++                    }),
++                }
++              : {}),
+             write: (payload) =>
+               Effect.gen(function* () {
+                 for (const event of payload.events) {
+@@ -3280,7 +3416,10 @@ function captureRootRunTermination(input: {
            }),
            IdAllocator.layer,
            Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
@@ -1091,7 +1098,7 @@ index e25b4c7ab5..1dd594f17a 100644
            }),
            ServerSettings.layerTest(),
            Layer.succeed(RunFinalizationService.RunFinalizationObserver, {
-@@ -3303,37 +3428,38 @@ function captureRootRunTermination(input: {
+@@ -3303,37 +3442,38 @@ function captureRootRunTermination(input: {
          providerSessionId: ProviderSessionId.make(`session:${input.key}`),
          session: {
            events: Stream.empty,
@@ -1160,7 +1167,7 @@ index e25b4c7ab5..1dd594f17a 100644
            startTurn: input.startTurn ?? (() => Effect.void),
            interruptTurn: input.interruptTurn ?? (() => Effect.void),
            hasPendingBackgroundWorkForThread: input.hasPendingBackgroundWorkForThread,
-@@ -3409,6 +3535,7 @@ function captureRootRunTermination(input: {
+@@ -3409,6 +3549,7 @@ function captureRootRunTermination(input: {
        previewActivityEnded,
        written: yield* Ref.get(writtenItems),
        finalEvents: yield* Ref.get(finalEvents),
@@ -1168,7 +1175,7 @@ index e25b4c7ab5..1dd594f17a 100644
        observed: yield* Ref.get(observed),
        submittedEffects: yield* Ref.get(submittedEffects),
        committedEffects: yield* Ref.get(committedEffects),
-@@ -3484,7 +3611,7 @@ function childBackgroundTurnItemEvent(
+@@ -3484,7 +3625,7 @@ function childBackgroundTurnItemEvent(
  function backgroundTurnItemEvent(
    ids: BackgroundScenarioIds,
    type: "command_execution" | "dynamic_tool" | "subagent",
@@ -1177,7 +1184,7 @@ index e25b4c7ab5..1dd594f17a 100644
    ordinal: number,
    itemId?: TurnItemId,
  ): ProviderAdapter.ProviderAdapterV2Event {
-@@ -3855,27 +3982,28 @@ function runBackgroundItemScenario(
+@@ -3855,27 +3996,28 @@ function runBackgroundItemScenario(
            ...(options?.hasPendingBackgroundWorkForThread === undefined
              ? {}
              : { hasPendingBackgroundWorkForThread: options.hasPendingBackgroundWorkForThread }),
@@ -1228,7 +1235,7 @@ index e25b4c7ab5..1dd594f17a 100644
          } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
          run: {
 diff --git a/apps/server/src/orchestration-v2/RunExecutionService.ts b/apps/server/src/orchestration-v2/RunExecutionService.ts
-index 07811415fa..55cdb2fa17 100644
+index e981ab7362..91782c3d89 100644
 --- a/apps/server/src/orchestration-v2/RunExecutionService.ts
 +++ b/apps/server/src/orchestration-v2/RunExecutionService.ts
 @@ -5,6 +5,8 @@ import {
@@ -1240,7 +1247,7 @@ index 07811415fa..55cdb2fa17 100644
    type NodeId,
    type OrchestrationV2AppThread,
    type OrchestrationV2CheckpointScope,
-@@ -640,6 +642,7 @@ export const layer: Layer.Layer<
+@@ -642,6 +644,7 @@ export const layer: Layer.Layer<
          // Root turn snapshot written with the run when T3 ends the run itself.
          readonly abandonedProviderTurn?: OrchestrationV2ProviderTurn;
          readonly terminal: ProviderTerminalEvent;
@@ -1248,7 +1255,7 @@ index 07811415fa..55cdb2fa17 100644
          readonly completedAt?: DateTime.Utc;
          readonly failureItemPersisted: boolean;
          readonly refreshAfterTurn: Effect.Effect<void>;
-@@ -808,6 +811,9 @@ export const layer: Layer.Layer<
+@@ -810,6 +813,9 @@ export const layer: Layer.Layer<
                        providerThread: input.providerThread,
                        reason,
                        completedAt,
@@ -1258,7 +1265,7 @@ index 07811415fa..55cdb2fa17 100644
                      }),
                    },
                  ]
-@@ -1032,6 +1038,9 @@ export const layer: Layer.Layer<
+@@ -1034,6 +1040,9 @@ export const layer: Layer.Layer<
              context: { ...analyticsContext, segment: "initial" },
            });
          }
@@ -1268,7 +1275,7 @@ index 07811415fa..55cdb2fa17 100644
          const routeIdentity: ProviderEventRouteIdentity = {
            threadId: input.run.threadId,
            runId: input.run.id,
-@@ -1041,7 +1050,7 @@ export const layer: Layer.Layer<
+@@ -1043,7 +1052,7 @@ export const layer: Layer.Layer<
          const eventSubscription =
            input.session.subscribeEvents === undefined
              ? { events: input.session.events, close: Effect.void }
@@ -1277,7 +1284,7 @@ index 07811415fa..55cdb2fa17 100644
          const inheritedBackgroundTurnItems = yield* (
            input.loadInheritedBackgroundTurnItems?.() ?? Effect.succeed([])
          ).pipe(
-@@ -1073,6 +1082,7 @@ export const layer: Layer.Layer<
+@@ -1075,6 +1084,7 @@ export const layer: Layer.Layer<
          );
          const rootTerminalSeen = yield* Ref.make(false);
          const rootRunFinalized = yield* Ref.make(false);
@@ -1285,7 +1292,7 @@ index 07811415fa..55cdb2fa17 100644
          const providerThreadOwnerLost = yield* Ref.make(false);
          const pendingBackgroundProviderTurns = new Set<ProviderTurnId>();
          const activeChildProviderTurns = yield* Ref.make<ReadonlySet<ProviderTurnId>>(new Set());
-@@ -1095,6 +1105,7 @@ export const layer: Layer.Layer<
+@@ -1097,6 +1107,7 @@ export const layer: Layer.Layer<
            }
            const providerThread = yield* Ref.get(latestProviderThread);
            const openSubagents = yield* Ref.get(openRunOwnedSubagents);
@@ -1293,7 +1300,7 @@ index 07811415fa..55cdb2fa17 100644
            yield* writeFinalRunEvents({
              run: input.run,
              rootNode: input.rootNode,
-@@ -1122,6 +1133,7 @@ export const layer: Layer.Layer<
+@@ -1124,6 +1135,7 @@ export const layer: Layer.Layer<
                : { loadRunInterruptReason: input.loadRunInterruptReason }),
              openRunOwnedSubagents: openSubagents,
              terminal,
@@ -1301,7 +1308,7 @@ index 07811415fa..55cdb2fa17 100644
              failureItemPersisted: terminal.status === "failed",
              refreshAfterTurn,
            }).pipe(
-@@ -1546,6 +1558,15 @@ export const layer: Layer.Layer<
+@@ -1548,6 +1560,15 @@ export const layer: Layer.Layer<
            ) {
              yield* Ref.set(latestRootProviderTurn, event.providerTurn);
            }
@@ -1317,7 +1324,7 @@ index 07811415fa..55cdb2fa17 100644
            let storedEventCount = 0;
            const deliveredEvent = assistantStreaming.filter(
              event,
-@@ -1579,6 +1600,15 @@ export const layer: Layer.Layer<
+@@ -1581,6 +1602,15 @@ export const layer: Layer.Layer<
              yield* Ref.update(latestTurnItemOrdinal, (current) =>
                Math.max(current, event.turnItem.ordinal),
              );
@@ -1333,100 +1340,103 @@ index 07811415fa..55cdb2fa17 100644
            }
            if (event.type === "turn.terminal") {
              yield* Ref.set(terminalEvent, event);
-@@ -1595,9 +1625,91 @@ export const layer: Layer.Layer<
+@@ -1597,17 +1627,92 @@ export const layer: Layer.Layer<
            yield* trackChildLifecycle(event, deliveredEvent !== null);
            yield* scheduleIdleFlush;
          });
-+        const providerEvents = eventSubscription.events.pipe(
-+          Stream.catchTag("ProviderAdapterSessionDetached", (detached) =>
-+            detached.providerSessionId !== input.providerSessionId ||
-+            detached.threadId !== input.run.threadId
-+              ? Stream.fail(detached)
-+              : Stream.unwrap(
-+                  Effect.gen(function* () {
-+                    const rootFinalized = yield* Ref.get(rootRunFinalized);
-+                    yield* Ref.set(
-+                      interruptionMessage,
-+                      "Run interrupted because the workspace changed",
-+                    );
-+                    const routing = yield* Ref.get(eventRouting);
-+                    const providerTurn = yield* Ref.get(latestRootProviderTurn);
-+                    const completedAt = yield* DateTime.now;
-+                    const terminal = {
-+                      type: "turn.terminal",
-+                      driver: input.providerThread.driver,
-+                      providerThreadId: input.providerThread.id,
-+                      providerTurnId:
-+                        routing.rootProviderTurnId ??
-+                        input.attempt.providerTurnId ??
-+                        idAllocator.derive.providerTurn({
-+                          driver: input.providerThread.driver,
-+                          nativeTurnId: `detached:${input.attempt.id}`,
-+                        }),
-+                      runOrdinal: input.run.ordinal,
-+                      status: "interrupted",
-+                      failure: null,
-+                      threadDisposition: "reusable",
-+                    } satisfies ProviderTerminalEvent;
-+                    // Before the provider's first turn event, the planned
-+                    // detach supplies this run's root identity for routing.
-+                    yield* Ref.update(eventRouting, (state) =>
-+                      state.rootProviderTurnId === null
-+                        ? {
-+                            ...state,
-+                            rootProviderTurnId: terminal.providerTurnId,
-+                            ownedProviderTurns: new Map(state.ownedProviderTurns).set(
-+                              terminal.providerTurnId,
-+                              input.providerThread.id,
-+                            ),
-+                          }
-+                        : state,
-+                    );
-+                    return Stream.fromIterable<ProviderAdapter.ProviderAdapterV2Event>([
-+                      ...[...openRootTurnItems.values()].map((turnItem) => ({
-+                        type: "turn_item.updated" as const,
-+                        driver: input.providerThread.driver,
-+                        turnItem: {
-+                          ...turnItem,
-+                          ...("streaming" in turnItem ? { streaming: false } : {}),
-+                          status: "interrupted" as const,
-+                          completedAt,
-+                          updatedAt: completedAt,
-+                        },
-+                      })),
-+                      ...[...streamingRootMessages.values()].map((message) => ({
-+                        type: "message.updated" as const,
-+                        driver: input.providerThread.driver,
-+                        message: { ...message, streaming: false, updatedAt: completedAt },
-+                      })),
-+                      ...(!rootFinalized &&
-+                      (providerTurn?.status === "running" || providerTurn?.status === "pending")
-+                        ? [
-+                            {
-+                              type: "provider_turn.updated" as const,
-+                              driver: input.providerThread.driver,
-+                              providerTurn: {
-+                                ...providerTurn,
-+                                status: "interrupted" as const,
-+                                completedAt,
-+                              },
-+                            },
-+                          ]
-+                        : []),
-+                      ...(!rootFinalized ? [terminal] : []),
-+                    ]);
-+                  }),
-+                ),
-+          ),
-+        );
++        // A planned detach ends the stream. It settles in ingestion order, after buffered events.
++        const settleDetachedRun = Effect.fnUntraced(function* () {
++          const rootFinalized = yield* Ref.get(rootRunFinalized);
++          yield* Ref.set(interruptionMessage, "Run interrupted because the workspace changed");
++          const routing = yield* Ref.get(eventRouting);
++          const providerTurn = yield* Ref.get(latestRootProviderTurn);
++          const completedAt = yield* DateTime.now;
++          const terminal = {
++            type: "turn.terminal",
++            driver: input.providerThread.driver,
++            providerThreadId: input.providerThread.id,
++            providerTurnId:
++              routing.rootProviderTurnId ??
++              input.attempt.providerTurnId ??
++              idAllocator.derive.providerTurn({
++                driver: input.providerThread.driver,
++                nativeTurnId: `detached:${input.attempt.id}`,
++              }),
++            runOrdinal: input.run.ordinal,
++            status: "interrupted",
++            failure: null,
++            threadDisposition: "reusable",
++          } satisfies ProviderTerminalEvent;
++          // Before the provider's first turn event, the detach supplies the root identity for routing.
++          yield* Ref.update(eventRouting, (state) =>
++            state.rootProviderTurnId === null
++              ? {
++                  ...state,
++                  rootProviderTurnId: terminal.providerTurnId,
++                  ownedProviderTurns: new Map(state.ownedProviderTurns).set(
++                    terminal.providerTurnId,
++                    input.providerThread.id,
++                  ),
++                }
++              : state,
++          );
++          const settlement: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event> = [
++            ...[...openRootTurnItems.values()].map((turnItem) => ({
++              type: "turn_item.updated" as const,
++              driver: input.providerThread.driver,
++              turnItem: {
++                ...turnItem,
++                ...("streaming" in turnItem ? { streaming: false } : {}),
++                status: "interrupted" as const,
++                completedAt,
++                updatedAt: completedAt,
++              },
++            })),
++            ...[...streamingRootMessages.values()].map((message) => ({
++              type: "message.updated" as const,
++              driver: input.providerThread.driver,
++              message: { ...message, streaming: false, updatedAt: completedAt },
++            })),
++            ...(!rootFinalized &&
++            (providerTurn?.status === "running" || providerTurn?.status === "pending")
++              ? [
++                  {
++                    type: "provider_turn.updated" as const,
++                    driver: input.providerThread.driver,
++                    providerTurn: { ...providerTurn, status: "interrupted" as const, completedAt },
++                  },
++                ]
++              : []),
++            ...(!rootFinalized ? [terminal] : []),
++          ];
++          for (const event of settlement) yield* ingestEvent(yield* routeEvent(event));
++        });
          const providerEventFiber = yield* eventSink
            .consumeProviderEvents(
--            eventSubscription.events.pipe(
-+            providerEvents.pipe(
+             eventSubscription.events.pipe(
++              Stream.catchTag("ProviderAdapterSessionDetached", (detached) =>
++                detached.providerSessionId !== input.providerSessionId ||
++                detached.threadId !== input.run.threadId
++                  ? Stream.fail(detached)
++                  : Stream.succeed({ type: "workspace_detached" as const }),
++              ),
                Stream.merge(Stream.fromQueue(idleFlushTicks), { haltStrategy: "left" }),
              ),
              (event) =>
-@@ -1903,6 +2015,7 @@ export function makeInterruptResultTurnItem(input: {
+               event.type === "idle_flush"
+                 ? flushIdleAssistantText(event.at)
+-                : Effect.gen(function* () {
+-                    yield* ingestEvent(yield* routeEvent(event));
+-                  }),
++                : event.type === "workspace_detached"
++                  ? settleDetachedRun()
++                  : Effect.gen(function* () {
++                      yield* ingestEvent(yield* routeEvent(event));
++                    }),
+             Effect.gen(function* () {
+               if (yield* agentTurnsSettled) yield* endPreviewActivity;
+               return yield* shouldStopProviderEventIngestion;
+@@ -1905,6 +2010,7 @@ export function makeInterruptResultTurnItem(input: {
    readonly providerThread: OrchestrationV2ProviderThread;
    readonly reason: string | undefined;
    readonly completedAt: DateTime.Utc;
@@ -1434,7 +1444,7 @@ index 07811415fa..55cdb2fa17 100644
  }): OrchestrationV2TurnItem {
    return {
      id: input.idAllocator.derive.runSignalTurnItem({
-@@ -1926,6 +2039,6 @@ export function makeInterruptResultTurnItem(input: {
+@@ -1928,6 +2034,6 @@ export function makeInterruptResultTurnItem(input: {
      completedAt: input.completedAt,
      updatedAt: input.completedAt,
      type: "run_interrupt_result",
@@ -1986,25 +1996,24 @@ index f24e3625d9..48e02d1617 100644
  command-id retries.
  [ProjectionMaintenance](../../apps/server/src/orchestration-v2/ProjectionMaintenance.ts) deletes
 diff --git a/docs/user/composer.md b/docs/user/composer.md
-index 32de36e13b..eefaa6fa4b 100644
+index df880e49c6..d816807838 100644
 --- a/docs/user/composer.md
 +++ b/docs/user/composer.md
-@@ -73,6 +73,10 @@ If your **Send shortcut** requires `Cmd+Enter` or `Ctrl+Enter`, that shortcut us
+@@ -73,6 +73,9 @@ If your **Send shortcut** requires `Cmd+Enter` or `Ctrl+Enter`, that shortcut us
  your default follow-up behavior; add **Shift** to use the opposite action. This
  applies only to multiline messages when you choose the multiline send option.
  
 +When an agent moves its thread into a worktree with a continuation message, work resumes
-+automatically in that worktree. An explicit Stop or a provider failure pauses queued messages
-+until you resume the queue; the messages stay saved.
++automatically in that worktree.
 +
  Use `Cmd+Shift+Enter` on macOS or `Ctrl+Shift+Enter` on Windows and Linux to send
  the oldest queued message as a steer. This leaves the current draft intact and
  requires an active turn that supports steering. If that shortcut sends the opposite
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
-index ed69c31140..7dc2d324fe 100644
+index c9621eeb41..0fded8db37 100644
 --- a/packages/contracts/src/orchestrationV2.ts
 +++ b/packages/contracts/src/orchestrationV2.ts
-@@ -3098,6 +3098,10 @@ export const OrchestrationV2Command = Schema.Union([
+@@ -3102,6 +3102,10 @@ export const OrchestrationV2Command = Schema.Union([
      worktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
      expectedWorktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
      expectedBranch: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
@@ -2016,10 +2025,10 @@ index ed69c31140..7dc2d324fe 100644
      expectedEmpty: Schema.optional(Schema.Boolean),
      limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecoveryUpdate)),
 diff --git a/packages/provider-core/src/server/ProviderAdapter.ts b/packages/provider-core/src/server/ProviderAdapter.ts
-index 86c11a87f4..91bc30ac66 100644
+index 0c43deb4f7..3f6ca112c4 100644
 --- a/packages/provider-core/src/server/ProviderAdapter.ts
 +++ b/packages/provider-core/src/server/ProviderAdapter.ts
-@@ -416,6 +416,15 @@ const ProviderAdapterFailureReason = Schema.Literals([
+@@ -425,6 +425,15 @@ const ProviderAdapterFailureReason = Schema.Literals([
    "attachment_unreadable",
  ]);
  export type ProviderAdapterFailureReason = typeof ProviderAdapterFailureReason.Type;
@@ -2035,7 +2044,7 @@ index 86c11a87f4..91bc30ac66 100644
  
  export class ProviderAdapterProtocolError extends Schema.TaggedError<ProviderAdapterProtocolError>()(
    "ProviderAdapterProtocolError",
-@@ -458,6 +467,7 @@ export const ProviderAdapterV2Error = Schema.Union([
+@@ -467,6 +476,7 @@ export const ProviderAdapterV2Error = Schema.Union([
    ProviderAdapterInterruptTimeoutError,
    ProviderAdapterRuntimeRequestResponseError,
    ProviderAdapterEventStreamError,
@@ -2043,7 +2052,7 @@ index 86c11a87f4..91bc30ac66 100644
    ProviderAdapterProtocolError,
    ProviderAdapterSessionStoppedError,
  ]);
-@@ -622,8 +632,10 @@ export interface ProviderAdapterV2SessionRuntime {
+@@ -631,8 +641,10 @@ export interface ProviderAdapterV2SessionRuntime {
    /** False keeps conversations alive when the provider cannot restore them after a restart. */
    readonly canResumeAfterRestart?: boolean;
    readonly events: Stream.Stream<ProviderAdapterV2Event, ProviderAdapterV2Error>;
