@@ -22,39 +22,40 @@ guide line, context-menu collapse and a summary stub.
  .../orchestration-v2/ThreadLaunchService.ts   |    8 +
  .../ThreadManagementService.test.ts           |    9 +-
  .../ThreadManagementService.ts                |    2 +
- .../ThreadSettlementService.test.ts           |  237 ++++
+ .../ThreadSettlementService.test.ts           |  237 +++
  .../ThreadSettlementService.ts                |  176 ++-
  .../src/orchestration-v2/runtimeLayer.test.ts |   85 ++
  .../Sidebar.childThreads.browser.test.tsx     |  181 +++
- .../components/Sidebar.childThreads.test.ts   |  591 ++++++++
- .../src/components/Sidebar.childThreads.tsx   | 1232 +++++++++++++++++
+ .../components/Sidebar.childThreads.test.ts   |  617 ++++++++
+ .../src/components/Sidebar.childThreads.tsx   | 1291 +++++++++++++++++
  .../src/components/Sidebar.families.test.ts   |  519 +++++++
  apps/web/src/components/Sidebar.families.ts   |  381 +++++
  apps/web/src/components/Sidebar.logic.test.ts |   45 +
  apps/web/src/components/Sidebar.logic.ts      |   58 +-
  apps/web/src/components/Sidebar.tsx           |  186 ++-
  ...hreadRelationshipsControl.browser.test.tsx |    9 +
- ...lationshipsControl.opened.browser.test.tsx |  285 ++++
- .../chat/ThreadRelationshipsControl.tsx       |  302 +++-
+ ...lationshipsControl.opened.browser.test.tsx |  373 +++++
+ .../chat/ThreadRelationshipsControl.tsx       |  338 ++++-
  .../components/sidebar/SidebarThreadRow.tsx   |   99 +-
- .../SidebarThreadRow.workers.browser.test.tsx |  409 ++++++
+ .../SidebarThreadRow.workers.browser.test.tsx |  507 +++++++
  .../web/src/components/sidebar/routeReveal.ts |   18 +-
  .../components/threadActionMenu.logic.test.ts |   33 +
- .../src/components/threadActionMenu.logic.ts  |   33 +
- apps/web/src/contextMenuFallback.ts           |   27 +
+ .../src/components/threadActionMenu.logic.ts  |   39 +
+ apps/web/src/components/ui/tooltip.tsx        |   10 +-
+ apps/web/src/contextMenuFallback.ts           |   23 +
  apps/web/src/hooks/useSidebarProjectGroups.ts |    8 +-
- apps/web/src/hooks/useThreadActionMenu.ts     |   23 +
+ apps/web/src/hooks/useThreadActionMenu.ts     |   24 +
  apps/web/src/lib/sidebarTree.ts               |   17 +-
  apps/web/src/state/openedThreads.test.ts      |  109 ++
  apps/web/src/state/openedThreads.ts           |  105 ++
- apps/web/src/state/sidebarListing.ts          |   48 +
- apps/web/src/state/subthreads.ts              |   61 +
+ apps/web/src/state/sidebarListing.ts          |   58 +
+ apps/web/src/state/subthreads.ts              |   41 +
  apps/web/src/test-fixtures.ts                 |    4 +-
  packages/client-runtime/package.json          |    4 +
  .../src/operations/commands.test.ts           |   23 +
  .../client-runtime/src/operations/commands.ts |    6 +-
- .../src/state/childThreadSummary.test.ts      |  230 +++
- .../src/state/childThreadSummary.ts           |  393 ++++++
+ .../src/state/childThreadSummary.test.ts      |  257 ++++
+ .../src/state/childThreadSummary.ts           |  432 ++++++
  packages/client-runtime/src/state/models.ts   |   23 +
  .../src/state/shell-sync.test.ts              |   21 +-
  packages/client-runtime/src/state/shell.ts    |    7 +-
@@ -64,7 +65,7 @@ guide line, context-menu collapse and a summary stub.
  packages/contracts/src/orchestrationV2.ts     |   32 +
  packages/contracts/src/orchestratorMcp.ts     |    6 +
  .../src/server/subagentProjection.ts          |    9 +-
- 55 files changed, 6277 insertions(+), 138 deletions(-)
+ 56 files changed, 6652 insertions(+), 139 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.childThreads.browser.test.tsx
  create mode 100644 apps/web/src/components/Sidebar.childThreads.test.ts
  create mode 100644 apps/web/src/components/Sidebar.childThreads.tsx
@@ -1473,10 +1474,10 @@ index 0000000000..3a924c41b5
 +);
 diff --git a/apps/web/src/components/Sidebar.childThreads.test.ts b/apps/web/src/components/Sidebar.childThreads.test.ts
 new file mode 100644
-index 0000000000..a6197b6392
+index 0000000000..9a57a4f111
 --- /dev/null
 +++ b/apps/web/src/components/Sidebar.childThreads.test.ts
-@@ -0,0 +1,591 @@
+@@ -0,0 +1,617 @@
 +import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 +import { describe, expect, it } from "vite-plus/test";
 +
@@ -1489,6 +1490,7 @@ index 0000000000..a6197b6392
 +  resolveSidebarRowThreadKey,
 +  sidebarChildRowStatusOf,
 +  sidebarThreadOpenerKeyOf,
++  subthreadMenuStateOf,
 +} from "./Sidebar.childThreads";
 +import { filterSidebarV2VisibleThreads, isSidebarV2ThreadListed } from "./Sidebar.logic";
 +import { sidebarUnderParentKeys } from "../state/sidebarListing";
@@ -2062,18 +2064,43 @@ index 0000000000..a6197b6392
 +    expect(ids(listed(new Set(["env:main"])))).toEqual(["head", "main"]);
 +    expect(sidebarThreadOpenerKeyOf(main)).toBeNull();
 +    const keys = ["env:launched", "env:main", "env:gone", "air:elsewhere"];
-+    expect(pruneSubthreadKeys(keys, all, (environmentId) => environmentId === "env")).toEqual([
-+      "env:launched",
-+      "air:elsewhere",
-+    ]);
++    expect(pruneSubthreadKeys(keys, all)).toEqual(["env:launched", "env:gone", "air:elsewhere"]);
++  });
++
++  it("keeps a subthread choice whose thread is not in the loaded list yet", () => {
++    // Older settled threads page in later, and at startup the list may still be empty.
++    const keys = ["env:launched"];
++    expect(pruneSubthreadKeys(keys, [])).toBe(keys);
++    expect(pruneSubthreadKeys(keys, [head])).toBe(keys);
++  });
++
++  it("keeps a row for a launched thread the user pinned and offers no subthread toggle", () => {
++    const pinned = {
++      ...thread("pinned", { openedBy: "head" }),
++      pinnedAt: "2026-11-01T00:00:00.000Z",
++    };
++    const threads = [...all, pinned];
++    expect(ids(threads.filter(listedAmong(threads)))).toContain("pinned");
++    expect(
++      buildSidebarDelegatedWorkers(threads, { hasRow: listedAmong(threads), isUnread: () => false })
++        .get("env:head")
++        ?.workers.map((entry) => entry.thread.id),
++    ).not.toContain("pinned");
++    expect(subthreadMenuStateOf(pinned, new Set(), () => true)).toBeNull();
++  });
++
++  it("offers no subthread toggle on a launched thread whose opener is not listed", () => {
++    expect(subthreadMenuStateOf(launched, new Set(), () => false)).toBeNull();
++    expect(subthreadMenuStateOf(launched, new Set(), () => true)).toBe("hidden");
++    expect(subthreadMenuStateOf(worker, new Set(["env:worker"]), () => false)).toBe("shown");
 +  });
 +});
 diff --git a/apps/web/src/components/Sidebar.childThreads.tsx b/apps/web/src/components/Sidebar.childThreads.tsx
 new file mode 100644
-index 0000000000..a8a615bfac
+index 0000000000..2b7b28e0a6
 --- /dev/null
 +++ b/apps/web/src/components/Sidebar.childThreads.tsx
-@@ -0,0 +1,1232 @@
+@@ -0,0 +1,1291 @@
 +// Child threads in the sidebar (patches-tt/0003). Family rules live in Sidebar.families.ts;
 +// this module holds the sidebar's state and rendering so Sidebar.tsx only calls into it.
 +import { observeResize } from "~/lib/observeResize";
@@ -2113,9 +2140,9 @@ index 0000000000..a8a615bfac
 +  EyeIcon,
 +  GitForkIcon,
 +  HammerIcon,
-+  ListPlusIcon,
++  CornerLeftUpIcon,
 +  ListChecksIcon,
-+  ListTreeIcon,
++  ListIndentIncreaseIcon,
 +  MessageCircleQuestionIcon,
 +  ShieldQuestionIcon,
 +  UserRoundIcon,
@@ -2257,13 +2284,14 @@ index 0000000000..a8a615bfac
 +/**
 + * The subthread entry of a thread's context menu: "hidden" for a worker or launched thread its
 + * opener's row counts ("Show as subthread"), "shown" for one the user shows as a subthread
-+ * ("Hide from sidebar"), else null.
++ * ("Hide subthread"), else null.
 + */
 +export function subthreadMenuStateOf(
 +  thread: EnvironmentThreadShell,
 +  subthreadKeys: ReadonlySet<string>,
++  isOpenerListed: (environmentId: string, threadId: string) => boolean,
 +): "shown" | "hidden" | null {
-+  if (!canShowAsSubthread(thread)) return null;
++  if (!canShowAsSubthread(thread, isOpenerListed)) return null;
 +  return subthreadKeys.has(threadShellKey(thread)) ? "shown" : "hidden";
 +}
 +
@@ -2566,11 +2594,9 @@ index 0000000000..a8a615bfac
 +  // Drops subthread choices for threads that are gone or became main threads.
 +  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- prunes persisted subthread keys as threads change.
 +  useEffect(() => {
-+    const pruned = pruneSubthreadKeys(storedSubthreadKeys, threads, (environmentId) =>
-+      serverConfigs.has(environmentId as EnvironmentId),
-+    );
++    const pruned = pruneSubthreadKeys(storedSubthreadKeys, threads);
 +    if (pruned !== storedSubthreadKeys) setStoredSubthreadKeys(pruned);
-+  }, [serverConfigs, setStoredSubthreadKeys, storedSubthreadKeys, threads]);
++  }, [setStoredSubthreadKeys, storedSubthreadKeys, threads]);
 +  const settledPage = pageSidebarSettledFamilies({
 +    settledThreads: input.settledThreads,
 +    limit: input.settledVisibleCount,
@@ -3070,13 +3096,24 @@ index 0000000000..a8a615bfac
 +  event.key === "Enter" || event.key === " ";
 +
 +// Stock menu item metrics (`MenuItem` in ui/menu.tsx), as the popover is a menu of workers.
++// Stock menu item metrics (`MenuItem` in ui/menu.tsx), as the popover is a menu of workers.
 +const WORKER_MENU_ITEM_CLASS_NAME =
-+  "flex min-h-8 w-full min-w-0 cursor-pointer select-none items-center gap-2 rounded-sm px-2 py-1 text-left text-sm text-foreground outline-none hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring sm:min-h-7";
++  "flex min-h-8 w-full min-w-0 cursor-pointer select-none items-center gap-2 rounded-sm px-2 py-1 text-left text-sm text-foreground outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring sm:min-h-7";
++
++// Arrow keys move between the popover's entries and "All in Lineage" (`data-worker-nav`).
++const WORKER_NAV_SELECTOR = "[data-worker-nav]";
++
++// Opens an entry's "More actions" menu from the keyboard, as a context menu opens.
++const opensEntryMenu = (event: KeyboardEvent<HTMLElement>) =>
++  event.key === "ArrowRight" ||
++  event.key === "ContextMenu" ||
++  (event.key === "F10" && event.shiftKey);
 +
 +/**
 + * One worker in the chips' popover: status, title on one line (the full title in a tooltip when
 + * it is cut off), the sidebar's compact age, and a "More actions" menu that replaces the age on
-+ * hover or focus.
++ * hover or focus. The entry is one Tab stop: its menu opens with ArrowRight, Shift+F10 or the
++ * ContextMenu key.
 + */
 +function SidebarDelegatedWorkerEntry(props: {
 +  readonly worker: SidebarDelegatedWorker;
@@ -3089,6 +3126,7 @@ index 0000000000..a8a615bfac
 +  const [titleCut, setTitleCut] = useState(false);
 +  const [menuOpen, setMenuOpen] = useState(false);
 +  const titleRef = useRef<HTMLSpanElement>(null);
++  const entryRef = useRef<HTMLButtonElement>(null);
 +  // The full title shows in a tooltip only while the entry cuts it off.
 +  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- follows the title's rendered width (ResizeObserver).
 +  useLayoutEffect(() => {
@@ -3099,22 +3137,35 @@ index 0000000000..a8a615bfac
 +    return observeResize([element], measure);
 +  }, []);
 +  return (
-+    <li className="group/worker relative">
++    <li
++      className={cn(
++        "group/worker relative rounded-sm hover:bg-accent focus-within:bg-accent",
++        menuOpen && "bg-accent",
++      )}
++    >
 +      <Tooltip disabled={!titleCut || menuOpen}>
 +        <TooltipTrigger
 +          render={
 +            <button
++              ref={entryRef}
 +              type="button"
 +              data-testid="sidebar-delegated-worker"
++              data-worker-nav=""
 +              className={cn(WORKER_MENU_ITEM_CLASS_NAME, "pe-9")}
 +              onClick={() => onAction({ type: "open", thread: worker.thread })}
++              onKeyDown={(event) => {
++                if (!opensEntryMenu(event)) return;
++                event.preventDefault();
++                event.stopPropagation();
++                setMenuOpen(true);
++              }}
 +            />
 +          }
 +        >
 +          <span
 +            role="img"
 +            aria-label={status.label}
-+            className={cn("inline-flex shrink-0 items-center", status.className)}
++            className={cn("-mx-0.5 inline-flex shrink-0 items-center", status.className)}
 +          >
 +            <SidebarStatusIcon icon={status.icon} />
 +          </span>
@@ -3132,15 +3183,23 @@ index 0000000000..a8a615bfac
 +            )}
 +          </span>
 +        </TooltipTrigger>
-+        <TooltipPopup side="right">{title}</TooltipPopup>
++        {/* Right of the popover where it fits, else left, else above: never over the next entries. */}
++        <TooltipPopup
++          side="right"
++          align="start"
++          collisionAvoidance={{ side: "flip", align: "shift", fallbackAxisSide: "start" }}
++        >
++          {title}
++        </TooltipPopup>
 +      </Tooltip>
-+      {/* Trailing slot: the age, swapped for the actions while the entry is hovered or focused. */}
++      {/* Trailing slot: the age, swapped for the actions while the entry is hovered or focused;
++          on touch the actions always show, so the age gives way. */}
 +      <div className="pointer-events-none absolute inset-y-0 right-1 flex items-center">
 +        {timestamp === null ? null : (
 +          <span
 +            data-testid="sidebar-delegated-worker-age"
 +            className={cn(
-+              "pe-1 text-xs text-muted-foreground tabular-nums group-hover/worker:opacity-0 group-focus-within/worker:opacity-0",
++              "pe-1 text-xs text-muted-foreground tabular-nums group-hover/worker:opacity-0 group-focus-within/worker:opacity-0 pointer-coarse:opacity-0",
 +              menuOpen && "opacity-0",
 +            )}
 +          >
@@ -3161,25 +3220,26 @@ index 0000000000..a8a615bfac
 +                  data-testid="sidebar-delegated-worker-actions"
 +                  size="icon-xs"
 +                  variant="ghost-muted"
++                  tabIndex={-1}
 +                />
 +              }
 +            >
 +              <EllipsisIcon aria-hidden />
 +            </MenuTrigger>
 +          </span>
-+          <MenuPopup side="bottom" align="end">
++          <MenuPopup side="bottom" align="end" finalFocus={entryRef}>
 +            <MenuItem
 +              data-testid="sidebar-delegated-worker-show-subthread"
 +              onClick={() => onAction({ type: "show-as-subthread", thread: worker.thread })}
 +            >
-+              <ListTreeIcon aria-hidden />
++              <ListIndentIncreaseIcon aria-hidden />
 +              Show as subthread
 +            </MenuItem>
 +            <MenuItem
 +              data-testid="sidebar-delegated-worker-make-main"
 +              onClick={() => onAction({ type: "make-main-thread", thread: worker.thread })}
 +            >
-+              <ListPlusIcon aria-hidden />
++              <CornerLeftUpIcon aria-hidden />
 +              Make main thread
 +            </MenuItem>
 +          </MenuPopup>
@@ -3187,6 +3247,23 @@ index 0000000000..a8a615bfac
 +      </div>
 +    </li>
 +  );
++}
++
++/** Moves focus between the popover's entries and "All in Lineage" on ArrowUp and ArrowDown. */
++function moveWorkerFocus(event: KeyboardEvent<HTMLElement>) {
++  if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
++  const items = [...event.currentTarget.querySelectorAll<HTMLElement>(WORKER_NAV_SELECTOR)];
++  if (items.length === 0) return;
++  event.preventDefault();
++  event.stopPropagation();
++  const index = items.findIndex((item) => item === document.activeElement);
++  const next =
++    index === -1
++      ? event.key === "ArrowDown"
++        ? 0
++        : items.length - 1
++      : (index + (event.key === "ArrowDown" ? 1 : items.length - 1)) % items.length;
++  items[next]?.focus();
 +}
 +
 +/**
@@ -3278,7 +3355,12 @@ index 0000000000..a8a615bfac
 +        onKeyDown={stopActivation}
 +        onContextMenu={stop}
 +      >
-+        <div ref={popupFocusRef} tabIndex={-1} className="flex flex-col p-1 outline-none">
++        <div
++          ref={popupFocusRef}
++          tabIndex={-1}
++          className="flex flex-col p-1 outline-none"
++          onKeyDown={moveWorkerFocus}
++        >
 +          <div id={popupId} className="px-2 py-1.5 text-xs font-medium text-muted-foreground">
 +            {workers.label}
 +          </div>
@@ -3291,14 +3373,18 @@ index 0000000000..a8a615bfac
 +              />
 +            ))}
 +          </ul>
-+          <div role="separator" className="-mx-1 my-1 h-px bg-border" />
++          <div role="separator" className="mx-2 my-1 h-px bg-border" />
 +          <button
 +            type="button"
 +            data-testid="sidebar-delegated-workers-lineage"
-+            className={WORKER_MENU_ITEM_CLASS_NAME}
++            data-worker-nav=""
++            className={cn(
++              WORKER_MENU_ITEM_CLASS_NAME,
++              "hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent",
++            )}
 +            onClick={() => act({ type: "open-lineage", rowThread })}
 +          >
-+            <GitForkIcon aria-hidden className="size-4 shrink-0 text-muted-foreground" />
++            <GitForkIcon aria-hidden className="-mx-0.5 size-4 shrink-0 text-muted-foreground" />
 +            All in Lineage
 +          </button>
 +        </div>
@@ -4401,7 +4487,7 @@ index ef229d1424..e40c5ca084 100644
    );
  }
 diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
-index 2b1a840393..ae3263bbd8 100644
+index 2b1a840393..3587159696 100644
 --- a/apps/web/src/components/Sidebar.tsx
 +++ b/apps/web/src/components/Sidebar.tsx
 @@ -147,12 +147,13 @@ import {
@@ -4414,7 +4500,7 @@ index 2b1a840393..ae3263bbd8 100644
    useQuietThreadShells,
  } from "../state/entities";
  import { environmentPresentations } from "../state/presentation";
-+import { useSidebarListing } from "../state/sidebarListing";
++import { isOpenerListed, useSidebarListing } from "../state/sidebarListing";
 +import { useSetShownAsSubthread } from "../state/subthreads";
  import { primaryServerKeybindingsAtom } from "../state/server";
  import { environmentProjects } from "../state/projects";
@@ -4727,7 +4813,7 @@ index 2b1a840393..ae3263bbd8 100644
                snoozePresets,
 +              childThreads: childThreads.menuStateOf(threadKey),
 +              canMakeMainThread: canMakeMainThread(thread),
-+              subthread: subthreadMenuStateOf(thread, subthreadKeys),
++              subthread: subthreadMenuStateOf(thread, subthreadKeys, isOpenerListed),
              }),
              position,
            ),
@@ -4743,7 +4829,7 @@ index 2b1a840393..ae3263bbd8 100644
 +            await makeMainThread(threadRef);
 +            return;
 +          case "show-as-subthread":
-+          case "hide-from-sidebar":
++          case "hide-subthread":
 +            setShownAsSubthread(
 +              { environmentId: threadRef.environmentId, id: threadRef.threadId },
 +              clicked.value === "show-as-subthread",
@@ -4830,14 +4916,15 @@ index 9679f42569..b4f99c4eaf 100644
    useEnvironmentProviders: (() => new Map()) as never,
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.opened.browser.test.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.opened.browser.test.tsx
 new file mode 100644
-index 0000000000..3514621838
+index 0000000000..062164e375
 --- /dev/null
 +++ b/apps/web/src/components/chat/ThreadRelationshipsControl.opened.browser.test.tsx
-@@ -0,0 +1,285 @@
+@@ -0,0 +1,373 @@
 +import type { ReactElement, ReactNode } from "react";
 +import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 +import * as DateTime from "effect/DateTime";
 +import { expect, it, vi } from "vite-plus/test";
++import { userEvent } from "vite-plus/test/browser";
 +import "~/index.css";
 +import { act, fakeTimers, render } from "../../../test/render";
 +import { makeThreadProjectionFixture } from "../../test-fixtures";
@@ -5106,7 +5193,7 @@ index 0000000000..3514621838
 +    expect(JSON.parse(localStorage.getItem("t3code:sidebar:subthreads") ?? "[]")).toEqual([
 +      "test:w1",
 +    ]);
-+    expect(toggles()[0]?.getAttribute("aria-label")).toBe("Hide from sidebar: W: port 0003");
++    expect(toggles()[0]?.getAttribute("aria-label")).toBe("Hide subthread: W: port 0003");
 +  }
 +  {
 +    // A reload reads the choice back.
@@ -5114,13 +5201,100 @@ index 0000000000..3514621838
 +    const toggle = screen.container.querySelector<HTMLButtonElement>(
 +      "[data-testid='lineage-subthread-toggle']",
 +    );
-+    expect(toggle?.getAttribute("aria-label")).toBe("Hide from sidebar: W: port 0003");
++    expect(toggle?.getAttribute("aria-label")).toBe("Hide subthread: W: port 0003");
 +    await act(async () => toggle!.click());
 +    expect(JSON.parse(localStorage.getItem("t3code:sidebar:subthreads") ?? "[]")).toEqual([]);
 +  }
 +});
++
++/**
++ * Classes that hide an element under a pointer that has no hover. Chromium cannot undo CDP touch
++ * emulation within a page, so these tests read the touch rules from the classes instead.
++ */
++const touchHidden = (element: Element) =>
++  [...element.classList].some(
++    (name) =>
++      name === "opacity-0" ||
++      name === "pointer-coarse:opacity-0" ||
++      name === "[@media(hover:none)]:opacity-0",
++  );
++const hoverHidden = (element: Element) =>
++  [...element.classList].some((name) => name.endsWith(":opacity-0"));
++
++const visible = (element: Element) => Number(getComputedStyle(element).opacity) > 0;
++const overlaps = (a: Element, b: Element) => {
++  const boxA = a.getBoundingClientRect();
++  const boxB = b.getBoundingClientRect();
++  return boxA.left < boxB.right && boxB.left < boxA.right;
++};
++
++it("keeps the age and a red Failed readable beside the subthread toggle on a touch screen", async () => {
++  using _clock = fixedClock();
++  localStorage.removeItem("t3code:sidebar:subthreads");
++  const opener = shell({ id: "opener", title: "Orchestrate the port" });
++  state.shells = [
++    opener,
++    shell({ id: "w1", title: "W: port 0003", openedBy: "opener", ranMinutesAgo: 4 }),
++    shell({ id: "w2", title: "W: broke", openedBy: "opener", status: "failed", ranMinutesAgo: 3 }),
++  ];
++  state.projection = projectionOf(opener);
++  await using screen = await render(<div className="w-80">{panel("opener")}</div>);
++  const rowOf = (title: string) =>
++    [...screen.container.querySelectorAll("li")].find((li) => li.textContent?.includes(title))!;
++  const labelOf = (row: Element, trailing: string) =>
++    [...row.querySelectorAll("span.shrink-0")].find((span) =>
++      span.textContent?.endsWith(trailing),
++    )!;
++
++  const aged = rowOf("W: port 0003");
++  const age = labelOf(aged, "4m");
++  // The age hides under the toggle only on hover with a mouse; on touch both show.
++  expect(touchHidden(age)).toBe(false);
++  expect(hoverHidden(age)).toBe(true);
++  const agedActions = aged.querySelector(
++    "[data-testid='lineage-subthread-toggle']",
++  )!.parentElement!;
++  expect(agedActions.classList).toContain("pointer-coarse:static");
++  expect(agedActions.classList).toContain("[@media(hover:none)]:static");
++  expect(agedActions.classList).toContain("pointer-coarse:opacity-100");
++
++  // "Failed" is never hidden, and its toggle always sits in the row's flow, beside it.
++  const broke = rowOf("W: broke");
++  const failed = labelOf(broke, "Failed");
++  expect(failed.classList).toContain("text-destructive");
++  expect(hoverHidden(failed)).toBe(false);
++  const toggle = broke.querySelector("[data-testid='lineage-subthread-toggle']")!;
++  expect(getComputedStyle(toggle.parentElement!).position).toBe("static");
++  expect(overlaps(failed, toggle)).toBe(false);
++  expect(toggle.getBoundingClientRect().right).toBeLessThanOrEqual(
++    broke.getBoundingClientRect().right,
++  );
++});
++
++it("never hides a red Failed under the subthread toggle on hover", async () => {
++  using _clock = fixedClock();
++  const opener = shell({ id: "opener", title: "Orchestrate the port" });
++  state.shells = [
++    opener,
++    shell({ id: "w2", title: "W: broke", openedBy: "opener", status: "failed", ranMinutesAgo: 3 }),
++  ];
++  state.projection = projectionOf(opener);
++  await using screen = await render(<div className="w-80">{panel("opener")}</div>);
++  const row = [...screen.container.querySelectorAll("li")].find((li) =>
++    li.textContent?.includes("W: broke"),
++  )!;
++  await userEvent.hover(row);
++  const label = [...row.querySelectorAll("span")].find((span) => span.textContent === "Failed")!;
++  const toggle = row.querySelector("[data-testid='lineage-subthread-toggle']")!;
++  await expect.poll(() => visible(toggle.parentElement!)).toBe(true);
++  expect(visible(label)).toBe(true);
++  expect(overlaps(label, toggle)).toBe(false);
++  expect(toggle.getBoundingClientRect().right).toBeLessThanOrEqual(
++    row.getBoundingClientRect().right,
++  );
++});
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
-index 102d9734de..af5bc98648 100644
+index 102d9734de..db658fb41b 100644
 --- a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
 +++ b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
 @@ -48,15 +48,18 @@ import {
@@ -5131,8 +5305,8 @@ index 102d9734de..af5bc98648 100644
    CornerLeftUpIcon,
    GitForkIcon,
    MessagesSquareIcon,
-+  EyeOffIcon,
-+  ListTreeIcon,
++  ListIndentDecreaseIcon,
++  ListIndentIncreaseIcon,
    MoreHorizontalIcon,
    PlusIcon,
    SquareIcon,
@@ -5208,7 +5382,7 @@ index 102d9734de..af5bc98648 100644
            <span className={cn(THREAD_DETAILS_PANEL_LABEL_CLASS, "min-w-0 flex-1 truncate")}>
              {props.label}
            </span>
-@@ -330,6 +357,132 @@ function RemoteSubagentRow(props: {
+@@ -330,6 +357,153 @@ function RemoteSubagentRow(props: {
    );
  }
  
@@ -5218,6 +5392,18 @@ index 102d9734de..af5bc98648 100644
 +/** Trailing text the row actions cover. */
 +const LINEAGE_ROW_TRAILING_HIDDEN_CLASS =
 +  "group-hover:opacity-0 group-focus-within:opacity-0 pointer-coarse:opacity-0 [@media(hover:none)]:opacity-0";
++/**
++ * The subthread toggle alone: over the trailing label on hover with a mouse, but in the row's
++ * flow on touch screens, so the label stays readable there.
++ */
++const LINEAGE_SUBTHREAD_ACTIONS_CLASS =
++  "pointer-events-none absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:static pointer-coarse:shrink-0 pointer-coarse:translate-y-0 pointer-coarse:pe-1 pointer-coarse:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:static [@media(hover:none)]:shrink-0 [@media(hover:none)]:translate-y-0 [@media(hover:none)]:pe-1 [@media(hover:none)]:opacity-100";
++/** The subthread toggle next to a "Failed" label, which nothing may cover: always in the flow. */
++const LINEAGE_SUBTHREAD_ACTIONS_INLINE_CLASS =
++  "flex shrink-0 items-center pe-1 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100 [@media(hover:none)]:opacity-100";
++/** Trailing text the subthread toggle covers, only with a mouse. */
++const LINEAGE_SUBTHREAD_TRAILING_HIDDEN_CLASS =
++  "pointer-fine:group-hover:opacity-0 pointer-fine:group-focus-within:opacity-0";
 +
 +/** Whether a worker or launched thread shows as a subthread in the sidebar, and its toggle. */
 +interface LineageSubthreadState {
@@ -5227,14 +5413,14 @@ index 102d9734de..af5bc98648 100644
 +
 +/**
 + * Fork (patches-tt/0003): a worker or launched thread counts on its opener's sidebar row; this
-+ * shows it as a nested subthread row there ("Show as subthread"), or back ("Hide from sidebar").
++ * shows it as a nested subthread row there ("Show as subthread"), or back ("Hide subthread").
 + */
 +function LineageSubthreadAction(props: {
 +  readonly title: string;
 +  readonly subthread: LineageSubthreadState;
 +}) {
 +  const { shown, onToggle } = props.subthread;
-+  const label = shown ? "Hide from sidebar" : "Show as subthread";
++  const label = shown ? "Hide subthread" : "Show as subthread";
 +  return (
 +    <Tooltip>
 +      <TooltipTrigger
@@ -5250,9 +5436,9 @@ index 102d9734de..af5bc98648 100644
 +        }
 +      >
 +        {shown ? (
-+          <EyeOffIcon aria-hidden className="size-3" />
++          <ListIndentDecreaseIcon aria-hidden className="size-3" />
 +        ) : (
-+          <ListTreeIcon aria-hidden className="size-3" />
++          <ListIndentIncreaseIcon aria-hidden className="size-3" />
 +        )}
 +      </TooltipTrigger>
 +      <TooltipPopup side="left">{label}</TooltipPopup>
@@ -5276,10 +5462,10 @@ index 102d9734de..af5bc98648 100644
 +}) {
 +  const { thread } = props;
 +  const subthread = props.subthread ?? null;
-+  const trailingClass = subthread === null ? "" : LINEAGE_ROW_TRAILING_HIDDEN_CLASS;
 +  const status = openedThreadStatus(thread);
 +  const statusLabel = threadRelationshipStatusLabel(status);
 +  const failed = status === "failed";
++  const trailingClass = subthread === null ? "" : LINEAGE_SUBTHREAD_TRAILING_HIDDEN_CLASS;
 +  const isOpener = props.relation === "opener";
 +  return (
 +    <li className="group relative flex h-8 items-center rounded-lg">
@@ -5287,7 +5473,14 @@ index 102d9734de..af5bc98648 100644
 +        <TooltipTrigger
 +          delay={200}
 +          render={
-+            <ThreadDetailsControl size="sm" variant="ghost" part="row" onClick={props.onOpen} />
++            <ThreadDetailsControl
++              size="sm"
++              variant="ghost"
++              part="row"
++              // Leaves room for the subthread toggle when it sits in the row's flow.
++              className={subthread === null ? undefined : "shrink"}
++              onClick={props.onOpen}
++            />
 +          }
 +        >
 +          <ThreadRelationshipIcon
@@ -5306,9 +5499,7 @@ index 102d9734de..af5bc98648 100644
 +            <ArrowRightIcon className="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
 +          ) : null}
 +          {failed ? (
-+            <span className={cn("shrink-0 text-2xs text-destructive", trailingClass)}>
-+              {statusLabel}
-+            </span>
++            <span className="shrink-0 text-2xs text-destructive">{statusLabel}</span>
 +          ) : (
 +            <span
 +              className={cn("shrink-0 text-2xs tabular-nums text-muted-foreground", trailingClass)}
@@ -5330,7 +5521,11 @@ index 102d9734de..af5bc98648 100644
 +        </TooltipPopup>
 +      </Tooltip>
 +      {subthread === null ? null : (
-+        <div className={LINEAGE_ROW_ACTIONS_CLASS}>
++        <div
++          className={
++            failed ? LINEAGE_SUBTHREAD_ACTIONS_INLINE_CLASS : LINEAGE_SUBTHREAD_ACTIONS_CLASS
++          }
++        >
 +          <LineageSubthreadAction title={thread.title} subthread={subthread} />
 +        </div>
 +      )}
@@ -5341,7 +5536,7 @@ index 102d9734de..af5bc98648 100644
  /**
   * The thread on a linked environment whose agent delegated this one. It opens
   * there when this client is connected to that environment.
-@@ -429,6 +582,13 @@ export function ThreadRelationshipsPanel(props: {
+@@ -429,6 +603,13 @@ export function ThreadRelationshipsPanel(props: {
        ? scopeThreadRef(props.environmentId, parentShell.id)
        : null;
    const parentProjection = useThreadProjection(parentRef)?.projection;
@@ -5355,7 +5550,7 @@ index 102d9734de..af5bc98648 100644
    const navigate = useNavigate();
    const mergeBack = useAtomCommand(threadEnvironment.mergeBack);
    const stopSession = useAtomCommand(threadEnvironment.stopSession);
-@@ -541,6 +701,26 @@ export function ThreadRelationshipsPanel(props: {
+@@ -541,6 +722,26 @@ export function ThreadRelationshipsPanel(props: {
        Object.hasOwn(resolvedThreadTitles, threadId),
    );
    const canDetach = projection ? canDetachThreadProviderSession(projection) : false;
@@ -5382,7 +5577,7 @@ index 102d9734de..af5bc98648 100644
  
    const {
      related = [],
-@@ -563,11 +743,19 @@ export function ThreadRelationshipsPanel(props: {
+@@ -563,11 +764,19 @@ export function ThreadRelationshipsPanel(props: {
    const groups: ReadonlyArray<{
      id: string;
      label: string | null;
@@ -5402,7 +5597,7 @@ index 102d9734de..af5bc98648 100644
      {
        id: "previous",
        label: "Previous agents",
-@@ -578,7 +766,9 @@ export function ThreadRelationshipsPanel(props: {
+@@ -578,7 +787,9 @@ export function ThreadRelationshipsPanel(props: {
    const runningCount =
      (projection?.subagents.filter(
        (agent) => agent.childThreadId === null && agent.status === "running",
@@ -5413,7 +5608,7 @@ index 102d9734de..af5bc98648 100644
  
    // A linked environment's agent may have delegated this thread from there.
    const delegatedFrom = currentThread?.delegatedFrom;
-@@ -591,6 +781,8 @@ export function ThreadRelationshipsPanel(props: {
+@@ -591,6 +802,8 @@ export function ThreadRelationshipsPanel(props: {
        runningCount > 0 ||
        remoteActive.length > 0 ||
        remotePrevious.length > 0 ||
@@ -5422,7 +5617,7 @@ index 102d9734de..af5bc98648 100644
        delegatedFrom !== undefined ||
        // Disconnect lives in this heading, so a thread with only side chats still shows it.
        (canDetach && sideChats.length > 0));
-@@ -685,6 +877,20 @@ export function ThreadRelationshipsPanel(props: {
+@@ -685,6 +898,21 @@ export function ThreadRelationshipsPanel(props: {
      }
    };
  
@@ -5433,7 +5628,8 @@ index 102d9734de..af5bc98648 100644
 +  ): LineageSubthreadState | null => {
 +    if (!thread) return null;
 +    const links = { ...thread, environmentId: props.environmentId };
-+    if (!canShowAsSubthread(links)) return null;
++    // This thread is the opener (or delegator), so it is loaded.
++    if (!canShowAsSubthread(links, () => true)) return null;
 +    const shown = subthreadKeys.has(
 +      scopedThreadKey(scopeThreadRef(props.environmentId, thread.id)),
 +    );
@@ -5443,7 +5639,7 @@ index 102d9734de..af5bc98648 100644
    const parentTitle =
      mergeTargetThreadId === null
        ? null
-@@ -750,9 +956,11 @@ export function ThreadRelationshipsPanel(props: {
+@@ -750,9 +978,15 @@ export function ThreadRelationshipsPanel(props: {
        workflowGroup?.workflow.status === "running" &&
        agent?.origin === "provider_native" &&
        providerDriver === "claudeAgent";
@@ -5451,14 +5647,27 @@ index 102d9734de..af5bc98648 100644
 -      ? "group-hover:opacity-0 group-focus-within:opacity-0 pointer-coarse:opacity-0 [@media(hover:none)]:opacity-0"
 -      : "";
 +    const subthread = isParent || workflowGroup ? null : subthreadStateOf(node?.thread);
-+    const trailingVisibilityClass =
-+      (workflowGroup ? canStopWorkflow : canStop) || subthread !== null
-+        ? LINEAGE_ROW_TRAILING_HIDDEN_CLASS
++    // Upstream hides the trailing label under the stop button; the subthread toggle alone covers
++    // it only with a mouse, and never covers "Failed".
++    const coversTrailing = workflowGroup ? canStopWorkflow : canStop;
++    const trailingVisibilityClass = coversTrailing
++      ? LINEAGE_ROW_TRAILING_HIDDEN_CLASS
++      : subthread !== null && !failed
++        ? LINEAGE_SUBTHREAD_TRAILING_HIDDEN_CLASS
 +        : "";
      const project = projects.find((project) => project.id === node?.thread?.projectId);
      const relationshipHint = `Open ${relationship.toLowerCase()} in this chat`;
      const RelationshipPopup = agent ? ThreadHoverCardPopup : TooltipPopup;
-@@ -910,30 +1118,35 @@ export function ThreadRelationshipsPanel(props: {
+@@ -823,6 +1057,8 @@ export function ThreadRelationshipsPanel(props: {
+               size="sm"
+               variant="ghost"
+               part={workflowGroup ? "primary" : "row"}
++              // Leaves room for the subthread toggle when it sits in the row's flow.
++              className={subthread === null ? undefined : "shrink"}
+               onClick={() => openThread(threadId)}
+             />
+           }
+@@ -910,30 +1146,43 @@ export function ThreadRelationshipsPanel(props: {
          ) : (
            relationshipLink
          )}
@@ -5487,7 +5696,15 @@ index 102d9734de..af5bc98648 100644
 -              <TooltipPopup side="left">Stop subagent</TooltipPopup>
 -            </Tooltip>
 +        {(canStop && agent) || subthread !== null ? (
-+          <div className={LINEAGE_ROW_ACTIONS_CLASS}>
++          <div
++            className={
++              canStop && agent
++                ? LINEAGE_ROW_ACTIONS_CLASS
++                : failed
++                  ? LINEAGE_SUBTHREAD_ACTIONS_INLINE_CLASS
++                  : LINEAGE_SUBTHREAD_ACTIONS_CLASS
++            }
++          >
 +            {subthread === null ? null : (
 +              <LineageSubthreadAction title={threadTitle} subthread={subthread} />
 +            )}
@@ -5518,7 +5735,7 @@ index 102d9734de..af5bc98648 100644
            </div>
          ) : null}
        </li>
-@@ -953,6 +1166,8 @@ export function ThreadRelationshipsPanel(props: {
+@@ -953,6 +1202,8 @@ export function ThreadRelationshipsPanel(props: {
              related.length > 0 ||
              active.length > 0 ||
              remoteActive.length > 0 ||
@@ -5527,7 +5744,7 @@ index 102d9734de..af5bc98648 100644
              delegatedFrom !== undefined
            }
            data-thread-relationships-panel
-@@ -990,11 +1205,30 @@ export function ThreadRelationshipsPanel(props: {
+@@ -990,11 +1241,30 @@ export function ThreadRelationshipsPanel(props: {
                />
              </ThreadLineageRowList>
            )}
@@ -5804,18 +6021,18 @@ index 3a50e76d06..8cb15e0000 100644
  });
 diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx
 new file mode 100644
-index 0000000000..a2de9bba53
+index 0000000000..7294d3dd61
 --- /dev/null
 +++ b/apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx
-@@ -0,0 +1,409 @@
+@@ -0,0 +1,507 @@
 +import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 +import { describe, expect, it, vi } from "vite-plus/test";
-+import { page, userEvent } from "vite-plus/test/browser";
++import { cdp, page, userEvent } from "vite-plus/test/browser";
 +import { useState } from "react";
 +
 +import "~/index.css";
 +
-+import { render } from "../../../test/render";
++import { act, fakeTimers, render } from "../../../test/render";
 +import { attachSidebarTree } from "../../lib/sidebarTree";
 +import { useEnvironmentScope } from "../../state/session";
 +import {
@@ -6216,6 +6433,104 @@ index 0000000000..a2de9bba53
 +        .toBe(LONG_TITLE);
 +    },
 +  );
++
++  it("moves through the entries with the arrow keys and opens an entry's menu from the keyboard", async () => {
++    const onAction = vi.fn();
++    await using _screen = await renderRow(1280, 800, onAction);
++    const trigger = page.getByTestId("sidebar-delegated-workers");
++    (trigger.element() as HTMLElement).focus();
++    await userEvent.keyboard("{Enter}");
++    const entries = () => [
++      ...document.querySelectorAll<HTMLElement>('[data-testid="sidebar-delegated-worker"]'),
++    ];
++    const lineage = page.getByRole("button", { name: "All in Lineage" }).element();
++    await expect.poll(() => document.activeElement).toBe(entries()[0]);
++
++    await userEvent.keyboard("{ArrowDown}");
++    expect(document.activeElement).toBe(entries()[1]);
++    await userEvent.keyboard("{ArrowUp}{ArrowUp}");
++    // Up from the first entry wraps to "All in Lineage", and down from it back to the first.
++    expect(document.activeElement).toBe(lineage);
++    await userEvent.keyboard("{ArrowDown}");
++    expect(document.activeElement).toBe(entries()[0]);
++    await expect.element(page.getByTestId("sidebar-delegated-workers-popover")).toBeVisible();
++
++    // One Tab stop per entry: its "More actions" button stays out of the Tab order.
++    const more = page.getByRole("button", { name: "More actions for S2: migration" }).element();
++    expect(more.getAttribute("tabindex")).toBe("-1");
++
++    for (const keys of ["{ArrowRight}", "{Shift>}{F10}{/Shift}", "{ContextMenu}"]) {
++      await userEvent.keyboard(keys);
++      await expect.element(page.getByRole("menuitem", { name: "Make main thread" })).toBeVisible();
++      // The entry keeps its highlight while its menu is open.
++      const entry = entries()[0]!.closest("li")!;
++      expect(getComputedStyle(entry).backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
++      await userEvent.keyboard("{Escape}");
++      await expect.element(page.getByRole("menu")).not.toBeInTheDocument();
++      await expect.poll(() => document.activeElement).toBe(entries()[0]);
++    }
++
++    await userEvent.keyboard("{ArrowRight}");
++    await userEvent.keyboard("{ArrowDown}{Enter}");
++    expect(onAction).toHaveBeenLastCalledWith({
++      type: expect.stringMatching(/^(show-as-subthread|make-main-thread)$/),
++      thread: expect.objectContaining({ id: "asks" }),
++    });
++  });
++
++  it("keeps the entry highlighted while the pointer is on its More actions button", async () => {
++    await using _screen = await renderRow(1280, 800, vi.fn());
++    await userEvent.click(page.getByTestId("sidebar-delegated-workers"));
++    const more = page.getByRole("button", { name: "More actions for S2: migration" });
++    await userEvent.hover(more);
++    const entry = more.element().closest("li")!;
++    await expect.poll(() => getComputedStyle(entry).backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
++  });
++
++  it("ages an entry from UTC minutes, also in a timezone ahead of UTC", async () => {
++    const session = cdp();
++    await session.send("Emulation.setTimezoneOverride", { timezoneId: "Europe/Amsterdam" });
++    using _clock = fakeTimers();
++    // 12:00 UTC is 13:00 in Amsterdam.
++    const minute = Date.UTC(2026, 10, 11, 12, 0);
++    vi.setSystemTime(minute);
++    try {
++      const ranAt = new Date(minute - 30 * 60_000).toISOString();
++      await using _screen = await renderRow(1280, 800, vi.fn(), noop, [
++        HEAD,
++        worker("aged", "W: aged", {
++          runtime: { status: "running" },
++          createdAt: ranAt,
++          updatedAt: ranAt,
++          latestUserMessageAt: ranAt,
++        }),
++      ]);
++      expect(new Date(minute).getTimezoneOffset()).toBeLessThan(0);
++      await act(async () =>
++        (page.getByTestId("sidebar-delegated-workers").element() as HTMLElement).click(),
++      );
++      // Read as local time, the minute string would put the entry an hour or more off.
++      await expect
++        .element(page.getByTestId("sidebar-delegated-worker-age"))
++        .toHaveTextContent("30m");
++      expect(page.getByTestId("sidebar-delegated-worker-age").element().textContent).toBe("30m");
++    } finally {
++      await session.send("Emulation.setTimezoneOverride", { timezoneId: "" });
++    }
++  });
++
++  it("hides the age under an always-visible More actions button on a touch screen", async () => {
++    // Chromium cannot undo CDP touch emulation within a page, so this reads the touch rules.
++    await using _screen = await renderRow(390, 844, vi.fn());
++    await userEvent.click(page.getByTestId("sidebar-delegated-workers"));
++    const age = document.querySelector('[data-testid="sidebar-delegated-worker-age"]')!;
++    const more = page
++      .getByRole("button", { name: /^More actions for / })
++      .first()
++      .element();
++    expect(age.classList).toContain("pointer-coarse:opacity-0");
++    expect(more.parentElement!.classList).toContain("pointer-coarse:opacity-100");
++  });
 +});
 diff --git a/apps/web/src/components/sidebar/routeReveal.ts b/apps/web/src/components/sidebar/routeReveal.ts
 index f884335775..b260461f12 100644
@@ -6254,7 +6569,7 @@ index f884335775..b260461f12 100644
    return { pendingKey, widensScope };
  }
 diff --git a/apps/web/src/components/threadActionMenu.logic.test.ts b/apps/web/src/components/threadActionMenu.logic.test.ts
-index bd9dfdcdcc..10e6cfef17 100644
+index bd9dfdcdcc..301f9f8d62 100644
 --- a/apps/web/src/components/threadActionMenu.logic.test.ts
 +++ b/apps/web/src/components/threadActionMenu.logic.test.ts
 @@ -25,7 +25,40 @@ const baseState: ThreadActionMenuState = {
@@ -6276,12 +6591,12 @@ index bd9dfdcdcc..10e6cfef17 100644
 +
 +  it("offers showing a worker as a subthread, and hiding it from the sidebar again", () => {
 +    expect(ids(baseState)).not.toContain("show-as-subthread");
-+    expect(ids({ ...baseState, subthread: null })).not.toContain("hide-from-sidebar");
++    expect(ids({ ...baseState, subthread: null })).not.toContain("hide-subthread");
 +    const show = buildThreadActionMenuItems({ ...baseState, subthread: "hidden" });
 +    expect(show.find((entry) => entry.id === "show-as-subthread")?.label).toBe("Show as subthread");
-+    expect(show.map((entry) => entry.id)).not.toContain("hide-from-sidebar");
++    expect(show.map((entry) => entry.id)).not.toContain("hide-subthread");
 +    const hide = buildThreadActionMenuItems({ ...baseState, subthread: "shown" });
-+    expect(hide.find((entry) => entry.id === "hide-from-sidebar")?.label).toBe("Hide from sidebar");
++    expect(hide.find((entry) => entry.id === "hide-subthread")?.label).toBe("Hide subthread");
 +  });
 +
 +  it("offers hiding and showing child threads only on a family head", () => {
@@ -6299,7 +6614,7 @@ index bd9dfdcdcc..10e6cfef17 100644
      "disables both lifecycle directions without permission (reversed: %s)",
      (reversed) => {
 diff --git a/apps/web/src/components/threadActionMenu.logic.ts b/apps/web/src/components/threadActionMenu.logic.ts
-index 36913c70c5..55751c8762 100644
+index 36913c70c5..4909a4b578 100644
 --- a/apps/web/src/components/threadActionMenu.logic.ts
 +++ b/apps/web/src/components/threadActionMenu.logic.ts
 @@ -21,6 +21,11 @@ export type ThreadActionMenuId =
@@ -6310,7 +6625,7 @@ index 36913c70c5..55751c8762 100644
 +  | "show-child-threads"
 +  | "make-main-thread"
 +  | "show-as-subthread"
-+  | "hide-from-sidebar"
++  | "hide-subthread"
    | "copy"
    | "copy-path"
    | "copy-branch"
@@ -6337,11 +6652,11 @@ index 36913c70c5..55751c8762 100644
 +    "hide-child-threads",
 +    "show-child-threads",
 +    "show-as-subthread",
-+    "hide-from-sidebar",
++    "hide-subthread",
      "copy",
      "copy-path",
      "copy-branch",
-@@ -181,6 +199,21 @@ export function buildThreadActionMenuItems(
+@@ -181,6 +199,27 @@ export function buildThreadActionMenuItems(
      ...(state.canShareWithGuest
        ? [{ id: "share-guest" as const, label: "Share with guest", icon: "user-plus" }]
        : []),
@@ -6353,9 +6668,15 @@ index 36913c70c5..55751c8762 100644
 +        ]
 +      : []),
 +    ...(state.subthread === "hidden"
-+      ? [{ id: "show-as-subthread" as const, label: "Show as subthread", icon: "list-tree" }]
++      ? [
++          {
++            id: "show-as-subthread" as const,
++            label: "Show as subthread",
++            icon: "list-indent-increase",
++          },
++        ]
 +      : state.subthread === "shown"
-+        ? [{ id: "hide-from-sidebar" as const, label: "Hide from sidebar", icon: "eye-off" }]
++        ? [{ id: "hide-subthread" as const, label: "Hide subthread", icon: "list-indent-decrease" }]
 +        : []),
 +    ...(state.canMakeMainThread
 +      ? [{ id: "make-main-thread" as const, label: "Make main thread", icon: "corner-left-up" }]
@@ -6363,11 +6684,42 @@ index 36913c70c5..55751c8762 100644
      ...(state.projectFilter
        ? [
            {
+diff --git a/apps/web/src/components/ui/tooltip.tsx b/apps/web/src/components/ui/tooltip.tsx
+index ff8b9e8f16..5b105b6f0c 100644
+--- a/apps/web/src/components/ui/tooltip.tsx
++++ b/apps/web/src/components/ui/tooltip.tsx
+@@ -124,6 +124,7 @@ function TooltipPopup({
+   side = "top",
+   variant = "default",
+   anchor,
++  collisionAvoidance,
+   children,
+   ...props
+ }: TooltipPrimitive.Popup.Props & {
+@@ -132,10 +133,17 @@ function TooltipPopup({
+   sideOffset?: TooltipPrimitive.Positioner.Props["sideOffset"];
+   variant?: "default" | "glass" | "code";
+   anchor?: TooltipPrimitive.Positioner.Props["anchor"];
++  collisionAvoidance?: TooltipPrimitive.Positioner.Props["collisionAvoidance"];
+ }) {
+   return (
+     <TooltipPrimitive.Portal>
+-      <TooltipPositioner align={align} anchor={anchor} side={side} sideOffset={sideOffset}>
++      <TooltipPositioner
++        align={align}
++        anchor={anchor}
++        collisionAvoidance={collisionAvoidance}
++        side={side}
++        sideOffset={sideOffset}
++      >
+         <TooltipPrimitive.Popup
+           className={cn(
+             "relative flex origin-(--transform-origin) text-balance rounded-md text-popover-foreground text-xs transition-[scale,opacity] before:pointer-events-none before:absolute before:inset-0 before:rounded-[calc(var(--radius-md)-1px)] before:shadow-[0_1px_--theme(--color-black/4%)] data-ending-style:scale-98 data-starting-style:scale-98 data-ending-style:opacity-0 data-starting-style:opacity-0 data-instant:duration-0 dark:before:shadow-[0_-1px_--theme(--color-white/6%)]",
 diff --git a/apps/web/src/contextMenuFallback.ts b/apps/web/src/contextMenuFallback.ts
-index a3e760ddc5..82390b9739 100644
+index a3e760ddc5..8cd478483c 100644
 --- a/apps/web/src/contextMenuFallback.ts
 +++ b/apps/web/src/contextMenuFallback.ts
-@@ -134,6 +134,33 @@ const ICON_PATHS: Record<string, ReadonlyArray<{ tag: string; attrs: Record<stri
+@@ -134,6 +134,29 @@ const ICON_PATHS: Record<string, ReadonlyArray<{ tag: string; attrs: Record<stri
        },
      },
    ],
@@ -6375,21 +6727,17 @@ index a3e760ddc5..82390b9739 100644
 +    { tag: "path", attrs: { d: "M14 9 9 4 4 9" } },
 +    { tag: "path", attrs: { d: "M20 20h-7a4 4 0 0 1-4-4V4" } },
 +  ],
-+  "eye-off": [
-+    {
-+      tag: "path",
-+      attrs: {
-+        d: "M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49",
-+      },
-+    },
-+    { tag: "path", attrs: { d: "M14.084 14.158a3 3 0 0 1-4.242-4.242" } },
-+    {
-+      tag: "path",
-+      attrs: {
-+        d: "M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143",
-+      },
-+    },
-+    { tag: "path", attrs: { d: "m2 2 20 20" } },
++  "list-indent-decrease": [
++    { tag: "path", attrs: { d: "M21 5H11" } },
++    { tag: "path", attrs: { d: "M21 12H11" } },
++    { tag: "path", attrs: { d: "M21 19H11" } },
++    { tag: "path", attrs: { d: "m7 8-4 4 4 4" } },
++  ],
++  "list-indent-increase": [
++    { tag: "path", attrs: { d: "M21 5H11" } },
++    { tag: "path", attrs: { d: "M21 12H11" } },
++    { tag: "path", attrs: { d: "M21 19H11" } },
++    { tag: "path", attrs: { d: "m3 8 4 4-4 4" } },
 +  ],
 +  "list-tree": [
 +    { tag: "path", attrs: { d: "M21 12h-8" } },
@@ -6433,19 +6781,20 @@ index 88210360d2..6a67828c58 100644
 +  return sortSidebarV2ProjectGroups(unsortedGroups, threads, sortOrder, underParent, subthreadKeys);
  }
 diff --git a/apps/web/src/hooks/useThreadActionMenu.ts b/apps/web/src/hooks/useThreadActionMenu.ts
-index f2d5509c94..dde1c67443 100644
+index f2d5509c94..1242b8cb6b 100644
 --- a/apps/web/src/hooks/useThreadActionMenu.ts
 +++ b/apps/web/src/hooks/useThreadActionMenu.ts
-@@ -15,6 +15,8 @@ import {
+@@ -15,6 +15,9 @@ import {
  } from "@t3tools/contracts";
  import { useRouter } from "@tanstack/react-router";
  
 +import { canMakeMainThread, subthreadMenuStateOf } from "../components/Sidebar.childThreads";
++import { isOpenerListed } from "../state/sidebarListing";
 +import { useSetShownAsSubthread, useSubthreadKeys } from "../state/subthreads";
  import { pickSnoozePreset, resolveSnoozePresets } from "../components/Sidebar.snooze";
  import {
    buildThreadActionMenuItems,
-@@ -115,6 +117,10 @@ export function useThreadActionMenu(input: {
+@@ -115,6 +118,10 @@ export function useThreadActionMenu(input: {
      onError: (error) => failureToast("Failed to copy thread ID", error),
    });
  
@@ -6456,21 +6805,21 @@ index f2d5509c94..dde1c67443 100644
    const openMenu = (position: { x: number; y: number }) => {
      if (threadRef === null) return;
      void (async () => {
-@@ -152,6 +158,8 @@ export function useThreadActionMenu(input: {
+@@ -152,6 +159,8 @@ export function useThreadActionMenu(input: {
          snoozePresets,
          canShareWithGuest,
          canTurnIntoProject: canTurnThreadIntoProject(threadRef),
 +        canMakeMainThread: canMakeMainThread(thread),
-+        subthread: subthreadMenuStateOf(thread, subthreadKeys),
++        subthread: subthreadMenuStateOf(thread, subthreadKeys, isOpenerListed),
        });
        const clicked = await settlePromise(() => api.contextMenu.show(items, position));
        if (clicked._tag === "Failure" || clicked.value === null) return;
-@@ -259,6 +267,21 @@ export function useThreadActionMenu(input: {
+@@ -259,6 +268,21 @@ export function useThreadActionMenu(input: {
              }),
            );
            return;
 +        case "show-as-subthread":
-+        case "hide-from-sidebar":
++        case "hide-subthread":
 +          setShownAsSubthread(
 +            { environmentId: threadRef.environmentId, id: threadRef.threadId },
 +            action === "show-as-subthread",
@@ -6743,18 +7092,20 @@ index 0000000000..c7ff30687f
 +}
 diff --git a/apps/web/src/state/sidebarListing.ts b/apps/web/src/state/sidebarListing.ts
 new file mode 100644
-index 0000000000..5b1c9421bb
+index 0000000000..023666d875
 --- /dev/null
 +++ b/apps/web/src/state/sidebarListing.ts
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,58 @@
 +// What the sidebar lists (patches-tt/0003): upstream's `delegatedUnderParent` plus the threads an
 +// agent launched, which count on their opener's row like `delegate_task` workers, and the
 +// threads the user shows as a subthread (subthreads.ts).
 +import { threadKey } from "@t3tools/client-runtime/state/entities";
 +import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
++import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 +import { launchedThreadsUnderOpener } from "@t3tools/client-runtime/state/thread-family-summary";
++import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 +
-+import { useDelegatedUnderParent, useQuietThreadShells } from "./entities";
++import { readThreadShell, useDelegatedUnderParent, useQuietThreadShells } from "./entities";
 +import { useSubthreadKeys } from "./subthreads";
 +
 +/**
@@ -6795,23 +7146,30 @@ index 0000000000..5b1c9421bb
 +    subthreadKeys,
 +  };
 +}
++
++/** Whether a launched thread's opener is loaded and not archived, for the subthread toggle. */
++export function isOpenerListed(environmentId: string, threadId: string): boolean {
++  const opener = readThreadShell(
++    scopeThreadRef(environmentId as EnvironmentId, threadId as ThreadId),
++  );
++  return opener !== null && opener.archivedAt === null;
++}
 diff --git a/apps/web/src/state/subthreads.ts b/apps/web/src/state/subthreads.ts
 new file mode 100644
-index 0000000000..787cd0831e
+index 0000000000..9f9faf7704
 --- /dev/null
 +++ b/apps/web/src/state/subthreads.ts
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,41 @@
 +// Threads the user shows as a subthread (patches-tt/0003). A `delegate_task` worker or a thread
 +// an agent launched has no sidebar row: its opener's row counts it. "Show as subthread" gives one
-+// a nested row under its opener again, until "Hide from sidebar". The choice is per device, in
++// a nested row under its opener again, until "Hide subthread". The choice is per device, in
 +// localStorage, like the sidebar's family folds; the server has no per-thread flag for it.
-+import {
-+  canShowAsSubthread,
-+  type WorkerLinks,
-+} from "@t3tools/client-runtime/state/thread-family-summary";
++import type { WorkerLinks } from "@t3tools/client-runtime/state/thread-family-summary";
 +import * as Schema from "effect/Schema";
 +
 +import { useLocalStorage } from "../hooks/useLocalStorage";
++
++export { pruneSubthreadKeys } from "@t3tools/client-runtime/state/thread-family-summary";
 +
 +export const SUBTHREAD_KEYS_STORAGE_KEY = "t3code:sidebar:subthreads";
 +const SubthreadKeys = Schema.Array(Schema.String);
@@ -6842,25 +7200,6 @@ index 0000000000..787cd0831e
 +): readonly string[] {
 +  const without = keys.filter((candidate) => candidate !== key);
 +  return shown ? [...without, key] : without;
-+}
-+
-+/**
-+ * Keys whose thread is gone from a loaded environment, or no longer a worker or launched thread
-+ * (made a main thread), drop out, as the family folds do. `isLoaded` tells whether an
-+ * environment's threads are known.
-+ */
-+export function pruneSubthreadKeys(
-+  keys: readonly string[],
-+  threads: readonly WorkerLinks[],
-+  isLoaded: (environmentId: string) => boolean,
-+): readonly string[] {
-+  const byKey = new Map(threads.map((thread) => [keyOf(thread), thread] as const));
-+  const kept = keys.filter((key) => {
-+    const thread = byKey.get(key);
-+    if (thread !== undefined) return canShowAsSubthread(thread);
-+    return !isLoaded(key.slice(0, key.indexOf(":")));
-+  });
-+  return kept.length === keys.length ? keys : kept;
 +}
 diff --git a/apps/web/src/test-fixtures.ts b/apps/web/src/test-fixtures.ts
 index 494d95caa8..38edb1bd7f 100644
@@ -6973,10 +7312,10 @@ index f813ece95d..785f83de0b 100644
      if (input.modelSelection !== undefined) {
 diff --git a/packages/client-runtime/src/state/childThreadSummary.test.ts b/packages/client-runtime/src/state/childThreadSummary.test.ts
 new file mode 100644
-index 0000000000..2350fefa8b
+index 0000000000..97d286d5c4
 --- /dev/null
 +++ b/packages/client-runtime/src/state/childThreadSummary.test.ts
-@@ -0,0 +1,230 @@
+@@ -0,0 +1,257 @@
 +import { describe, expect, it } from "vite-plus/test";
 +
 +import {
@@ -6988,7 +7327,9 @@ index 0000000000..2350fefa8b
 +  foldChildThreadFamily,
 +  formatChildThreadKindsLabel,
 +  canShowAsSubthread,
++  keepsSubthreadChoice,
 +  launchedThreadsUnderOpener,
++  pruneSubthreadKeys,
 +  resolveListedAncestorKey,
 +  workerParentKeyOf,
 +  type ChildThreadKind,
@@ -7201,18 +7542,43 @@ index 0000000000..2350fefa8b
 +  });
 +
 +  it("offers the subthread choice on workers and launched threads, not on main threads", () => {
-+    expect(canShowAsSubthread(launched)).toBe(true);
-+    expect(canShowAsSubthread(worker)).toBe(true);
-+    expect(canShowAsSubthread(main)).toBe(false);
-+    expect(canShowAsSubthread(head)).toBe(false);
++    const listed = () => true;
++    expect(canShowAsSubthread(launched, listed)).toBe(true);
++    expect(canShowAsSubthread(worker, listed)).toBe(true);
++    expect(canShowAsSubthread(main, listed)).toBe(false);
++    expect(canShowAsSubthread(head, listed)).toBe(false);
++  });
++
++  it("keeps a pinned launched thread on its own row, and needs a listed opener to offer the toggle", () => {
++    const pinned = { ...launched, pinnedAt: "2026-11-01T00:00:00.000Z" };
++    expect(workerParentKeyOf(pinned, new Set())).toBeNull();
++    expect(launchedThreadsUnderOpener([head, pinned], new Set())).toEqual([]);
++    expect(canShowAsSubthread(pinned, () => true)).toBe(false);
++    expect(canShowAsSubthread(launched, () => false)).toBe(false);
++    expect(canShowAsSubthread(worker, () => false)).toBe(true);
++    expect(keepsSubthreadChoice(launched)).toBe(true);
++    expect(keepsSubthreadChoice(main)).toBe(false);
++  });
++
++  it("prunes only the choices of loaded threads that can no longer be a subthread", () => {
++    const keys = ["env:kid", "env:main", "env:w", "env:unloaded"];
++    expect(pruneSubthreadKeys(keys, [head, launched, main, worker])).toEqual([
++      "env:kid",
++      "env:w",
++      "env:unloaded",
++    ]);
++    // Nothing to drop returns the same array, so a stored value is not rewritten.
++    const kept = ["env:kid", "env:unloaded"];
++    expect(pruneSubthreadKeys(kept, [head, launched])).toBe(kept);
++    expect(pruneSubthreadKeys(kept, [])).toBe(kept);
 +  });
 +});
 diff --git a/packages/client-runtime/src/state/childThreadSummary.ts b/packages/client-runtime/src/state/childThreadSummary.ts
 new file mode 100644
-index 0000000000..b2fcef33fc
+index 0000000000..e3ea91ae66
 --- /dev/null
 +++ b/packages/client-runtime/src/state/childThreadSummary.ts
-@@ -0,0 +1,393 @@
+@@ -0,0 +1,432 @@
 +// What a family's children are doing (patches-tt/0003), shared by the web sidebar and the
 +// mobile thread list: one kind per child, the chips a family's disclosure row shows, the order
 +// its live children list in, the fold that keeps settled children behind one "+N settled" row,
@@ -7459,6 +7825,8 @@ index 0000000000..b2fcef33fc
 +export interface WorkerLinks extends DelegatedWorkerLinks {
 +  readonly id: string;
 +  readonly openedByThreadId?: string | undefined;
++  /** A launched thread the user pinned keeps its own row. */
++  readonly pinnedAt?: unknown;
 +}
 +
 +const workerKeyOf = (thread: Pick<WorkerLinks, "environmentId" | "id">) =>
@@ -7475,12 +7843,10 @@ index 0000000000..b2fcef33fc
 +  subthreadKeys: ReadonlySet<string>,
 +): string | null {
 +  if (thread.detachedFromOpener === true || subthreadKeys.has(workerKeyOf(thread))) return null;
-+  return (
-+    delegatedWorkerParentKeyOf(thread) ??
-+    (thread.openedByThreadId === undefined
-+      ? null
-+      : `${thread.environmentId}:${thread.openedByThreadId}`)
-+  );
++  const delegator = delegatedWorkerParentKeyOf(thread);
++  if (delegator !== null) return delegator;
++  if (thread.openedByThreadId === undefined || thread.pinnedAt != null) return null;
++  return `${thread.environmentId}:${thread.openedByThreadId}`;
 +}
 +
 +/**
@@ -7500,9 +7866,48 @@ index 0000000000..b2fcef33fc
 +  });
 +}
 +
-+/** Whether the user can show `thread` as a subthread: a worker or launched thread, not main. */
-+export function canShowAsSubthread(thread: WorkerLinks): boolean {
-+  return thread.detachedFromOpener !== true && workerParentKeyOf(thread, new Set()) !== null;
++const NO_KEYS: ReadonlySet<string> = new Set();
++
++/**
++ * Whether the user can show `thread` as a subthread: a worker, or a launched thread whose opener
++ * is loaded and not archived (`isOpenerListed`, the rule of `launchedThreadsUnderOpener`); not a
++ * main thread or a pinned launched thread, which keep a row of their own.
++ */
++export function canShowAsSubthread(
++  thread: WorkerLinks,
++  isOpenerListed: (environmentId: string, threadId: string) => boolean,
++): boolean {
++  if (workerParentKeyOf(thread, NO_KEYS) === null) return false;
++  if (isDelegatedWorker(thread) || thread.openedByThreadId === undefined) return true;
++  return isOpenerListed(thread.environmentId, thread.openedByThreadId);
++}
++
++/**
++ * Whether a stored subthread choice still applies: a worker or launched thread that is not a
++ * main thread. Its opener may be out of the loaded list, so this does not ask for it.
++ */
++export function keepsSubthreadChoice(thread: WorkerLinks): boolean {
++  return (
++    thread.detachedFromOpener !== true &&
++    (isDelegatedWorker(thread) || thread.openedByThreadId !== undefined)
++  );
++}
++
++/**
++ * Drops the stored subthread keys (`<environmentId>:<threadId>`) whose thread is loaded and no
++ * longer keeps the choice (made a main thread). A key whose thread is not in `threads` stays: the
++ * list leaves out older settled threads until they page in, and at startup it may be empty.
++ */
++export function pruneSubthreadKeys(
++  keys: readonly string[],
++  threads: readonly WorkerLinks[],
++): readonly string[] {
++  const byKey = new Map(threads.map((thread) => [workerKeyOf(thread), thread] as const));
++  const kept = keys.filter((key) => {
++    const thread = byKey.get(key);
++    return thread === undefined || keepsSubthreadChoice(thread);
++  });
++  return kept.length === keys.length ? keys : kept;
 +}
 +
 +export interface DelegatedWorker<T> {
