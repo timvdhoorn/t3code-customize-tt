@@ -65,7 +65,11 @@ run the same patches.
 - **How each machine gets a new nightly:**
   - Mac: T3's own updater. In the customized build it downloads a new nightly as soon as it finds
     one and installs it when Tim quits the app (`patches-tt/0005`); nothing restarts the app for
-    it. The install changes the app's `Info.plist`, the `autoupdate` LaunchAgent rebuilds the
+    it. It does this only for a nightly the patches cover: it reads `covered-nightly.txt` from
+    `main` of this repo (the port export writes it, the port PR carries it) and leaves a newer nightly
+    alone, also when the lookup fails, until a merged port covers it, so the launcher never opens
+    stock for lack of patches. A click on "Download" or "Restart to update" in Settings is not
+    gated. The install changes the app's `Info.plist`, the `autoupdate` LaunchAgent rebuilds the
     overlay, and the next launcher start loads it (opened before that, it opens stock and starts the
     rebuild). On the MacBook Pro (`"ios": true`) the same run then builds the iOS app for the new
     nightly and uploads it to TestFlight. It does the same when only the patches changed under the
@@ -96,8 +100,8 @@ run the same patches.
 - **A new machine:** follow "A new machine" in [README.md](../README.md). A new Linux box is first set up
   with `~/Devops/Personal/playbook-new-box`; this repo only adds the patches.
 - Never edit a machine's T3 install by hand; `server`, `server-off` and `update` own it. On a Mac,
-  T3's own updater installs new releases into the untouched app; `update` (and `autoupdate`) only
-  rebuild the overlay for it, and until then the launcher opens stock.
+  T3's own updater installs new releases (up to the covered nightly, `covered-nightly.txt`) into the
+  untouched app; `update` (and `autoupdate`) only rebuild the overlay for it, and until then the launcher opens stock.
 - Python must stay compatible with macOS's system Python 3.9.
 
 ## Unattended ports
@@ -124,7 +128,7 @@ against `main`. It merges that PR (squash) and starts `fleet`, without asking, o
 3. nothing else changed: `checks-tt.json`, `checks-ios.json`, the script and every other file are
    byte-identical to `main`, and the repo was on `main`. Untracked files count only inside the patch
    folders (a checkout's own installed skills or lock files do not). The PR holds only the `*.patch` and
-   `base.txt` files of the patch folders (a changed check list goes along, for review).
+   `base.txt` files of the patch folders and `covered-nightly.txt` (a changed check list goes along, for review).
 
 The run publishes the port right after exporting it, before it waits for idle threads, so a
 deferred or failed restart never loses it. A `port/nightly-<version>` branch that holds commits

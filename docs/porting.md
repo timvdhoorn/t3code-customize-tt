@@ -82,7 +82,7 @@ git -C ~/.cache/t3code-customize/t3code worktree add --detach <dir> HEAD
 `port` applies all three layers onto that nightly (the newest when you leave out `--version`),
 then you run the loop above with `--source <dir>`, and `port --source <dir> --version <v> --resume
 --dry-run` exports the result to `~/.cache/t3code-customize/port-dry-run/<v>/` and says whether
-every patch kept its code lines. Without `--dry-run` it writes the patch folders in this repo and
+every patch kept its code lines. Without `--dry-run` it writes the patch folders and `covered-nightly.txt` (the newest nightly the patches cover, which the customized desktop app reads from `main` before it downloads an update) in this repo and
 opens the PR (see [machines.md](machines.md#unattended-ports)). Remove the worktree when done
 (`git -C ~/.cache/t3code-customize/t3code worktree remove <dir>`).
 

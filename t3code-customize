@@ -160,6 +160,9 @@ def save(path, value):
 RECIPE = REPO
 PORT = REPO / 'patches-port'
 SHARED = REPO / 'patches'
+# The newest nightly these patches cover, written by every port export. A customized T3 Code reads it
+# from this repo's main and downloads no newer nightly (patches-tt, "Updates on quit").
+COVERED_NIGHTLY = 'covered-nightly.txt'
 
 
 def patches():
@@ -1730,8 +1733,10 @@ def working_folder(folder):
 
 
 def is_port_file(path):
-    """A file export_patches writes: a patch or base.txt directly in a patch folder."""
+    """A file export_patches writes: a patch or base.txt directly in a patch folder, or the covered nightly."""
     parts = Path(path).parts
+    if parts == (COVERED_NIGHTLY,):
+        return True
     return len(parts) == 2 and parts[0] in PATCH_FOLDERS and (parts[1].endswith('.patch') or parts[1] == 'base.txt')
 
 
@@ -1749,7 +1754,7 @@ def port_changes():
         paths.append(entry[3:])
         if entry[0] in 'RC':
             paths.append(next(entries, ''))  # where a rename came from changed too
-    paths += run('ls-files', '--others', '--exclude-standard', '-z', '--', *PATCH_FOLDERS).split('\0')
+    paths += run('ls-files', '--others', '--exclude-standard', '-z', '--', *PATCH_FOLDERS, COVERED_NIGHTLY).split('\0')
     port, other = [], []
     for path in filter(None, paths):
         if '.syncthing.' not in Path(path).name:
@@ -2318,7 +2323,7 @@ def cmd_build(args):
         if app.fingerprint() != stock_fingerprint:
             raise Stop('The installed T3 Code changed during the build. Run again for its new version.')
         if ported:
-            export_patches(target)
+            export_patches(target, version=version)
             publish_port(args, version)
         build_dir = DATA / 'builds' / f'{version}-{recipe_hash()}-{job.name}'
         build_dir.mkdir(parents=True)
@@ -2345,11 +2350,34 @@ def cmd_build(args):
     return True
 
 
-def export_patches(target, root=None):
+NIGHTLY_VERSION = re.compile(r'(\d+)\.(\d+)\.(\d+)-nightly\.(\d+)\.(\d+)')
+
+
+def nightly_key(version):
+    """(major, minor, patch, date, build) of a nightly version, else None."""
+    match = NIGHTLY_VERSION.fullmatch((version or '').strip())
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def write_covered_nightly(version, folder):
+    """Record version as the newest nightly the patches cover, never an older one. The customized
+    desktop app fetches this file from main and installs no nightly above it. A version that is not
+    a nightly (a port by commit) leaves the file alone."""
+    key = nightly_key(version)
+    if not key:
+        return
+    path = folder / COVERED_NIGHTLY
+    known = nightly_key(path.read_text()) if path.exists() else None
+    if known is None or key >= known:
+        path.write_text(version.strip() + '\n')
+
+
+def export_patches(target, root=None, version=None):
     """Keep a port that an agent or you finished, so the next build starts from it.
 
     The shared patches go to patches-port/ (upstream's patches/ is never changed); the
     commits after them go to patches-tt/ (and, for the iOS app, patches-ios/). Commit them.
+    `version` is the nightly the patches now target; covered-nightly.txt follows it.
     """
     commits = git('rev-list', '--reverse', target + '..HEAD').split()
     shared = len(patches())
@@ -2373,6 +2401,7 @@ def export_patches(target, root=None):
                 f'{commits[start - 1] if start else target}..{commits[start + size - 1]}', capture=False)
         start += size
     (out / 'base.txt').write_text(target + '\n')
+    write_covered_nightly(version, Path(root) if root else REPO)
 
 
 def prune(keep=3):
@@ -2548,7 +2577,7 @@ def cmd_port(args):
         if args.dry_run:
             out = CACHE / 'port-dry-run' / version
             shutil.rmtree(out, ignore_errors=True)
-            export_patches(target, root=out)
+            export_patches(target, root=out, version=version)
 
             def read(folder):
                 return {p.name: p.read_text() for p in sorted((out / folder).glob('*.patch'))}
@@ -2557,7 +2586,7 @@ def cmd_port(args):
             say(f'Dry run: the port is in {out}, not published. Every patch keeps the same code lines: '
                 + ('yes, the standing grant would merge it.' if same else 'no, its PR would wait for review.'))
             return True
-        export_patches(target)
+        export_patches(target, version=version)
         publish_port(args, version)
     return True
 
@@ -3104,7 +3133,7 @@ def cmd_server(args):
         if git('rev-parse', 'HEAD').strip() != head:
             raise Stop('The source checkout changed during the build.')
         if ported:
-            export_patches(target)
+            export_patches(target, version=version)
             # Before the idle wait, so a deferred or failed restart never loses the port.
             publish_port(args, version)
         # What this build is made of, read now: once the lock is released a port may change the patches.
@@ -4289,7 +4318,7 @@ def cmd_ios(args):
         if git('rev-parse', 'HEAD').strip() != head:
             raise Stop('The source checkout changed during the build.')
         if ported:
-            export_patches(target)
+            export_patches(target, version=version)
             publish_port(args, version)
         built = recipe_hash() if ported else recipe
         if getattr(args, 'attempt', None):
