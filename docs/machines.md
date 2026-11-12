@@ -66,7 +66,11 @@ run the same patches.
     it. The install changes the app's `Info.plist`, the `autoupdate` LaunchAgent rebuilds the
     overlay, and the next launcher start loads it (opened before that, it opens stock and starts the
     rebuild). On the MacBook Pro (`"ios": true`) the same run then builds the iOS app for the new
-    nightly and uploads it to TestFlight. When the patches do not fit the new nightly, the run
+    nightly and uploads it to TestFlight. It does the same when only the patches changed under the
+    same nightly (a merged `patches-ios/` fix, say): the desktop says "Already up to date" and stays
+    as it is, and iOS builds because `ios-state.json` records another patch recipe (`ios_behind`;
+    `status` then says `behind`). So after such a merge, `fleet` (which kickstarts that LaunchAgent)
+    is all it takes. When the patches do not fit the new nightly, the run
     notifies Tim and stays on its current build (see "Ports" below). A re-signed copy at `~/Applications/T3 Code (Customized).app`
     from older versions of this tool ran with `T3CODE_DISABLE_AUTO_UPDATE=true`, so it never
     updated; `install_mac_launcher` removes it, and none may remain.

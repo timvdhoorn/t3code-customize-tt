@@ -848,17 +848,43 @@ class AutoupdateReloadTest(unittest.TestCase):
 
 
 class IosAfterUpdateTest(unittest.TestCase):
-    def test_ios_builds_only_when_the_nightly_changed(self):
-        cases = (({'version': 'n2'}, {'version': 'n1'}, True), ({'version': 'n2'}, {'version': 'n2'}, False),
-                 ({}, {'version': 'n1'}, False))
-        for state, ios_state, expected in cases:
-            with patch.object(customize, 'load', side_effect=lambda path, default=None:
-                              state if path == customize.STATE else ios_state):
-                self.assertEqual(customize.ios_behind_nightly(), expected)
+    def needs_build(self, state, ios_state, recipe='r1'):
+        with patch.object(customize, 'load', side_effect=lambda path, default=None:
+                          state if path == customize.STATE else ios_state), \
+                patch.object(customize, 'ios_recipe_hash', return_value=recipe):
+            return customize.ios_needs_build()
+
+    def test_ios_builds_when_the_nightly_changed(self):
+        self.assertTrue(self.needs_build({'version': 'n2'}, {'version': 'n1', 'recipe': 'r1'}))
+
+    def test_ios_builds_when_the_patches_changed_under_the_same_nightly(self):
+        # A change to patches-ios/ (or patches-tt/, patches/, patches-port/) alone, as in PR #95.
+        self.assertTrue(self.needs_build({'version': 'n2'}, {'version': 'n2', 'recipe': 'r1'}, recipe='r2'))
+
+    def test_ios_does_not_build_when_nightly_and_patches_are_unchanged(self):
+        self.assertFalse(self.needs_build({'version': 'n2'}, {'version': 'n2', 'recipe': 'r1'}))
+
+    def test_ios_does_not_build_before_the_desktop_build(self):
+        self.assertFalse(self.needs_build({}, {'version': 'n1', 'recipe': 'r1'}, recipe='r2'))
+
+    def run_update_ios(self, attempt, recipe='r2'):
+        stores = {customize.IOS_ATTEMPT: attempt, customize.STATE: {'version': 'n2'}}
+        with patch.object(customize, 'ios_needs_build', return_value=True), \
+                patch.object(customize, 'load', side_effect=lambda path, default=None: stores.get(path, {})), \
+                patch.object(customize, 'ios_recipe_hash', return_value=recipe), \
+                patch.object(customize, 'cmd_ios', return_value=False) as ios, patch.object(customize, 'notify'):
+            customize.update_ios(argparse.Namespace(app=None, fix=None))
+        return ios.called
+
+    def test_one_attempt_per_nightly_and_patch_set(self):
+        self.assertFalse(self.run_update_ios({'version': 'n2', 'recipe': 'r2'}))
+        # An upload that failed for the old patches does not hold back a build for the new ones.
+        self.assertTrue(self.run_update_ios({'version': 'n2', 'recipe': 'r1'}))
+        self.assertTrue(self.run_update_ios({'version': 'n1', 'recipe': 'r2'}))
 
     def test_a_build_that_fails_before_the_upload_is_tried_again(self):
         saved = []
-        with patch.object(customize, 'ios_behind_nightly', return_value=True), \
+        with patch.object(customize, 'ios_needs_build', return_value=True), \
                 patch.object(customize, 'load', side_effect=lambda path, default=None:
                              {} if path == customize.IOS_ATTEMPT else {'version': 'n2'}), \
                 patch.object(customize, 'save', lambda path, value: saved.append(path)), \
@@ -868,6 +894,35 @@ class IosAfterUpdateTest(unittest.TestCase):
         self.assertEqual(saved, [])
         self.assertIs(ios.call_args.args[0].attempt, customize.IOS_ATTEMPT)
 
+    def test_an_up_to_date_desktop_still_checks_ios_without_rebuilding(self):
+        # cmd_build answers "Already up to date" (False); the iOS check runs anyway, the desktop is untouched.
+        args = argparse.Namespace(app=None, fix=None, background=True, ios=True)
+        with patch.object(customize, 'MAC', True), patch.object(customize, 'app_settled', return_value=True), \
+                patch.object(customize, 'installed_app'), \
+                patch.object(customize, 'cmd_build', return_value=False) as build, \
+                patch.object(customize, 'notify') as notify, patch.object(customize, 'update_ios') as ios:
+            customize.cmd_update(args)
+        build.assert_called_once()
+        notify.assert_not_called()
+        ios.assert_called_once_with(args)
+
+
+class IosStatusTest(unittest.TestCase):
+    def status_line(self, ios_state, recipe, bundle='n2'):
+        with patch.object(customize, 'ios_recipe_hash', return_value=recipe):
+            return customize.ios_status_line(ios_state, bundle, staged=None)
+
+    def test_status_says_behind_when_the_patches_changed(self):
+        line = self.status_line({'version': 'n2', 'recipe': 'r1', 'buildNumber': '1'}, 'r2')
+        self.assertIn('(behind; run t3code-customize ios)', line)
+
+    def test_status_says_behind_for_another_nightly(self):
+        line = self.status_line({'version': 'n1', 'recipe': 'r1', 'buildNumber': '1'}, 'r1')
+        self.assertIn('behind', line)
+
+    def test_status_is_quiet_when_ios_is_current(self):
+        line = self.status_line({'version': 'n2', 'recipe': 'r1', 'buildNumber': '1'}, 'r1')
+        self.assertNotIn('behind', line)
 
 if __name__ == '__main__':
     unittest.main()

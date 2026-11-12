@@ -3277,20 +3277,29 @@ def cmd_update(args):
         raise
 
 
-def ios_behind_nightly():
-    """True when the iOS app on TestFlight was built for another nightly than the customized desktop build."""
+def ios_behind(ios_state, version):
+    """True when the iOS build on TestFlight (ios_state) is not the one for this nightly with the
+    patches and tool on disk now: another nightly, or a changed patch set under the same nightly
+    (patches-ios/ or patches-tt/, the shared patches or their port; ios_recipe_hash)."""
+    return ios_state.get('version') != version or ios_state.get('recipe') != ios_recipe_hash()
+
+
+def ios_needs_build():
+    """True when the iOS app lags the customized desktop build: its nightly or its patch set."""
     built = load(STATE, {}).get('version')
-    return bool(built) and IOS_CONFIG.exists() and load(IOS_STATE, {}).get('version') != built
+    return bool(built) and IOS_CONFIG.exists() and ios_behind(load(IOS_STATE, {}), built)
 
 
 def update_ios(args):
-    """After a background update: build the iOS app for the new nightly, in this run (it holds the lock)."""
-    if not ios_behind_nightly():
+    """After a background update: build the iOS app for a new nightly or changed patches, in this
+    run (it holds the lock). Runs also when the desktop was already up to date."""
+    if not ios_needs_build():
         return
-    # One upload per nightly: cmd_ios records the attempt once its build worked, so an upload
-    # that fails notifies once, not every hour; a build that fails before that tries again.
+    # One upload per nightly and patch set: cmd_ios records the attempt once its build worked, so an
+    # upload that fails notifies once, not every hour; a build that fails before that tries again.
     version = load(STATE, {}).get('version')
-    if load(IOS_ATTEMPT, {}).get('version') == version:
+    attempt = load(IOS_ATTEMPT, {})
+    if attempt.get('version') == version and attempt.get('recipe') == ios_recipe_hash():
         return
     ios_args = argparse.Namespace(app=args.app, fix=args.fix, resume=False, skip_checks=False, force=False,
                                   no_pull=True, attempt=IOS_ATTEMPT, background=getattr(args, 'background', False))
@@ -3301,6 +3310,14 @@ def update_ios(args):
         return
     except (Stop, PlatformError) as stop:
         notify(LAUNCHER_NAME, f'iOS build failed: {str(stop).strip().splitlines()[0]} Run {NAME} ios in a terminal.')
+
+
+def ios_status_line(ios_state, version, staged):
+    """status: the iOS build on TestFlight, and whether it lags the installed nightly or the patches."""
+    # A build now would be for the nightly the quit replaces; the rebuild after it builds iOS.
+    hint = 'quit T3 Code first, its update then builds it' if staged else f'run {NAME} ios'
+    return (f"iOS app:            build {ios_state['buildNumber']} for {ios_state['version']}"
+            + (f' (behind; {hint})' if ios_behind(ios_state, version) else ''))
 
 
 def cmd_autoupdate(args):
@@ -3400,12 +3417,7 @@ def _status():
             say(f'App update:         {staged} staged; installs when T3 Code quits')
         ios_state = load(IOS_STATE)
         if ios_state:
-            behind = (ios_state.get('recipe') != ios_recipe_hash()
-                      or ios_state.get('version') != bundle_version(app.path))
-            # A build now would be for the nightly the quit replaces; the rebuild after it builds iOS.
-            hint = 'quit T3 Code first, its update then builds it' if staged else f'run {NAME} ios'
-            say(f"iOS app:            build {ios_state['buildNumber']} for {ios_state['version']}"
-                + (f' (behind; {hint})' if behind else ''))
+            say(ios_status_line(ios_state, bundle_version(app.path), staged))
 
 
 # --- Ported upstream PRs ------------------------------------------------------------
@@ -4232,7 +4244,7 @@ def cmd_ios(args):
         raise Stop('This session cannot reach the login keychain, so Xcode could not sign the iOS app'
                    ' (errSecInternalComponent, after a build of a quarter of an hour). An SSH session never'
                    ' can. Run it in the login session instead: launchctl kickstart'
-                   f' gui/{os.getuid()}/{AUTOUPDATE_LABEL} (its run builds iOS when the nightly changed;'
+                   f' gui/{os.getuid()}/{AUTOUPDATE_LABEL} (its run builds iOS when the nightly or the patches changed;'
                    f' fleet starts it that way), or {NAME} ios in Terminal on this Mac.')
     config = ios_config()
     if not args.no_pull and not args.resume:
@@ -4278,14 +4290,16 @@ def cmd_ios(args):
         if ported:
             export_patches(target)
             publish_port(args, version)
+        built = recipe_hash() if ported else recipe
         if getattr(args, 'attempt', None):
-            # The build worked; an upload that fails from here is not retried every hour.
-            save(args.attempt, {'version': version, 'at': time.strftime('%Y-%m-%dT%H:%M:%S')})
+            # The build worked; an upload that fails from here is not retried every hour for this
+            # nightly and patch set (update_ios).
+            save(args.attempt, {'version': version, 'recipe': built, 'at': time.strftime('%Y-%m-%dT%H:%M:%S')})
         step(f'Uploading build {build_number} to TestFlight and waiting for processing...')
         asc(config, 'builds', 'upload', '--app-id', app_id, '--file', str(ipa), '--version', marketing,
             '--build-number', build_number, '--wait', '--timeout', '60m', log=log)
         group = ios_testers(config, app_id, log)
-        save(IOS_STATE, {'commit': target, 'version': version, 'recipe': recipe_hash() if ported else recipe,
+        save(IOS_STATE, {'commit': target, 'version': version, 'recipe': built,
                          'bundleId': config['bundleId'], 'appId': app_id, 'buildNumber': build_number,
                          'marketingVersion': marketing, 'uploadedAt': time.strftime('%Y-%m-%dT%H:%M:%S')})
     shutil.rmtree(job, ignore_errors=True)
@@ -4339,12 +4353,12 @@ def main():
     update = sub.add_parser('update', help='build, and on failure notify (what autoupdate runs; the default on macOS)')
     build_options(update)
     update.add_argument('--background', action='store_true', help=argparse.SUPPRESS)
-    update.add_argument('--ios', action='store_true', help='then build the iOS app when the nightly changed')
+    update.add_argument('--ios', action='store_true', help='then build the iOS app when the nightly or the patches changed')
     auto = sub.add_parser('autoupdate', help='macOS: keep everything up to date in the background')
     auto.add_argument('state', choices=['on', 'off'])
     auto.add_argument('--every', type=int, default=60, help='minutes between checks (default 60)')
     auto.add_argument('--fix', choices=sorted(AGENTS), help='let this agent port broken patches unattended')
-    auto.add_argument('--ios', action='store_true', help='macOS: also build the iOS app when the nightly changed')
+    auto.add_argument('--ios', action='store_true', help='macOS: also build the iOS app when the nightly or the patches changed')
     launch = sub.add_parser('launch', help='open the customized build if it matches your T3 Code, else stock')
     launch.add_argument('rest', nargs=argparse.REMAINDER)
     sub.add_parser('status', help='show what the next launch opens')
