@@ -1,0 +1,187 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t3code-customize <t3code-customize@localhost>
+Date: Thu, 12 Nov 2026 20:06:41 +0100
+Subject: [PATCH 12/12] feat(server): read Codex usage limits through the
+ running session
+
+The shared usage-limits patch polls Codex limits through a reader the
+Codex adapter registers. That hook came with the stats-for-nerds patch,
+which this fork leaves out (skip-shared.json); this carries only the
+reader: once the session's app-server connection is initialized it asks
+account/rateLimits/read, times out after 3 seconds and never spawns or
+initializes anything itself.
+---
+ .../Adapters/CodexAdapterV2.test.ts           | 79 +++++++++++++++++++
+ .../Adapters/CodexAdapterV2.ts                | 27 ++++++-
+ 2 files changed, 105 insertions(+), 1 deletion(-)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
+index 6e5fd3516e..ae2db1f78e 100644
+--- a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
+@@ -1302,6 +1302,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
+     onUsageLimits?: CodexAdapterV2.CodexAdapterV2Options["onUsageLimits"],
+     promptSuggestions: Effect.Effect<boolean> = Effect.succeed(false),
+     onNotification: (method: string) => Effect.Effect<void> = () => Effect.void,
++    hooks: Pick<CodexAdapterV2.CodexAdapterV2Options, "registerUsageLimitsReader"> = {},
+   ) =>
+     Effect.gen(function* () {
+       const fileSystem = yield* FileSystem.FileSystem;
+@@ -1365,6 +1366,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
+         clientFactory,
+         ...(onUsageLimits ? { onUsageLimits } : {}),
+         digest: yield* Digest.Digest,
++        ...hooks,
+         fileSystem,
+         idAllocator,
+         serverConfig,
+@@ -1614,6 +1616,83 @@ describe("CodexAdapterV2 post-settle continuation", () => {
+       ),
+   );
+ 
++  it.effect("reads fresh limits through the existing initialized session connection", () =>
++    Effect.scoped(
++      Effect.gen(function* () {
++        let reader:
++          | Effect.Effect<import("@t3tools/contracts").ServerProviderUsageLimits | undefined>
++          | undefined;
++        const methods: string[] = [];
++        const transcript = makeCodexReplayTranscript({
++          scenario: "limits-only-existing-client",
++          entries: [
++            ...codexReplayPreamble({
++              nativeThreadId: "limits-thread",
++              nativeTurnId: "unused",
++              prompt: "unused",
++            }).slice(0, 5),
++            {
++              type: "expect_outbound",
++              label: "limits-read",
++              frame: { id: 3, method: "account/rateLimits/read", params: null },
++            },
++            {
++              type: "emit_inbound",
++              label: "limits-result",
++              frame: {
++                id: 3,
++                result: {
++                  rateLimits: {
++                    limitId: "codex",
++                    primary: { usedPercent: 60, windowDurationMins: 300, resetsAt: 2000100000 },
++                  },
++                  rateLimitsByLimitId: null,
++                  rateLimitResetCredits: null,
++                },
++              },
++            },
++          ],
++        });
++        yield* makeCodexReplayHarness(
++          transcript,
++          () => Effect.void,
++          (method) =>
++            Effect.sync(() => {
++              methods.push(method);
++            }),
++          undefined,
++          undefined,
++          undefined,
++          undefined,
++          undefined,
++          {
++            registerUsageLimitsReader: (read) =>
++              Effect.gen(function* () {
++                reader = read;
++                // Reading before initialization must not initialize or spawn anything.
++                assert.isUndefined(yield* read);
++              }),
++          },
++        );
++        assert.isDefined(reader);
++        yield* TestClock.adjust("1 minute");
++        const limits = yield* reader!;
++        assert.strictEqual(limits?.windows[0]?.usedPercent, 60);
++        assert.strictEqual(limits?.checkedAt, "1970-01-01T00:01:00.000Z");
++        assert.deepStrictEqual(methods, ["initialize", "thread/start", "account/rateLimits/read"]);
++      }).pipe(
++        Effect.provide(
++          Layer.mergeAll(
++            IdAllocator.layer,
++            McpProviderSessions.layer,
++            NodeServices.layer,
++            NodeCrypto.layer,
++          ),
++        ),
++      ),
++    ),
++  );
++
+   it.effect.each(["supported", "unsupported", "invalid"] as const)(
+     "delivers native history with %s app-server protocol",
+     (response) =>
+diff --git a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
+index 4e8fd1ac5f..51b8643d1f 100644
+--- a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
+@@ -24,6 +24,7 @@ import {
+ } from "../../provider/CodexProvider.ts";
+ import {
+   codexRateLimitsToUpdate,
++  codexRateLimitsToLimits,
+   mergeCodexRateLimits,
+   codexUsageLimitResetAt,
+   type CodexRateLimitSnapshot,
+@@ -76,6 +77,7 @@ import type {
+   ProviderThreadId,
+   ProviderTurnId,
+   ProviderInstanceId,
++  ServerProviderUsageLimits,
+   RuntimeMode,
+   ThreadId,
+ } from "@t3tools/contracts";
+@@ -1683,7 +1685,10 @@ export type CodexAdapterV2DriverEnv =
+ 
+ export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapterV2")(function* (
+   { instanceId, environment, enabled, config }: ProviderAdapterDriverCreateInput<CodexSettings>,
+-  hooks: Pick<CodexAdapterV2Options, "onUsageLimits" | "resolveRuntime" | "compatibility"> = {},
++  hooks: Pick<
++    CodexAdapterV2Options,
++    "onUsageLimits" | "resolveRuntime" | "compatibility" | "registerUsageLimitsReader"
++  > = {},
+ ) {
+   const clientFactory = yield* CodexAppServerClientFactory;
+   const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
+@@ -1728,6 +1733,9 @@ export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapter
+ });
+ 
+ export interface CodexAdapterV2Options {
++  readonly registerUsageLimitsReader?: (
++    reader: Effect.Effect<ServerProviderUsageLimits | undefined>,
++  ) => Effect.Effect<void, never, Scope.Scope>;
+   readonly instanceId: ProviderInstanceId;
+   readonly settings: CodexSettings;
+   readonly environment: NodeJS.ProcessEnv;
+@@ -1878,6 +1886,23 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+         );
+         // A failed open is discarded, so the next turn spawns the updated binary.
+         if (adapterOptions.compatibility !== undefined) yield* ensureInitialized;
++        if (adapterOptions.registerUsageLimitsReader) {
++          yield* adapterOptions.registerUsageLimitsReader(
++            Effect.gen(function* () {
++              if (!(yield* Ref.get(initialized))) return undefined;
++              const response = yield* client.request("account/rateLimits/read", null);
++              return codexRateLimitsToLimits({
++                snapshot: response.rateLimits,
++                rateLimitsByLimitId: response.rateLimitsByLimitId,
++                resetCredits: response.rateLimitResetCredits,
++                checkedAt: DateTime.formatIso(yield* DateTime.now),
++              });
++            }).pipe(
++              Effect.timeout("3 seconds"),
++              Effect.orElseSucceed(() => undefined),
++            ),
++          );
++        }
+         const now = yield* DateTime.now;
+         const session = providerSession({
+           providerSessionId: input.providerSessionId,
