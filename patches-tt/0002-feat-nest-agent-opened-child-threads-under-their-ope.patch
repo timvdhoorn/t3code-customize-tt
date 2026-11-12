@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: timvdhoorn <timvdhoorn@gmail.com>
 Date: Thu, 15 Oct 2026 14:33:02 +0200
-Subject: [PATCH 02/10] feat: nest agent-opened child threads under their
+Subject: [PATCH 02/11] feat: nest agent-opened child threads under their
  opener in the sidebar
 
 Ports the server side of pingdotgg/t3code#16699 (openedByThreadId on
@@ -27,7 +27,7 @@ guide line, context-menu collapse and a summary stub.
  .../src/orchestration-v2/runtimeLayer.test.ts |   85 ++
  .../Sidebar.childThreads.browser.test.tsx     |  181 +++
  .../components/Sidebar.childThreads.test.ts   |  617 ++++++++
- .../src/components/Sidebar.childThreads.tsx   | 1299 +++++++++++++++++
+ .../src/components/Sidebar.childThreads.tsx   | 1305 +++++++++++++++++
  .../src/components/Sidebar.families.test.ts   |  519 +++++++
  apps/web/src/components/Sidebar.families.ts   |  381 +++++
  apps/web/src/components/Sidebar.logic.test.ts |   45 +
@@ -37,7 +37,7 @@ guide line, context-menu collapse and a summary stub.
  ...lationshipsControl.opened.browser.test.tsx |  373 +++++
  .../chat/ThreadRelationshipsControl.tsx       |  338 ++++-
  .../components/sidebar/SidebarThreadRow.tsx   |   99 +-
- .../SidebarThreadRow.workers.browser.test.tsx |  551 +++++++
+ .../SidebarThreadRow.workers.browser.test.tsx |  609 ++++++++
  .../web/src/components/sidebar/routeReveal.ts |   18 +-
  .../components/threadActionMenu.logic.test.ts |   33 +
  .../src/components/threadActionMenu.logic.ts  |   39 +
@@ -65,7 +65,7 @@ guide line, context-menu collapse and a summary stub.
  packages/contracts/src/orchestrationV2.ts     |   32 +
  packages/contracts/src/orchestratorMcp.ts     |    6 +
  .../src/server/subagentProjection.ts          |    9 +-
- 56 files changed, 6712 insertions(+), 139 deletions(-)
+ 56 files changed, 6776 insertions(+), 139 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.childThreads.browser.test.tsx
  create mode 100644 apps/web/src/components/Sidebar.childThreads.test.ts
  create mode 100644 apps/web/src/components/Sidebar.childThreads.tsx
@@ -2105,10 +2105,10 @@ index 0000000000..9a57a4f111
 +});
 diff --git a/apps/web/src/components/Sidebar.childThreads.tsx b/apps/web/src/components/Sidebar.childThreads.tsx
 new file mode 100644
-index 0000000000..d8070f40e5
+index 0000000000..cf36f6d035
 --- /dev/null
 +++ b/apps/web/src/components/Sidebar.childThreads.tsx
-@@ -0,0 +1,1299 @@
+@@ -0,0 +1,1305 @@
 +// Child threads in the sidebar (patches-tt/0003). Family rules live in Sidebar.families.ts;
 +// this module holds the sidebar's state and rendering so Sidebar.tsx only calls into it.
 +import { observeResize } from "~/lib/observeResize";
@@ -3094,8 +3094,14 @@ index 0000000000..d8070f40e5
 +      );
 +    };
 +    measure();
++    // The placeholder also moves without resizing when an item before it on its line grows or
++    // shrinks (a branch that truncates once a pull request badge loads), so its line's items count
++    // too. An item added later resizes one of them, at least the line's spacer.
 +    const row = rowElement.current;
-+    return observeResize(row === null ? [anchor, item] : [anchor, item, row], measure);
++    const line = anchor.parentElement === null ? [] : [...anchor.parentElement.children];
++    const observed = new Set<Element>([anchor, item, ...line]);
++    if (row !== null) observed.add(row);
++    return observeResize([...observed], measure);
 +  }, [anchor, rowElement]);
 +  return offset;
 +}
@@ -6045,10 +6051,10 @@ index 0621f83773..6278b869de 100644
  });
 diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx
 new file mode 100644
-index 0000000000..10bd904d30
+index 0000000000..97b0a482a7
 --- /dev/null
 +++ b/apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx
-@@ -0,0 +1,551 @@
+@@ -0,0 +1,609 @@
 +import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 +import { describe, expect, it, vi } from "vite-plus/test";
 +import { cdp, page, userEvent } from "vite-plus/test/browser";
@@ -6305,7 +6311,9 @@ index 0000000000..10bd904d30
 +      expect(trigger.element().closest('[role="button"]')).toBeNull();
 +      const anchor = page.getByTestId("sidebar-delegated-workers-anchor").element();
 +      expect(anchor.closest('[role="button"]')).not.toBeNull();
-+      expect(anchor.parentElement!.textContent).toContain("main");
++      // On the card's meta line, not its title line.
++      expect(anchor.closest('[data-testid="sidebar-row-card"]')).not.toBeNull();
++      expect(anchor.parentElement!.textContent).not.toContain(HEAD.title);
 +      const anchorBox = anchor.getBoundingClientRect();
 +      const triggerBox = trigger.element().getBoundingClientRect();
 +      expect(Math.abs(triggerBox.left - anchorBox.left)).toBeLessThan(1);
@@ -6375,6 +6383,62 @@ index 0000000000..10bd904d30
 +    await expect
 +      .element(page.getByTestId("sidebar-delegated-workers-popover"))
 +      .not.toBeInTheDocument();
++  });
++
++  it("keeps the chips on their place, clear of the line's other items, when an item before them changes width", async () => {
++    vi.mocked(useEnvironmentScope).mockReturnValue(true);
++    await page.viewport(1280, 800);
++    // A thread without a branch shows its machine before the chips; the label's width moves the
++    // chips' placeholder along its line without resizing it, its row or the row's item.
++    const tree = (machineLabel: string) => (
++      <TooltipProvider delay={150} closeDelay={0}>
++        <div className="w-72 bg-sidebar p-2 text-sidebar-foreground">
++          <ul className="flex flex-col gap-px">
++            <NestedThreadRow
++              {...rowProps(noop)}
++              thread={{ ...HEAD, branch: null }}
++              scratchMachineLabel={machineLabel}
++              environmentMachine="server"
++            />
++          </ul>
++        </div>
++      </TooltipProvider>
++    );
++    await using screen = await render(tree("dev"));
++    const trigger = page.getByTestId("sidebar-delegated-workers");
++    await expect.element(trigger).toBeVisible();
++    const overlaps = (a: DOMRect, b: DOMRect) =>
++      a.left < b.right - 0.5 && b.left < a.right - 0.5 && a.top < b.bottom && b.top < a.bottom;
++    const expectChipsClear = () => {
++      const anchor = page.getByTestId("sidebar-delegated-workers-anchor").element();
++      const triggerBox = trigger.element().getBoundingClientRect();
++      const anchorBox = anchor.getBoundingClientRect();
++      expect(Math.abs(triggerBox.left - anchorBox.left)).toBeLessThan(1);
++      expect(Math.abs(triggerBox.top - anchorBox.top)).toBeLessThan(1);
++      // No other item on the meta line sits under the chips.
++      for (const item of anchor.parentElement!.children) {
++        if (item === anchor) continue;
++        const box = item.getBoundingClientRect();
++        if (box.width === 0 || item.textContent === "") continue;
++        expect(overlaps(triggerBox, box), item.textContent ?? "").toBe(false);
++      }
++      // Nor do the chips overlap each other.
++      const chips = [
++        ...trigger.element().querySelectorAll('[data-testid="sidebar-child-thread-chip"]'),
++      ].map((chip) => chip.getBoundingClientRect());
++      for (let index = 1; index < chips.length; index++) {
++        expect(chips[index]!.left).toBeGreaterThanOrEqual(chips[index - 1]!.right);
++      }
++    };
++    expectChipsClear();
++
++    // A stale position never corrects itself, so retrying only waits out the resize callback.
++    await screen.rerender(tree("buildbox (remote build host)"));
++    await expect.poll(() => document.body.textContent).toContain("buildbox (remote");
++    await vi.waitFor(expectChipsClear);
++
++    await screen.rerender(tree("dev"));
++    await vi.waitFor(expectChipsClear);
 +  });
 +
 +  it("puts focus back on the row when the last worker becomes a main thread", async () => {

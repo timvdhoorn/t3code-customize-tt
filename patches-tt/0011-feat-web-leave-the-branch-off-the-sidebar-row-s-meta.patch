@@ -1,0 +1,241 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: timvdhoorn <timvdhoorn@gmail.com>
+Date: Thu, 12 Nov 2026 20:18:38 +0100
+Subject: [PATCH 11/11] feat(web): leave the branch off the sidebar row's meta
+ line
+
+The card's meta line no longer shows the branch name and its worktree or
+folder icon. Worker chips, pull request and diff indicators, the machine
+icon and the provider avatar keep their place; a meta line with only a
+branch collapses. The row's hover card still names the branch.
+---
+ .../SidebarThreadRow.branch.browser.test.tsx  | 180 ++++++++++++++++++
+ .../components/sidebar/SidebarThreadRow.tsx   |  10 +-
+ 2 files changed, 183 insertions(+), 7 deletions(-)
+ create mode 100644 apps/web/src/components/sidebar/SidebarThreadRow.branch.browser.test.tsx
+
+diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.branch.browser.test.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.branch.browser.test.tsx
+new file mode 100644
+index 0000000000..a0410821ad
+--- /dev/null
++++ b/apps/web/src/components/sidebar/SidebarThreadRow.branch.browser.test.tsx
+@@ -0,0 +1,180 @@
++import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
++import { describe, expect, it, vi } from "vite-plus/test";
++import { page, userEvent } from "vite-plus/test/browser";
++
++import "~/index.css";
++
++import { render } from "../../../test/render";
++import { useEnvironmentScope } from "../../state/session";
++import { buildSidebarDelegatedWorkers } from "../Sidebar.childThreads";
++import { TooltipProvider } from "../ui/tooltip";
++import { NestedThreadRow } from "./SidebarThreadRow";
++
++vi.mock("../../state/session", { spy: true });
++
++const UPDATED_AT = "2026-11-10T12:00:00.000Z";
++const BRANCH = "docs/csv-import-2511";
++
++function shell(
++  id: string,
++  title: string,
++  overrides: Partial<Record<string, unknown>> = {},
++): EnvironmentThreadShell {
++  return {
++    environmentId: "env",
++    id,
++    projectId: "project",
++    title,
++    providerInstanceId: "claude",
++    modelSelection: { instanceId: "claude", model: "claude-opus-5-5" },
++    runtimeMode: "full-access",
++    interactionMode: "default",
++    branch: BRANCH,
++    worktreePath: "/worktrees/graph",
++    latestRun: null,
++    runtime: null,
++    latestUserMessageAt: UPDATED_AT,
++    hasPendingApprovals: false,
++    hasPendingUserInput: false,
++    pendingSubagentRequest: null,
++    hasActionableProposedPlan: false,
++    pendingBackgroundTasks: [],
++    providerInstanceHistory: [],
++    goal: null,
++    itemCount: 4,
++    visibleItemCount: 4,
++    createdAt: UPDATED_AT,
++    updatedAt: UPDATED_AT,
++    archivedAt: null,
++    settledOverride: null,
++    settledAt: null,
++    unsettledAt: null,
++    snoozedUntil: null,
++    snoozedAt: null,
++    pinnedAt: null,
++    pinOrderKey: null,
++    activeOrderKey: null,
++    pullRequests: [],
++    lineage: { rootThreadId: id, parentThreadId: null, relationshipToParent: null },
++    delegatedFrom: null,
++    ...overrides,
++  } as unknown as EnvironmentThreadShell;
++}
++
++const noop = () => {};
++
++function rowProps(thread: EnvironmentThreadShell, variant: "card" | "folder-multiline") {
++  return {
++    thread,
++    variant,
++    variantAction: "settle",
++    settlementSupported: true,
++    snoozeSupported: true,
++    pinningSupported: true,
++    isPinned: false,
++    dropVerb: null,
++    dragOverPinned: false,
++    sweepAction: null,
++    snoozeWakeLabelText: null,
++    wokeAt: null,
++    isActive: false,
++    isRouteThread: false,
++    openPullRequestsInRightPanel: false,
++    jumpLabel: null,
++    currentEnvironmentId: "env",
++    environmentLabel: null,
++    environmentMachine: "server",
++    scratchMachineLabel: null,
++    project: null,
++    projectDisplayName: "timvdhoorn/LMManagement",
++    providerEntryByInstanceId: new Map(),
++    timestampFormat: "locale",
++    onThreadClick: noop,
++    onThreadActivate: noop,
++    onStartRename: noop,
++    onRenameTitleChange: noop,
++    onCommitRename: noop,
++    onCancelRename: noop,
++    isRenaming: false,
++    renamingTitle: "",
++    onContextMenu: noop,
++    onSettle: noop,
++    onActionSweepStart: noop,
++    onUnsettle: noop,
++    onSnooze: noop,
++    onUnsnooze: noop,
++    onUnpin: noop,
++    onAcknowledgeWoke: noop,
++  } as unknown as Parameters<typeof NestedThreadRow>[0];
++}
++
++const HEAD = shell("head", "Grill: CSV import");
++const WORKER = shell("worker", "W: Importer", {
++  branch: null,
++  worktreePath: null,
++  delegatedByThreadId: "head",
++  runtime: { status: "running" },
++  lineage: { rootThreadId: "head", parentThreadId: "head", relationshipToParent: "subagent" },
++});
++
++async function renderRows(variant: "card" | "folder-multiline") {
++  vi.mocked(useEnvironmentScope).mockReturnValue(true);
++  await page.viewport(1280, 800);
++  const workers = buildSidebarDelegatedWorkers([HEAD, WORKER], {
++    hasRow: (thread) => thread.id === "head",
++    isUnread: () => false,
++    environmentLabelOf: () => null,
++  }).get("env:head");
++  return render(
++    <TooltipProvider delay={0} closeDelay={0}>
++      <div className="w-72 bg-sidebar p-2 text-sidebar-foreground">
++        <ul className="flex flex-col gap-px">
++          <NestedThreadRow {...rowProps(shell("branch", "Met branch"), variant)} />
++          <NestedThreadRow
++            {...rowProps(shell("none", "Zonder branch", { branch: null, worktreePath: null }), variant)}
++          />
++          <NestedThreadRow
++            {...rowProps(HEAD, variant)}
++            delegatedWorkers={workers ?? null}
++            onDelegatedWorkerAction={noop}
++          />
++        </ul>
++      </div>
++    </TooltipProvider>,
++  );
++}
++
++const rowItem = (title: string) =>
++  [...document.querySelectorAll("li")].find((item) => item.textContent?.includes(title))!;
++
++describe("the sidebar row's meta line leaves the branch out", () => {
++  it.each(["card", "folder-multiline"] as const)(
++    "%s: a branch alone adds no line, and the chips start the line",
++    async (variant) => {
++      await using _screen = await renderRows(variant);
++      await expect.element(page.getByTestId("sidebar-delegated-workers")).toBeVisible();
++
++      // Neither the branch name nor any part of it shows on a row.
++      for (const item of document.querySelectorAll("li")) {
++        expect(item.textContent).not.toContain("docs/");
++        expect(item.textContent).not.toContain("2511");
++      }
++      // A row with only a branch is as tall as one without: its meta line collapsed.
++      expect(rowItem("Met branch").getBoundingClientRect().height).toBe(
++        rowItem("Zonder branch").getBoundingClientRect().height,
++      );
++      // The worker chips keep their line and lead it.
++      const anchor = page.getByTestId("sidebar-delegated-workers-anchor").element();
++      expect(anchor.parentElement!.firstElementChild).toBe(anchor);
++      expect(rowItem(HEAD.title).getBoundingClientRect().height).toBeGreaterThan(
++        rowItem("Met branch").getBoundingClientRect().height,
++      );
++    },
++  );
++
++  it("keeps the branch in the row's hover card", async () => {
++    await using _screen = await renderRows("card");
++    await userEvent.hover(page.getByTestId("sidebar-row-card").first());
++    await expect.poll(() => document.body.textContent).toContain("2511");
++  });
++});
+diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
+index a1df0bb00f..79a011fd8e 100644
+--- a/apps/web/src/components/sidebar/SidebarThreadRow.tsx
++++ b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
+@@ -98,7 +98,6 @@ import { resolveLocalCheckoutBranchMismatch } from "../BranchToolbar.logic";
+ import {
+   ThreadPullRequestBadgeControl,
+   ThreadPullRequestsMiniList,
+-  ThreadWorktreeIndicator,
+   prStatusIndicator,
+   resolveThreadPullRequestBadge,
+   terminalStatusFromRunningIds,
+@@ -1236,9 +1235,9 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+       />
+     ) : null;
+   // Only the trailing icons would remain, so the row moves them to the title line instead.
++  // The branch does not count: the meta line leaves it out (it stays in the hover card).
+   const metaLineEmpty =
+     workerChips === null &&
+-    !checkoutThread.branch &&
+     !showsScratchMachine &&
+     prBadge === null &&
+     diff === null &&
+@@ -1246,13 +1245,10 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+   const metaLine = metaLineEmpty ? null : (
+     <div className="mt-0.5 flex min-w-0 items-center gap-1.5 text-secondary-label text-xs">
+       {checkoutThread.branch ? (
++        // No branch name or worktree icon here; the rest of the line keeps its place.
+         <>
+-          <ThreadWorktreeIndicator thread={checkoutThread} />
+-          <span className={cn("flex min-w-0", workerChips === null && "flex-1")}>
+-            <MiddleTruncate value={checkoutThread.branch} showTitle={false} />
+-          </span>
+           {workerChips}
+-          {workerChips === null ? null : <span className="flex-1" />}
++          <span className="flex-1" />
+         </>
+       ) : showsScratchMachine ? (
+         <>
