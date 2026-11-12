@@ -17,8 +17,10 @@ can do. [docs/machines.md](../../docs/machines.md) holds the rules (ports, the i
    lists the repo's open PRs: report each one, a port or feature waiting there has not shipped.
 2. Nothing newer and nothing behind: report that per machine and stop.
 3. A Mac whose app is older than the newest nightly gets it from T3's own updater: the customized
-   build downloads it itself and installs on quit (`patches-tt/0005`). Do not quit or relaunch the
-   app; tell Tim it installs the next time he quits T3 Code, unless he asks you to wait for it.
+   build downloads it itself and installs on quit (`patches-tt/0005`), but only up to the nightly in
+   `covered-nightly.txt` on `main` (the port export writes it): a newer nightly waits for its port to
+   merge, so the launcher never opens stock. Do not quit or relaunch the app; tell Tim it installs the
+   next time he quits T3 Code, unless he asks you to wait for it.
 4. Port when the patches no longer apply: a `build`, `update` or `server` reports a conflict or
    failing check. No agent ports unattended; you port, in this thread, on devbox1. Work in your own
    detached worktree of the shared checkout: `./t3code-customize port --source <worktree> --version

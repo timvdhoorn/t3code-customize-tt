@@ -72,8 +72,8 @@ personal data. Name where a secret lives (a 1Password item, a path under
 
 | Upstream owns (never commit changes) | The fork owns (commit changes) |
 | --- | --- |
-| `patches/*.patch`, `patches/base.txt`, `checks.json` | `patches-port/`, `patches-tt/`, `checks-tt.json`, `patches-ios/`, `checks-ios.json`, `ios.json`, `ported-prs.json`, `known-upstream-failures.json`, `.agents/playbooks/`, this section, `docs/fork-changes.md`, `docs/machines.md`, `docs/porting.md`, `CLAUDE.md` |
-| the Linux, Windows and macOS build and launch paths in `t3code-customize`, `platform_support.py`, `macos/`, `install.ps1`, `tests/`, `docs/macos.md` | update, autoupdate, server, fleet and ios code in `t3code-customize`, `machines.json`, `tests/test_checkout_guard.py`, `tests/test_unattended_updates.py`, `tests/test_fleet_sync.py`, `tests/test_port_flow.py`, `tests/test_lint_step.py`, `tests/test_typechecker.py`, `tests/test_ios_build.py`, the `README.md` macOS, server and machines sections |
+| `patches/*.patch`, `patches/base.txt`, `checks.json` | `patches-port/`, `patches-tt/`, `checks-tt.json`, `patches-ios/`, `checks-ios.json`, `ios.json`, `ported-prs.json`, `covered-nightly.txt` (written by the port export), `known-upstream-failures.json`, `.agents/playbooks/`, this section, `docs/fork-changes.md`, `docs/machines.md`, `docs/porting.md`, `CLAUDE.md` |
+| the Linux, Windows and macOS build and launch paths in `t3code-customize`, `platform_support.py`, `macos/`, `install.ps1`, `tests/`, `docs/macos.md` | update, autoupdate, server, fleet and ios code in `t3code-customize`, `machines.json`, `tests/test_checkout_guard.py`, `tests/test_unattended_updates.py`, `tests/test_fleet_sync.py`, `tests/test_port_flow.py`, `tests/test_lint_step.py`, `tests/test_covered_nightly.py`, `tests/test_typechecker.py`, `tests/test_ios_build.py`, the `README.md` macOS, server and machines sections |
 
 - A port of the shared patches goes to `patches-port/` (with its own `base.txt`), never to
   `patches/`; the tool writes it there. Builds use it while it targets a newer nightly than
