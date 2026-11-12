@@ -66,7 +66,8 @@ run the same patches.
   - Mac: T3's own updater. In the customized build it downloads a new nightly as soon as it finds
     one and installs it when Tim quits the app (`patches-tt/0005`); nothing restarts the app for
     it. It does this only for a nightly the patches cover: it reads `covered-nightly.txt` from
-    `main` of this repo (the port export writes it, the port PR carries it) and leaves a newer nightly
+    `main` of this repo (the port export writes it, the port PR carries it; for a nightly that needs no
+    port devbox1's cover PR does, see "Covering a clean nightly") and leaves a newer nightly
     alone, also when the lookup fails, until a merged port covers it, so the launcher never opens
     stock for lack of patches. A click on "Download" or "Restart to update" in Settings is not
     gated. The install changes the app's `Info.plist`, the `autoupdate` LaunchAgent rebuilds the
@@ -83,7 +84,8 @@ run the same patches.
   - devbox1: the `autoupdate` timer at 04:30 runs `server --t3-update`: `t3 update`
     stages the newest `t3@nightly` (a no-op when it already runs it), the customized server is built
     for it, and the one restart waits for idle as above. When the patches break there, it notifies
-    and keeps its current build.
+    and keeps its current build. When they apply cleanly and the checks pass, it also advances
+    `covered-nightly.txt` ("Covering a clean nightly").
 - **Ports.** No machine ports unattended and no run starts an agent (Tim's decision, 2026-11-06:
   the unattended agent ports kept failing). No machine in `machines.json` has `"fix"`, so no run
   hands a port off, and `fleet` turns `autoupdate on` without `--fix`. A run that hits a conflict or
@@ -137,6 +139,42 @@ the tool did not make is left alone; the port goes to `-2`, `-3` and so on. Afte
 Only a machine with git and `gh` can publish: the porter, devbox1. A port that does not qualify
 leaves its PR open (`status` lists it under "Open PRs") and notifies Tim. The grant covers
 exactly this case. An agent porting by hand follows the normal PR flow.
+
+### Covering a clean nightly
+
+A nightly the patches apply to without a conflict, with every check passing, needs no port, so no
+port export writes `covered-nightly.txt` and the Macs (which install only up to that version) would
+stay put until some later nightly needs a port. `publish_cover` closes that gap on the porter,
+without an agent. It runs in two places, after the patches applied, the checks passed and the build
+succeeded (the same spot where `publish_port` runs for a port): `server` (devbox1's 04:30 run, `fleet`
+and any manual run that builds) and `port` (not `--dry-run`). It does nothing unless all of these hold:
+
+- the run applied this repo's own patch set (not an older one from history, for a nightly older than
+  the patches) and ran every check, so not with `--skip-checks`; a port takes its own path and carries
+  the file in its PR;
+- the version is a nightly, and `origin/main` names an older one (or no file): equal or newer is a
+  no-op, so the version never goes down and a repeated run opens nothing;
+- this machine can publish: a git checkout, `gh` and a working `gh auth status` (devbox1; a Mac
+  never runs `server`, and a machine without a login does nothing, quietly).
+
+It then goes through `_publish_port`, the same path and the same grant as a port, with `cover` set:
+branch `cover/nightly-<version>`, title `chore: cover nightly <version>`, `covered-nightly.txt` the
+only file. It merges (squash) under rules 1 and 3 above and a checkout that holds exactly that
+change: on `main`, no patch change or other file changed here. Otherwise the PR stays open, a
+notification says so and the checkout goes back to what is committed. It starts no `fleet`: nothing
+was rebuilt, and the Macs read the file themselves from `main` the next time their updater checks.
+A failure (no network, a refused push) notifies and never fails the run; the next run that builds this
+nightly retries (`server --force` when the server already runs it, since an up-to-date server run
+exits before the build). It holds the checkout lock like a port export and runs before the idle wait,
+so neither the idle gate nor the restart lock change.
+
+**Cadence.** The 04:30 run is enough. Covering a nightly takes the same apply and checks as building
+the server for it, so a cheaper separate check does not exist; an extra timer would only repeat that
+work. Nightlies come out about daily, so a Mac gets a new one at most about a day after it appears
+(04:30 after it was released, plus the build), and the Mac only ever holds back, it never opens stock.
+The other triggers (`fleet`, a version switch of the T3 service, a manual `server` or `port`) cover
+sooner when asked. Only the nightly `t3 update` stages at 04:30 is considered; nightlies released and
+replaced between two runs are older than the covered one and install as before.
 
 ### Known upstream failures
 
