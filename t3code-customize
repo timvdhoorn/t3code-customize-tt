@@ -13,6 +13,8 @@ import argparse
 import ast
 import contextlib
 import copy
+import email
+import email.policy
 import hashlib
 import io
 import json
@@ -165,8 +167,49 @@ SHARED = REPO / 'patches'
 COVERED_NIGHTLY = 'covered-nightly.txt'
 
 
+# Shared patches this fork leaves out, with the checks.json entries only they need. Patches are
+# matched by subject, so upstream renumbering one keeps it out; a subject that upstream's patches/
+# no longer has stops the run (check_skips), since a renamed patch would otherwise come back unnoticed.
+SKIP_SHARED = 'skip-shared.json'
+
+
+def patch_subject(path):
+    """The commit subject of a git format-patch file, unfolded and without its [PATCH n/m] prefix."""
+    head = Path(path).read_text(encoding='utf-8', errors='replace').split('\n\n', 1)[0]
+    if head.startswith('From '):
+        head = head.split('\n', 1)[1] if '\n' in head else ''
+    subject = email.message_from_string(head + '\n\n', policy=email.policy.default).get('Subject') or ''
+    return re.sub(r'^\[PATCH[^\]]*\]\s*', '', ' '.join(str(subject).split()))
+
+
+def shared_skips():
+    """skip-shared.json of the patch set this run applies; an older patch set without one skips nothing."""
+    return load(RECIPE / SKIP_SHARED, {})
+
+
+def skipped_subjects():
+    return {entry['subject'] for entry in shared_skips().get('patches', [])}
+
+
 def patches():
-    return sorted(SHARED.glob('*.patch'))
+    """The shared patches this run applies: those of SHARED that skip-shared.json does not leave out."""
+    skipped = skipped_subjects()
+    return [p for p in sorted(SHARED.glob('*.patch')) if not skipped or patch_subject(p) not in skipped]
+
+
+def unmatched_skips():
+    """Subjects in skip-shared.json that upstream's patches/ has no patch for."""
+    return sorted(skipped_subjects() - {patch_subject(p) for p in (RECIPE / 'patches').glob('*.patch')})
+
+
+def check_skips():
+    missing = unmatched_skips()
+    if missing:
+        raise Stop(f'{SKIP_SHARED} leaves out shared patches that upstream\'s patches/ no longer has:\n'
+                   + '\n'.join('  ' + subject for subject in missing)
+                   + '\nUpstream renamed, merged or dropped them. Find what became of each (git log -p -- patches/):'
+                   ' update the subject when it is the same change under a new name, or remove the entry when'
+                   ' upstream dropped it. See "Skipped shared patches" in docs/fork-changes.md.')
 
 
 def shared_base():
@@ -177,6 +220,7 @@ def choose_shared(log):
     """Use patches-port/ when it is a port to a newer nightly than upstream's patches/."""
     global SHARED
     SHARED = RECIPE / 'patches'
+    check_skips()
     if not (PORT / 'base.txt').exists():
         return
     upstream_base = (RECIPE / 'patches/base.txt').read_text().strip()
@@ -254,6 +298,7 @@ OPERATIONAL_CODE = frozenset({
     'still_newest', 'restore_server_stock', 'systemctl', 'server_healthy', 'restart_server',
     'cmd_server_off', 'server_autoupdate', 'cmd_on', 'cmd_off', 'cmd_uninstall', 'cmd_autoupdate',
     'start_background_update', 'app_settled', 'cmd_status', '_status', 'report_known_failures', 'staged_app_update',
+    'report_skipped_shared',
     'report_ported_prs', '_report_ported_prs', 'fork_repo', 'report_open_prs', 'stuck_message',
     'port_failed', 'recent_failure', 'port_pending', 'porter_machine', 'port_command', 'repo_path',
     'remote_port_line', 'handed_off_already', 'hand_off_port', 'spawn_detached', 'publish_port',
@@ -293,7 +338,8 @@ def recipe_hash(full=False):
     lists = [REPO / 'checks-tt.json'] + ([REPO / 'checks-ios.json'] if WITH_IOS else [])
     own = [p for folder in folders for p in sorted((REPO / folder).glob('*.patch'))]
     known = [KNOWN_FAILURES] if KNOWN_FAILURES.exists() else []
-    for path in (shared + own + [REPO / 'checks.json'] + [c for c in lists if c.exists()] + known
+    skips = [REPO / SKIP_SHARED] if (REPO / SKIP_SHARED).exists() else []
+    for path in (shared + own + [REPO / 'checks.json'] + [c for c in lists if c.exists()] + known + skips
                  + [REPO / NAME, REPO / 'platform_support.py'] + sorted((REPO / 'macos').glob('*'))):
         data = path.read_bytes()
         if path.name == NAME and not full:
@@ -878,8 +924,11 @@ def typechecker(log=None):
 
 
 def check_spec():
-    """The tests and typechecks of checks.json plus the own check lists this run applies."""
+    """The tests and typechecks of checks.json (without the entries skip-shared.json leaves out with
+    their patches) plus the own check lists this run applies."""
     spec = json.loads((RECIPE / 'checks.json').read_text())
+    skipped = set(shared_skips().get('checks', []))
+    spec = {key: [path for path in spec.get(key, []) if path not in skipped] for key in ('tests', 'typecheck')}
     for path in own_checks():
         own = load(path, {})
         spec = {key: list(dict.fromkeys(spec.get(key, []) + own.get(key, []))) for key in ('tests', 'typecheck')}
@@ -898,7 +947,7 @@ def mobile_install_scripts():
 
 def check_lists_hash():
     digest = hashlib.sha256()
-    for path in [RECIPE / 'checks.json'] + own_checks():
+    for path in [RECIPE / 'checks.json', RECIPE / SKIP_SHARED] + own_checks():
         digest.update(path.name.encode() + (path.read_bytes() if path.exists() else b''))
     return digest.hexdigest()[:12]
 
@@ -1525,7 +1574,8 @@ class Waiting(Stop):
     """Nothing to do until the installed app updates; a clean exit (0)."""
 
 
-RECIPE_FILES = ('patches', 'patches-port', 'patches-tt', 'patches-ios', 'checks.json', 'checks-tt.json', 'checks-ios.json')
+RECIPE_FILES = ('patches', 'patches-port', 'patches-tt', 'patches-ios', 'checks.json', 'checks-tt.json', 'checks-ios.json',
+                SKIP_SHARED)
 
 
 def effective_base(read, newer=None):
@@ -3495,6 +3545,25 @@ def cmd_status(args):
         _status()
     finally:
         report_known_failures()
+        report_skipped_shared()
+
+
+def report_skipped_shared():
+    """The shared patches skip-shared.json leaves out, and its entries that no longer match anything."""
+    skips = shared_skips()
+    if not skips.get('patches') and not skips.get('checks'):
+        return
+    say()
+    say(f'Shared patches left out ({SKIP_SHARED}):')
+    missing = set(unmatched_skips())
+    for entry in skips.get('patches', []):
+        state = 'not in patches/ any more: update or remove it' if entry['subject'] in missing else 'left out'
+        say(f"    {entry['subject']}: {state}")
+    listed = json.loads((RECIPE / 'checks.json').read_text())
+    listed = set(listed.get('tests', []) + listed.get('typecheck', []))
+    for check in skips.get('checks', []):
+        if check not in listed:
+            say(f'    check {check}: not in checks.json any more: remove it')
 
 
 def _status():

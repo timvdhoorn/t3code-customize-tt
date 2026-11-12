@@ -10,7 +10,8 @@ still doing what its row says.
 A port applies three layers on top of the nightly commit, in order:
 
 1. the shared patches (`patches-port/` while it targets a newer nightly than `patches/base.txt`,
-   else `patches/`), rebased from their base onto the nightly;
+   else `patches/`), without those `skip-shared.json` leaves out, rebased from their base onto the
+   nightly;
 2. `patches-tt/`, with `git am --3way`;
 3. `patches-ios/`, with `git am --3way` (only `port` and `ios` apply it; a desktop `build` and
    `server` stop after `patches-tt/`).
@@ -53,7 +54,11 @@ push or build.
 
 ## The rules of a port
 
-- One commit per patch, in the same order; the export maps commits to patches by count.
+- One commit per patch, in the same order; the export maps commits to patches by count. A shared
+  patch `skip-shared.json` leaves out has no commit and its `checks.json` entries do not run; never
+  re-add it to get a later patch to apply. A shared patch that needs code from a skipped one gets
+  that code from a `patches-tt/` commit (as `patches-tt/0012` does for the usage-limits patch), or
+  needs Tim's decision when it builds on the skipped feature itself.
 - A port keeps every patch and every test. A failing check is fixed in the patch, so the checks
   stay as strong as before and no step is skipped. Only a test that also fails without any patch
   goes in `known-upstream-failures.json` (file, full name `describe > test`, upstream PR or issue,

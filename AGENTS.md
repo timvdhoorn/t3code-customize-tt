@@ -72,11 +72,12 @@ personal data. Name where a secret lives (a 1Password item, a path under
 
 | Upstream owns (never commit changes) | The fork owns (commit changes) |
 | --- | --- |
-| `patches/*.patch`, `patches/base.txt`, `checks.json` | `patches-port/`, `patches-tt/`, `checks-tt.json`, `patches-ios/`, `checks-ios.json`, `ios.json`, `ported-prs.json`, `covered-nightly.txt` (written by the port export), `known-upstream-failures.json`, `.agents/playbooks/`, this section, `docs/fork-changes.md`, `docs/machines.md`, `docs/porting.md`, `CLAUDE.md` |
-| the Linux, Windows and macOS build and launch paths in `t3code-customize`, `platform_support.py`, `macos/`, `install.ps1`, `tests/`, `docs/macos.md` | update, autoupdate, server, fleet and ios code in `t3code-customize`, `machines.json`, `tests/test_checkout_guard.py`, `tests/test_unattended_updates.py`, `tests/test_fleet_sync.py`, `tests/test_port_flow.py`, `tests/test_lint_step.py`, `tests/test_covered_nightly.py`, `tests/test_typechecker.py`, `tests/test_ios_build.py`, the `README.md` macOS, server and machines sections |
+| `patches/*.patch`, `patches/base.txt`, `checks.json` | `patches-port/`, `patches-tt/`, `checks-tt.json`, `patches-ios/`, `checks-ios.json`, `skip-shared.json`, `ios.json`, `ported-prs.json`, `covered-nightly.txt` (written by the port export), `known-upstream-failures.json`, `.agents/playbooks/`, this section, `docs/fork-changes.md`, `docs/machines.md`, `docs/porting.md`, `CLAUDE.md` |
+| the Linux, Windows and macOS build and launch paths in `t3code-customize`, `platform_support.py`, `macos/`, `install.ps1`, `tests/`, `docs/macos.md` | update, autoupdate, server, fleet, ios and shared-patch skip code in `t3code-customize`, `machines.json`, `tests/test_checkout_guard.py`, `tests/test_unattended_updates.py`, `tests/test_fleet_sync.py`, `tests/test_port_flow.py`, `tests/test_lint_step.py`, `tests/test_covered_nightly.py`, `tests/test_typechecker.py`, `tests/test_ios_build.py`, `tests/test_skip_shared.py`, the `README.md` macOS, server and machines sections |
 
 - A port of the shared patches goes to `patches-port/` (with its own `base.txt`), never to
-  `patches/`; the tool writes it there. Builds use it while it targets a newer nightly than
+  `patches/`; the tool writes it there. To leave a shared patch out, name it in `skip-shared.json`
+  (by subject, with its `checks.json` entries), never delete it from `patches/` or edit `checks.json`. Builds use it while it targets a newer nightly than
   `patches/base.txt`. Once upstream catches up, the tool says `patches-port/` is unused:
   delete it in a commit.
 - Every change to T3 Code itself is one commit in `patches-tt/`, with its tests in
@@ -106,7 +107,7 @@ personal data. Name where a secret lives (a 1Password item, a path under
   `python3 -m py_compile t3code-customize`, `python3 -m unittest discover -s tests` and
   `./t3code-customize status`.
 - When upstream changes `t3code-customize`, merge it by hand if `pull_latest` could not: keep the
-  `update`, `autoupdate`, `server`, `fleet`, `port`, `continue`, `checks`, `ios` and own-patch code,
+  `update`, `autoupdate`, `server`, `fleet`, `port`, `continue`, `checks`, `ios`, shared-patch skip and own-patch code,
   the lock that names its holder and Python 3.9 compatibility, then run the checks above.
 
 ## Agent skills

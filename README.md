@@ -1,7 +1,7 @@
 # t3code-customize-tt
 
-Tim's build of T3 Code Nightly: the stats bar under the composer, plus his own fixes and
-features, on his Macs, his Linux server and his iPhone. One command rebuilds it after every
+Tim's build of T3 Code Nightly: his own fixes and features and the usage-limit patches from
+upstream, on his Macs, his Linux server and his iPhone, with the stats line under the iPhone's composer. One command rebuilds it after every
 T3 Code update.
 
 Unofficial. Not affiliated with T3 Tools. Built on
@@ -10,13 +10,9 @@ For T3 Code Nightly on macOS, a headless Linux T3 server, a Linux AppImage, Wind
 
 ## What you get
 
-**Stats for nerds** under the composer (the shared patches in `patches/`, from upstream):
-
-- **Usage meters** for your 5 hour and weekly limits, from the limits T3 already gets from your providers.
-- **Context** used in the thread. Hover it for the window size, the auto-compaction threshold and a Compact now button.
-- **Tokens per second** for the last response, with turn time and token details on hover. Claude rates are measured from the stream; Codex rates are labeled approximate.
-- **Cache rate** for the last turn.
-- **Subscription switch** when you have more than one signed-in subscription that offers your model. If the current one is on pace to run out before its 5 hour or weekly window resets, a chip like **Opus 5.5 on Personal →** switches the thread to the same model on the one with the most room. It also points out a subscription whose weekly allowance resets within a day mostly unused. Hover it for the reasoning.
+**Usage limits** (the shared patches in `patches/`, from upstream): background polling of your 5 hour and
+weekly limits, reset-aware merging and fetch-time ordering. Upstream's desktop stats line, response
+throughput and subscription switch are left out (`skip-shared.json`); the iPhone keeps its own stats line.
 
 **Own changes** (`patches-tt/`, on top of the shared patches):
 
@@ -24,7 +20,8 @@ For T3 Code Nightly on macOS, a headless Linux T3 server, a Linux AppImage, Wind
 - **Child threads** nest under the thread that opened them in the sidebar, with their status, as in Claude.app.
 - **Direct push**: your own servers send notifications and Live Activity updates to your iPhone over APNs.
 
-**iOS app** (`patches-ios/`, TestFlight under your own Apple team): the same stats line, nested
+**iOS app** (`patches-ios/`, TestFlight under your own Apple team): a stats line under the composer
+(5 hour and weekly limits, context and cache rate, behind Settings > Threads > Stats for nerds), nested
 child threads and direct push, JetBrains Sans and JetBrains Mono as the fonts, and the desktop's Claude theme.
 
 Everything else is stock T3 Code, including T3 Connect.
@@ -71,17 +68,15 @@ Or clone this repository and run `python3 ./t3code-customize build`. AppImages i
 are discovered automatically. For other paths, pass
 `--app /path/to/T3-Code.AppImage`. The old `--appimage` option still works.
 
-### Enable the stats
+### Open the customized app
 
 After the build succeeds, **quit T3 Code fully**. Open **T3 Code (Customized)**
 from the Windows Start menu, the Linux app launcher or Spotlight on macOS.
-Enable **Settings > General > Stats for nerds**.
 
 The customized app opens the normal T3 Code main screen; it does not show a
-separate setup wizard. Open Settings manually and search for **Stats for nerds**
-if you cannot find the switch. It is off by default. Once enabled, the stats
-appear below the chat composer; which values are available depends on the
-provider and the conversation.
+separate setup wizard. This fork leaves out upstream's desktop stats line
+(`skip-shared.json`), so there is no **Stats for nerds** switch on the desktop;
+the iPhone app has its own under Settings > Threads.
 
 The command wrapper lives in `~/.local/bin` on Linux, or
 `%LOCALAPPDATA%\t3code-customize\bin` on Windows. If it is not on PATH, add that
@@ -230,7 +225,7 @@ T3 Code is open source (MIT). This repo holds patch layers and one script:
 
 | Folder | What | Applied by |
 | --- | --- | --- |
-| `patches/` | Stats for nerds, shared with upstream | every build |
+| `patches/` | stats for nerds and usage limits, shared with upstream | every build, without what `skip-shared.json` leaves out |
 | `patches-port/` | this fork's port of `patches/` while upstream lags behind a nightly | every build, instead of `patches/` |
 | `patches-tt/` | own changes to T3 Code | every build |
 | `patches-ios/` | changes only the iOS app needs | `t3code-customize ios` |

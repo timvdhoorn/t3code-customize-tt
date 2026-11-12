@@ -3,31 +3,34 @@ From: timvdhoorn <timvdhoorn@gmail.com>
 Date: Thu, 15 Oct 2026 20:14:40 +0200
 Subject: [PATCH 3/9] feat(mobile): show stats for nerds in the composer
 
+The stats logic lives in packages/client-runtime (composer-stats and
+context-window), so only the iOS app carries it; the desktop composer
+has no stats line in this fork. It includes the context-window fixes
+the stats read: compaction counts only once completed, and whether a
+thread compacts automatically comes from the provider thread.
 ---
  .../settings/SettingsFollowUpRouteScreen.tsx  |  17 +
  .../src/features/settings/settings-search.ts  |   9 +-
- .../src/features/threads/ComposerStats.tsx    | 622 ++++++++++++++++
+ .../src/features/threads/ComposerStats.tsx    | 607 ++++++++++++++++++
  .../features/threads/NewTaskDraftScreen.tsx   |   1 +
  .../src/features/threads/ThreadComposer.tsx   |   3 +
- .../features/threads/ThreadDetailScreen.tsx   |  37 +
+ .../features/threads/ThreadDetailScreen.tsx   |  37 ++
  .../features/threads/ThreadRouteScreen.tsx    |   1 +
- .../features/threads/composerStatsRow.test.ts | 223 ++++++
- .../src/features/threads/composerStatsRow.ts  | 143 ++++
+ .../features/threads/composerStatsRow.test.ts | 221 +++++++
+ .../src/features/threads/composerStatsRow.ts  | 140 ++++
  apps/mobile/src/lib/storage.test.ts           |  10 +
  .../src/persistence/mobile-preferences.ts     |   6 +
  apps/mobile/src/state/composer-cache-usage.ts |  55 ++
  apps/mobile/src/state/use-composer-stats.ts   |  66 ++
  .../src/state/use-thread-composer-state.ts    |  34 +
- apps/web/src/components/ChatView.tsx          |  59 +-
- .../components/chat/ComposerStats.logic.ts    | 307 +-------
- .../web/src/components/chat/ComposerStats.tsx |  59 +-
+ apps/web/src/lib/contextWindow.test.ts        |  56 +-
  apps/web/src/lib/contextWindow.ts             |  16 +-
  packages/client-runtime/package.json          |   4 +
- .../src/state/composerStats.test.ts           | 668 ++++++++++++++++++
- .../client-runtime/src/state/composerStats.ts | 433 ++++++++++++
+ .../src/state/composerStats.test.ts           | 595 +++++++++++++++++
+ .../client-runtime/src/state/composerStats.ts | 401 ++++++++++++
  .../src/state/contextWindow.test.ts           |  18 +-
- .../client-runtime/src/state/contextWindow.ts |  16 +
- 23 files changed, 2390 insertions(+), 417 deletions(-)
+ .../client-runtime/src/state/contextWindow.ts |  31 +-
+ 21 files changed, 2300 insertions(+), 28 deletions(-)
  create mode 100644 apps/mobile/src/features/threads/ComposerStats.tsx
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.test.ts
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.ts
@@ -100,10 +103,10 @@ index 49e1a8dbe0..7e0c8adb47 100644
      "provider accounts",
 diff --git a/apps/mobile/src/features/threads/ComposerStats.tsx b/apps/mobile/src/features/threads/ComposerStats.tsx
 new file mode 100644
-index 0000000000..ffdc3498a7
+index 0000000000..3e8e4d29fb
 --- /dev/null
 +++ b/apps/mobile/src/features/threads/ComposerStats.tsx
-@@ -0,0 +1,622 @@
+@@ -0,0 +1,607 @@
 +import {
 +  COMPOSER_STATS_CLOCK_MS,
 +  composerLimitDisplay,
@@ -112,7 +115,6 @@ index 0000000000..ffdc3498a7
 +  deriveTurnCachePercentage,
 +  deriveTurnElapsedMs,
 +  formatCachePercentage,
-+  formatResponseRateText,
 +  formatStatCount,
 +  formatUsageTimestamp,
 +  selectComposerLimitWindows,
@@ -348,13 +350,10 @@ index 0000000000..ffdc3498a7
 +  readonly onClose: () => void;
 +}) {
 +  const { turn } = props;
-+  const rateText = formatResponseRateText(turn);
-+  const estimated = turn.responseThroughput?.basis === "codex_active_windows_estimate";
 +  const usage = turn.turnTokenUsage;
 +  const available = usage?.usageStatus !== "unavailable" ? usage : undefined;
 +  const cache = deriveTurnCachePercentage(available);
 +  const elapsed = deriveTurnElapsedMs(turn, props.now);
-+  const throughput = turn.responseThroughput;
 +  return (
 +    <Sheet
 +      title={`${turn.status === "running" ? "Current" : "Latest"} turn`}
@@ -365,9 +364,6 @@ index 0000000000..ffdc3498a7
 +          <Separated>
 +            {[
 +              <Detail key="status" label="Status" value={turn.status} />,
-+              ...(rateText !== null
-+                ? [<Detail key="rate" label="Output rate" value={`${rateText} tok/s`} />]
-+                : []),
 +              ...(elapsed !== null
 +                ? [
 +                    <Detail
@@ -416,14 +412,6 @@ index 0000000000..ffdc3498a7
 +            ? " Partial report: counts cover only the usage this provider reported."
 +            : ""}
 +        </Note>
-+        {rateText !== null ? (
-+          <Note>
-+            {estimated
-+              ? "Output rate: Codex-reported turn output tokens, including reasoning and tool arguments, divided by estimated response-active time. Silent reasoning, queue time and tool argument generation may be missed."
-+              : "Output rate: Claude-reported output tokens, including reasoning and tool arguments, divided by observed response start-to-stop time. Includes network, buffering and server-side waits; excludes local tool waits between responses."}
-+            {throughput?.partial ? " Partial coverage: some activity could not be measured." : ""}
-+          </Note>
-+        ) : null}
 +      </SheetBody>
 +    </Sheet>
 +  );
@@ -846,10 +834,10 @@ index 6205fd1281..7662902921 100644
            onRespondToApproval={requests.onRespondToApproval}
 diff --git a/apps/mobile/src/features/threads/composerStatsRow.test.ts b/apps/mobile/src/features/threads/composerStatsRow.test.ts
 new file mode 100644
-index 0000000000..a480247a0f
+index 0000000000..d5b42e657c
 --- /dev/null
 +++ b/apps/mobile/src/features/threads/composerStatsRow.test.ts
-@@ -0,0 +1,223 @@
+@@ -0,0 +1,221 @@
 +import { NodeId, ProviderThreadId, ProviderTurnId } from "@t3tools/contracts";
 +import type { ComposerStatsData } from "@t3tools/client-runtime/state/composer-stats";
 +import * as DateTime from "effect/DateTime";
@@ -881,7 +869,6 @@ index 0000000000..a480247a0f
 +    status: "completed",
 +    startedAt: DateTime.makeUnsafe("2026-10-17T17:59:00Z"),
 +    completedAt: DateTime.makeUnsafe("2026-10-17T17:59:48Z"),
-+    responseThroughput: { outputTokens: 400, elapsedMs: 4000, responseCount: 2, partial: false },
 +    turnTokenUsage: {
 +      usageStatus: "complete",
 +      usageScope: "main_agent",
@@ -998,7 +985,6 @@ index 0000000000..a480247a0f
 +        status: "completed",
 +        startedAt: null,
 +        completedAt: null,
-+        responseThroughput: null,
 +        turnTokenUsage: undefined,
 +      } as unknown as ComposerStatsData["turn"]),
 +    ]) {
@@ -1075,14 +1061,13 @@ index 0000000000..a480247a0f
 +});
 diff --git a/apps/mobile/src/features/threads/composerStatsRow.ts b/apps/mobile/src/features/threads/composerStatsRow.ts
 new file mode 100644
-index 0000000000..d223c210f5
+index 0000000000..362e7deacb
 --- /dev/null
 +++ b/apps/mobile/src/features/threads/composerStatsRow.ts
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,140 @@
 +import {
 +  composerLimitDisplay,
 +  deriveContextCompaction,
-+  deriveResponseRate,
 +  deriveTurnCachePercentage,
 +  deriveTurnElapsedMs,
 +  selectComposerLimitWindows,
@@ -1124,9 +1109,8 @@ index 0000000000..d223c210f5
 +
 +/**
 + * The stats line under the mobile composer: the 5h and weekly limits, context and the
-+ * cache hit rate, on one line. Unlike the desktop it leaves out the output rate (tok/s);
-+ * the turn sheet, opened from the cache chip, still shows it. The cache chip is always
-+ * there ("–% cached" without a figure), so the row does not jump when the figure arrives.
++ * cache hit rate, on one line. The cache chip is always there ("–% cached" without a
++ * figure), so the row does not jump when the figure arrives.
 + */
 +export interface ComposerStatsRow {
 +  readonly limits: ReadonlyArray<ComposerStatsRowLimit>;
@@ -1185,8 +1169,7 @@ index 0000000000..d223c210f5
 +    ((turn.startedAt !== null &&
 +      (turn.status === "running" || deriveTurnElapsedMs(turn, 0) !== null)) ||
 +      available?.inputTokens !== undefined ||
-+      available?.outputTokens !== undefined ||
-+      deriveResponseRate(turn) !== null);
++      available?.outputTokens !== undefined);
 +  return {
 +    limits,
 +    context: input.showContext
@@ -1459,510 +1442,92 @@ index 11b38251ce..fc9af44397 100644
      sideChatUnavailableReason,
    };
  }
-diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index 77348dfa9f..45ab9bb428 100644
---- a/apps/web/src/components/ChatView.tsx
-+++ b/apps/web/src/components/ChatView.tsx
-@@ -327,7 +327,7 @@ import { useRightPanelSurfaceClose } from "../hooks/useRightPanelSurfaceClose";
- import { ComposerBannerStack, type ComposerBannerStackItem } from "./chat/ComposerBannerStack";
- import { modelFallbackBannerItem } from "./chat/ComposerUsageLimits";
- import { ComposerStats } from "./chat/ComposerStats";
--import { selectComposerStatsTurns, selectRecordedCompactions } from "./chat/ComposerStats.logic";
-+import { composerCompactDisabledReason, deriveComposerStats } from "./chat/ComposerStats.logic";
- import { ComposerSurface } from "./chat/ComposerSurface";
- import { resolveThreadSyncPhase } from "../threadSync";
- import { hasAvailableCompactionProvider } from "./chat/compaction.logic";
-@@ -1498,45 +1498,11 @@ export default function ChatView(props: ChatViewProps) {
-     activeProviderStatus?.displayName?.trim() || activeProviderStatus?.instanceId || "";
-   const composerStats = (() => {
-     if (!settings.statsForNerdsEnabled) return null;
--    const usageLimits = activeUsageLimits
--      ? { limits: activeUsageLimits, providerName: activeProviderName }
--      : null;
--    if (!serverProjection)
--      return {
--        turn: null,
--        compactions: [],
--        context: null,
--        usageLimits,
--        contextDriver: undefined,
--        configuredClaudeThreshold: undefined,
--      };
--    const turns = selectComposerStatsTurns(serverProjection);
--    const contextUsage = turns.findLast((turn) => turn.tokenUsage !== undefined)?.tokenUsage;
--    const providerThread = serverProjection.providerThreads.find(
--      (thread) => thread.id === serverProjection.thread.activeProviderThreadId,
-+    return deriveComposerStats(
-+      serverProjection,
-+      settings.providerInstances,
-+      activeUsageLimits ? { limits: activeUsageLimits, providerName: activeProviderName } : null,
-     );
--    const providerConfig = providerThread
--      ? settings.providerInstances[providerThread.providerInstanceId]?.config
--      : undefined;
--    const configuredClaudeThreshold =
--      providerConfig !== null &&
--      typeof providerConfig === "object" &&
--      "autoCompactWindow" in providerConfig
--        ? providerConfig.autoCompactWindow
--        : undefined;
--    const compactions = selectRecordedCompactions(serverProjection.turnItems, turns);
--    return {
--      turn: turns.at(-1) ?? null,
--      compactions,
--      usageLimits,
--      contextDriver: providerThread?.driver,
--      configuredClaudeThreshold,
--      context: deriveLatestContextWindowSnapshot(
--        compactions.map((item) => ({ item })),
--        contextUsage,
--        providerThread,
--      ),
--    };
-   })();
-   const pendingBackgroundTasks = deriveThreadPendingBackgroundTasks(serverProjection);
-   const activeWorkStartedAt =
-@@ -3901,15 +3867,12 @@ export default function ChatView(props: ChatViewProps) {
-                           {...composerStats}
-                           onCompact={() => composerRef.current?.compactContext()}
-                           compactDisabled={compactDisabled}
--                          compactDisabledReason={
--                            pendingApprovals.length > 0
--                              ? "Resolve the pending approval first."
--                              : pendingUserInputs.length > 0
--                                ? "Answer the pending question first."
--                                : isWorking
--                                  ? "Wait for the current turn to finish."
--                                  : compactDisabledReason
--                          }
-+                          compactDisabledReason={composerCompactDisabledReason({
-+                            hasPendingApproval: pendingApprovals.length > 0,
-+                            hasPendingUserInput: pendingUserInputs.length > 0,
-+                            isWorking,
-+                            fallback: compactDisabledReason,
-+                          })}
-                           isCompacting={isCompacting}
-                           subscriptionSwitch={{
-                             providers: providerStatuses,
-diff --git a/apps/web/src/components/chat/ComposerStats.logic.ts b/apps/web/src/components/chat/ComposerStats.logic.ts
-index 5f88749c98..f9196990b5 100644
---- a/apps/web/src/components/chat/ComposerStats.logic.ts
-+++ b/apps/web/src/components/chat/ComposerStats.logic.ts
-@@ -1,306 +1 @@
--import type {
--  OrchestrationV2ProviderTurn,
--  OrchestrationV2ThreadProjection,
--  OrchestrationV2TurnItem,
--  ServerProviderUsageLimits,
--  ServerProviderUsageWindow,
--  TurnTokenUsage,
--} from "@t3tools/contracts";
--import * as DateTime from "effect/DateTime";
--import type { ContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
--
--/** Provider turn ordinals are scoped to a provider thread; children have their own nodes. */
--export function selectComposerStatsTurns(projection: {
--  readonly thread: Pick<OrchestrationV2ThreadProjection["thread"], "activeProviderThreadId">;
--  readonly nodes: ReadonlyArray<
--    Pick<OrchestrationV2ThreadProjection["nodes"][number], "id" | "kind" | "parentNodeId">
--  >;
--  readonly providerTurns: ReadonlyArray<OrchestrationV2ProviderTurn>;
--}): ReadonlyArray<OrchestrationV2ProviderTurn> {
--  const mainNodes = new Set(
--    projection.nodes
--      .filter((node) => node.kind === "root_turn" && node.parentNodeId === null)
--      .map((node) => node.id),
--  );
--  return projection.providerTurns
--    .filter(
--      (turn) =>
--        turn.providerThreadId === projection.thread.activeProviderThreadId &&
--        mainNodes.has(turn.nodeId),
--    )
--    .toSorted((a, b) => a.ordinal - b.ordinal);
--}
--
--/** Cache reads are a subset of normalized input (which includes cache writes). */
--export function deriveTurnCachePercentage(usage: TurnTokenUsage | undefined): number | null {
--  if (
--    usage === undefined ||
--    usage.usageStatus === "unavailable" ||
--    usage.inputTokens === undefined ||
--    usage.inputTokens <= 0 ||
--    usage.cachedInputTokens === undefined ||
--    usage.cachedInputTokens > usage.inputTokens
--  ) {
--    return null;
--  }
--  return (usage.cachedInputTokens / usage.inputTokens) * 100;
--}
--
--/**
-- * One decimal, truncated: 99.96% reads 99.9%, so 100% means every input token was cached.
-- * The epsilon keeps exact tenths (99.8) from flooring to the tenth below.
-- */
--export function formatCachePercentage(percentage: number): string {
--  if (percentage >= 100) return "100%";
--  if (percentage <= 0) return "0%";
--  return `${(Math.floor(percentage * 10 + 1e-9) / 10).toFixed(1)}%`;
--}
--
--/** Wall time includes tools and waits. It must never be used as generation time for TPS. */
--export function deriveTurnElapsedMs(
--  turn: Pick<OrchestrationV2ProviderTurn, "status" | "startedAt" | "completedAt">,
--  nowMs: number,
--): number | null {
--  if (turn.startedAt === null) return null;
--  const end =
--    turn.status === "running"
--      ? nowMs
--      : turn.completedAt === null
--        ? null
--        : DateTime.toEpochMillis(turn.completedAt);
--  const start = DateTime.toEpochMillis(turn.startedAt);
--  return end !== null && Number.isFinite(end) && end >= start ? end - start : null;
--}
--
--/** These are observed completed events, not a lifetime count for a provider. */
--export function selectRecordedCompactions(
--  // Structure-only items (no streamed text) carry every field a compaction needs.
--  items: ReadonlyArray<
--    | { readonly type: Exclude<OrchestrationV2TurnItem["type"], "compaction"> }
--    | Extract<OrchestrationV2TurnItem, { type: "compaction" }>
--  >,
--  turns: ReadonlyArray<OrchestrationV2ProviderTurn>,
--): ReadonlyArray<Extract<OrchestrationV2TurnItem, { type: "compaction" }>> {
--  const nodes = new Set(turns.map((turn) => turn.nodeId));
--  const threads = new Set(turns.map((turn) => turn.providerThreadId));
--  const turnIds = new Set(turns.map((turn) => turn.id));
--  const nativeAcpTurns = new Set(
--    items
--      .filter(
--        (item): item is Extract<OrchestrationV2TurnItem, { type: "compaction" }> =>
--          item.type === "compaction" &&
--          item.status === "completed" &&
--          item.nativeItemRef?.nativeId?.startsWith("acp-compaction:") === true,
--      )
--      .map((item) => item.providerTurnId),
--  );
--  const seen = new Set<string>();
--  return items
--    .filter((item): item is Extract<OrchestrationV2TurnItem, { type: "compaction" }> => {
--      if (
--        item.type !== "compaction" ||
--        item.status !== "completed" ||
--        !(
--          (item.nodeId !== null && nodes.has(item.nodeId)) ||
--          (item.providerTurnId !== null && turnIds.has(item.providerTurnId))
--        ) ||
--        item.providerThreadId === null ||
--        !threads.has(item.providerThreadId) ||
--        // ACP may report the native event as well as a synthetic /compact completion.
--        (item.providerTurnId !== null &&
--          nativeAcpTurns.has(item.providerTurnId) &&
--          item.nativeItemRef?.strength === "weak" &&
--          item.nativeItemRef.nativeId?.endsWith(":compaction")) ||
--        seen.has(item.id)
--      )
--        return false;
--      seen.add(item.id);
--      return true;
--    })
--    .toSorted((a, b) => DateTime.toEpochMillis(a.updatedAt) - DateTime.toEpochMillis(b.updatedAt));
--}
--
--/** Persisted provider telemetry is independent of whole-turn wall time. */
--export function deriveResponseRate(turn: OrchestrationV2ProviderTurn | null): number | null {
--  const throughput = turn?.responseThroughput;
--  if (
--    !(
--      (turn?.nativeTurnRef?.driver === "claudeAgent" &&
--        (throughput?.basis === undefined || throughput.basis === "claude_observed")) ||
--      (turn?.nativeTurnRef?.driver === "codex" &&
--        throughput?.basis === "codex_active_windows_estimate")
--    ) ||
--    throughput === undefined ||
--    throughput.responseCount <= 0 ||
--    !Number.isSafeInteger(throughput.responseCount) ||
--    !Number.isSafeInteger(throughput.outputTokens) ||
--    throughput.outputTokens < 0 ||
--    !Number.isFinite(throughput.elapsedMs) ||
--    throughput.elapsedMs <= 0
--  )
--    return null;
--  return throughput.outputTokens / (throughput.elapsedMs / 1000);
--}
--
--function windowShortLabel(window: ServerProviderUsageWindow): string {
--  const mins = window.windowDurationMins;
--  if (mins !== undefined && mins > 0) {
--    if (mins % 10_080 === 0) return mins === 10_080 ? "Week" : `${mins / 10_080}wk`;
--    if (mins % 1_440 === 0) return `${mins / 1_440}d`;
--    if (mins % 60 === 0) return `${mins / 60}h`;
--    return `${mins}m`;
--  }
--  return window.kind === "session" ? "Session" : window.kind === "weekly" ? "Week" : window.label;
--}
--
--/**
-- * The account-wide session and weekly windows for the inline stats line, in
-- * that order. Model-scoped weeklies stay in the popover; providers list the
-- * account-wide window of each kind first.
-- */
--export function selectComposerLimitWindows(
--  limits: ServerProviderUsageLimits | undefined,
--): ReadonlyArray<{ readonly window: ServerProviderUsageWindow; readonly shortLabel: string }> {
--  if (!limits || limits.unavailable?.reason === "unsupported") return [];
--  return (["session", "weekly"] as const).flatMap((kind) => {
--    const window = limits.windows.find((candidate) => candidate.kind === kind);
--    return window ? [{ window, shortLabel: windowShortLabel(window) }] : [];
--  });
--}
--
--export const COMPOSER_STATS_CLOCK_MS = 30_000;
--
--/** Age of the newest valid fetch among the displayed windows. */
--export function composerLimitsFreshness(
--  checkedAts: ReadonlyArray<string | undefined>,
--  nowMs: number,
--): {
--  readonly status: "fresh" | "stale" | "expired";
--  readonly ageMins: number | null;
--  readonly checkedAt: string | undefined;
--} {
--  const times = checkedAts.flatMap((checkedAt) => {
--    const time = checkedAt === undefined ? NaN : Date.parse(checkedAt);
--    // The render clock can trail a newly received fetch by one interval.
--    return Number.isFinite(time) && time <= nowMs + COMPOSER_STATS_CLOCK_MS
--      ? [{ time, checkedAt }]
--      : [];
--  });
--  const newest = times.toSorted((a, b) => b.time - a.time)[0];
--  if (!newest) return { status: "expired", ageMins: null, checkedAt: undefined };
--  const ageMs = Math.max(0, nowMs - newest.time);
--  return {
--    status: ageMs <= 3 * 60_000 ? "fresh" : ageMs <= 15 * 60_000 ? "stale" : "expired",
--    ageMins: Math.floor(ageMs / 60_000),
--    checkedAt: newest.checkedAt,
--  };
--}
--
--export function composerLimitResetPending(
--  window: Pick<ServerProviderUsageWindow, "resetPending" | "resetsAt">,
--  nowMs: number,
--): boolean {
--  if (window.resetPending === true) return true;
--  if (window.resetsAt === undefined) return false;
--  const resetMs = Date.parse(window.resetsAt);
--  return Number.isFinite(resetMs) && resetMs <= nowMs;
--}
--
--export function composerLimitSourceLabel(
--  source: ServerProviderUsageWindow["source"],
--): "account" | "turn" | "CLI estimate" {
--  return source === "account" ? "account" : source === "turn" ? "turn" : "CLI estimate";
--}
--
--export function composerLimitDisplay(
--  window: ServerProviderUsageWindow,
--  fallbackCheckedAt: string | undefined,
--  nowMs: number,
--): {
--  readonly freshness: ReturnType<typeof composerLimitsFreshness>;
--  readonly resetPending: boolean;
--  readonly displayPercent: number | null;
--  readonly percentText: string;
--  readonly dimmed: boolean;
--} {
--  const freshness = composerLimitsFreshness([window.checkedAt ?? fallbackCheckedAt], nowMs);
--  const resetPending = composerLimitResetPending(window, nowMs);
--  if (resetPending) {
--    return {
--      freshness,
--      resetPending: true,
--      displayPercent: 0,
--      percentText: "0%",
--      dimmed: true,
--    };
--  }
--  if (freshness.status === "expired") {
--    return {
--      freshness,
--      resetPending: false,
--      displayPercent: null,
--      percentText: "–",
--      dimmed: true,
--    };
--  }
--  const age =
--    freshness.status === "stale" && freshness.ageMins !== null ? ` · ${freshness.ageMins}m` : "";
--  return {
--    freshness,
--    resetPending: false,
--    displayPercent: window.usedPercent,
--    percentText: `${Math.round(window.usedPercent)}%${age}`,
--    dimmed: freshness.status !== "fresh",
--  };
--}
--
--/** A configured limit is a launch setting, not proof of the running query's limit. */
--export function deriveContextCompaction(
--  context: Pick<
--    ContextWindowSnapshot,
--    "usedTokens" | "usedPercentage" | "autoCompactThreshold" | "compactsAutomatically"
--  > | null,
--  driver: string | undefined,
--  configuredClaudeThreshold: unknown,
--) {
--  const configured =
--    driver === "claudeAgent" &&
--    typeof configuredClaudeThreshold === "string" &&
--    /^\d+$/.test(configuredClaudeThreshold.trim())
--      ? Number(configuredClaudeThreshold)
--      : null;
--  const validConfigured =
--    configured !== null && configured >= 100_000 && configured <= 1_000_000 ? configured : null;
--  const reported = context?.autoCompactThreshold;
--  const validReported =
--    context?.compactsAutomatically !== false &&
--    typeof reported === "number" &&
--    Number.isFinite(reported) &&
--    reported > 0
--      ? reported
--      : null;
--  const threshold =
--    context?.compactsAutomatically === false ? null : (validReported ?? validConfigured);
--  const source = threshold === null ? null : validReported !== null ? "reported" : "configured";
--  const usedTokens = context?.usedTokens;
--  const remainingTokens =
--    threshold !== null && usedTokens !== undefined ? Math.max(0, threshold - usedTokens) : null;
--  const thresholdPercentage =
--    threshold !== null && usedTokens !== undefined ? (usedTokens / threshold) * 100 : null;
--  const pressurePercentage = Math.max(context?.usedPercentage ?? 0, thresholdPercentage ?? 0);
--  const status =
--    context?.compactsAutomatically === false
--      ? "Reported off"
--      : threshold !== null
--        ? source === "reported"
--          ? "Provider reported"
--          : "Claude setting"
--        : driver === "claudeAgent"
--          ? "Managed by Claude (threshold not reported)"
--          : driver === "codex"
--            ? "Managed by Codex (threshold not reported)"
--            : context?.compactsAutomatically === true
--              ? "On (threshold not reported)"
--              : "Not reported";
--  return { threshold, source, remainingTokens, thresholdPercentage, pressurePercentage, status };
--}
-+export * from "@t3tools/client-runtime/state/composer-stats";
-diff --git a/apps/web/src/components/chat/ComposerStats.tsx b/apps/web/src/components/chat/ComposerStats.tsx
-index 7e73a42eb9..88b4d74a65 100644
---- a/apps/web/src/components/chat/ComposerStats.tsx
-+++ b/apps/web/src/components/chat/ComposerStats.tsx
-@@ -11,8 +11,10 @@ import { formatResetsIn } from "@t3tools/shared/usageLimits";
- import * as DateTime from "effect/DateTime";
- import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
+diff --git a/apps/web/src/lib/contextWindow.test.ts b/apps/web/src/lib/contextWindow.test.ts
+index f3540d3738..afeab1444b 100644
+--- a/apps/web/src/lib/contextWindow.test.ts
++++ b/apps/web/src/lib/contextWindow.test.ts
+@@ -21,7 +21,7 @@ const decodeTokenUsage = Schema.decodeSync(OrchestrationV2ProviderTurnTokenUsage
  
--import type { ContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
--import { formatContextWindowTokens } from "~/lib/contextWindow";
-+import {
-+  type ContextWindowSnapshot,
-+  formatContextWindowTokens,
-+} from "@t3tools/client-runtime/state/context-window";
- import { Button } from "../ui/button";
- import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
- import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
-@@ -20,15 +22,20 @@ import { composerFloatingLayerProps } from "./composerEventScope";
- import {
-   COMPOSER_STATS_CLOCK_MS,
-   composerLimitDisplay,
--  composerLimitSourceLabel,
-   composerLimitsFreshness,
-   deriveContextCompaction,
-   deriveResponseRate,
-   deriveTurnCachePercentage,
-   formatCachePercentage,
-   deriveTurnElapsedMs,
-+  formatStatCount,
-+  formatResponseRateText,
-+  formatUsageTimestamp,
-   selectComposerLimitWindows,
--} from "./ComposerStats.logic";
-+  toneOf,
-+  usageReadingLabel,
-+  type ComposerStatsTone as Tone,
-+} from "@t3tools/client-runtime/state/composer-stats";
- import { recommendSubscriptionSwitch } from "./SubscriptionSwitch.logic";
+ describe("V2 context window presentation", () => {
+   it("uses retained compaction token data when available", () => {
+-    const snapshot = deriveLatestContextWindowSnapshot([
++    const entries = [
+       {
+         item: {
+           id: "compaction-1" as never,
+@@ -35,8 +35,8 @@ describe("V2 context window presentation", () => {
+           ordinal: 1,
+           status: "completed",
+           title: null,
+-          startedAt: null,
+-          completedAt: null,
++          startedAt: DateTime.makeUnsafe("2026-06-19T23:59:00.000Z"),
++          completedAt: DateTime.makeUnsafe("2026-06-20T00:00:00.000Z"),
+           updatedAt: DateTime.makeUnsafe("2026-06-20T00:00:00.000Z"),
+           type: "compaction",
+           driver: null,
+@@ -44,9 +44,19 @@ describe("V2 context window presentation", () => {
+           afterTokenCount: 2_000,
+         },
+       },
+-    ]);
++    ] as const;
++    const snapshot = deriveLatestContextWindowSnapshot(entries);
++    expect(snapshot?.updatedAt).toBe("2026-06-20T00:00:00.000Z");
++    for (const status of ["running", "failed"] as const) {
++      expect(
++        deriveLatestContextWindowSnapshot(
++          entries.map((entry) => ({ item: { ...entry.item, status } })),
++        ),
++      ).toBeNull();
++    }
+     expect(snapshot?.usedTokens).toBe(2_000);
+-    expect(snapshot?.totalProcessedTokens).toBe(10_000);
++    expect(snapshot?.totalProcessedTokens).toBeNull();
++    expect(snapshot?.compactsAutomatically).toBeNull();
+   });
+ });
  
- function ElapsedTime({ turn }: { turn: OrchestrationV2ProviderTurn }) {
-@@ -70,12 +77,6 @@ function ContextBar({ percentage }: { percentage: number }) {
-   );
- }
- 
--type Tone = "normal" | "warning" | "critical";
--
--function toneOf(usedPercent: number): Tone {
--  return usedPercent >= 90 ? "critical" : usedPercent >= 75 ? "warning" : "normal";
--}
--
- const TONE_TEXT: Record<Tone, string> = {
-   normal: "text-foreground/80",
-   warning: "text-warning",
-@@ -129,36 +130,6 @@ function Meter({
-   );
- }
- 
--function formatUsageTimestamp(value: string | undefined): string {
--  if (value === undefined) return "unknown time";
--  const timeMs = Date.parse(value);
--  if (!Number.isFinite(timeMs)) return "unknown time";
--  return new Intl.DateTimeFormat(undefined, {
--    month: "short",
--    day: "numeric",
--    hour: "numeric",
--    minute: "2-digit",
--  }).format(new Date(timeMs));
--}
--
--function usageReadingLabel(
--  window: ServerProviderUsageWindow,
--  fallbackCheckedAt: string | undefined,
--  now: number,
--): string {
--  const checkedAt = window.checkedAt ?? fallbackCheckedAt;
--  const freshness = composerLimitsFreshness([checkedAt], now);
--  const age =
--    freshness.ageMins === null
--      ? "age unknown"
--      : freshness.ageMins === 0
--        ? "just now"
--        : `${freshness.ageMins}m ago`;
--  return `as of ${formatUsageTimestamp(checkedAt)} (${age}) · ${composerLimitSourceLabel(
--    window.source,
--  )}`;
--}
--
- /** Ages and reset countdowns share the summary clock while the popover is open. */
- function UsageLimitRows({
-   windows,
-@@ -392,14 +363,10 @@ export function ComposerStats({
-     compactDisabled
-   )
-     return null;
--  const count = (value: number | undefined) =>
--    value === undefined ? "Not reported" : value.toLocaleString("en-US");
-+  const count = formatStatCount;
-   const stats: Array<{ key: string; node: ReactNode }> = [];
-   const throughput = turn?.responseThroughput;
--  const rateText =
--    responseRate === null
--      ? null
--      : `${estimated ? "≈" : ""}${responseRate.toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
-+  const rateText = formatResponseRateText(turn, responseRate);
-   // T3 already shows turn time inline in the timeline, so the line shows tok/s and
-   // keeps elapsed time in the details popover.
-   if (turn !== null && (hasElapsed || hasTokens || rateText !== null)) {
+@@ -207,3 +217,39 @@ describe("latestProviderTurnTokenUsage", () => {
+     }
+   });
+ });
++
++describe("compaction policy metadata", () => {
++  it("preserves reported policy alongside newer turn occupancy", () => {
++    const snapshot = deriveLatestContextWindowSnapshot(
++      [],
++      {
++        usedTokens: 360_000,
++        maxTokens: 1_000_000,
++        updatedAt: "2026-10-10T12:00:00.000Z",
++      },
++      {
++        contextUsage: {
++          usedTokens: 300_000,
++          autoCompactThreshold: 400_000,
++          compactsAutomatically: true,
++        },
++        updatedAt: DateTime.makeUnsafe("2026-10-10T11:00:00.000Z"),
++      },
++    );
++    expect(snapshot).toMatchObject({
++      usedTokens: 360_000,
++      usedPercentage: 36,
++      autoCompactThreshold: 400_000,
++      compactsAutomatically: true,
++    });
++  });
++
++  it("does not assume automatic compaction from a usage report", () => {
++    expect(
++      deriveLatestContextWindowSnapshot([], {
++        usedTokens: 42_000,
++        updatedAt: "2026-10-10T12:00:00.000Z",
++      }),
++    ).toMatchObject({ compactsAutomatically: null, autoCompactThreshold: null });
++  });
++});
 diff --git a/apps/web/src/lib/contextWindow.ts b/apps/web/src/lib/contextWindow.ts
 index 1cf3eee799..b4e8bb5647 100644
 --- a/apps/web/src/lib/contextWindow.ts
@@ -2001,10 +1566,10 @@ index 960d5e11ae..f961d211a8 100644
        "default": "./src/state/auth.ts"
 diff --git a/packages/client-runtime/src/state/composerStats.test.ts b/packages/client-runtime/src/state/composerStats.test.ts
 new file mode 100644
-index 0000000000..a7b6fa8701
+index 0000000000..90e31ec97b
 --- /dev/null
 +++ b/packages/client-runtime/src/state/composerStats.test.ts
-@@ -0,0 +1,668 @@
+@@ -0,0 +1,595 @@
 +import {
 +  NodeId,
 +  ProviderDriverKind,
@@ -2024,7 +1589,6 @@ index 0000000000..a7b6fa8701
 +  composerCompactDisabledReason,
 +  deriveComposerStats,
 +  deriveContextCompaction,
-+  deriveResponseRate,
 +  deriveTurnCachePercentage,
 +  formatCachePercentage,
 +  deriveTurnElapsedMs,
@@ -2223,78 +1787,6 @@ index 0000000000..a7b6fa8701
 +    const older = { ...compaction("older"), ordinal: 99, updatedAt: start };
 +    const newer = compaction("newer");
 +    expect(selectRecordedCompactions([newer, older], [turn(1)])).toEqual([older, newer]);
-+  });
-+});
-+
-+describe("observed response rate", () => {
-+  const measured = {
-+    ...turn(1),
-+    nativeTurnRef: {
-+      driver: ProviderDriverKind.make("claudeAgent"),
-+      nativeId: "root",
-+      strength: "strong",
-+    },
-+    responseThroughput: { outputTokens: 400, elapsedMs: 4000, responseCount: 2, partial: false },
-+  } as const;
-+  it("uses persisted envelopes, including partial coverage, without turn wall time", () => {
-+    expect(deriveResponseRate(measured)).toBe(100);
-+    expect(
-+      deriveResponseRate({
-+        ...measured,
-+        responseThroughput: { ...measured.responseThroughput, partial: true },
-+      }),
-+    ).toBe(100);
-+    expect(
-+      deriveResponseRate({
-+        ...measured,
-+        responseThroughput: { ...measured.responseThroughput, outputTokens: 0 },
-+      }),
-+    ).toBe(0);
-+  });
-+  it("distinguishes Codex estimates from observed Claude and legacy payloads", () => {
-+    const codex = {
-+      ...measured,
-+      nativeTurnRef: { ...measured.nativeTurnRef, driver: ProviderDriverKind.make("codex") },
-+      responseThroughput: {
-+        ...measured.responseThroughput,
-+        basis: "codex_active_windows_estimate",
-+      },
-+    } as const;
-+    expect(deriveResponseRate(codex)).toBe(100);
-+    expect(
-+      deriveResponseRate({
-+        ...codex,
-+        status: "interrupted",
-+        responseThroughput: { ...codex.responseThroughput, partial: true },
-+      }),
-+    ).toBe(100);
-+    expect(
-+      deriveResponseRate({ ...measured, responseThroughput: codex.responseThroughput }),
-+    ).toBeNull();
-+    expect(
-+      deriveResponseRate({
-+        ...measured,
-+        responseThroughput: { ...measured.responseThroughput, basis: "claude_observed" },
-+      }),
-+    ).toBe(100);
-+  });
-+  it("omits historical, unsupported and invalid telemetry", () => {
-+    expect(deriveResponseRate(null)).toBeNull();
-+    expect(deriveResponseRate(turn(1))).toBeNull();
-+    expect(
-+      deriveResponseRate({
-+        ...measured,
-+        nativeTurnRef: { ...measured.nativeTurnRef, driver: ProviderDriverKind.make("codex") },
-+      }),
-+    ).toBeNull();
-+    for (const elapsedMs of [0, -1, NaN, Infinity]) {
-+      expect(
-+        deriveResponseRate({
-+          ...measured,
-+          responseThroughput: { ...measured.responseThroughput, elapsedMs },
-+        }),
-+      ).toBeNull();
-+    }
 +  });
 +});
 +
@@ -2675,10 +2167,10 @@ index 0000000000..a7b6fa8701
 +});
 diff --git a/packages/client-runtime/src/state/composerStats.ts b/packages/client-runtime/src/state/composerStats.ts
 new file mode 100644
-index 0000000000..64949ac445
+index 0000000000..bd2233b716
 --- /dev/null
 +++ b/packages/client-runtime/src/state/composerStats.ts
-@@ -0,0 +1,433 @@
+@@ -0,0 +1,401 @@
 +import type {
 +  OrchestrationV2ProviderTurn,
 +  OrchestrationV2ThreadProjection,
@@ -2802,28 +2294,6 @@ index 0000000000..64949ac445
 +      return true;
 +    })
 +    .sort((a, b) => DateTime.toEpochMillis(a.updatedAt) - DateTime.toEpochMillis(b.updatedAt));
-+}
-+
-+/** Persisted provider telemetry is independent of whole-turn wall time. */
-+export function deriveResponseRate(turn: OrchestrationV2ProviderTurn | null): number | null {
-+  const throughput = turn?.responseThroughput;
-+  if (
-+    !(
-+      (turn?.nativeTurnRef?.driver === "claudeAgent" &&
-+        (throughput?.basis === undefined || throughput.basis === "claude_observed")) ||
-+      (turn?.nativeTurnRef?.driver === "codex" &&
-+        throughput?.basis === "codex_active_windows_estimate")
-+    ) ||
-+    throughput === undefined ||
-+    throughput.responseCount <= 0 ||
-+    !Number.isSafeInteger(throughput.responseCount) ||
-+    !Number.isSafeInteger(throughput.outputTokens) ||
-+    throughput.outputTokens < 0 ||
-+    !Number.isFinite(throughput.elapsedMs) ||
-+    throughput.elapsedMs <= 0
-+  )
-+    return null;
-+  return throughput.outputTokens / (throughput.elapsedMs / 1000);
 +}
 +
 +function windowShortLabel(window: ServerProviderUsageWindow): string {
@@ -2999,16 +2469,6 @@ index 0000000000..64949ac445
 +  return value === undefined ? "Not reported" : value.toLocaleString("en-US");
 +}
 +
-+/** Output rate text; a leading "≈" marks Codex's estimate. */
-+export function formatResponseRateText(
-+  turn: OrchestrationV2ProviderTurn | null,
-+  responseRate: number | null = deriveResponseRate(turn),
-+): string | null {
-+  if (responseRate === null) return null;
-+  const estimated = turn?.responseThroughput?.basis === "codex_active_windows_estimate";
-+  return `${estimated ? "≈" : ""}${responseRate.toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
-+}
-+
 +export function formatUsageTimestamp(value: string | undefined): string {
 +  if (value === undefined) return "unknown time";
 +  const timeMs = Date.parse(value);
@@ -3146,10 +2606,55 @@ index 994d3d62a2..daa9c29c1c 100644
 +  });
 +});
 diff --git a/packages/client-runtime/src/state/contextWindow.ts b/packages/client-runtime/src/state/contextWindow.ts
-index 99bab4c982..c422647928 100644
+index 94be1e481a..c422647928 100644
 --- a/packages/client-runtime/src/state/contextWindow.ts
 +++ b/packages/client-runtime/src/state/contextWindow.ts
-@@ -321,3 +321,19 @@ export function compactBeforeSendTokens(input: {
+@@ -105,8 +105,11 @@ export function deriveLatestContextWindowSnapshot(
+       lastReasoningOutputTokens: null,
+       toolUses: null,
+       durationMs: null,
+-      compactsAutomatically: true,
+-      autoCompactThreshold: liveUsage.autoCompactThreshold ?? null,
++      compactsAutomatically: providerThread?.contextUsage?.compactsAutomatically ?? null,
++      autoCompactThreshold:
++        liveUsage.autoCompactThreshold ??
++        providerThread?.contextUsage?.autoCompactThreshold ??
++        null,
+       cost: null,
+       updatedAt: liveUsage.updatedAt,
+     };
+@@ -148,7 +151,7 @@ export function deriveLatestContextWindowSnapshot(
+   }
+   for (let index = entries.length - 1; index >= 0; index -= 1) {
+     const entry = entries[index];
+-    if (!entry || entry.item.type !== "compaction") {
++    if (!entry || entry.item.type !== "compaction" || entry.item.status !== "completed") {
+       continue;
+     }
+     const payload = entry.item;
+@@ -166,7 +169,7 @@ export function deriveLatestContextWindowSnapshot(
+ 
+     return {
+       usedTokens,
+-      totalProcessedTokens: asFiniteNumber(payload.beforeTokenCount),
++      totalProcessedTokens: null,
+       maxTokens,
+       remainingTokens,
+       usedPercentage,
+@@ -182,10 +185,10 @@ export function deriveLatestContextWindowSnapshot(
+       lastReasoningOutputTokens: null,
+       toolUses: null,
+       durationMs: null,
+-      compactsAutomatically: true,
++      compactsAutomatically: null,
+       autoCompactThreshold: null,
+       cost: null,
+-      updatedAt: DateTime.formatIso(payload.startedAt ?? payload.updatedAt),
++      updatedAt: DateTime.formatIso(payload.completedAt ?? payload.updatedAt),
+     };
+   }
+ 
+@@ -318,3 +321,19 @@ export function compactBeforeSendTokens(input: {
      ? contextWindow.usedTokens
      : null;
  }

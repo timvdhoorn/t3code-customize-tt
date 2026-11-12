@@ -1,20 +1,19 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Thu, 15 Oct 2026 12:15:33 +0200
-Subject: [PATCH 01/11] fix(server): measure Claude context against
+Subject: [PATCH 01/12] fix(server): measure Claude context against
  autoCompactWindow
 
 ---
  .../Adapters/ClaudeAdapterV2.test.ts          | 84 +++++++++++++++++++
  .../Adapters/ClaudeAdapterV2.ts               | 21 ++++-
- .../components/chat/ComposerStats.logic.ts    |  2 +-
- 3 files changed, 104 insertions(+), 3 deletions(-)
+ 2 files changed, 103 insertions(+), 2 deletions(-)
 
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-index 00c7d06aaf..e2ec9041b8 100644
+index 3ab716b2af..52e1c6e145 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-@@ -819,6 +819,27 @@ describe("ClaudeAdapterV2 context usage", () => {
+@@ -818,6 +818,27 @@ describe("ClaudeAdapterV2 context usage", () => {
      );
      assert.strictEqual(usage.promptCacheExpiresAt, "2026-08-29T00:05:00.000Z");
    });
@@ -42,7 +41,7 @@ index 00c7d06aaf..e2ec9041b8 100644
  });
  
  describe("ClaudeAdapterV2 approval presentation", () => {
-@@ -9319,6 +9340,69 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+@@ -9109,6 +9130,69 @@ describe("ClaudeAdapterV2 background wake turns", () => {
        ),
    );
  
@@ -113,10 +112,10 @@ index 00c7d06aaf..e2ec9041b8 100644
      Effect.gen(function* () {
        const fileSystem = yield* FileSystem.FileSystem;
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-index 477044eb54..b6ece9cf6c 100644
+index 6fe2003fd8..aa3d95da73 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-@@ -251,6 +251,19 @@ export const CLAUDE_QUERY_ENDED_BEFORE_TURN_DETAIL =
+@@ -250,6 +250,19 @@ export const CLAUDE_QUERY_ENDED_BEFORE_TURN_DETAIL =
    "Claude provider query ended before the turn could start.";
  const CLAUDE_AGENT_SDK_QUERY_PROTOCOL = "claude-agent-sdk.query" as const;
  
@@ -136,7 +135,7 @@ index 477044eb54..b6ece9cf6c 100644
  interface ClaudeCacheCreation {
    readonly ephemeral_1h_input_tokens: number;
    readonly ephemeral_5m_input_tokens: number;
-@@ -301,6 +314,7 @@ export function claudeProviderTurnTokenUsage(
+@@ -300,6 +313,7 @@ export function claudeProviderTurnTokenUsage(
    updatedAt: string,
    autoCompactWindow = "",
    requestedAt?: DateTime.Utc,
@@ -144,7 +143,7 @@ index 477044eb54..b6ece9cf6c 100644
  ) {
    const inputTokens = claudeMessageInputTokens(usage);
    const outputTokens = usage.output_tokens;
-@@ -312,12 +326,13 @@ export function claudeProviderTurnTokenUsage(
+@@ -311,12 +325,13 @@ export function claudeProviderTurnTokenUsage(
        : DateTime.formatIso(DateTime.add(requestedAt, { milliseconds: promptCacheTtlMs }));
    return {
      usedTokens: inputTokens + outputTokens,
@@ -159,7 +158,7 @@ index 477044eb54..b6ece9cf6c 100644
      ...claudeAutoCompactThreshold(autoCompactWindow, maxTokens),
      ...(promptCacheExpiresAt === undefined ? {} : { promptCacheExpiresAt }),
      updatedAt,
-@@ -5905,11 +5920,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -5899,11 +5914,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
            // arrives after generation, so it leaves the cache expiry unknown.
            if (requestStarted && context.streamUsage !== null) context.streamUsage.requestedAt = now;
            const maxTokens = claudeContextWindow(context.input.modelSelection);
@@ -173,7 +172,7 @@ index 477044eb54..b6ece9cf6c 100644
                    ...claudeAutoCompactThreshold(context.autoCompactWindow, maxTokens),
                    updatedAt: DateTime.formatIso(now),
                  }
-@@ -5919,6 +5935,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -5913,6 +5929,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                    DateTime.formatIso(now),
                    context.autoCompactWindow,
                    context.streamUsage?.requestedAt,
@@ -181,16 +180,3 @@ index 477044eb54..b6ece9cf6c 100644
                  );
            if (typeof usage !== "number") {
              if (claudeMessageInputTokens(usage) <= 0) return;
-diff --git a/apps/web/src/components/chat/ComposerStats.logic.ts b/apps/web/src/components/chat/ComposerStats.logic.ts
-index 8f359cd0af..5f88749c98 100644
---- a/apps/web/src/components/chat/ComposerStats.logic.ts
-+++ b/apps/web/src/components/chat/ComposerStats.logic.ts
-@@ -296,7 +296,7 @@ export function deriveContextCompaction(
-           ? "Provider reported"
-           : "Claude setting"
-         : driver === "claudeAgent"
--          ? "Claude default (threshold not reported)"
-+          ? "Managed by Claude (threshold not reported)"
-           : driver === "codex"
-             ? "Managed by Codex (threshold not reported)"
-             : context?.compactsAutomatically === true
