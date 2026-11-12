@@ -162,3 +162,28 @@ class SkipSharedTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class BundleMarkersTest(unittest.TestCase):
+    """The bundle check looks for skip-shared.json's markers, since the default ones come from a shared patch."""
+
+    def test_markers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recipe = Path(tmp)
+            with patch.object(customize, 'RECIPE', recipe):
+                self.assertEqual(customize.bundle_markers(),
+                                 tuple((prefix, (marker,)) for prefix, marker in customize.MARKERS))
+                (recipe / customize.SKIP_SHARED).write_text(json.dumps({'patches': [], 'markers': [
+                    ['apps/server/dist/client/', 'openedByThreadId']]}))
+                self.assertIn(('apps/server/dist/client/', (b'statsForNerds', b'openedByThreadId')),
+                              customize.bundle_markers())
+
+    def test_repo_markers_come_from_kept_patches(self):
+        """Every marker in this repo's skip-shared.json appears in a patch the fork still applies."""
+        skips = json.loads((ROOT / customize.SKIP_SHARED).read_text())
+        skipped = {entry['subject'] for entry in skips['patches']}
+        kept = [p for folder in ('patches-port', 'patches-tt') for p in sorted((ROOT / folder).glob('*.patch'))
+                if customize.patch_subject(p) not in skipped]
+        self.assertEqual({prefix for prefix, _ in skips['markers']}, {prefix for prefix, _ in customize.MARKERS})
+        for _, marker in skips['markers']:
+            self.assertTrue(any(marker in p.read_text(encoding='utf-8', errors='replace') for p in kept), marker)
