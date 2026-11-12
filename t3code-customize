@@ -187,6 +187,15 @@ def shared_skips():
     return load(RECIPE / SKIP_SHARED, {})
 
 
+def bundle_markers():
+    """(prefix, markers) pairs: a rebuilt bundle under prefix carries the patches when it holds any of them.
+    skip-shared.json adds its own, since the default markers come from shared patches it can leave out."""
+    extra = {}
+    for prefix, marker in shared_skips().get('markers', []):
+        extra.setdefault(prefix, []).append(marker.encode())
+    return tuple((prefix, (marker,) + tuple(extra.get(prefix, ()))) for prefix, marker in MARKERS)
+
+
 def skipped_subjects():
     return {entry['subject'] for entry in shared_skips().get('patches', [])}
 
@@ -510,10 +519,11 @@ class Folder:
 
 def check_bundles(stock, patched, config, prefixes):
     """The rebuilt bundles carry the patches and the same T3 Connect config as stock."""
-    for prefix, marker in MARKERS:
+    for prefix, markers in bundle_markers():
         if (any(prefix.startswith(p + '/') for p in prefixes) and
-                not any(marker in data for _, data in patched.scripts(prefix))):
-            raise Stop(f'The rebuilt bundle under {prefix} is missing the stats bar.')
+                not any(m in data for _, data in patched.scripts(prefix) for m in markers)):
+            raise Stop(f'The rebuilt bundle under {prefix} is missing the patches'
+                       f' (none of {", ".join(m.decode() for m in markers)}).')
     # Connect needs the same public config as stock in every bundle that carries it.
     for prefix in ('apps/server/dist/client/', 'apps/server/dist/', 'apps/desktop/dist-electron/'):
         if not any(prefix.startswith(p + '/') for p in prefixes):
