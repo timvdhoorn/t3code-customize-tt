@@ -277,6 +277,7 @@ class ServerRunLockTest(unittest.TestCase):
                 patch.object(customize, 'ensure_commit', return_value='abc'), \
                 patch.object(customize, 'apply_patches', return_value=ported), \
                 patch.object(customize, 'export_patches'), patch.object(customize, 'publish_port'), \
+                patch.object(customize, 'publish_cover') as self.cover, \
                 patch.object(customize, 'git', return_value='head'), \
                 patch.object(customize, 'build_rewrites_discarded', contextlib.nullcontext), \
                 patch.object(customize, 'build_server'), \
@@ -297,6 +298,15 @@ class ServerRunLockTest(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(self.installed, ['r'])
         restart.assert_called_once()
+
+    def test_a_clean_apply_advances_the_covered_nightly(self):
+        self.run_server()
+        self.cover.assert_called_once()
+        self.assertEqual(self.cover.call_args.args[1], '1.1-nightly')
+
+    def test_a_port_publishes_itself_and_does_not_cover(self):
+        self.run_server(ported=True)  # the port PR carries covered-nightly.txt
+        self.cover.assert_not_called()
 
     def test_the_restart_lock_is_free_while_the_server_run_waits_for_idle(self):
         free = []

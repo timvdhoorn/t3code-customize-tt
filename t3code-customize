@@ -257,7 +257,7 @@ OPERATIONAL_CODE = frozenset({
     'report_ported_prs', '_report_ported_prs', 'fork_repo', 'report_open_prs', 'stuck_message',
     'port_failed', 'recent_failure', 'port_pending', 'porter_machine', 'port_command', 'repo_path',
     'remote_port_line', 'handed_off_already', 'hand_off_port', 'spawn_detached', 'publish_port',
-    '_publish_port', 'port_branch', 'port_changes', 'committed_folder', 'working_folder',
+    '_publish_port', 'publish_cover', '_publish_cover', 'can_publish', 'port_branch', 'port_changes', 'committed_folder', 'working_folder',
     'is_port_file', 'newest_nightly', 'cmd_port', 'cmd_continue',
     'find_agent', 'available_agents', 'choose_agent', 'agent_prompt',
 })
@@ -1762,17 +1762,17 @@ def port_changes():
     return sorted(set(port)), sorted(set(other))
 
 
-def port_branch(version, title):
-    """port/nightly-<version>, or a fresh -2, -3 when that branch has commits this tool did not make."""
+def port_branch(version, title, prefix='port'):
+    """<prefix>/nightly-<version>, or a fresh -2, -3 when that branch has commits this tool did not make."""
     for suffix in [''] + [f'-{n}' for n in range(2, 10)]:
-        branch = f'port/nightly-{version}{suffix}'
+        branch = f'{prefix}/nightly-{version}{suffix}'
         if not repo_run('git', 'ls-remote', '--heads', 'origin', branch, check=False):
             return branch
         repo_run('git', 'fetch', '--quiet', 'origin', branch, check=False)
         subjects = repo_run('git', 'log', '--format=%s', 'HEAD..FETCH_HEAD', check=False).splitlines()
         if all(subject == title for subject in subjects):
             return branch
-    raise Stop(f'port/nightly-{version} and its suffixes all hold commits from someone else')
+    raise Stop(f'{prefix}/nightly-{version} and its suffixes all hold commits from someone else')
 
 
 class MergedButStuck(Stop):
@@ -1809,7 +1809,72 @@ def publish_port(args, version):
                ' This machine already runs the port.')
 
 
-def _publish_port(version, checked):
+def can_publish():
+    """True on a machine that can open and merge a PR for this repo: a git checkout, gh, and a gh login."""
+    if not (REPO / '.git').exists() or not shutil.which('gh'):
+        return False
+    try:
+        return subprocess.run(['gh', 'auth', 'status'], capture_output=True, timeout=30,
+                              stdin=subprocess.DEVNULL).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def publish_cover(args, version):
+    """The patches applied to nightly `version` without a conflict and every check passed (no port was
+    needed): advance covered-nightly.txt on main to it, so the Macs may install it. Quiet no-op unless this
+    run applied this repo's own patch set, ran every check, and can publish; never lowers the version.
+    A failure notifies and never stops the run."""
+    if (getattr(args, 'skip_checks', False) or RECIPE != REPO or not nightly_key(version)
+            or not can_publish()):
+        return
+    try:
+        url, merged = _publish_cover(version)
+    except MergedButStuck as error:
+        notify(LAUNCHER_NAME, f'The patches cover {version}. {error}')
+        return
+    except (Stop, OSError, subprocess.CalledProcessError) as error:
+        notify(LAUNCHER_NAME, f'The patches cover {version}, but advancing {COVERED_NIGHTLY} failed: {error}'
+               ' The Macs wait for it; the next server run that builds this nightly (server --force) retries.')
+        return
+    if merged:
+        say(f'The patches cover {version}: {url} is merged, so the Macs may install it.')
+    elif url:
+        notify(LAUNCHER_NAME, f'The patches cover {version}, but advancing {COVERED_NIGHTLY} waits for review: {url}.')
+
+
+def _publish_cover(version):
+    """(url, merged) of the PR that moves covered-nightly.txt to version, or (None, False) when main
+    already names this nightly or a newer one."""
+    repo_run('git', 'fetch', '--quiet', 'origin', 'main')
+    shown = subprocess.run(['git', 'show', f'FETCH_HEAD:{COVERED_NIGHTLY}'], cwd=REPO, capture_output=True, text=True)
+    known = nightly_key(shown.stdout) if shown.returncode == 0 else None
+    if known and nightly_key(version) <= known:
+        return None, False
+    write_covered_nightly(version, REPO)
+    try:
+        if port_changes()[0] != [COVERED_NIGHTLY]:
+            # Unpublished patch changes here, or this copy is ahead of main already: not this run's to publish.
+            restore_covered_nightly()
+            return None, False
+        url, merged = _publish_port(version, checked=True, cover=True)
+    except BaseException:
+        restore_covered_nightly()
+        raise
+    if not merged:
+        restore_covered_nightly()
+    return url, merged
+
+
+def restore_covered_nightly():
+    """Put covered-nightly.txt back as committed, so an unmerged cover leaves this checkout clean."""
+    if repo_run('git', 'ls-files', '--', COVERED_NIGHTLY, check=False):
+        repo_run('git', 'checkout', '--quiet', 'HEAD', '--', COVERED_NIGHTLY, check=False)
+    else:
+        (REPO / COVERED_NIGHTLY).unlink(missing_ok=True)
+
+
+def _publish_port(version, checked, cover=False):
     if not (REPO / '.git').exists() or not shutil.which('gh'):
         raise Stop('this copy of the repo has no git or gh')
     port, other = port_changes()
@@ -1820,8 +1885,11 @@ def _publish_port(version, checked):
     before, after = patch_sets(committed_folder), patch_sets(working_folder)
     # The grant covers patches alone: checks, the script and every other file stay as on main.
     safe = checked and on_main and not other and code_unchanged(before, after)
-    title = f'chore: port patches to nightly {version}'
-    branch = port_branch(version, title)
+    if cover:
+        # A cover moves covered-nightly.txt alone: patches or anything else that changed wait for review.
+        safe = safe and port == [COVERED_NIGHTLY]
+    title = f'chore: cover nightly {version}' if cover else f'chore: port patches to nightly {version}'
+    branch = port_branch(version, title, 'cover' if cover else 'port')
     worktree = Path(tempfile.mkdtemp(prefix='port-', dir=CACHE))
     try:
         repo_run('git', 'worktree', 'add', '--quiet', '-B', branch, str(worktree), 'HEAD')
@@ -1841,7 +1909,10 @@ def _publish_port(version, checked):
     finally:
         repo_run('git', 'worktree', 'remove', '--force', str(worktree), check=False)
         shutil.rmtree(worktree, ignore_errors=True)
-    if safe:
+    if safe and cover:
+        verdict = ('Checks passed, the patches are the ones on main and only covered-nightly.txt changes, so it'
+                   ' merges under the standing grant in docs/machines.md.')
+    elif safe:
         verdict = ('Checks passed and every patch keeps the same code lines (only context, comments and line'
                    ' numbers moved), so it merges under the standing grant in docs/machines.md.')
     else:
@@ -1851,8 +1922,11 @@ def _publish_port(version, checked):
         verdict = 'Waits for review: ' + '; '.join(reasons) + '.'
     url = repo_run('gh', 'pr', 'view', branch, '--json', 'url', '--jq', '.url', check=False)
     if not url:
+        what = (f'{NAME} applied the current patches to nightly {version} without a conflict and every check'
+                f' passed, so no port is needed. This lets the Macs install it.' if cover else
+                f'Unattended port by {NAME} --fix for nightly {version}.')
         url = repo_run('gh', 'pr', 'create', '--base', 'main', '--head', branch, '--title', title,
-                       '--body', f'Unattended port by {NAME} --fix for nightly {version}.\n\n{verdict}').splitlines()[-1]
+                       '--body', f'{what}\n\n{verdict}').splitlines()[-1]
     if not safe:
         return url, False
     repo_run('gh', 'pr', 'merge', branch, '--squash', '--delete-branch')
@@ -1867,6 +1941,8 @@ def _publish_port(version, checked):
     except Stop as error:
         raise MergedButStuck(f'{url} is merged, but {REPO} could not fast-forward to it ({error}).'
                              f' Run git pull there, then {NAME} fleet.')
+    if cover:
+        return url, True  # nothing was rebuilt: no fleet run needed
     # fleet waits for this run's lock, then updates every machine, this one included. This run may
     # still build the iOS app after it (update --ios), so fleet waits longer than a normal run.
     spawn_detached([sys.executable, str(REPO / NAME), 'fleet', '--no-pull', '--wait-lock', str(PORT_FLEET_WAIT)],
@@ -2573,6 +2649,8 @@ def cmd_port(args):
         ported = apply_patches(args, target, version, env, log, handoff=False)
         if not ported:
             say(f'The patches apply to {version} and pass their checks; nothing to port.')
+            if not args.dry_run:
+                publish_cover(args, version)
             return False
         if args.dry_run:
             out = CACHE / 'port-dry-run' / version
@@ -3136,6 +3214,9 @@ def cmd_server(args):
             export_patches(target, version=version)
             # Before the idle wait, so a deferred or failed restart never loses the port.
             publish_port(args, version)
+        else:
+            # Clean apply and passing checks: no port, but main may still need to name this nightly.
+            publish_cover(args, version)
         # What this build is made of, read now: once the lock is released a port may change the patches.
         built_recipe = recipe_hash() if ported else recipe
         with restart_lock():
