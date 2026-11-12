@@ -27,7 +27,7 @@ guide line, context-menu collapse and a summary stub.
  .../src/orchestration-v2/runtimeLayer.test.ts |   85 ++
  .../Sidebar.childThreads.browser.test.tsx     |  181 +++
  .../components/Sidebar.childThreads.test.ts   |  617 ++++++++
- .../src/components/Sidebar.childThreads.tsx   | 1291 +++++++++++++++++
+ .../src/components/Sidebar.childThreads.tsx   | 1299 +++++++++++++++++
  .../src/components/Sidebar.families.test.ts   |  519 +++++++
  apps/web/src/components/Sidebar.families.ts   |  381 +++++
  apps/web/src/components/Sidebar.logic.test.ts |   45 +
@@ -37,7 +37,7 @@ guide line, context-menu collapse and a summary stub.
  ...lationshipsControl.opened.browser.test.tsx |  373 +++++
  .../chat/ThreadRelationshipsControl.tsx       |  338 ++++-
  .../components/sidebar/SidebarThreadRow.tsx   |   99 +-
- .../SidebarThreadRow.workers.browser.test.tsx |  507 +++++++
+ .../SidebarThreadRow.workers.browser.test.tsx |  551 +++++++
  .../web/src/components/sidebar/routeReveal.ts |   18 +-
  .../components/threadActionMenu.logic.test.ts |   33 +
  .../src/components/threadActionMenu.logic.ts  |   39 +
@@ -65,7 +65,7 @@ guide line, context-menu collapse and a summary stub.
  packages/contracts/src/orchestrationV2.ts     |   32 +
  packages/contracts/src/orchestratorMcp.ts     |    6 +
  .../src/server/subagentProjection.ts          |    9 +-
- 56 files changed, 6660 insertions(+), 139 deletions(-)
+ 56 files changed, 6712 insertions(+), 139 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.childThreads.browser.test.tsx
  create mode 100644 apps/web/src/components/Sidebar.childThreads.test.ts
  create mode 100644 apps/web/src/components/Sidebar.childThreads.tsx
@@ -2105,10 +2105,10 @@ index 0000000000..9a57a4f111
 +});
 diff --git a/apps/web/src/components/Sidebar.childThreads.tsx b/apps/web/src/components/Sidebar.childThreads.tsx
 new file mode 100644
-index 0000000000..2b7b28e0a6
+index 0000000000..d8070f40e5
 --- /dev/null
 +++ b/apps/web/src/components/Sidebar.childThreads.tsx
-@@ -0,0 +1,1291 @@
+@@ -0,0 +1,1299 @@
 +// Child threads in the sidebar (patches-tt/0003). Family rules live in Sidebar.families.ts;
 +// this module holds the sidebar's state and rendering so Sidebar.tsx only calls into it.
 +import { observeResize } from "~/lib/observeResize";
@@ -3162,6 +3162,14 @@ index 0000000000..2b7b28e0a6
 +              className={cn(WORKER_MENU_ITEM_CLASS_NAME, "pe-9")}
 +              onClick={() => onAction({ type: "open", thread: worker.thread })}
 +              onKeyDown={(event) => {
++                // The menu takes focus a frame after it shows. Escape before that lands here, where
++                // the popover's own Escape would close the popover around the menu.
++                if (event.key === "Escape" && menuOpen) {
++                  event.preventDefault();
++                  event.stopPropagation();
++                  setMenuOpen(false);
++                  return;
++                }
 +                if (!opensEntryMenu(event)) return;
 +                event.preventDefault();
 +                event.stopPropagation();
@@ -6037,10 +6045,10 @@ index 1813eba805..dd13c2e0f5 100644
  });
 diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx
 new file mode 100644
-index 0000000000..7294d3dd61
+index 0000000000..10bd904d30
 --- /dev/null
 +++ b/apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx
-@@ -0,0 +1,507 @@
+@@ -0,0 +1,551 @@
 +import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 +import { describe, expect, it, vi } from "vite-plus/test";
 +import { cdp, page, userEvent } from "vite-plus/test/browser";
@@ -6238,6 +6246,28 @@ index 0000000000..7294d3dd61
 +      </div>
 +    </TooltipProvider>,
 +  );
++}
++
++/**
++ * Holds the page's animation frames until disposed, as a busy or throttled page delays them: Base
++ * UI moves focus into a menu a frame after it shows.
++ */
++function holdAnimationFrames() {
++  const { requestAnimationFrame: request, cancelAnimationFrame: cancel } = window;
++  const held = new Map<number, FrameRequestCallback>();
++  let next = 0;
++  window.requestAnimationFrame = (callback) => {
++    held.set(++next, callback);
++    return next;
++  };
++  window.cancelAnimationFrame = (id) => void held.delete(id);
++  return {
++    [Symbol.dispose]: () => {
++      window.requestAnimationFrame = request;
++      window.cancelAnimationFrame = cancel;
++      for (const callback of held.values()) request(callback);
++    },
++  };
 +}
 +
 +/** Runs an entry's action from its "More actions" menu. */
@@ -6487,11 +6517,33 @@ index 0000000000..7294d3dd61
 +    }
 +
 +    await userEvent.keyboard("{ArrowRight}");
++    // Base UI moves focus into the menu a frame after it shows, later under load.
++    await expect.poll(() => document.activeElement?.getAttribute("role")).toBe("menu");
 +    await userEvent.keyboard("{ArrowDown}{Enter}");
 +    expect(onAction).toHaveBeenLastCalledWith({
 +      type: expect.stringMatching(/^(show-as-subthread|make-main-thread)$/),
 +      thread: expect.objectContaining({ id: "asks" }),
 +    });
++  });
++
++  it("closes only the entry's menu on Escape, also before the menu takes focus", async () => {
++    await using _screen = await renderRow(1280, 800, vi.fn());
++    (page.getByTestId("sidebar-delegated-workers").element() as HTMLElement).focus();
++    await userEvent.keyboard("{Enter}");
++    const entry = () =>
++      document.querySelector<HTMLElement>('[data-testid="sidebar-delegated-worker"]');
++    await expect.poll(() => document.activeElement).toBe(entry());
++    {
++      using _frames = holdAnimationFrames();
++      await userEvent.keyboard("{ArrowRight}");
++      await expect.element(page.getByRole("menuitem", { name: "Make main thread" })).toBeVisible();
++      // The menu shows, but focus is still on the entry when Escape comes.
++      expect(document.activeElement).toBe(entry());
++      await userEvent.keyboard("{Escape}");
++    }
++    await expect.element(page.getByRole("menu")).not.toBeInTheDocument();
++    await expect.element(page.getByTestId("sidebar-delegated-workers-popover")).toBeVisible();
++    await expect.poll(() => document.activeElement).toBe(entry());
 +  });
 +
 +  it("keeps the entry highlighted while the pointer is on its More actions button", async () => {
