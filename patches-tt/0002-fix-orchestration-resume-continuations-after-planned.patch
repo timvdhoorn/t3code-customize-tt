@@ -15,17 +15,17 @@ closes ingestion.
  .../src/orchestration-v2/EffectOutbox.ts      |   1 +
  .../src/orchestration-v2/EffectWorker.ts      |   1 +
  .../src/orchestration-v2/Orchestrator.ts      |  61 +-
- .../ProviderSessionManager.test.ts            |  20 +-
+ .../ProviderSessionManager.test.ts            |  24 +-
  .../ProviderSessionManager.ts                 |  82 ++-
- .../RunExecutionService.test.ts               | 424 +++++++++-----
+ .../RunExecutionService.test.ts               | 455 ++++++++++-----
  .../orchestration-v2/RunExecutionService.ts   | 116 +++-
- .../SelectionRestart.integration.test.ts      | 539 +++++++++++++++++-
+ .../SelectionRestart.integration.test.ts      | 545 +++++++++++++++++-
  .../testkit/ProviderReplayHarness.ts          |   3 +-
  docs/internals/overview.md                    |   4 +
  docs/user/composer.md                         |   3 +
  packages/contracts/src/orchestrationV2.ts     |   4 +
  .../src/server/ProviderAdapter.ts             |  16 +-
- 15 files changed, 1210 insertions(+), 245 deletions(-)
+ 15 files changed, 1233 insertions(+), 263 deletions(-)
 
 diff --git a/apps/server/src/mcp/WorktreeMcpService.test.ts b/apps/server/src/mcp/WorktreeMcpService.test.ts
 index 90cf3c7f84..269a84b3bd 100644
@@ -316,10 +316,10 @@ index 0ee45bb7f8..a514c8d1c2 100644
          yield* vcsStatusBroadcaster
            .refreshStatus(worktreePath)
 diff --git a/apps/server/src/orchestration-v2/EffectOutbox.ts b/apps/server/src/orchestration-v2/EffectOutbox.ts
-index 92e1e01ad4..3fd9c675aa 100644
+index eb1209158c..e228de0af2 100644
 --- a/apps/server/src/orchestration-v2/EffectOutbox.ts
 +++ b/apps/server/src/orchestration-v2/EffectOutbox.ts
-@@ -38,6 +38,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
+@@ -40,6 +40,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
      type: Schema.Literal("provider-session.detach"),
      providerSessionId: ProviderSessionId,
      detail: Schema.optional(Schema.String),
@@ -328,10 +328,10 @@ index 92e1e01ad4..3fd9c675aa 100644
    }),
    Schema.Struct({
 diff --git a/apps/server/src/orchestration-v2/EffectWorker.ts b/apps/server/src/orchestration-v2/EffectWorker.ts
-index c5b5ea9b38..443e58615f 100644
+index 3578657617..73241e2cee 100644
 --- a/apps/server/src/orchestration-v2/EffectWorker.ts
 +++ b/apps/server/src/orchestration-v2/EffectWorker.ts
-@@ -124,6 +124,7 @@ export const layerExecutor: Layer.Layer<
+@@ -126,6 +126,7 @@ export const layerExecutor: Layer.Layer<
                  providerSessionId: effect.request.providerSessionId,
                  threadId: effect.threadId,
                  ...(effect.request.detail === undefined ? {} : { detail: effect.request.detail }),
@@ -340,10 +340,10 @@ index c5b5ea9b38..443e58615f 100644
                    ? {}
                    : { revokeMcpCredential: effect.request.revokeMcpCredential }),
 diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
-index 59fb1d9731..19a401dfae 100644
+index 8ce6e01a0e..20bd8e1a89 100644
 --- a/apps/server/src/orchestration-v2/Orchestrator.ts
 +++ b/apps/server/src/orchestration-v2/Orchestrator.ts
-@@ -3740,6 +3740,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -3828,6 +3828,26 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
          cause: `Thread ${command.threadId} branch changed before the metadata update could be applied.`,
        });
      }
@@ -370,7 +370,7 @@ index 59fb1d9731..19a401dfae 100644
      if (command.type === "thread.metadata.update" && command.expectedEmpty === true) {
        const records = yield* projectionStore
          .getThreadRecords(command.threadId, ["runs"])
-@@ -4801,6 +4821,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -4929,6 +4949,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                            ? "Runtime mode changed."
                            : "Provider or model selection changed.",
                  // Terminal detaches revoke MCP credentials; reattachments need other detach reasons to preserve them.
@@ -380,15 +380,15 @@ index 59fb1d9731..19a401dfae 100644
                  ...(command.type === "thread.archive" ? { revokeMcpCredential: true } : {}),
                },
              } satisfies PendingOrchestrationEffectV2;
-@@ -6030,6 +6053,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -6175,6 +6198,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
      command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
      effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
 +    worktreeContinuationOfRunId?: RunId,
    ) {
      let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
-     if (command.manualContinuationOfRunId !== undefined) {
-@@ -6101,6 +6125,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+     if (command.steerFollowUpOfRunId !== undefined) {
+@@ -6282,6 +6306,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
        if (
          !source ||
          !(
@@ -396,7 +396,7 @@ index 59fb1d9731..19a401dfae 100644
            isRestartContinuationSource(source, projection.providerTurns) ||
            continuationFailedBeforePrompt(source, projection.providerTurns)
          ) ||
-@@ -6116,6 +6141,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -6297,6 +6322,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
          ) ||
          (yield* stopReachedRun(command, command.threadId, source.id))
        ) {
@@ -410,7 +410,7 @@ index 59fb1d9731..19a401dfae 100644
          // Preserve the current row so stale automatic deliveries receive an
          // accepted receipt without changing work or repeatedly retrying.
          yield* emit(
-@@ -13848,7 +13880,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -14188,7 +14220,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
        case "thread.active.reorder":
        case "thread.tag.set":
        case "thread.mark-unread":
@@ -418,7 +418,7 @@ index 59fb1d9731..19a401dfae 100644
        case "thread.pull-request.link":
        case "thread.pull-request.unlink":
        case "thread.pull-request-link.sync":
-@@ -13861,6 +13892,34 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+@@ -14201,6 +14232,34 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
        case "provider.switch":
          yield* dispatchThreadMutation(command, events, effects);
          break;
@@ -454,10 +454,10 @@ index 59fb1d9731..19a401dfae 100644
          yield* dispatchPullRequestWatchSync(command, events, effects);
          break;
 diff --git a/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts b/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
-index 25ae18f7b6..5464fdef86 100644
+index 5e494b8b31..dc7212a07d 100644
 --- a/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
 +++ b/apps/server/src/orchestration-v2/ProviderSessionManager.test.ts
-@@ -1702,8 +1702,8 @@ it.effect(
+@@ -1767,8 +1767,8 @@ it.effect(
            modelSelection,
            runtimePolicy,
          });
@@ -468,7 +468,7 @@ index 25ae18f7b6..5464fdef86 100644
          const oldQueue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
          assert.isDefined(oldQueue);
          const statuses = [{ key: "watch", text: "Watching 4 files" }];
-@@ -1758,7 +1758,7 @@ it.effect(
+@@ -1823,7 +1823,7 @@ it.effect(
            modelSelection,
            runtimePolicy,
          });
@@ -477,7 +477,7 @@ index 25ae18f7b6..5464fdef86 100644
          const newQueue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
          assert.isDefined(newQueue);
          yield* Queue.offer(oldQueue!, {
-@@ -1823,7 +1823,7 @@ it.effect.each(["session metadata", "session status changes", "provider work"] a
+@@ -1888,7 +1888,7 @@ it.effect.each(["session metadata", "session status changes", "provider work"] a
            modelSelection,
            runtimePolicy,
          });
@@ -486,7 +486,7 @@ index 25ae18f7b6..5464fdef86 100644
          const observed = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
          yield* subscriber.events.pipe(
            Stream.runForEach((event) => Queue.offer(observed, event)),
-@@ -1934,8 +1934,8 @@ it.effect("ProviderSessionManagerV2 interrupts event subscriptions on server shu
+@@ -1999,8 +1999,8 @@ it.effect("ProviderSessionManagerV2 interrupts event subscriptions on server shu
          modelSelection,
          runtimePolicy,
        });
@@ -497,7 +497,7 @@ index 25ae18f7b6..5464fdef86 100644
        const adapterQueue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
        assert.isDefined(adapterQueue);
        yield* Queue.offer(adapterQueue!, {
-@@ -1977,7 +1977,7 @@ it.effect("ProviderSessionManagerV2 drains subscribers when the provider stops",
+@@ -2042,7 +2042,7 @@ it.effect("ProviderSessionManagerV2 drains subscribers when the provider stops",
          modelSelection,
          runtimePolicy,
        });
@@ -506,7 +506,25 @@ index 25ae18f7b6..5464fdef86 100644
        const collected = yield* subscription.events.pipe(Stream.runCollect, Effect.forkScoped);
        const adapterQueue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
        assert.isDefined(adapterQueue);
-@@ -3983,8 +3983,8 @@ it.effect(
+@@ -2121,7 +2121,7 @@ it.effect("ProviderSessionManagerV2 fails a turn whose provider retry never resu
+         modelSelection,
+         runtimePolicy,
+       });
+-      const subscription = yield* runtime.subscribeEvents!;
++      const subscription = yield* runtime.subscribeEvents!();
+       const published = yield* Queue.unbounded<void>();
+       // The pump updates the stall watch before it publishes a turn item.
+       const collected = yield* subscription.events.pipe(
+@@ -4269,7 +4269,7 @@ it.effect.each([
+             modelSelection: selection,
+             runtimePolicy,
+           });
+-          const subscription = yield* secondRuntime.subscribeEvents!;
++          const subscription = yield* secondRuntime.subscribeEvents!();
+           const terminal = yield* subscription.events.pipe(
+             Stream.filter((event) => event.type === "turn.terminal"),
+             Stream.runHead,
+@@ -4309,8 +4309,8 @@ it.effect.each([
          const subscribe = firstRuntime.subscribeEvents;
          assert.isDefined(subscribe);
          if (subscribe === undefined) return;
@@ -517,7 +535,7 @@ index 25ae18f7b6..5464fdef86 100644
          const queue = (yield* Ref.get(state)).eventQueues.get(String(providerSessionId));
          assert.isDefined(queue);
          yield* Queue.offer(queue!, {
-@@ -4252,7 +4252,7 @@ it.effect(
+@@ -4614,7 +4614,7 @@ it.effect(
          const publish = Effect.fnUntraced(function* (
            event: ProviderAdapter.ProviderAdapterV2Event,
          ) {
@@ -527,10 +545,10 @@ index 25ae18f7b6..5464fdef86 100644
            // Observing the exact event ensures the manager has handled it before resuming.
            assert.deepEqual(yield* subscription.events.pipe(Stream.runHead), Option.some(event));
 diff --git a/apps/server/src/orchestration-v2/ProviderSessionManager.ts b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
-index 84a64b10c8..11e60d5707 100644
+index 3308878561..95a82115d8 100644
 --- a/apps/server/src/orchestration-v2/ProviderSessionManager.ts
 +++ b/apps/server/src/orchestration-v2/ProviderSessionManager.ts
-@@ -191,6 +191,7 @@ export interface ProviderSessionManagerV2Shape {
+@@ -202,6 +202,7 @@ export interface ProviderSessionManagerV2Shape {
      readonly providerSessionId: ProviderSessionId;
      readonly threadId: ThreadId;
      readonly detail?: string;
@@ -538,7 +556,7 @@ index 84a64b10c8..11e60d5707 100644
      readonly revokeMcpCredential?: boolean;
    }) => Effect.Effect<void, ProviderSessionManagerV2Error>;
    /**
-@@ -234,9 +235,7 @@ interface LiveSessionEntry {
+@@ -245,9 +246,7 @@ interface LiveSessionEntry {
    readonly supportsMultipleProviderThreads: boolean;
    readonly runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime;
    readonly exposedRuntime: ProviderAdapter.ProviderAdapterV2SessionRuntime;
@@ -549,7 +567,7 @@ index 84a64b10c8..11e60d5707 100644
    readonly requestEventPermit: Semaphore.Semaphore;
    readonly scope: Scope.Closeable;
    readonly idleGeneration: number;
-@@ -252,6 +251,11 @@ interface IdleThreadUnload {
+@@ -263,6 +262,11 @@ interface IdleThreadUnload {
    readonly fiber: Fiber.Fiber<void, never> | null;
  }
  
@@ -561,7 +579,7 @@ index 84a64b10c8..11e60d5707 100644
  type ProviderSessionEventSignal =
    | { readonly type: "event"; readonly event: ProviderAdapter.ProviderAdapterV2Event }
    | {
-@@ -553,14 +557,12 @@ export const layerWithOptions = (
+@@ -572,14 +576,12 @@ export const layerWithOptions = (
              );
  
        const publishToSubscribers = (
@@ -578,7 +596,7 @@ index 84a64b10c8..11e60d5707 100644
                discard: true,
              }),
            ),
-@@ -568,17 +570,23 @@ export const layerWithOptions = (
+@@ -587,17 +589,23 @@ export const layerWithOptions = (
  
        const failSubscribers = Effect.fn("ProviderSessionManager.failSubscribers")(function* (
          entry: LiveSessionEntry,
@@ -610,7 +628,7 @@ index 84a64b10c8..11e60d5707 100644
              Queue.offer(queue, {
                type: "failure",
                cause: Cause.fail(error),
-@@ -595,7 +603,7 @@ export const layerWithOptions = (
+@@ -614,7 +622,7 @@ export const layerWithOptions = (
            const subscribers = yield* Ref.getAndSet(entry.eventSubscribers, new Map());
            yield* Effect.forEach(
              subscribers.values(),
@@ -619,7 +637,7 @@ index 84a64b10c8..11e60d5707 100644
              { discard: true },
            );
          },
-@@ -607,7 +615,7 @@ export const layerWithOptions = (
+@@ -626,7 +634,7 @@ export const layerWithOptions = (
          entry: LiveSessionEntry,
        ) {
          const subscribers = yield* Ref.getAndSet(entry.eventSubscribers, new Map());
@@ -628,7 +646,7 @@ index 84a64b10c8..11e60d5707 100644
            discard: true,
          });
        });
-@@ -1103,7 +1111,11 @@ export const layerWithOptions = (
+@@ -1122,7 +1130,11 @@ export const layerWithOptions = (
                    } else {
                      yield* failSubscribers(
                        entry,
@@ -641,7 +659,7 @@ index 84a64b10c8..11e60d5707 100644
                      );
                    }
                    const closeExit = yield* closeScopeWithin(entry.scope, {
-@@ -1894,15 +1906,14 @@ export const layerWithOptions = (
+@@ -1913,15 +1925,14 @@ export const layerWithOptions = (
  
        const makeEventSubscription = Effect.fn("ProviderSessionManager.makeEventSubscription")(
          function* (
@@ -660,7 +678,7 @@ index 84a64b10c8..11e60d5707 100644
              return updated;
            });
            const close = Ref.modify(subscribers, (current) => {
-@@ -1933,12 +1944,11 @@ export const layerWithOptions = (
+@@ -1952,12 +1963,11 @@ export const layerWithOptions = (
  
        const decorateRuntime = (
          runtime: ProviderAdapter.ProviderAdapterV2SessionRuntime,
@@ -676,7 +694,7 @@ index 84a64b10c8..11e60d5707 100644
          const turnMetrics = (operation: string, model?: string) =>
            withMetrics({
              counter: providerTurnsTotal,
-@@ -1957,7 +1967,7 @@ export const layerWithOptions = (
+@@ -1976,7 +1986,7 @@ export const layerWithOptions = (
            },
            subscribeEvents,
            events: Stream.unwrap(
@@ -685,7 +703,7 @@ index 84a64b10c8..11e60d5707 100644
            ),
            ensureThread: (input) =>
              observeActivity(
-@@ -2519,7 +2529,7 @@ export const layerWithOptions = (
+@@ -2726,7 +2736,7 @@ export const layerWithOptions = (
                    }),
                  );
                const eventSubscribers = yield* Ref.make<
@@ -694,7 +712,7 @@ index 84a64b10c8..11e60d5707 100644
                >(new Map());
                const exposedRuntime = decorateRuntime(runtime, eventSubscribers);
                const entry: LiveSessionEntry = {
-@@ -2689,6 +2699,7 @@ export const layerWithOptions = (
+@@ -2896,6 +2906,7 @@ export const layerWithOptions = (
              const key = sessionKey(input.providerSessionId);
              const currentEntry = (yield* Ref.get(sessions)).get(key);
              let detachedProviderThreads: ReadonlyArray<OrchestrationV2ProviderThread> = [];
@@ -702,7 +720,7 @@ index 84a64b10c8..11e60d5707 100644
              if (currentEntry?.supportsMultipleProviderThreads === true) {
                const projection = yield* Effect.option(
                  projectionStore.getThreadRecords(input.threadId, [
-@@ -2706,7 +2717,7 @@ export const layerWithOptions = (
+@@ -2913,7 +2924,7 @@ export const layerWithOptions = (
                  const activeTurns = projection.value.providerTurns.filter(
                    (turn) => turn.status === "running" && providerThreads.has(turn.providerThreadId),
                  );
@@ -711,7 +729,7 @@ index 84a64b10c8..11e60d5707 100644
                    activeTurns,
                    (turn) =>
                      currentEntry.exposedRuntime
-@@ -2789,6 +2800,19 @@ export const layerWithOptions = (
+@@ -2996,6 +3007,19 @@ export const layerWithOptions = (
              if (Option.isNone(detached)) {
                return;
              }
@@ -732,7 +750,7 @@ index 84a64b10c8..11e60d5707 100644
                detached.value.attachedThreadIds.size === 0 &&
                !detached.value.supportsMultipleProviderThreads
 diff --git a/apps/server/src/orchestration-v2/RunExecutionService.test.ts b/apps/server/src/orchestration-v2/RunExecutionService.test.ts
-index e25b4c7ab5..e532e99374 100644
+index eec68b1e84..912b65291b 100644
 --- a/apps/server/src/orchestration-v2/RunExecutionService.test.ts
 +++ b/apps/server/src/orchestration-v2/RunExecutionService.test.ts
 @@ -2266,98 +2266,99 @@ it.effect(
@@ -923,7 +941,45 @@ index e25b4c7ab5..e532e99374 100644
              startTurn: () => Effect.void,
            } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
            run: {
-@@ -2715,6 +2716,127 @@ it.effect("does not refresh pull requests for auxiliary or stale provider termin
+@@ -2632,21 +2633,22 @@ it.effect("settles native subagents when a workspace handoff completes the root
+         providerSessionId: ProviderSessionId.make("session:subagent-workspace-handoff"),
+         session: {
+           events: Stream.empty,
+-          subscribeEvents: Effect.succeed({
+-            // The provider event stream stays open: only settled children may end ingestion.
+-            events: Stream.concat(
+-              Stream.fromIterable([
+-                childThreadCreatedEvent(ids),
+-                { type: "subagent.updated", driver, subagent: runningSubagent },
+-                { type: "node.updated", driver, node: runningNode },
+-                { type: "node.updated", driver, node: runningChildNode },
+-                { type: "turn_item.updated", driver, turnItem: runningTurnItem },
+-                rootTerminalEvent(ids, "interrupted"),
+-              ] satisfies ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>),
+-              Stream.never,
+-            ),
+-            close: Deferred.succeed(ingestionDone, undefined),
+-          }),
++          subscribeEvents: () =>
++            Effect.succeed({
++              // The provider event stream stays open: only settled children may end ingestion.
++              events: Stream.concat(
++                Stream.fromIterable([
++                  childThreadCreatedEvent(ids),
++                  { type: "subagent.updated", driver, subagent: runningSubagent },
++                  { type: "node.updated", driver, node: runningNode },
++                  { type: "node.updated", driver, node: runningChildNode },
++                  { type: "turn_item.updated", driver, turnItem: runningTurnItem },
++                  rootTerminalEvent(ids, "interrupted"),
++                ] satisfies ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>),
++                Stream.never,
++              ),
++              close: Deferred.succeed(ingestionDone, undefined),
++            }),
+           startTurn: () => Effect.void,
+         } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
+         run: {
+@@ -2883,6 +2885,127 @@ it.effect("does not refresh pull requests for auxiliary or stale provider termin
    }),
  );
  
@@ -1051,7 +1107,7 @@ index e25b4c7ab5..e532e99374 100644
  it.effect("refreshes pull requests after a provider stream exits with an error", () =>
    Effect.gen(function* () {
      const { written, observed } = yield* captureRootRunTermination({
-@@ -3206,6 +3328,8 @@ function captureRootRunTermination(input: {
+@@ -3390,6 +3513,8 @@ function captureRootRunTermination(input: {
    readonly afterStart?: (
      closed: Deferred.Deferred<void>,
    ) => Effect.Effect<void, never, PreviewAgentActivity.PreviewAgentActivity>;
@@ -1060,7 +1116,7 @@ index e25b4c7ab5..e532e99374 100644
  }) {
    return Effect.gen(function* () {
      const ids = backgroundScenarioIds(input.key);
-@@ -3219,6 +3343,7 @@ function captureRootRunTermination(input: {
+@@ -3403,6 +3528,7 @@ function captureRootRunTermination(input: {
      });
      const writtenItems = yield* Ref.make<ReadonlyArray<OrchestrationV2TurnItem>>([]);
      const finalEvents = yield* Ref.make<ReadonlyArray<OrchestrationV2DomainEvent>>([]);
@@ -1068,7 +1124,7 @@ index e25b4c7ab5..e532e99374 100644
      const observed = yield* Ref.make<ReadonlyArray<string>>([]);
      const submittedEffects = yield* Ref.make<ReadonlyArray<PendingOrchestrationEffectV2>>([]);
      const committedEffects = yield* Ref.make<ReadonlyArray<PendingOrchestrationEffectV2>>([]);
-@@ -3246,6 +3371,17 @@ function captureRootRunTermination(input: {
+@@ -3430,6 +3556,17 @@ function captureRootRunTermination(input: {
            Layer.mock(CheckpointService.CheckpointServiceV2)({ captureBaseline: () => Effect.void }),
            layerTurnItemPositionsTest,
            mockEventSink({
@@ -1086,7 +1142,7 @@ index e25b4c7ab5..e532e99374 100644
              write: (payload) =>
                Effect.gen(function* () {
                  for (const event of payload.events) {
-@@ -3280,7 +3416,10 @@ function captureRootRunTermination(input: {
+@@ -3464,7 +3601,10 @@ function captureRootRunTermination(input: {
            }),
            IdAllocator.layer,
            Layer.mock(ProviderEventIngestor.ProviderEventIngestorV2)({
@@ -1098,9 +1154,9 @@ index e25b4c7ab5..e532e99374 100644
            }),
            ServerSettings.layerTest(),
            Layer.succeed(RunFinalizationService.RunFinalizationObserver, {
-@@ -3303,37 +3442,38 @@ function captureRootRunTermination(input: {
-         providerSessionId: ProviderSessionId.make(`session:${input.key}`),
+@@ -3488,37 +3628,38 @@ function captureRootRunTermination(input: {
          session: {
+           driver,
            events: Stream.empty,
 -          subscribeEvents: Effect.succeed({
 -            events:
@@ -1167,7 +1223,7 @@ index e25b4c7ab5..e532e99374 100644
            startTurn: input.startTurn ?? (() => Effect.void),
            interruptTurn: input.interruptTurn ?? (() => Effect.void),
            hasPendingBackgroundWorkForThread: input.hasPendingBackgroundWorkForThread,
-@@ -3409,6 +3549,7 @@ function captureRootRunTermination(input: {
+@@ -3597,6 +3738,7 @@ function captureRootRunTermination(input: {
        previewActivityEnded,
        written: yield* Ref.get(writtenItems),
        finalEvents: yield* Ref.get(finalEvents),
@@ -1175,7 +1231,7 @@ index e25b4c7ab5..e532e99374 100644
        observed: yield* Ref.get(observed),
        submittedEffects: yield* Ref.get(submittedEffects),
        committedEffects: yield* Ref.get(committedEffects),
-@@ -3484,7 +3625,7 @@ function childBackgroundTurnItemEvent(
+@@ -3672,7 +3814,7 @@ function childBackgroundTurnItemEvent(
  function backgroundTurnItemEvent(
    ids: BackgroundScenarioIds,
    type: "command_execution" | "dynamic_tool" | "subagent",
@@ -1184,7 +1240,7 @@ index e25b4c7ab5..e532e99374 100644
    ordinal: number,
    itemId?: TurnItemId,
  ): ProviderAdapter.ProviderAdapterV2Event {
-@@ -3855,27 +3996,28 @@ function runBackgroundItemScenario(
+@@ -4043,27 +4185,28 @@ function runBackgroundItemScenario(
            ...(options?.hasPendingBackgroundWorkForThread === undefined
              ? {}
              : { hasPendingBackgroundWorkForThread: options.hasPendingBackgroundWorkForThread }),
@@ -1235,7 +1291,7 @@ index e25b4c7ab5..e532e99374 100644
          } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime,
          run: {
 diff --git a/apps/server/src/orchestration-v2/RunExecutionService.ts b/apps/server/src/orchestration-v2/RunExecutionService.ts
-index e981ab7362..91782c3d89 100644
+index e9a7d674ff..d1f480216b 100644
 --- a/apps/server/src/orchestration-v2/RunExecutionService.ts
 +++ b/apps/server/src/orchestration-v2/RunExecutionService.ts
 @@ -5,6 +5,8 @@ import {
@@ -1247,7 +1303,7 @@ index e981ab7362..91782c3d89 100644
    type NodeId,
    type OrchestrationV2AppThread,
    type OrchestrationV2CheckpointScope,
-@@ -642,6 +644,7 @@ export const layer: Layer.Layer<
+@@ -644,6 +646,7 @@ export const layer: Layer.Layer<
          // Root turn snapshot written with the run when T3 ends the run itself.
          readonly abandonedProviderTurn?: OrchestrationV2ProviderTurn;
          readonly terminal: ProviderTerminalEvent;
@@ -1255,7 +1311,7 @@ index e981ab7362..91782c3d89 100644
          readonly completedAt?: DateTime.Utc;
          readonly failureItemPersisted: boolean;
          readonly refreshAfterTurn: Effect.Effect<void>;
-@@ -810,6 +813,9 @@ export const layer: Layer.Layer<
+@@ -814,6 +817,9 @@ export const layer: Layer.Layer<
                        providerThread: input.providerThread,
                        reason,
                        completedAt,
@@ -1265,7 +1321,7 @@ index e981ab7362..91782c3d89 100644
                      }),
                    },
                  ]
-@@ -1034,6 +1040,9 @@ export const layer: Layer.Layer<
+@@ -1053,6 +1059,9 @@ export const layer: Layer.Layer<
              context: { ...analyticsContext, segment: "initial" },
            });
          }
@@ -1275,7 +1331,7 @@ index e981ab7362..91782c3d89 100644
          const routeIdentity: ProviderEventRouteIdentity = {
            threadId: input.run.threadId,
            runId: input.run.id,
-@@ -1043,7 +1052,7 @@ export const layer: Layer.Layer<
+@@ -1062,7 +1071,7 @@ export const layer: Layer.Layer<
          const eventSubscription =
            input.session.subscribeEvents === undefined
              ? { events: input.session.events, close: Effect.void }
@@ -1284,7 +1340,7 @@ index e981ab7362..91782c3d89 100644
          const inheritedBackgroundTurnItems = yield* (
            input.loadInheritedBackgroundTurnItems?.() ?? Effect.succeed([])
          ).pipe(
-@@ -1075,6 +1084,7 @@ export const layer: Layer.Layer<
+@@ -1094,6 +1103,7 @@ export const layer: Layer.Layer<
          );
          const rootTerminalSeen = yield* Ref.make(false);
          const rootRunFinalized = yield* Ref.make(false);
@@ -1292,23 +1348,23 @@ index e981ab7362..91782c3d89 100644
          const providerThreadOwnerLost = yield* Ref.make(false);
          const pendingBackgroundProviderTurns = new Set<ProviderTurnId>();
          const activeChildProviderTurns = yield* Ref.make<ReadonlySet<ProviderTurnId>>(new Set());
-@@ -1097,6 +1107,7 @@ export const layer: Layer.Layer<
+@@ -1116,6 +1126,7 @@ export const layer: Layer.Layer<
            }
            const providerThread = yield* Ref.get(latestProviderThread);
            const openSubagents = yield* Ref.get(openRunOwnedSubagents);
 +          const message = yield* Ref.get(interruptionMessage);
-           yield* writeFinalRunEvents({
-             run: input.run,
-             rootNode: input.rootNode,
-@@ -1124,6 +1135,7 @@ export const layer: Layer.Layer<
-               : { loadRunInterruptReason: input.loadRunInterruptReason }),
-             openRunOwnedSubagents: openSubagents,
-             terminal,
-+            ...(message === undefined ? {} : { interruptionMessage: message }),
-             failureItemPersisted: terminal.status === "failed",
-             refreshAfterTurn,
-           }).pipe(
-@@ -1548,6 +1560,15 @@ export const layer: Layer.Layer<
+           const writeTerminal = (settledTerminal: ProviderTerminalEvent) =>
+             writeFinalRunEvents({
+               run: input.run,
+@@ -1146,6 +1157,7 @@ export const layer: Layer.Layer<
+               openRunOwnedSubagents: openSubagents,
+               openRunOwnedSubagentsTerminal: terminal,
+               terminal: settledTerminal,
++              ...(message === undefined ? {} : { interruptionMessage: message }),
+               failureItemPersisted: settledTerminal.status === "failed",
+               refreshAfterTurn,
+             }).pipe(
+@@ -1584,6 +1596,15 @@ export const layer: Layer.Layer<
            ) {
              yield* Ref.set(latestRootProviderTurn, event.providerTurn);
            }
@@ -1324,7 +1380,7 @@ index e981ab7362..91782c3d89 100644
            let storedEventCount = 0;
            const deliveredEvent = assistantStreaming.filter(
              event,
-@@ -1581,6 +1602,15 @@ export const layer: Layer.Layer<
+@@ -1617,6 +1638,15 @@ export const layer: Layer.Layer<
              yield* Ref.update(latestTurnItemOrdinal, (current) =>
                Math.max(current, event.turnItem.ordinal),
              );
@@ -1340,7 +1396,7 @@ index e981ab7362..91782c3d89 100644
            }
            if (event.type === "turn.terminal") {
              yield* Ref.set(terminalEvent, event);
-@@ -1597,17 +1627,92 @@ export const layer: Layer.Layer<
+@@ -1633,17 +1663,92 @@ export const layer: Layer.Layer<
            yield* trackChildLifecycle(event, deliveredEvent !== null);
            yield* scheduleIdleFlush;
          });
@@ -1436,7 +1492,7 @@ index e981ab7362..91782c3d89 100644
              Effect.gen(function* () {
                if (yield* agentTurnsSettled) yield* endPreviewActivity;
                return yield* shouldStopProviderEventIngestion;
-@@ -1905,6 +2010,7 @@ export function makeInterruptResultTurnItem(input: {
+@@ -1944,6 +2049,7 @@ export function makeInterruptResultTurnItem(input: {
    readonly providerThread: OrchestrationV2ProviderThread;
    readonly reason: string | undefined;
    readonly completedAt: DateTime.Utc;
@@ -1444,7 +1500,7 @@ index e981ab7362..91782c3d89 100644
  }): OrchestrationV2TurnItem {
    return {
      id: input.idAllocator.derive.runSignalTurnItem({
-@@ -1928,6 +2034,6 @@ export function makeInterruptResultTurnItem(input: {
+@@ -1967,6 +2073,6 @@ export function makeInterruptResultTurnItem(input: {
      completedAt: input.completedAt,
      updatedAt: input.completedAt,
      type: "run_interrupt_result",
@@ -1453,7 +1509,7 @@ index e981ab7362..91782c3d89 100644
    };
  }
 diff --git a/apps/server/src/orchestration-v2/SelectionRestart.integration.test.ts b/apps/server/src/orchestration-v2/SelectionRestart.integration.test.ts
-index 4352d8b2d6..16ff5767b3 100644
+index ba49f0bcfb..885523179b 100644
 --- a/apps/server/src/orchestration-v2/SelectionRestart.integration.test.ts
 +++ b/apps/server/src/orchestration-v2/SelectionRestart.integration.test.ts
 @@ -18,6 +18,7 @@ import {
@@ -1561,7 +1617,19 @@ index 4352d8b2d6..16ff5767b3 100644
                yield* publishTerminal(active, "completed");
              }),
            steerTurn: () => Effect.void,
-@@ -897,3 +957,480 @@ it.live.each(["active", "idle", "selection-command", "pooled", "separate-home"]
+@@ -522,7 +582,10 @@ it.live("a workspace handoff during a run does not leave the run interrupted", (
+                 event.type === "run.updated" &&
+                 event.payload.status !== "running" &&
+                 event.payload.status !== "queued" &&
+-                event.payload.status !== "starting",
++                event.payload.status !== "starting" &&
++                // The planned detach settles the run while the detach effect still holds
++                // the worker lane, so its checkpoint capture runs after that effect ends.
++                event.payload.status !== "waiting",
+             ),
+             Stream.take(1),
+             Stream.runDrain,
+@@ -1010,3 +1073,481 @@ it.live.each(["active", "idle", "selection-command", "pooled", "separate-home"]
        }),
      ),
  );
@@ -1895,7 +1963,7 @@ index 4352d8b2d6..16ff5767b3 100644
 +          }
 +          // The real outbox must keep the detach behind startup, even while
 +          // the event subscriber exists and the app-context read is suspended.
-+          assert.isFalse(yield* worker.runOnce);
++          assert.isFalse(yield* worker.runOnce());
 +          assert.isFalse(yield* Deferred.isDone(childReady));
 +          yield* Deferred.succeed(finishContextRead, undefined);
 +          yield* Fiber.join(startingChild);
@@ -1942,14 +2010,15 @@ index 4352d8b2d6..16ff5767b3 100644
 +            Stream.runDrain,
 +          );
 +          const detached = yield* orchestrator.getThreadProjection(childId);
++          // A workspace handoff completes the moving run instead of interrupting it.
 +          assert.equal(
 +            detached.runs[0]?.status,
-+            "interrupted",
++            "completed",
 +            "planned detach must terminate the moving run before another provider event is ingested",
 +          );
-+          assert.equal(
-+            detached.turnItems.find((item) => item.type === "run_interrupt_result")?.message,
-+            "Run interrupted because the workspace changed",
++          assert.isFalse(
++            detached.turnItems.some((item) => item.type === "run_interrupt_result"),
++            "an intentional workspace handoff must not project an interrupt result",
 +          );
 +          yield* Deferred.await(continuationStarted);
 +          yield* publishFence(parent, "parent-still-alive");
@@ -1980,7 +2049,7 @@ index 4352d8b2d6..16ff5767b3 100644
 +          const continuing = yield* orchestrator.getThreadProjection(childId);
 +          assert.deepEqual(
 +            continuing.runs.map((run) => run.status),
-+            ["interrupted", "running"],
++            ["completed", "running"],
 +          );
 +          assert.isFalse(continuing.runs.some((run) => run.queueHeld));
 +          assert.equal(continuing.runs[1]?.delegatedTaskId, continuing.runs[0]?.delegatedTaskId);
@@ -2007,7 +2076,7 @@ index 4352d8b2d6..16ff5767b3 100644
 +          const childFinished = yield* orchestrator.getThreadProjection(childId);
 +          assert.deepEqual(
 +            childFinished.runs.map((run) => run.status),
-+            ["interrupted", "completed"],
++            ["completed", "completed"],
 +          );
 +          assert.lengthOf(
 +            childFinished.messages.filter((message) => message.text === "handoff continuation"),
@@ -2043,10 +2112,10 @@ index 4352d8b2d6..16ff5767b3 100644
 +    ),
 +);
 diff --git a/apps/server/src/orchestration-v2/testkit/ProviderReplayHarness.ts b/apps/server/src/orchestration-v2/testkit/ProviderReplayHarness.ts
-index 363164b688..046d43b024 100644
+index e3672cfcc1..da6a644055 100644
 --- a/apps/server/src/orchestration-v2/testkit/ProviderReplayHarness.ts
 +++ b/apps/server/src/orchestration-v2/testkit/ProviderReplayHarness.ts
-@@ -278,6 +278,7 @@ export function layerWithRegistry<Error>(
+@@ -279,6 +279,7 @@ export function layerWithRegistry<Error>(
        SqlClient.SqlClient,
        MigrationError | PlatformError.PlatformError | SqlError
      >;
@@ -2054,7 +2123,7 @@ index 363164b688..046d43b024 100644
      readonly runEffectWorker?: boolean;
      readonly runContinuationWorker?: boolean;
      readonly recoverOnStartup?: boolean;
-@@ -403,7 +404,7 @@ export function layerWithRegistry<Error>(
+@@ -421,7 +422,7 @@ export function layerWithRegistry<Error>(
    const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
      Layer.provide(
        Layer.mergeAll(
@@ -2093,10 +2162,10 @@ index df880e49c6..d816807838 100644
  the oldest queued message as a steer. This leaves the current draft intact and
  requires an active turn that supports steering. If that shortcut sends the opposite
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
-index b38c49faad..7c97bdec6b 100644
+index db61c55769..1ebaa93683 100644
 --- a/packages/contracts/src/orchestrationV2.ts
 +++ b/packages/contracts/src/orchestrationV2.ts
-@@ -3117,6 +3117,10 @@ export const OrchestrationV2Command = Schema.Union([
+@@ -3108,6 +3108,10 @@ export const OrchestrationV2Command = Schema.Union([
      worktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
      expectedWorktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
      expectedBranch: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
@@ -2108,10 +2177,10 @@ index b38c49faad..7c97bdec6b 100644
      expectedEmpty: Schema.optional(Schema.Boolean),
      limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecoveryUpdate)),
 diff --git a/packages/provider-core/src/server/ProviderAdapter.ts b/packages/provider-core/src/server/ProviderAdapter.ts
-index 98f71a7473..283fe8b8b0 100644
+index c387f6439f..80c3c778dd 100644
 --- a/packages/provider-core/src/server/ProviderAdapter.ts
 +++ b/packages/provider-core/src/server/ProviderAdapter.ts
-@@ -429,6 +429,15 @@ const ProviderAdapterFailureReason = Schema.Literals([
+@@ -453,6 +453,15 @@ const ProviderAdapterFailureReason = Schema.Literals([
    "attachment_unreadable",
  ]);
  export type ProviderAdapterFailureReason = typeof ProviderAdapterFailureReason.Type;
@@ -2127,7 +2196,7 @@ index 98f71a7473..283fe8b8b0 100644
  
  export class ProviderAdapterProtocolError extends Schema.TaggedError<ProviderAdapterProtocolError>()(
    "ProviderAdapterProtocolError",
-@@ -471,6 +480,7 @@ export const ProviderAdapterV2Error = Schema.Union([
+@@ -496,6 +505,7 @@ export const ProviderAdapterV2Error = Schema.Union([
    ProviderAdapterInterruptTimeoutError,
    ProviderAdapterRuntimeRequestResponseError,
    ProviderAdapterEventStreamError,
@@ -2135,7 +2204,7 @@ index 98f71a7473..283fe8b8b0 100644
    ProviderAdapterProtocolError,
    ProviderAdapterSessionStoppedError,
  ]);
-@@ -637,8 +647,10 @@ export interface ProviderAdapterV2SessionRuntime {
+@@ -664,8 +674,10 @@ export interface ProviderAdapterV2SessionRuntime {
    /** False keeps conversations alive when the provider cannot restore them after a restart. */
    readonly canResumeAfterRestart?: boolean;
    readonly events: Stream.Stream<ProviderAdapterV2Event, ProviderAdapterV2Error>;
