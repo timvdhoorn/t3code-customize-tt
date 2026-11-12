@@ -31,7 +31,9 @@ run the same patches.
   the login session, so on the MacBook Pro the iOS build it may start can sign: from an SSH session
   codesign fails with `errSecInternalComponent` after the whole build. `ios` itself stops at once when
   `security show-keychain-info` fails (any SSH session) and names that kickstart. `--force` and
-  `--fix` first rebuild directly over SSH; that path never builds iOS.
+  `--fix` first rebuild directly over SSH; that path never builds iOS. The agent runs at `ProcessType`
+  Interactive with `Nice` 10: as Standard its browser checks ran at priority 20 and failed under load
+  ("Unattended updates" in [fork-changes.md](fork-changes.md)).
 - **Never interrupt a running thread.** Nothing in this tool quits or relaunches the Mac app. A
   T3 server restarts only in `server` and `server-off`, once per run, and only while it is idle:
   `busy_threads` finds no live work in `~/.t3/userdata/statev2.sqlite`, by the rules the server

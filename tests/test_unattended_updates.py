@@ -835,10 +835,11 @@ class AutoupdateReloadTest(unittest.TestCase):
         self.assertEqual(calls, ['enable', 'print', 'bootout', 'bootstrap'])
 
     def test_the_agent_runs_at_normal_priority_with_nice(self):
-        # Background jobs stay on the efficiency cores, where browser tests time out.
+        # Background jobs stay on the efficiency cores and Standard jobs run at priority 20 instead
+        # of 31; under load the browser tests then miss their animation frames and fail.
         _, plist = self.run_autoupdate(None, loaded=False)
         agent = plistlib.loads(plist.read_bytes())
-        self.assertEqual(agent['ProcessType'], 'Standard')
+        self.assertEqual(agent['ProcessType'], 'Interactive')
         self.assertEqual(agent['Nice'], 10)
         self.assertTrue(agent['LowPriorityIO'])
 
