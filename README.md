@@ -21,7 +21,6 @@ For T3 Code Nightly on macOS, a headless Linux T3 server, a Linux AppImage, Wind
 **Own changes** (`patches-tt/`, on top of the shared patches):
 
 - **Claude context window** measured against the smaller of the model window and Claude's `autoCompactWindow` setting.
-- **Worktree handoff** continues in the new worktree instead of failing with "Provider event stream closed unexpectedly" (a port of upstream PR #15203).
 - **Child threads** nest under the thread that opened them in the sidebar, with their status, as in Claude.app.
 - **Direct push**: your own servers send notifications and Live Activity updates to your iPhone over APNs.
 
@@ -170,7 +169,7 @@ Google sign-in, and no over-the-air updates (all are bound to T3's team or bundl
 the app with your servers directly, over Tailscale, or sign in to T3 Connect.
 
 Push notifications and Live Activity updates come from your own servers instead of T3's relay
-(`patches-tt/0004`, `patches-ios/0005`). Each server needs your team's APNs key as
+(`patches-tt/0003`, `patches-ios/0005`). Each server needs your team's APNs key as
 `~/.t3/userdata/secrets/direct-push-apns.bin` (JSON with `teamId`, `keyId`, `privateKey`, `bundleId` and `environment`, mode 600; the 1Password item "T3 Code TT APNs key", field `serverconfig`, holds it);
 without it the server behaves as upstream.
 
@@ -303,7 +302,7 @@ and provider integration checks.
 ## Credits
 
 - **[Tyler South](https://github.com/btsouth)** wrote [t3code-customize](https://github.com/btsouth/t3code-customize): the build script, the Linux AppImage build and the Stats for nerds and usage-limit patches this fork builds on.
-- **[T3 Tools](https://github.com/pingdotgg/t3code)** makes T3 Code. The worktree handoff fix ports upstream PR [#15203](https://github.com/pingdotgg/t3code/pull/15203); the child-thread server side follows PR [#16699](https://github.com/pingdotgg/t3code/pull/16699).
+- **[T3 Tools](https://github.com/pingdotgg/t3code)** makes T3 Code. The child-thread server side follows PR [#16699](https://github.com/pingdotgg/t3code/pull/16699).
 - **[asc-cli](https://github.com/tddworks/asc-cli)** by tddworks uploads the iOS build to TestFlight.
 
 ## License
