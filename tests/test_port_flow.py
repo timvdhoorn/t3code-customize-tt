@@ -484,9 +484,9 @@ class HandOffTest(Sandbox):
         self.assertEqual(customize.port_command(porter, 'f' * 40, 'n2'),
                          ['port', '--commit', 'f' * 40, '--version', 'n2', '--fix', 'claude', '--background',
                           '--wait-lock', '180'])
-        line = customize.remote_port_line(porter, 'f' * 40, 'n2', 'Devops/Personal/t3code-customize-tt')
+        line = customize.remote_port_line(porter, 'f' * 40, 'n2', 'Devops/agent-tooling/t3code-customize-tt')
         self.assertIn('systemd-run --user --collect --unit=t3code-customize-port-ffffffffffff', line)
-        self.assertIn('python3 "$HOME"/Devops/Personal/t3code-customize-tt/t3code-customize port --commit', line)
+        self.assertIn('python3 "$HOME"/Devops/agent-tooling/t3code-customize-tt/t3code-customize port --commit', line)
         self.assertIn('nohup', line)
 
     def run_line(self, systemd):

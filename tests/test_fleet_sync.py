@@ -272,7 +272,7 @@ class FleetMacRouteTest(unittest.TestCase):
         with patch.object(customize, 'load', return_value=machines), \
                 patch.object(customize, 'ssh_target', return_value='mac'), \
                 patch.object(customize, 'sync_repo'), patch.object(customize, 'this_machine', return_value=None), \
-                patch.object(customize, 'repo_path', return_value='Devops/Personal/t3code-customize-tt'), \
+                patch.object(customize, 'repo_path', return_value='Devops/agent-tooling/t3code-customize-tt'), \
                 patch.object(customize, 'identity', return_value={}), patch.object(customize, 'say'), \
                 patch.object(customize.subprocess, 'Popen', popen):
             customize.cmd_fleet(args)

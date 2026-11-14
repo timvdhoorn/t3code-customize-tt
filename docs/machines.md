@@ -14,7 +14,7 @@ run the same patches.
   not wait on it in that turn, check `journalctl --user -u t3code-customize-fleet` later
   (`--foreground` runs it inline). On a Mac it runs inline and says not to wait on it.
 - **Fleet keeps each checkout on git.** It works on the main checkout's path on every machine
-  (`~/Devops/Personal/t3code-customize-tt`, `checkout_root`), also when it runs from a git worktree,
+  (`~/Devops/agent-tooling/t3code-customize-tt`, `checkout_root`), also when it runs from a git worktree,
   and never creates a missing checkout. It never copies files into a machine's git checkout: there it
   runs `git fetch` (or sends `origin/main` as a `git bundle` over SSH when that machine cannot reach
   GitHub) and fast-forwards `main` to `origin/main`. Files an older fleet copied in (identical to
@@ -100,7 +100,7 @@ run the same patches.
 - **Asked to update** ("update", "zijn er updates", "update alles"): follow
   [`.agents/playbooks/update.md`](../.agents/playbooks/update.md).
 - **A new machine:** follow "A new machine" in [README.md](../README.md). A new Linux box is first set up
-  with `~/Devops/Personal/playbook-new-box`; this repo only adds the patches.
+  with `~/Devops/agent-tooling/playbook-new-box`; this repo only adds the patches.
 - Never edit a machine's T3 install by hand; `server`, `server-off` and `update` own it. On a Mac,
   T3's own updater installs new releases (up to the covered nightly, `covered-nightly.txt`) into the
   untouched app; `update` (and `autoupdate`) only rebuild the overlay for it, and until then the launcher opens stock.
