@@ -72,7 +72,7 @@ personal data. Name where a secret lives (a 1Password item, a path under
 
 | Upstream owns (never commit changes) | The fork owns (commit changes) |
 | --- | --- |
-| `patches/*.patch`, `patches/base.txt`, `checks.json` | `patches-port/`, `patches-tt/`, `checks-tt.json`, `patches-ios/`, `checks-ios.json`, `skip-shared.json`, `ios.json`, `ported-prs.json`, `covered-nightly.txt` (written by the port export), `known-upstream-failures.json`, `.agents/playbooks/`, this section, `docs/fork-changes.md`, `docs/machines.md`, `docs/porting.md`, `CLAUDE.md` |
+| `patches/*.patch`, `patches/base.txt`, `checks.json` | `patches-port/`, `patches-tt/`, `checks-tt.json`, `patches-ios/`, `checks-ios.json`, `skip-shared.json`, `ios.json`, `ported-prs.json`, `covered-nightly.txt` (written by the port export), `known-upstream-failures.json`, `.agents/playbooks/`, `wiki/`, this section, `docs/fork-changes.md`, `docs/machines.md`, `docs/porting.md`, `CLAUDE.md` |
 | the Linux, Windows and macOS build and launch paths in `t3code-customize`, `platform_support.py`, `macos/`, `install.ps1`, `tests/`, `docs/macos.md` | update, autoupdate, server, fleet, ios and shared-patch skip code in `t3code-customize`, `machines.json`, `tests/test_checkout_guard.py`, `tests/test_unattended_updates.py`, `tests/test_fleet_sync.py`, `tests/test_port_flow.py`, `tests/test_lint_step.py`, `tests/test_covered_nightly.py`, `tests/test_typechecker.py`, `tests/test_ios_build.py`, `tests/test_skip_shared.py`, the `README.md` macOS, server and machines sections |
 
 - A port of the shared patches goes to `patches-port/` (with its own `base.txt`), never to
@@ -109,6 +109,14 @@ personal data. Name where a secret lives (a 1Password item, a path under
 - When upstream changes `t3code-customize`, merge it by hand if `pull_latest` could not: keep the
   `update`, `autoupdate`, `server`, `fleet`, `port`, `continue`, `checks`, `ios`, shared-patch skip and own-patch code,
   the lock that names its holder and Python 3.9 compatibility, then run the checks above.
+
+## Project memory
+
+- Folder: `wiki/`. Read `wiki/index.md` first; write by `wiki/RULES.md`.
+- Lint: `python3 wiki/lint.py` (exit 0 before you finish).
+- Dream: `wiki/DREAM.md`.
+- Human docs: `README.md` and `docs/` (fork-changes, machines, porting, macos).
+- Machine and harness facts outside this fork: `~/Devops/ttagent-memory`.
 
 ## Agent skills
 
