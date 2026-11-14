@@ -25,7 +25,9 @@ can do. [docs/machines.md](../../docs/machines.md) holds the rules (ports, the i
    failing check. No agent ports unattended; you port, in this thread, on devbox1. Work in your own
    detached worktree of the shared checkout: `./t3code-customize port --source <worktree> --version
    <nightly> --dry-run`, then the loop in `docs/porting.md` (`continue`, `checks --source`), then
-   `port --source <worktree> --version <nightly> --resume` to export and open the PR.
+   `port --source <worktree> --version <nightly> --resume` to export. It opens no PR: commit the
+   patch folders and `covered-nightly.txt` as `chore: port patches to nightly <nightly>` on a branch
+   and open the PR yourself.
 5. Merge after Tim's review of the PR, or when he already asked you to finish ("rond af").
 6. Run `./t3code-customize fleet` once the patches on `main` fit the newest nightly. It waits for a
    held lock, stages the newest nightly on devbox1 and restarts its server only when no thread
