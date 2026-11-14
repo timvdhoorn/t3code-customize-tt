@@ -11,31 +11,31 @@ reader: once the session's app-server connection is initialized it asks
 account/rateLimits/read, times out after 3 seconds and never spawns or
 initializes anything itself.
 ---
- .../Adapters/CodexAdapterV2.test.ts           | 79 +++++++++++++++++++
- .../Adapters/CodexAdapterV2.ts                | 27 ++++++-
- 2 files changed, 105 insertions(+), 1 deletion(-)
+ .../Adapters/CodexAdapterV2.test.ts           | 80 +++++++++++++++++++
+ .../Adapters/CodexAdapterV2.ts                | 28 ++++++-
+ 2 files changed, 107 insertions(+), 1 deletion(-)
 
 diff --git a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
-index 6e5fd3516e..ae2db1f78e 100644
+index 884e953a49..d245c52daa 100644
 --- a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
-@@ -1302,6 +1302,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
-     onUsageLimits?: CodexAdapterV2.CodexAdapterV2Options["onUsageLimits"],
+@@ -1372,6 +1372,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
      promptSuggestions: Effect.Effect<boolean> = Effect.succeed(false),
      onNotification: (method: string) => Effect.Effect<void> = () => Effect.void,
+     models?: CodexAdapterV2.CodexAdapterV2Options["models"],
 +    hooks: Pick<CodexAdapterV2.CodexAdapterV2Options, "registerUsageLimitsReader"> = {},
    ) =>
      Effect.gen(function* () {
        const fileSystem = yield* FileSystem.FileSystem;
-@@ -1365,6 +1366,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
-         clientFactory,
+@@ -1437,6 +1438,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
          ...(onUsageLimits ? { onUsageLimits } : {}),
+         ...(models ? { models } : {}),
          digest: yield* Digest.Digest,
 +        ...hooks,
          fileSystem,
          idAllocator,
          serverConfig,
-@@ -1614,6 +1616,83 @@ describe("CodexAdapterV2 post-settle continuation", () => {
+@@ -1766,6 +1768,84 @@ describe("CodexAdapterV2 post-settle continuation", () => {
        ),
    );
  
@@ -88,6 +88,7 @@ index 6e5fd3516e..ae2db1f78e 100644
 +          undefined,
 +          undefined,
 +          undefined,
++          undefined,
 +          {
 +            registerUsageLimitsReader: (read) =>
 +              Effect.gen(function* () {
@@ -120,7 +121,7 @@ index 6e5fd3516e..ae2db1f78e 100644
      "delivers native history with %s app-server protocol",
      (response) =>
 diff --git a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
-index 4e8fd1ac5f..51b8643d1f 100644
+index 7de690c5e4..7094ad387f 100644
 --- a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
 @@ -24,6 +24,7 @@ import {
@@ -131,27 +132,28 @@ index 4e8fd1ac5f..51b8643d1f 100644
    mergeCodexRateLimits,
    codexUsageLimitResetAt,
    type CodexRateLimitSnapshot,
-@@ -76,6 +77,7 @@ import type {
+@@ -78,6 +79,7 @@ import type {
    ProviderThreadId,
    ProviderTurnId,
    ProviderInstanceId,
 +  ServerProviderUsageLimits,
    RuntimeMode,
-   ThreadId,
  } from "@t3tools/contracts";
-@@ -1683,7 +1685,10 @@ export type CodexAdapterV2DriverEnv =
- 
- export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapterV2")(function* (
+ import * as CodexClient from "effect-codex-app-server/client";
+@@ -1775,7 +1777,11 @@ export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapter
    { instanceId, environment, enabled, config }: ProviderAdapterDriverCreateInput<CodexSettings>,
--  hooks: Pick<CodexAdapterV2Options, "onUsageLimits" | "resolveRuntime" | "compatibility"> = {},
-+  hooks: Pick<
-+    CodexAdapterV2Options,
-+    "onUsageLimits" | "resolveRuntime" | "compatibility" | "registerUsageLimitsReader"
-+  > = {},
+   hooks: Pick<
+     CodexAdapterV2Options,
+-    "onUsageLimits" | "resolveRuntime" | "compatibility" | "models"
++    | "onUsageLimits"
++    | "resolveRuntime"
++    | "compatibility"
++    | "models"
++    | "registerUsageLimitsReader"
+   > = {},
  ) {
    const clientFactory = yield* CodexAppServerClientFactory;
-   const continuationRequests = yield* ProviderContinuationRequests.ProviderContinuationRequests;
-@@ -1728,6 +1733,9 @@ export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapter
+@@ -1823,6 +1829,9 @@ export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapter
  });
  
  export interface CodexAdapterV2Options {
@@ -161,7 +163,7 @@ index 4e8fd1ac5f..51b8643d1f 100644
    readonly instanceId: ProviderInstanceId;
    readonly settings: CodexSettings;
    readonly environment: NodeJS.ProcessEnv;
-@@ -1878,6 +1886,23 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+@@ -1974,6 +1983,23 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
          );
          // A failed open is discarded, so the next turn spawns the updated binary.
          if (adapterOptions.compatibility !== undefined) yield* ensureInitialized;
