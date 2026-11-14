@@ -196,6 +196,14 @@ def bundle_markers():
     return tuple((prefix, (marker,) + tuple(extra.get(prefix, ()))) for prefix, marker in MARKERS)
 
 
+def server_build_markers():
+    """(folder, markers, scripts_only) for the server build: the web client and the executable, with the
+    bundle markers of their prefix, so a left-out shared patch does not fail the build."""
+    markers = dict(bundle_markers())
+    return (('apps/server/dist/client', markers['apps/server/dist/client/'], True),
+            ('apps/server/dist-exe', markers['apps/server/dist/'], False))
+
+
 def skipped_subjects():
     return {entry['subject'] for entry in shared_skips().get('patches', [])}
 
@@ -3043,10 +3051,10 @@ def build_server(env, version, config, log):
         run([str(sea_bin / 'node'), 'scripts/cli.ts', 'build-exe'], cwd=SOURCE / 'apps/server', env=exe_env, log=log)
     # Since nightly 4262 dist-exe holds the server code only inside the executable (bin.mjs is a
     # loader), so the executable counts too.
-    for folder, marker, scripts_only in (('apps/server/dist/client', b'statsForNerds', True),
-                                         ('apps/server/dist-exe', b'claude_observed', False)):
-        if not contains(SOURCE / folder, marker, scripts_only):
-            raise Stop(f'The build in {folder} is missing the patches (no {marker.decode()}).')
+    for folder, markers, scripts_only in server_build_markers():
+        if not any(contains(SOURCE / folder, marker, scripts_only) for marker in markers):
+            raise Stop(f'The build in {folder} is missing the patches'
+                       f' (none of {", ".join(m.decode() for m in markers)}).')
 
 
 def stage_server_build(folder, version):

@@ -178,6 +178,17 @@ class BundleMarkersTest(unittest.TestCase):
                 self.assertIn(('apps/server/dist/client/', (b'statsForNerds', b'openedByThreadId')),
                               customize.bundle_markers())
 
+    def test_server_build_markers(self):
+        """The server build checks the web client and the executable with the same markers as the bundles."""
+        with tempfile.TemporaryDirectory() as tmp:
+            recipe = Path(tmp)
+            with patch.object(customize, 'RECIPE', recipe):
+                (recipe / customize.SKIP_SHARED).write_text(json.dumps({'patches': [], 'markers': [
+                    ['apps/server/dist/client/', 'openedByThreadId'], ['apps/server/dist/', 'direct-push-apns']]}))
+                self.assertEqual(customize.server_build_markers(), (
+                    ('apps/server/dist/client', (b'statsForNerds', b'openedByThreadId'), True),
+                    ('apps/server/dist-exe', (b'claude_observed', b'direct-push-apns'), False)))
+
     def test_repo_markers_come_from_kept_patches(self):
         """Every marker in this repo's skip-shared.json appears in a patch the fork still applies."""
         skips = json.loads((ROOT / customize.SKIP_SHARED).read_text())
