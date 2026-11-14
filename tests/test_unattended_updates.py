@@ -911,9 +911,11 @@ class IosAfterUpdateTest(unittest.TestCase):
         with patch.object(customize, 'MAC', True), patch.object(customize, 'app_settled', return_value=True), \
                 patch.object(customize, 'installed_app'), \
                 patch.object(customize, 'cmd_build', return_value=False) as build, \
+                patch.object(customize, 'prebuild_quietly', return_value=False) as prebuild, \
                 patch.object(customize, 'notify') as notify, patch.object(customize, 'update_ios') as ios:
             customize.cmd_update(args)
         build.assert_called_once()
+        prebuild.assert_called_once_with(args)
         notify.assert_not_called()
         ios.assert_called_once_with(args)
 

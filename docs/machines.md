@@ -70,9 +70,15 @@ run the same patches.
     port devbox1's cover PR does, see "Covering a clean nightly") and leaves a newer nightly
     alone, also when the lookup fails, until a merged port covers it, so the launcher never opens
     stock for lack of patches. A click on "Download" or "Restart to update" in Settings is not
-    gated. The install changes the app's `Info.plist`, the `autoupdate` LaunchAgent rebuilds the
-    overlay, and the next launcher start loads it (opened before that, it opens stock and starts the
-    rebuild). On the MacBook Pro (`"ios": true`) the same run then builds the iOS app for the new
+    gated. It installs a download only once the customization for that nightly is built: the
+    finished download (in `~/Library/Caches/t3code-updater/pending/`) starts the `autoupdate`
+    LaunchAgent, which builds the overlay from the downloaded app while the old one is still
+    installed and then writes `prebuilt.json`; the app sees it within a minute and hands the
+    download to Squirrel, which installs it when Tim quits. The next launcher start opens the
+    customized build at once (`promote_prebuilt`). A build that fails leaves the download
+    uninstalled and Tim on his current customized app ("Build before install" in
+    `docs/fork-changes.md`). Only after a manual "Restart to update" can a launcher still open
+    stock and start the rebuild. On the MacBook Pro (`"ios": true`) the same run then builds the iOS app for the new
     nightly and uploads it to TestFlight. It does the same when only the patches changed under the
     same nightly (a merged `patches-ios/` fix, say): the desktop says "Already up to date" and stays
     as it is, and iOS builds because `ios-state.json` records another patch recipe (`ios_behind`;
