@@ -5,20 +5,20 @@ Subject: [PATCH 05/12] feat(desktop): download nightlies and install them on
  quit in customized builds
 
 ---
- .../updates/DesktopUpdateAutomation.test.ts   | 167 ++++++++++++++++++
- .../src/updates/DesktopUpdateAutomation.ts    |  79 +++++++++
- apps/desktop/src/updates/DesktopUpdates.ts    |  51 +++++-
- .../desktop/src/updates/updatesTestHarness.ts |  30 +++-
- 4 files changed, 319 insertions(+), 8 deletions(-)
+ .../updates/DesktopUpdateAutomation.test.ts   | 257 ++++++++++++++++++
+ .../src/updates/DesktopUpdateAutomation.ts    | 110 ++++++++
+ apps/desktop/src/updates/DesktopUpdates.ts    | 125 ++++++++-
+ .../desktop/src/updates/updatesTestHarness.ts |  38 ++-
+ 4 files changed, 522 insertions(+), 8 deletions(-)
  create mode 100644 apps/desktop/src/updates/DesktopUpdateAutomation.test.ts
  create mode 100644 apps/desktop/src/updates/DesktopUpdateAutomation.ts
 
 diff --git a/apps/desktop/src/updates/DesktopUpdateAutomation.test.ts b/apps/desktop/src/updates/DesktopUpdateAutomation.test.ts
 new file mode 100644
-index 0000000000..c4b92f576b
+index 0000000000..a4d205df9e
 --- /dev/null
 +++ b/apps/desktop/src/updates/DesktopUpdateAutomation.test.ts
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,257 @@
 +import { assert, describe, it } from "@effect/vitest";
 +import * as Effect from "effect/Effect";
 +import * as Layer from "effect/Layer";
@@ -28,7 +28,9 @@ index 0000000000..c4b92f576b
 +import * as DesktopUpdates from "./DesktopUpdates.ts";
 +import { flushCallbacks, makeHarness } from "./updatesTestHarness.ts";
 +
-+const CUSTOMIZED = DesktopUpdateAutomation.resolveDesktopUpdateAutomation("0123456789ab 2026-10-16T21:00:00");
++const CUSTOMIZED = DesktopUpdateAutomation.resolveDesktopUpdateAutomation(
++  "0123456789ab 2026-10-16T21:00:00",
++);
 +
 +// A check that finds a release, as electron-updater reports it while checkForUpdates runs.
 +const FOUND = "0.1.10-nightly.20261112.4580";
@@ -36,12 +38,14 @@ index 0000000000..c4b92f576b
 +const harnessFindingUpdate = (
 +  automation: DesktopUpdateAutomation.DesktopUpdateAutomationPolicy,
 +  coveredNightly: () => string | undefined = () => FOUND,
++  prebuiltNightly: () => string | undefined = () => FOUND,
 +) => {
 +  let emit: (eventName: string, payload?: unknown) => void = () => {};
 +  const harness = makeHarness({
 +    automation,
 +    appVersion: "0.1.10-nightly.20261112.4564",
 +    coveredNightly,
++    prebuiltNightly,
 +    checkForUpdates: Effect.sync(() => emit("update-available", { version: FOUND })),
 +  });
 +  emit = harness.emit;
@@ -59,30 +63,116 @@ index 0000000000..c4b92f576b
 +    }
 +  });
 +
-+  it.effect("a customized build downloads what a check finds and installs it on quit only", () => {
-+    const harness = harnessFindingUpdate(CUSTOMIZED);
++  it.effect(
++    "a customized build downloads what a check finds and installs it on quit once built",
++    () => {
++      const harness = harnessFindingUpdate(CUSTOMIZED);
++
++      return Effect.scoped(
++        Effect.gen(function* () {
++          const updates = yield* DesktopUpdates.DesktopUpdates;
++          yield* updates.configure;
++          assert.equal(harness.autoDownload(), false);
++          assert.equal(harness.autoInstallOnAppQuit(), false);
++
++          const result = yield* updates.check("manual");
++          assert.equal(result.checked, true);
++          yield* flushCallbacks;
++          yield* flushCallbacks;
++
++          assert.equal(harness.downloadCount(), 1);
++          assert.equal(harness.autoInstallOnAppQuit(), true);
++          harness.emit("update-downloaded", { version: FOUND });
++          yield* flushCallbacks;
++          assert.equal((yield* updates.getState).status, "downloaded");
++          // Installing waits for the user to quit; nothing restarts the app.
++          assert.equal(harness.quitAndInstalls(), 0);
++        }),
++      ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
++    },
++  );
++
++  it.effect("a covered download waits on disk until its customized build is ready", () => {
++    let prebuilt: string | undefined = "0.1.10-nightly.20261112.4564";
++    const harness = harnessFindingUpdate(
++      CUSTOMIZED,
++      () => FOUND,
++      () => prebuilt,
++    );
 +
 +    return Effect.scoped(
 +      Effect.gen(function* () {
 +        const updates = yield* DesktopUpdates.DesktopUpdates;
 +        yield* updates.configure;
-+        assert.equal(harness.autoDownload(), false);
-+        assert.equal(harness.autoInstallOnAppQuit(), false);
-+
-+        const result = yield* updates.check("manual");
-+        assert.equal(result.checked, true);
++        yield* updates.check("manual");
++        yield* flushCallbacks;
 +        yield* flushCallbacks;
 +        yield* flushCallbacks;
 +
++        // Downloaded, but Squirrel does not get it: quitting now keeps the current app.
 +        assert.equal(harness.downloadCount(), 1);
-+        assert.equal(harness.autoInstallOnAppQuit(), true);
++        assert.equal(harness.autoInstallOnAppQuit(), false);
 +        harness.emit("update-downloaded", { version: FOUND });
 +        yield* flushCallbacks;
 +        assert.equal((yield* updates.getState).status, "downloaded");
-+        // Installing waits for the user to quit; nothing restarts the app.
++
++        yield* TestClock.adjust("5 minutes");
++        assert.equal(harness.downloadCount(), 1);
++        assert.equal(harness.autoInstallOnAppQuit(), false);
++
++        // t3code-customize names the nightly as built: the file goes to Squirrel to install on quit.
++        prebuilt = FOUND;
++        yield* TestClock.adjust("1 minute");
++        yield* flushCallbacks;
++        assert.equal(harness.autoInstallOnAppQuit(), true);
++        assert.equal(harness.downloadCount(), 2);
 +        assert.equal(harness.quitAndInstalls(), 0);
++
++        // Handed over once.
++        yield* TestClock.adjust("10 minutes");
++        assert.equal(harness.downloadCount(), 2);
 +      }),
 +    ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
++  });
++
++  it.effect("a waiting download hands nothing over once the update is no longer downloaded", () => {
++    const harness = harnessFindingUpdate(
++      CUSTOMIZED,
++      () => FOUND,
++      () => undefined,
++    );
++
++    return Effect.scoped(
++      Effect.gen(function* () {
++        const updates = yield* DesktopUpdates.DesktopUpdates;
++        yield* updates.configure;
++        yield* updates.check("manual");
++        yield* flushCallbacks;
++        yield* flushCallbacks;
++        yield* flushCallbacks;
++        assert.equal(harness.downloadCount(), 1);
++        // No downloaded update (the user restarted, a check moved on): nothing is handed over.
++        yield* TestClock.adjust("5 minutes");
++        assert.equal(harness.downloadCount(), 1);
++        assert.equal(harness.autoInstallOnAppQuit(), false);
++      }),
++    ).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
++  });
++
++  it("reads the prebuilt nightly t3code-customize writes", () => {
++    const file = DesktopUpdateAutomation.prebuiltNightlyFile;
++    const join = (...segments: ReadonlyArray<string>) => segments.join("/");
++    assert.equal(
++      file(join, "/Users/tim", undefined),
++      "/Users/tim/.local/share/t3code-customize/prebuilt.json",
++    );
++    assert.equal(file(join, "/Users/tim", "/data"), "/data/t3code-customize/prebuilt.json");
++    const parse = DesktopUpdateAutomation.parsePrebuiltNightly;
++    assert.equal(parse('{"version": "0.1.10-nightly.20261112.4580", "build": "/x"}'), FOUND);
++    assert.equal(parse('{"version": ""}'), undefined);
++    assert.equal(parse("{}"), undefined);
++    assert.equal(parse("null"), undefined);
++    assert.equal(parse("not json"), undefined);
 +  });
 +
 +  it("covers a nightly up to the published one and nothing newer or unknown", () => {
@@ -188,10 +278,10 @@ index 0000000000..c4b92f576b
 +});
 diff --git a/apps/desktop/src/updates/DesktopUpdateAutomation.ts b/apps/desktop/src/updates/DesktopUpdateAutomation.ts
 new file mode 100644
-index 0000000000..4d906fd6e1
+index 0000000000..4d9cf61454
 --- /dev/null
 +++ b/apps/desktop/src/updates/DesktopUpdateAutomation.ts
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,110 @@
 +import * as Context from "effect/Context";
 +import * as Effect from "effect/Effect";
 +import * as FetchHttpClient from "effect/http/FetchHttpClient";
@@ -221,9 +311,7 @@ index 0000000000..4d906fd6e1
 +    ? undefined
 +    : __T3CODE_CUSTOMIZED_BUILD__,
 +): DesktopUpdateAutomationPolicy =>
-+  customizedBuild?.trim()
-+    ? { autoDownload: true, installOnQuit: true }
-+    : STOCK_UPDATE_AUTOMATION;
++  customizedBuild?.trim() ? { autoDownload: true, installOnQuit: true } : STOCK_UPDATE_AUTOMATION;
 +
 +export const DesktopUpdateAutomation = Context.Reference<DesktopUpdateAutomationPolicy>(
 +  "@t3tools/desktop/updates/DesktopUpdateAutomation",
@@ -271,32 +359,93 @@ index 0000000000..4d906fd6e1
 +  "@t3tools/desktop/updates/DesktopCoveredNightly",
 +  { defaultValue: () => fetchCoveredNightly },
 +);
++
++/**
++ * t3code-customize builds the customized app for a downloaded nightly before that nightly is
++ * installed, and then names it in this file (`prebuilt.json` in its data folder: JSON with the
++ * nightly as `version`). A download installs on quit only once its build is ready, so the first
++ * launch after the quit opens the customized app instead of stock T3.
++ */
++export const prebuiltNightlyFile = (
++  join: (...segments: ReadonlyArray<string>) => string,
++  homeDirectory: string,
++  xdgDataHome: string | undefined,
++): string =>
++  join(xdgDataHome || join(homeDirectory, ".local", "share"), "t3code-customize", "prebuilt.json");
++
++/** The nightly a prebuilt.json names, or undefined when it names none. */
++export const parsePrebuiltNightly = (text: string): string | undefined => {
++  try {
++    const parsed: unknown = JSON.parse(text);
++    if (typeof parsed !== "object" || parsed === null) return undefined;
++    const version = (parsed as { readonly version?: unknown }).version;
++    return typeof version === "string" && version.trim() ? version.trim() : undefined;
++  } catch {
++    return undefined;
++  }
++};
++
++/** Replaces how the app reads prebuilt.json (tests); undefined reads the file. */
++export const DesktopPrebuiltNightly = Context.Reference<
++  Effect.Effect<string | undefined> | undefined
++>("@t3tools/desktop/updates/DesktopPrebuiltNightly", { defaultValue: () => undefined });
++
++/** How often a download that waits for its customized build looks for it. */
++export const PREBUILT_POLL_INTERVAL = "1 minute";
 diff --git a/apps/desktop/src/updates/DesktopUpdates.ts b/apps/desktop/src/updates/DesktopUpdates.ts
-index db31e0bc11..e895d39054 100644
+index db31e0bc11..a66fd9bee6 100644
 --- a/apps/desktop/src/updates/DesktopUpdates.ts
 +++ b/apps/desktop/src/updates/DesktopUpdates.ts
-@@ -39,6 +39,11 @@ import * as IpcChannels from "../ipc/channels.ts";
+@@ -39,6 +39,15 @@ import * as IpcChannels from "../ipc/channels.ts";
  import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
  import * as DesktopSshEnvironment from "../ssh/DesktopSshEnvironment.ts";
  import * as DesktopUpdatePolicy from "./DesktopUpdatePolicy.ts";
 +import {
 +  DesktopUpdateAutomation,
 +  DesktopCoveredNightly,
++  DesktopPrebuiltNightly,
 +  isNightlyCovered,
++  parsePrebuiltNightly,
++  PREBUILT_POLL_INTERVAL,
++  prebuiltNightlyFile,
 +} from "./DesktopUpdateAutomation.ts";
  import {
    normalizeDesktopUpdateReleaseNotes,
    releaseNotesOfOfferedVersion,
-@@ -375,6 +380,8 @@ export const make = Effect.gen(function* () {
+@@ -375,6 +384,9 @@ export const make = Effect.gen(function* () {
    const sshEnvironment = yield* DesktopSshEnvironment.DesktopSshEnvironment;
    const desktopState = yield* DesktopState.DesktopState;
    const electronUpdater = yield* ElectronUpdater.ElectronUpdater;
 +  const automation = yield* DesktopUpdateAutomation;
 +  const coveredNightly = yield* DesktopCoveredNightly;
++  const prebuiltNightlyOverride = yield* DesktopPrebuiltNightly;
    const electronWindow = yield* ElectronWindow.ElectronWindow;
    const environment = yield* DesktopEnvironment.DesktopEnvironment;
    const fileSystem = yield* FileSystem.FileSystem;
-@@ -588,12 +595,42 @@ export const make = Effect.gen(function* () {
+@@ -439,6 +451,22 @@ export const make = Effect.gen(function* () {
+       }),
+     );
+ 
++  // The nightly t3code-customize has built the customized app for (prebuilt.json), if any.
++  const prebuiltNightly =
++    prebuiltNightlyOverride ??
++    fileSystem
++      .readFileString(
++        prebuiltNightlyFile(
++          environment.path.join,
++          environment.homeDirectory,
++          Option.getOrUndefined(config.xdgDataHome),
++        ),
++      )
++      .pipe(
++        Effect.map(parsePrebuiltNightly),
++        Effect.orElseSucceed(() => undefined),
++      );
++
+   const readAppUpdateYml = fileSystem.readFileString(environment.appUpdateYmlPath, "utf-8").pipe(
+     Effect.option,
+     Effect.flatMap(
+@@ -588,14 +616,97 @@ export const make = Effect.gen(function* () {
        );
      });
  
@@ -335,17 +484,72 @@ index db31e0bc11..e895d39054 100644
 +          return;
 +        }
 +        if (yield* Ref.get(desktopState.quitting)) return;
-+        yield* logUpdaterInfo("downloading update automatically (customized build)");
++        // Install on quit only once t3code-customize has built the customized app for this
++        // nightly, so the launch after the quit opens it instead of stock T3.
++        const prebuilt = automation.installOnQuit && (yield* prebuiltNightly) === version;
++        yield* logUpdaterInfo("downloading update automatically (customized build)", {
++          version,
++          installOnQuit: prebuilt ? "yes" : "once its customized build is ready",
++        });
 +        // electron-updater reads this flag when the download ends (macOS then hands the file to
 +        // Squirrel), so only this covered download installs on quit.
-+        yield* electronUpdater.setAutoInstallOnAppQuit(automation.installOnQuit);
-+        yield* downloadAvailableUpdate;
++        yield* electronUpdater.setAutoInstallOnAppQuit(prebuilt);
++        const result = yield* downloadAvailableUpdate;
++        if (automation.installOnQuit && !prebuilt && result.completed) {
++          yield* installOnQuitWhenPrebuilt(version);
++        }
 +      }),
 +    );
    });
  
++  // The download waits on disk until t3code-customize names its nightly as built, then hands it to
++  // Squirrel: electron-updater finds the file it downloaded and, with the flag on, serves it to
++  // Squirrel, which installs it on quit. It stops when the update is no longer the one downloaded
++  // (a newer check, a restart) or the app quits; a quit before then installs nothing.
++  const handOverIfPrebuilt = Effect.fn("desktop.updates.handOverIfPrebuilt")(function* (
++    version: string,
++  ) {
++    if (yield* Ref.get(desktopState.quitting)) return true;
++    const state = yield* Ref.get(updateStateRef);
++    if (state.status !== "downloaded" || state.downloadedVersion !== version) return true;
++    if ((yield* prebuiltNightly) !== version) return false;
++    if (!(yield* tryStartUpdateAction("download"))) return false;
++    return yield* Effect.gen(function* () {
++      yield* logUpdaterInfo("customized build ready: the update installs on quit", { version });
++      yield* electronUpdater.setAutoInstallOnAppQuit(true);
++      yield* electronUpdater.downloadUpdate;
++      return true;
++    }).pipe(
++      Effect.catchCauseIf(
++        (cause) => !Cause.hasInterruptsOnly(cause),
++        (cause) =>
++          electronUpdater.setAutoInstallOnAppQuit(false).pipe(
++            Effect.andThen(
++              logUpdaterError("could not hand the downloaded update to Squirrel", {
++                version,
++                cause: describeUpdateErrorCause(Cause.squash(cause)),
++              }),
++            ),
++            Effect.as(false),
++          ),
++      ),
++      Effect.ensuring(finishUpdateAction("download")),
++    );
++  });
++
++  const installOnQuitWhenPrebuilt = Effect.fn("desktop.updates.installOnQuitWhenPrebuilt")(
++    function* (version: string) {
++      yield* handOverIfPrebuilt(version).pipe(
++        Effect.delay(PREBUILT_POLL_INTERVAL),
++        Effect.repeat({ until: (done) => done }),
++      );
++    },
++  );
++
    const downloadAvailableUpdate = Effect.gen(function* () {
-@@ -1328,6 +1365,8 @@ export const make = Effect.gen(function* () {
+     const state = yield* Ref.get(updateStateRef);
+     if (!(yield* Ref.get(updaterConfiguredRef)) || state.status !== "available") {
+@@ -1328,6 +1439,8 @@ export const make = Effect.gen(function* () {
        };
      }),
      download: Effect.gen(function* () {
@@ -355,7 +559,7 @@ index db31e0bc11..e895d39054 100644
        return {
          accepted: result.accepted,
 diff --git a/apps/desktop/src/updates/updatesTestHarness.ts b/apps/desktop/src/updates/updatesTestHarness.ts
-index b118d15ced..0a342f1b80 100644
+index b118d15ced..3d1ced04f6 100644
 --- a/apps/desktop/src/updates/updatesTestHarness.ts
 +++ b/apps/desktop/src/updates/updatesTestHarness.ts
 @@ -17,6 +17,7 @@ import * as DesktopSshEnvironment from "../ssh/DesktopSshEnvironment.ts";
@@ -366,17 +570,19 @@ index b118d15ced..0a342f1b80 100644
  
  export const flushCallbacks = Effect.yieldNow;
  
-@@ -44,6 +45,9 @@ export interface UpdatesHarnessOptions {
+@@ -44,6 +45,11 @@ export interface UpdatesHarnessOptions {
    readonly savedChannel?: DesktopAppSettings.DesktopSettings["updateChannel"];
    /** Adds a WSL backend beside the primary, as on a Windows host with WSL enabled. */
    readonly wslBackend?: boolean;
 +  readonly automation?: DesktopUpdateAutomation.DesktopUpdateAutomationPolicy;
 +  /** The covered nightly the repo publishes, read on every lookup; undefined stands for a failed one. */
 +  readonly coveredNightly?: () => string | undefined;
++  /** The nightly t3code-customize names as built (prebuilt.json); undefined stands for none. */
++  readonly prebuiltNightly?: () => string | undefined;
  }
  
  export function makeHarness(options: UpdatesHarnessOptions = {}) {
-@@ -53,6 +57,8 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
+@@ -53,6 +59,8 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
    let allowDowngrade = false;
    const checkAllowedDowngrade: boolean[] = [];
    let fullChangelog = false;
@@ -385,7 +591,7 @@ index b118d15ced..0a342f1b80 100644
    const feedUrls: ElectronUpdater.ElectronUpdaterFeedUrl[] = [];
    const listeners = new Map<string, Set<(...args: readonly unknown[]) => void>>();
    const sentStates: DesktopUpdateState[] = [];
-@@ -80,8 +86,14 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
+@@ -80,8 +88,14 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
        Effect.sync(() => {
          feedUrls.push(options);
        }),
@@ -402,7 +608,7 @@ index b118d15ced..0a342f1b80 100644
      setChannel: () => Effect.void,
      setAllowPrerelease: () => Effect.void,
      allowDowngrade: Effect.sync(() => allowDowngrade),
-@@ -293,6 +305,18 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
+@@ -293,6 +307,24 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
    const layer = DesktopUpdates.layer.pipe(
      Layer.provide(layerFileSystem),
      Layer.provide(DesktopUpdatePolicy.layerTest(options.policy)),
@@ -418,10 +624,16 @@ index b118d15ced..0a342f1b80 100644
 +        Effect.sync(() => options.coveredNightly?.()),
 +      ),
 +    ),
++    Layer.provide(
++      Layer.succeed(
++        DesktopUpdateAutomation.DesktopPrebuiltNightly,
++        Effect.sync(() => options.prebuiltNightly?.()),
++      ),
++    ),
      Layer.provideMerge(layerUpdater),
      Layer.provideMerge(layerWindow),
      Layer.provideMerge(layerBackend),
-@@ -327,6 +351,8 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
+@@ -327,6 +359,8 @@ export function makeHarness(options: UpdatesHarnessOptions = {}) {
      /** Whether each feed check could offer an older release, and the flag now. */
      checkAllowedDowngrade,
      allowDowngrade: () => allowDowngrade,

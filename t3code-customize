@@ -11,6 +11,7 @@ for a headless T3 server, `ios` for the iOS app and `fleet` for every machine.
 """
 import argparse
 import ast
+import base64
 import contextlib
 import copy
 import email
@@ -38,7 +39,7 @@ import uuid
 from urllib.parse import unquote, urlparse
 import zipfile
 
-from platform_support import (PlatformError, InstalledApp, storage_paths, find_app,
+from platform_support import (PlatformError, InstalledApp, storage_paths, find_app, asar_header_hash,
                               host_platform, host_arch, node_target, node_bin,
                               command_args, build_lock, finalize_copy, write_cli,
                               write_windows_shortcut)
@@ -52,6 +53,12 @@ DATA, CACHE, CONFIG = storage_paths(HOME, SYSTEM)
 SHARE = DATA.parent
 SOURCE = CACHE / 't3code'
 STATE = DATA / 'state.json'
+# The build made for a nightly T3's updater downloaded but has not installed yet (macOS, `prebuild`).
+# The customized app reads its "version" before it lets Squirrel install that download on quit
+# (patches-tt/0005, DesktopUpdateAutomation.ts), so the launch after the quit opens customized.
+PREBUILT = DATA / 'prebuilt.json'
+# electron-updater keeps a download in <this>/<updaterCacheDirName>/pending until it installs.
+UPDATER_CACHES = HOME / 'Library/Caches'
 CURRENT = DATA / 'current'
 LOCK = DATA.parent / (NAME + '.lock')
 DISABLED = DATA / 'disabled'
@@ -2397,15 +2404,19 @@ def hand_off_port(target, version, problem, log, clock=time.time):
     raise PortHandedOff(f'{problem}\n\nPort running on {name}; this machine picks it up once it is merged.')
 
 
-def cmd_build(args):
+def cmd_build(args, stock=None):
+    """Build for the installed T3 Code. With stock (an unpacked app T3's updater downloaded, see
+    prebuild), build for that app instead and return the build's record without making it current."""
     started = time.time()
     if not shutil.which('git'):
         raise Stop('git is required. Install it and run again.')
     if not args.no_pull and not args.resume:
         pull_latest()
-    app = installed_app(args.app)
-    if args.app:
+    app = stock or installed_app(args.app)
+    if args.app and not stock:
         save(CONFIG / 'config.json', {**load(CONFIG / 'config.json', {}), 'app': str(app.path)})
+    if not stock:
+        promote_prebuilt(app)
     say('T3 Code: ' + str(app.path))
     if MAC and electron_fuses(app.path).get('EnableNodeCliInspectArguments') != '1':
         raise Stop('This T3 Code no longer lets a launcher hook into its startup, so the customization cannot load\n'
@@ -2413,7 +2424,7 @@ def cmd_build(args):
     stock_fingerprint = app.fingerprint()
     state = load(STATE, {})
     recipe = recipe_hash()
-    if (not args.force and not args.resume and state.get('stock') == stock_fingerprint
+    if (not stock and not args.force and not args.resume and state.get('stock') == stock_fingerprint
             and state.get('recipe') == recipe and current_executable(state).exists()):
         install_launcher(app)
         say(f'\nAlready up to date. Open "{LAUNCHER_NAME}" from your app launcher.')
@@ -2474,10 +2485,16 @@ def cmd_build(args):
         destination = build_dir / assembled.name
         shutil.move(str(assembled), destination)
         # The recipe this build was made from; a port changes it, a sync during the build must not.
-        save(STATE, {'stock': stock_fingerprint, 'version': version, 'commit': target,
-                     'recipe': recipe_hash() if ported else recipe,
-                     'build': str(destination), 'connect': len(config) == len(PUBLIC_CONFIG),
-                     'builtAt': time.strftime('%Y-%m-%dT%H:%M:%S')})
+        record = {'stock': stock_fingerprint, 'version': version, 'commit': target,
+                  'recipe': recipe_hash() if ported else recipe,
+                  'build': str(destination), 'connect': len(config) == len(PUBLIC_CONFIG),
+                  'builtAt': time.strftime('%Y-%m-%dT%H:%M:%S')}
+        if stock:
+            prune()
+            shutil.rmtree(job, ignore_errors=True)
+            say(f'\nBuilt the customization for T3 Code {version} before its install.')
+            return record
+        save(STATE, record)
         icon = destination / 't3code.png'
         if icon.exists():
             shutil.copy2(icon, DATA / 'icon.png')
@@ -2552,9 +2569,12 @@ def prune(keep=3):
     """Drop old builds, keeping the newest few so a running instance never loses its files."""
     state = load(STATE, {})
     current = Path(state['build']).parent if state.get('build') else CURRENT.resolve()
+    # The build made ahead of a nightly's install (prebuild) stays until that install uses it.
+    kept = {current.resolve()} | {Path(record['build']).parent.resolve() for record in [load(PREBUILT, {})]
+                                  if record.get('build')}
     builds = sorted((DATA / 'builds').iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
     for old in builds[keep:]:
-        if old.resolve() != current:
+        if old.resolve() not in kept:
             shutil.rmtree(old, ignore_errors=True)
 
 
@@ -2745,6 +2765,7 @@ def stock_target(app):
 def launch_target():
     """Use the customized build only while it matches the installed application."""
     app = installed_app()
+    promote_prebuilt(app)
     state = load(STATE, {})
     built = current_executable(state)
     if DISABLED.exists() or not built.exists():
@@ -3381,6 +3402,148 @@ def staged_app_update(app):
     return version if version and version != bundle_version(app) else None
 
 
+# --- Building before T3's updater installs (macOS) --------------------------------------
+# T3's updater (patches-tt/0005) downloads a covered nightly but hands it to Squirrel, which installs
+# it on quit, only once prebuilt.json names that nightly. Before then this builds the customization
+# from the downloaded app while the current one stays installed and in use; once Squirrel has
+# installed the same bytes, promote_prebuilt makes that build the current one.
+
+def updater_pending(app):
+    """The folder where T3's updater (electron-updater) keeps a downloaded update, or None."""
+    try:
+        text = (app.resources / 'app-update.yml').read_text()
+    except OSError:
+        return None
+    match = re.search(r'^updaterCacheDirName:\s*["\']?([^"\'\s/]+)', text, re.M)
+    return UPDATER_CACHES / match.group(1) / 'pending' if match else None
+
+
+def zip_bundle_version(archive):
+    """The version of the app inside an update zip, or None."""
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            names = [n for n in bundle.namelist() if re.fullmatch(r'[^/]+\.app/Contents/Info\.plist', n)]
+            if len(names) != 1:
+                return None
+            return plistlib.loads(bundle.read(names[0])).get('CFBundleShortVersionString')
+    except (OSError, zipfile.BadZipFile, plistlib.InvalidFileException, ValueError):
+        return None
+
+
+def downloaded_update(app):
+    """(zip, version) of a finished download T3's updater holds for a nightly newer than the
+    installed one, else None. The file must match the sha512 electron-updater recorded."""
+    pending = updater_pending(app)
+    try:
+        info = load(pending / 'update-info.json', {}) if pending else {}
+    except ValueError:
+        return None
+    name = info.get('fileName') if isinstance(info, dict) else None
+    if not name or Path(name).name != name or not (pending / name).is_file():
+        return None
+    archive = pending / name
+    version = zip_bundle_version(archive)
+    newer, installed = nightly_key(version), nightly_key(bundle_version(app.path))
+    if not newer or (installed and newer <= installed):
+        return None
+    digest = hashlib.sha512()
+    with archive.open('rb') as data:
+        for block in iter(lambda: data.read(1 << 20), b''):
+            digest.update(block)
+    if base64.b64encode(digest.digest()).decode() != info.get('sha512'):
+        return None
+    return archive, version
+
+
+def stock_identity(app):
+    """What makes two copies of T3 Code the same release: its version and the bytes of its executable
+    and archives (an archive header hashes every file in it), not where they are or when written.
+    Squirrel installs the very app the download holds (verified on the MacBook Air)."""
+    files = []
+    for path in sorted([app.executable, *app.resources.glob('*.asar')]):
+        item = {'name': path.relative_to(app.path).as_posix(), 'size': path.stat().st_size}
+        item['hash' if path == app.executable else 'header'] = (
+            sha256(path) if path == app.executable else asar_header_hash(path))
+        files.append(item)
+    return {'version': bundle_version(app.path), 'files': files}
+
+
+BUILD_RECORD = ('version', 'commit', 'recipe', 'build', 'connect', 'builtAt')
+
+
+def promote_prebuilt(app):
+    """Once T3's updater installed the nightly a build was made for ahead of time, make that build
+    the current one for this install. True if it did."""
+    if not MAC:
+        return False
+    try:
+        prebuilt = load(PREBUILT, {})
+        if not prebuilt.get('identity') or not prebuilt.get('build') or not Path(prebuilt['build']).exists():
+            return False
+        fingerprint = app.fingerprint()
+        if load(STATE, {}).get('stock') == fingerprint or stock_identity(app) != prebuilt['identity']:
+            return False
+    except (OSError, ValueError, PlatformError):
+        return False
+    save(STATE, {'stock': fingerprint, **{key: prebuilt.get(key) for key in BUILD_RECORD}})
+    say(f"Using the build made ahead for {prebuilt.get('version')}.")
+    return True
+
+
+def prebuild(args):
+    """Build the customization for the nightly T3's updater downloaded, before it is installed, and
+    name it in prebuilt.json. True if it built one; a failure raises and names nothing."""
+    app = installed_app(args.app)
+    found = downloaded_update(app)
+    if not found:
+        return False
+    archive, version = found
+    done = load(PREBUILT, {})
+    if (done.get('version') == version and done.get('recipe') == recipe_hash()
+            and done.get('build') and Path(done['build']).exists()):
+        return False
+    step(f'Building the customization for the downloaded T3 Code {version}...')
+    job = CACHE / 'prebuild' / version
+    shutil.rmtree(job, ignore_errors=True)
+    job.mkdir(parents=True)
+    try:
+        # ditto keeps the bundle's symlinks and signature, as Squirrel's unpacking does.
+        run(['ditto', '-x', '-k', str(archive), str(job)])
+        bundles = list(job.glob('*.app'))
+        if len(bundles) != 1:
+            raise Stop(f'The downloaded update {archive.name} holds no single app.')
+        stock = InstalledApp.inspect(bundles[0], SYSTEM)
+        release = stock_identity(stock)
+        if release['version'] != version:
+            raise Stop(f'The downloaded update is {release["version"]}, not {version}.')
+        build_args = argparse.Namespace(app=None, fix=getattr(args, 'fix', None), resume=False, skip_checks=False,
+                                        force=False, no_pull=True, background=getattr(args, 'background', False))
+        record = cmd_build(build_args, stock=stock)
+        save(PREBUILT, {key: record[key] for key in BUILD_RECORD} | {'identity': release})
+    finally:
+        shutil.rmtree(job, ignore_errors=True)
+    return True
+
+
+def prebuild_quietly(args):
+    """prebuild for a background run: notify the outcome, never raise. Without a build T3 keeps the
+    download and the current customized app; the next run tries again."""
+    try:
+        if not prebuild(args):
+            return False
+    except Waiting as waiting:
+        say(str(waiting))
+        return False
+    except (Stop, PlatformError, OSError) as stop:
+        first = (str(stop).strip().splitlines() or [''])[0]
+        notify(LAUNCHER_NAME, f'The downloaded T3 Code update waits: its customization did not build ({first}).'
+               ' T3 Code stays as it is.')
+        return False
+    notify(LAUNCHER_NAME, f"T3 Code {load(PREBUILT, {}).get('version')} is ready with the customization."
+           ' It installs when you quit T3 Code.')
+    return True
+
+
 def start_background_update():
     """Start the rebuild now (the LaunchAgent if autoupdate is on, else a detached run). Returns
     what to tell the user, or None if it could not start."""
@@ -3436,6 +3599,8 @@ def cmd_update(args):
             notify(LAUNCHER_NAME, 'Rebuilt for ' + load(STATE, {}).get('version', 'the latest Nightly')
                    + f'. Quit T3 Code and open "{LAUNCHER_NAME}" to use it.'
                    + (' The patches were ported; ask an agent to commit them and run fleet.' if ported else ''))
+        if MAC and args.background:
+            prebuild_quietly(args)
         if MAC and args.background and args.ios:
             update_ios(args)
     except Waiting as waiting:
@@ -3524,7 +3689,9 @@ def cmd_autoupdate(args):
         'Label': AUTOUPDATE_LABEL, 'ProgramArguments': command,
         # T3's updater replaces the app; a rebuild starts as soon as it does, the interval catches
         # patch changes. The run waits until T3 has stopped writing (see cmd_update).
-        'WatchPaths': [str(app.path / 'Contents/Info.plist'), str(app.resources / 'app.asar')],
+        # Its finished download starts the build for that nightly before it installs (prebuild).
+        'WatchPaths': [str(app.path / 'Contents/Info.plist'), str(app.resources / 'app.asar')]
+                      + ([str(updater_pending(app))] if updater_pending(app) else []),
         'ThrottleInterval': 120,
         # The build needs the same git, node and agents you have in a terminal.
         'EnvironmentVariables': {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(HOME)},
@@ -3613,6 +3780,9 @@ def _status():
         staged = staged_app_update(app.path)
         if staged:
             say(f'App update:         {staged} staged; installs when T3 Code quits')
+        prebuilt = load(PREBUILT, {}).get('version')
+        if nightly_key(prebuilt) and nightly_key(prebuilt) > (nightly_key(bundle_version(app.path)) or ()):
+            say(f'Built ahead:        {prebuilt} (T3 Code installs it on quit, then opens customized)')
         ios_state = load(IOS_STATE)
         if ios_state:
             say(ios_status_line(ios_state, bundle_version(app.path), staged))
