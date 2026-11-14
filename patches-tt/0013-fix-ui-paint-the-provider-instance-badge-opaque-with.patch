@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t3code-customize <t3code-customize@localhost>
+Date: Sat, 14 Nov 2026 16:04:39 +0100
+Subject: [PATCH 13/13] fix(ui): paint the provider instance badge opaque with
+ full-contrast initials
+
+---
+ apps/mobile/src/components/ProviderIcon.tsx   |  2 +-
+ ...roviderInstanceIcon.badge.browser.test.tsx | 54 +++++++++++++++++++
+ .../components/chat/ProviderInstanceIcon.tsx  |  9 +++-
+ 3 files changed, 62 insertions(+), 3 deletions(-)
+ create mode 100644 apps/web/src/components/chat/ProviderInstanceIcon.badge.browser.test.tsx
+
+diff --git a/apps/mobile/src/components/ProviderIcon.tsx b/apps/mobile/src/components/ProviderIcon.tsx
+index 62a6410226..c46b5f3df7 100644
+--- a/apps/mobile/src/components/ProviderIcon.tsx
++++ b/apps/mobile/src/components/ProviderIcon.tsx
+@@ -203,7 +203,7 @@ export function ProviderInstanceIcon(props: {
+             }}
+           >
+             <Text
+-              className={accentColor ? undefined : "text-foreground-muted"}
++              className={accentColor ? undefined : "text-foreground"}
+               style={{
+                 fontSize: 7,
+                 fontWeight: "600",
+diff --git a/apps/web/src/components/chat/ProviderInstanceIcon.badge.browser.test.tsx b/apps/web/src/components/chat/ProviderInstanceIcon.badge.browser.test.tsx
+new file mode 100644
+index 0000000000..41f8da891a
+--- /dev/null
++++ b/apps/web/src/components/chat/ProviderInstanceIcon.badge.browser.test.tsx
+@@ -0,0 +1,54 @@
++import { ProviderDriverKind } from "@t3tools/contracts";
++import { expect, it } from "vite-plus/test";
++
++import "~/index.css";
++
++import { render } from "../../../test/render";
++import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
++
++/** The painted RGBA of a CSS color, whatever syntax the browser serializes it in. */
++function painted(color: string): readonly number[] {
++  const context = document.createElement("canvas").getContext("2d")!;
++  context.fillStyle = color;
++  context.fillRect(0, 0, 1, 1);
++  return Array.from(context.getImageData(0, 0, 1, 1).data);
++}
++
++/** Dark mode, with or without window glass, for the lifetime of the test. */
++function darkAppearance(glass: boolean): Disposable {
++  const root = document.documentElement;
++  root.classList.add("dark");
++  if (glass) root.dataset.windowGlass = "";
++  return {
++    [Symbol.dispose]() {
++      root.classList.remove("dark");
++      delete root.dataset.windowGlass;
++    },
++  };
++}
++
++it.each([
++  { name: "without window glass", glass: false },
++  { name: "under window glass", glass: true },
++])("paints the instance badge opaque with foreground initials $name", async ({ glass }) => {
++  using _appearance = darkAppearance(glass);
++  await using _screen = await render(
++    <div className="dropdown-glass">
++      <ProviderInstanceIcon
++        driverKind={ProviderDriverKind.make("claudeAgent")}
++        displayName="Claude Tim"
++        showBadge
++      />
++    </div>,
++  );
++  const badge = Array.from(document.querySelectorAll<HTMLElement>("span[aria-hidden]")).find(
++    (node) => node.textContent === "CT",
++  )!;
++  const style = getComputedStyle(badge);
++  expect(painted(style.backgroundColor)[3]).toBe(255);
++  const probe = document.createElement("span");
++  probe.style.color = "var(--foreground)";
++  badge.parentElement!.append(probe);
++  expect(painted(style.color)).toEqual(painted(getComputedStyle(probe).color));
++  probe.remove();
++});
+diff --git a/apps/web/src/components/chat/ProviderInstanceIcon.tsx b/apps/web/src/components/chat/ProviderInstanceIcon.tsx
+index e7e3253d2c..7b3aea5a59 100644
+--- a/apps/web/src/components/chat/ProviderInstanceIcon.tsx
++++ b/apps/web/src/components/chat/ProviderInstanceIcon.tsx
+@@ -86,6 +86,10 @@ export function resolveProviderInstanceAcpRegistryIconUrl(input: {
+   );
+ }
+ 
++/** An instance badge without an accent color: an opaque surface with full-contrast initials.
++ * `--card` is a faint veil under window glass, so the logo behind it would show through. */
++export const INSTANCE_BADGE_SURFACE_CLASS = "bg-popover text-foreground";
++
+ export const ProviderInstanceIcon = memo(function ProviderInstanceIcon(props: {
+   driverKind: ProviderDriverKind;
+   displayName: string;
+@@ -151,7 +155,8 @@ export const ProviderInstanceIcon = memo(function ProviderInstanceIcon(props: {
+           </span>
+           <span
+             className={cn(
+-              "pointer-events-none absolute right-[-0.3125rem] bottom-[-0.3125rem] z-10 flex size-3 items-center justify-center rounded-full border bg-card text-foreground shadow-sm @max-[1.1rem]:hidden",
++              "pointer-events-none absolute right-[-0.3125rem] bottom-[-0.3125rem] z-10 flex size-3 items-center justify-center rounded-full border shadow-sm @max-[1.1rem]:hidden",
++              INSTANCE_BADGE_SURFACE_CLASS,
+               props.badgeClassName,
+             )}
+             style={{ borderColor: indicatorBackground }}
+@@ -178,7 +183,7 @@ export const ProviderInstanceIcon = memo(function ProviderInstanceIcon(props: {
+             "pointer-events-none absolute right-0 bottom-0 z-10 flex h-3.5 min-w-3.5 items-center justify-center rounded-full border px-0.5 text-4xs font-semibold leading-none shadow-sm",
+             accentColor
+               ? "bg-(--provider-accent) text-(--provider-accent-foreground)"
+-              : "bg-card text-muted-foreground",
++              : INSTANCE_BADGE_SURFACE_CLASS,
+             props.size === "compact" &&
+               "right-[-0.1875rem] bottom-[-0.1875rem] h-3 min-w-3 px-0.5 text-5xs",
+             props.badgeClassName,
