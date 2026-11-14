@@ -20,17 +20,17 @@ Subject: [PATCH 1/2] Usage limits: background polling, reset-aware merging and
  .../src/server/managedProvider.test.ts        | 268 ++++++++-
  .../src/server/managedProvider.ts             |  79 ++-
  .../src/server/usageLimits.test.ts            | 221 +++++++-
- .../provider-core/src/server/usageLimits.ts   | 243 ++++++--
+ .../provider-core/src/server/usageLimits.ts   | 245 ++++++--
  .../provider-cursor/src/server/usageLimits.ts |   1 +
  .../provider-grok/src/server/usageLimits.ts   |   1 +
  .../src/server/usageLimits.ts                 |   3 +
- 19 files changed, 1838 insertions(+), 101 deletions(-)
+ 19 files changed, 1839 insertions(+), 102 deletions(-)
 
 diff --git a/apps/server/src/provider/CodexProvider.ts b/apps/server/src/provider/CodexProvider.ts
-index 3fde32add2..5c8551f6a4 100644
+index df105d3ba2..7112174a5b 100644
 --- a/apps/server/src/provider/CodexProvider.ts
 +++ b/apps/server/src/provider/CodexProvider.ts
-@@ -60,6 +60,7 @@ const RATE_LIMITS_PROBE_TIMEOUT_MS = 3_000;
+@@ -60,6 +60,7 @@ const isCodexAppServerSpawnError = Schema.is(CodexErrors.CodexAppServerSpawnErro
  
  type CodexRateLimitsProbe =
    | {
@@ -38,10 +38,10 @@ index 3fde32add2..5c8551f6a4 100644
        readonly snapshot: CodexRateLimitSnapshot;
        readonly rateLimitsByLimitId?:
          | Readonly<Record<string, CodexRateLimitSnapshot>>
-@@ -576,15 +577,20 @@ const readCodexRateLimits = (
-     deadlineMs,
-     RATE_LIMITS_PROBE_TIMEOUT_MS,
-   ).pipe(
+@@ -684,15 +685,20 @@ const readCodexRateLimits = (
+   deadlineMs: number,
+ ) =>
+   withCodexDiscoveryDeadline(client.request("account/rateLimits/read", null), deadlineMs).pipe(
 -    Effect.map((response): CodexRateLimitsProbe =>
 -      response
 -        ? {
@@ -68,7 +68,7 @@ index 3fde32add2..5c8551f6a4 100644
      ),
      Effect.catch((error) =>
        Effect.logDebug("Codex rate-limit read failed.", { cause: error }).pipe(
-@@ -931,7 +937,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
+@@ -1059,7 +1065,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
              snapshot: snapshot.rateLimits.snapshot,
              rateLimitsByLimitId: snapshot.rateLimits.rateLimitsByLimitId,
              resetCredits: snapshot.rateLimits.resetCredits,
@@ -78,10 +78,10 @@ index 3fde32add2..5c8551f6a4 100644
  
    return buildServerProvider({
 diff --git a/apps/server/src/provider/Drivers/ClaudeDriver.ts b/apps/server/src/provider/Drivers/ClaudeDriver.ts
-index af20b76754..289238fe8f 100644
+index d75b1cad86..46d2bc21fd 100644
 --- a/apps/server/src/provider/Drivers/ClaudeDriver.ts
 +++ b/apps/server/src/provider/Drivers/ClaudeDriver.ts
-@@ -146,6 +146,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
+@@ -150,6 +150,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
      });
  
      const scopedLimitNames = yield* makeClaudeScopedLimitNames;
@@ -90,10 +90,10 @@ index af20b76754..289238fe8f 100644
 +      scopedLimitNames,
 +      yield* ClaudeResetCredits.claudeUsageShareDirectory(),
 +    );
-     const orchestrationAdapter = yield* createClaudeAdapterV2(
-       {
-         instanceId,
-@@ -247,11 +252,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
+     // The SDK's user source is the host's home, not a custom one; same rule as the adapter.
+     const customHome =
+       effectiveConfig.homePath.trim().length > 0 ||
+@@ -275,11 +280,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
                catalog,
                scopedLimitNames,
                (version) =>
@@ -106,7 +106,7 @@ index af20b76754..289238fe8f 100644
              ),
            ),
            Effect.tap((provider) =>
-@@ -280,6 +281,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
+@@ -310,6 +311,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
          ),
        checkProvider,
        invalidateUsageCache: Cache.invalidateAll(capabilitiesProbeCache),
@@ -116,10 +116,11 @@ index af20b76754..289238fe8f 100644
          resolveMaintenance().pipe(
            Effect.flatMap((maintenanceCapabilities) =>
 diff --git a/apps/server/src/provider/Drivers/CodexDriver.ts b/apps/server/src/provider/Drivers/CodexDriver.ts
-index c9cbb937c2..2264d73ac0 100644
+index f8a753169b..18dacf1d4c 100644
 --- a/apps/server/src/provider/Drivers/CodexDriver.ts
 +++ b/apps/server/src/provider/Drivers/CodexDriver.ts
-@@ -1,4 +1,8 @@
+@@ -1,5 +1,9 @@
+ import { resolveProviderProbeTimeoutMs } from "@t3tools/provider-core/server/snapshotProbe";
 -import { CodexSettings, ProviderDriverKind } from "@t3tools/contracts";
 +import {
 +  CodexSettings,
@@ -129,7 +130,7 @@ index c9cbb937c2..2264d73ac0 100644
  import * as Digest from "effect/crypto/Digest";
  import * as SecureRandom from "effect/crypto/SecureRandom";
  import type * as Signature from "effect/crypto/Signature";
-@@ -237,6 +241,7 @@ export const CodexDriver: ProviderDriver<
+@@ -238,6 +242,7 @@ export const CodexDriver: ProviderDriver<
          Effect.map((capabilities) => withCodexNativeLatestVersion(capabilities, httpClient)),
        );
  
@@ -137,9 +138,9 @@ index c9cbb937c2..2264d73ac0 100644
      const orchestrationAdapter = yield* createCodexAdapterV2(
        {
          instanceId,
-@@ -249,6 +254,14 @@ export const CodexDriver: ProviderDriver<
-       {
-         onUsageLimits: (update) => snapshot.applyUsageLimits(update),
+@@ -253,6 +258,14 @@ export const CodexDriver: ProviderDriver<
+           Effect.map((value) => value.models),
+         ),
          compatibility: installation.compatibility,
 +        registerUsageLimitsReader: (reader) =>
 +          Effect.acquireRelease(
@@ -152,7 +153,7 @@ index c9cbb937c2..2264d73ac0 100644
        },
      ).pipe(
        Effect.mapError(
-@@ -290,6 +303,13 @@ export const CodexDriver: ProviderDriver<
+@@ -294,6 +307,13 @@ export const CodexDriver: ProviderDriver<
            (draft, catalog) => stampIdentity(applyCodexModelCatalog(draft, catalog)),
          ),
        checkProvider,
@@ -167,10 +168,10 @@ index c9cbb937c2..2264d73ac0 100644
          resolveMaintenance().pipe(
            Effect.flatMap((maintenanceCapabilities) =>
 diff --git a/apps/server/src/provider/ProviderRegistry.test.ts b/apps/server/src/provider/ProviderRegistry.test.ts
-index b5501943ca..ec37563d33 100644
+index 564a90f40e..767a849968 100644
 --- a/apps/server/src/provider/ProviderRegistry.test.ts
 +++ b/apps/server/src/provider/ProviderRegistry.test.ts
-@@ -424,7 +424,11 @@ it.layer(
+@@ -525,7 +525,11 @@ it.layer(
            checkCodexProviderStatus(defaultCodexSettings, () =>
              Effect.succeed(
                makeCodexProbeSnapshot({
@@ -918,7 +919,7 @@ index d2000804cf..7263afd91d 100644
    readJson(Config, accountConfigPath).pipe(
      Effect.map((config) => config.oauthAccount),
 diff --git a/apps/server/src/provider/claudeUsageLimits.test.ts b/apps/server/src/provider/claudeUsageLimits.test.ts
-index f20d8b0543..615d80a29e 100644
+index b683c80f4f..8c84abfae4 100644
 --- a/apps/server/src/provider/claudeUsageLimits.test.ts
 +++ b/apps/server/src/provider/claudeUsageLimits.test.ts
 @@ -1,6 +1,10 @@
@@ -973,7 +974,7 @@ index f20d8b0543..615d80a29e 100644
          usedPercent: 12,
          windowDurationMins: 300,
        },
-@@ -241,6 +250,7 @@ describe("claudeRateLimitEventToUpdate", () => {
+@@ -257,6 +266,7 @@ describe("claudeRateLimitEventToUpdate", () => {
            id: "seven_day",
            kind: "weekly",
            label: "Weekly",
@@ -981,7 +982,7 @@ index f20d8b0543..615d80a29e 100644
            usedPercent: 85,
            windowDurationMins: 10080,
            resetsAt: "2026-07-14T03:33:20.000Z",
-@@ -262,10 +272,163 @@ describe("claudeRateLimitEventToUpdate", () => {
+@@ -278,10 +288,163 @@ describe("claudeRateLimitEventToUpdate", () => {
            id: "seven_day_fable",
            kind: "weekly",
            label: "Weekly · Fable",
@@ -1146,7 +1147,7 @@ index f20d8b0543..615d80a29e 100644
 +  });
  });
 diff --git a/apps/server/src/provider/claudeUsageLimits.ts b/apps/server/src/provider/claudeUsageLimits.ts
-index d0acf43bb4..247dade1d5 100644
+index ba1263ef70..98e4c9b55b 100644
 --- a/apps/server/src/provider/claudeUsageLimits.ts
 +++ b/apps/server/src/provider/claudeUsageLimits.ts
 @@ -18,6 +18,7 @@ import {
@@ -1157,7 +1158,7 @@ index d0acf43bb4..247dade1d5 100644
  
  const WINDOWS: Readonly<
    Record<string, Pick<ServerProviderUsageWindow, "kind" | "label" | "windowDurationMins">>
-@@ -55,11 +56,13 @@ function scopedWindow(
+@@ -67,11 +68,13 @@ function scopedWindow(
    displayName: string,
    usedPercent: number,
    resetsAt: string | undefined,
@@ -1171,7 +1172,7 @@ index d0acf43bb4..247dade1d5 100644
      windowDurationMins: WEEK_MINS,
      usedPercent: clampPercent(usedPercent),
      ...(resetsAt ? { resetsAt } : {}),
-@@ -141,42 +144,84 @@ function makeWindow(
+@@ -153,42 +156,84 @@ function makeWindow(
    id: keyof typeof WINDOWS & string,
    usedPercent: number,
    resetsAt: string | undefined,
@@ -1267,7 +1268,7 @@ index d0acf43bb4..247dade1d5 100644
    if (!response.rate_limits_available || !response.rate_limits) {
      return {
        limits: makeUnavailableUsageLimits({
-@@ -190,14 +235,14 @@ export function claudeUsageResponseToLimits(input: {
+@@ -202,14 +247,14 @@ export function claudeUsageResponseToLimits(input: {
    for (const id of Object.keys(WINDOWS)) {
      const window = response.rate_limits[id as "five_hour" | "seven_day"];
      if (!window || typeof window.utilization !== "number") continue;
@@ -1284,7 +1285,7 @@ index d0acf43bb4..247dade1d5 100644
      );
      overageIncluded ??= entry.display_name;
    }
-@@ -223,3 +268,72 @@ export const recordClaudeUsageResponse = (
+@@ -239,3 +284,72 @@ export const recordClaudeUsageResponse = (
    const { limits, names } = claudeUsageResponseToLimits(input);
    return Ref.set(namesRef, names).pipe(Effect.as(limits));
  };
@@ -1554,13 +1555,13 @@ index 030983f50e..eb24dba974 100644
            }).limits,
          };
 diff --git a/packages/contracts/src/providerUsageLimits.ts b/packages/contracts/src/providerUsageLimits.ts
-index 67acbe0d35..e6b081d0cc 100644
+index 446d4f1f31..03fe677e9b 100644
 --- a/packages/contracts/src/providerUsageLimits.ts
 +++ b/packages/contracts/src/providerUsageLimits.ts
-@@ -14,8 +14,18 @@ export const ServerProviderUsageWindow = Schema.Struct({
-   id: TrimmedNonEmptyString,
-   kind: Schema.Literals(["session", "weekly", "monthly", "other"]),
-   label: TrimmedNonEmptyString,
+@@ -17,8 +17,18 @@ export const ServerProviderUsageWindow = Schema.Struct({
+   /** When present, this limit applies only to these provider model IDs. */
+   modelIds: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
+   providerIds: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
 +  /**
 +   * How this reading was fetched. Account APIs and streamed turn events carry
 +   * more authority than a CLI estimate, so the server merge keeps their recent
@@ -1577,10 +1578,10 @@ index 67acbe0d35..e6b081d0cc 100644
  });
  export type ServerProviderUsageWindow = typeof ServerProviderUsageWindow.Type;
 diff --git a/packages/provider-core/src/server/managedProvider.test.ts b/packages/provider-core/src/server/managedProvider.test.ts
-index 67549e3a52..1728703e90 100644
+index f878b2f44e..44332804d8 100644
 --- a/packages/provider-core/src/server/managedProvider.test.ts
 +++ b/packages/provider-core/src/server/managedProvider.test.ts
-@@ -125,6 +125,7 @@ function layerProviderHost(input: {
+@@ -127,6 +127,7 @@ function layerProviderHost(input: {
  }
  
  const layerAlwaysRunTest = layerProviderHost({ runBackgroundWork: true });
@@ -1588,7 +1589,7 @@ index 67549e3a52..1728703e90 100644
  
  const enrichedSnapshotSecond: ServerProvider = {
    ...refreshedSnapshotSecond,
-@@ -731,12 +732,19 @@ describe("makeManagedServerProvider", () => {
+@@ -776,12 +777,19 @@ describe("makeManagedServerProvider", () => {
          assert.deepStrictEqual(update?.usageLimits, {
            checkedAt: "2026-04-10T00:05:00.000Z",
            windows: [
@@ -1609,7 +1610,7 @@ index 67549e3a52..1728703e90 100644
                resetsAt: "2026-04-17T00:00:00.000Z",
              },
            ],
-@@ -825,12 +833,16 @@ describe("makeManagedServerProvider", () => {
+@@ -870,12 +878,16 @@ describe("makeManagedServerProvider", () => {
            Effect.map((chunk) => Array.from(chunk)[0]!),
          );
          assert.deepStrictEqual(enriched.models, enrichedSnapshot.models);
@@ -1628,7 +1629,7 @@ index 67549e3a52..1728703e90 100644
          assert.strictEqual(refreshed.auth.workspaceId, "ws-a");
          assert.strictEqual(refreshed.auth.label, clearPlan ? undefined : "tier-2");
  
-@@ -921,7 +933,13 @@ describe("makeManagedServerProvider", () => {
+@@ -966,7 +978,13 @@ describe("makeManagedServerProvider", () => {
          assert.strictEqual((yield* provider.getSnapshot).auth.label, undefined);
          const refreshed = yield* provider.refresh;
          assert.strictEqual(refreshed.auth.label, undefined);
@@ -1643,7 +1644,7 @@ index 67549e3a52..1728703e90 100644
        }),
      ).pipe(Effect.provide(layerAlwaysRunTest)),
    );
-@@ -962,15 +980,21 @@ describe("makeManagedServerProvider", () => {
+@@ -1007,15 +1025,21 @@ describe("makeManagedServerProvider", () => {
          const partial = yield* provider.getSnapshot;
          assert.deepStrictEqual(partial.usageLimits, {
            checkedAt: "2026-04-10T00:00:02.000Z",
@@ -1668,7 +1669,7 @@ index 67549e3a52..1728703e90 100644
  
          const completeLimits = {
            checkedAt: "2026-04-10T00:00:04.000Z",
-@@ -980,8 +1004,236 @@ describe("makeManagedServerProvider", () => {
+@@ -1025,8 +1049,236 @@ describe("makeManagedServerProvider", () => {
            ],
          } as const;
          yield* Ref.set(probeSnapshot, { ...refreshedSnapshot, usageLimits: completeLimits });
@@ -1907,7 +1908,7 @@ index 67549e3a52..1728703e90 100644
 +  ).pipe(Effect.provide(layerAlwaysRunTest)),
 +);
 diff --git a/packages/provider-core/src/server/managedProvider.ts b/packages/provider-core/src/server/managedProvider.ts
-index 9f3a5277af..5c4cbc9dc1 100644
+index 33a8273359..b6318e17ca 100644
 --- a/packages/provider-core/src/server/managedProvider.ts
 +++ b/packages/provider-core/src/server/managedProvider.ts
 @@ -4,7 +4,9 @@ import {
@@ -2052,7 +2053,7 @@ index 9f3a5277af..5c4cbc9dc1 100644
      input.refreshInterval !== undefined
        ? Effect.succeed(input.refreshInterval)
 diff --git a/packages/provider-core/src/server/usageLimits.test.ts b/packages/provider-core/src/server/usageLimits.test.ts
-index 4b9c1b39c8..1543a82c9d 100644
+index 2acdb0ba15..c259ae78d0 100644
 --- a/packages/provider-core/src/server/usageLimits.test.ts
 +++ b/packages/provider-core/src/server/usageLimits.test.ts
 @@ -7,6 +7,7 @@ const session = {
@@ -2083,7 +2084,7 @@ index 4b9c1b39c8..1543a82c9d 100644
        update: {
          windows: [
            { ...weekly },
-@@ -46,7 +48,7 @@ describe("applyUsageLimitsUpdate", () => {
+@@ -69,7 +71,7 @@ describe("applyUsageLimitsUpdate", () => {
      expect(next).not.toBe(published);
      expect(next).toEqual({
        checkedAt: "2026-09-03T12:00:05.000Z",
@@ -2092,9 +2093,9 @@ index 4b9c1b39c8..1543a82c9d 100644
      });
    });
  
-@@ -71,12 +73,12 @@ describe("applyUsageLimitsUpdate", () => {
+@@ -94,12 +96,12 @@ describe("applyUsageLimitsUpdate", () => {
      const next = applyUsageLimitsUpdate({
-       previous: { ...published, resetCredits },
+       previous: { ...published, resetCredits, zeroSpendCap: true },
        checkedAt: "2026-09-03T12:00:05.000Z",
 -      update: { windows: [{ ...session, usedPercent: 55 }] },
 +      update: { windows: [{ ...session, checkedAt: "2026-09-03T12:00:05.000Z", usedPercent: 55 }] },
@@ -2105,9 +2106,9 @@ index 4b9c1b39c8..1543a82c9d 100644
 -      windows: [{ ...session, usedPercent: 55 }, weekly],
 +      windows: [{ ...session, usedPercent: 55, checkedAt: "2026-09-03T12:00:05.000Z" }, weekly],
        resetCredits,
+       zeroSpendCap: true,
      });
-   });
-@@ -108,8 +110,13 @@ describe("resolveUsageLimitsAfterProbe", () => {
+@@ -132,8 +134,13 @@ describe("resolveUsageLimitsAfterProbe", () => {
  
      const sameTime = { ...probed, checkedAt: live.checkedAt };
      const newer = { ...probed, checkedAt: "2026-09-03T12:00:06.000Z" };
@@ -2123,7 +2124,7 @@ index 4b9c1b39c8..1543a82c9d 100644
    });
  
    it("keeps the last good windows through a failed probe but not an unsupported one", () => {
-@@ -119,4 +126,204 @@ describe("resolveUsageLimitsAfterProbe", () => {
+@@ -143,4 +150,204 @@ describe("resolveUsageLimitsAfterProbe", () => {
      expect(resolveUsageLimitsAfterProbe({ published, probed: unsupported })).toBe(unsupported);
      expect(resolveUsageLimitsAfterProbe({ published: undefined, probed: failed })).toBe(failed);
    });
@@ -2329,7 +2330,7 @@ index 4b9c1b39c8..1543a82c9d 100644
 +  ).toBe(observed);
  });
 diff --git a/packages/provider-core/src/server/usageLimits.ts b/packages/provider-core/src/server/usageLimits.ts
-index 1e4bcd0090..dce5f77c59 100644
+index 7d1f6e6a91..a35c029af6 100644
 --- a/packages/provider-core/src/server/usageLimits.ts
 +++ b/packages/provider-core/src/server/usageLimits.ts
 @@ -11,6 +11,8 @@ const WINDOW_KIND_ORDER: Record<ServerProviderUsageWindow["kind"], number> = {
@@ -2431,7 +2432,7 @@ index 1e4bcd0090..dce5f77c59 100644
  }
  
  export function makeUnavailableUsageLimits(input: {
-@@ -53,68 +132,164 @@ export function applyUsageLimitsUpdate(input: {
+@@ -53,47 +132,96 @@ export function applyUsageLimitsUpdate(input: {
    readonly checkedAt: string;
  }): ServerProviderUsageLimits | undefined {
    const { previous, update } = input;
@@ -2521,6 +2522,7 @@ index 1e4bcd0090..dce5f77c59 100644
    return {
 -    ...makeUsageLimits({ checkedAt: input.checkedAt, windows: merged.values() }),
 -    ...(previous?.resetCredits !== undefined ? { resetCredits: previous.resetCredits } : {}),
+-    ...(previous?.zeroSpendCap ? { zeroSpendCap: true } : {}),
 +    ...makeUsageLimits({
 +      checkedAt:
 +        normalizedPrevious && Date.parse(normalizedPrevious.checkedAt) > Date.parse(input.checkedAt)
@@ -2531,6 +2533,7 @@ index 1e4bcd0090..dce5f77c59 100644
 +    ...(normalizedPrevious?.resetCredits !== undefined
 +      ? { resetCredits: normalizedPrevious.resetCredits }
 +      : {}),
++    ...(normalizedPrevious?.zeroSpendCap ? { zeroSpendCap: true } : {}),
      ...(unavailable !== undefined ? { unavailable } : {}),
    };
  }
@@ -2546,6 +2549,11 @@ index 1e4bcd0090..dce5f77c59 100644
      a.label === b.label &&
 +    a.source === b.source &&
      a.usedPercent === b.usedPercent &&
+     (a.modelIds === b.modelIds ||
+       (a.modelIds !== undefined &&
+@@ -106,26 +234,73 @@ function usageWindowEquals(a: ServerProviderUsageWindow, b: ServerProviderUsageW
+         a.providerIds.length === b.providerIds.length &&
+         a.providerIds.every((id, index) => id === b.providerIds?.[index]))) &&
      a.resetsAt === b.resetsAt &&
 +    a.resetPending === b.resetPending &&
      a.windowDurationMins === b.windowDurationMins
