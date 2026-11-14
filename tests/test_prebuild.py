@@ -156,6 +156,34 @@ class PrebuildTest(unittest.TestCase):
             self.assertFalse(customize.PREBUILT.exists())
             self.assertEqual(customize.load(customize.STATE)['build'], 'current-build')
 
+    def test_prebuilds_with_this_repo_s_patches_after_an_older_recipe_build(self):
+        # cmd_update first rebuilds an older installed nightly with the patch set of its day
+        # (use_recipe of an extracted one); the prebuild of the new nightly must use this repo's.
+        download(self.caches, self.new_release())
+        older = self.tmp / 'older-recipe'
+        seen = []
+
+        def build(args, stock):
+            seen.append((customize.RECIPE, customize.OWN_PATCHES, customize.OWN_CHECKS))
+            return self.built(args, stock)
+
+        customize.use_recipe(older)
+        try:
+            result, _ = self.run_prebuild(build)
+        finally:
+            customize.use_recipe(customize.REPO)
+        self.assertTrue(result)
+        self.assertEqual(seen, [(customize.REPO, customize.REPO / 'patches-tt', customize.REPO / 'checks-tt.json')])
+
+    def test_an_unreadable_record_does_not_break_the_background_run(self):
+        download(self.caches, self.new_release())
+        customize.PREBUILT.parent.mkdir(parents=True, exist_ok=True)
+        customize.PREBUILT.write_text('{not json')
+        result, cmd_build = self.run_prebuild(self.built)
+        self.assertFalse(result)
+        cmd_build.assert_not_called()
+        customize.notify.assert_called_once()
+
     def test_nothing_to_prebuild_without_a_download(self):
         result, cmd_build = self.run_prebuild(self.built)
         self.assertFalse(result)
