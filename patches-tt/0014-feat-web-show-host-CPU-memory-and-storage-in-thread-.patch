@@ -9,17 +9,17 @@ is a client setting toggled from the card's context menu. Extends
 server.getHostResources with optional fields; drop when pingdotgg/t3code#36693 merges.
 ---
  .../settings/DesktopClientSettings.test.ts    |   1 +
- .../resourceTelemetry/HostResources.test.ts   |  85 ++++++++++++++-
- .../src/resourceTelemetry/HostResources.ts    |  67 +++++++++++-
- .../chat/ThreadDetailsHost.browser.test.tsx   |  91 ++++++++++++++++
- .../src/components/chat/ThreadDetailsHost.tsx | 101 ++++++++++++++++++
- .../chat/ThreadDetailsItemsMenu.tsx           |   8 ++
+ .../resourceTelemetry/HostResources.test.ts   | 145 +++++++++++++++++-
+ .../src/resourceTelemetry/HostResources.ts    |  91 ++++++++++-
+ .../chat/ThreadDetailsHost.browser.test.tsx   | 112 ++++++++++++++
+ .../src/components/chat/ThreadDetailsHost.tsx | 125 +++++++++++++++
+ .../chat/ThreadDetailsItemsMenu.tsx           |   8 +
  .../components/chat/ThreadDetailsPanel.tsx    |   3 +
  .../components/chat/ThreadDetailsUsage.tsx    |   2 +-
  .../src/components/chat/threadDetailsItems.ts |   1 +
- packages/contracts/src/resourceTelemetry.ts   |   6 ++
+ packages/contracts/src/resourceTelemetry.ts   |   6 +
  packages/contracts/src/settings.ts            |   2 +
- 11 files changed, 361 insertions(+), 6 deletions(-)
+ 11 files changed, 489 insertions(+), 7 deletions(-)
  create mode 100644 apps/web/src/components/chat/ThreadDetailsHost.browser.test.tsx
  create mode 100644 apps/web/src/components/chat/ThreadDetailsHost.tsx
 
@@ -36,7 +36,7 @@ index 90c8740f83..74bf5d07af 100644
    loadBalancingEnabled: false,
    loadBalancingWeights: { "environment-1": 75, "environment-2": 0 },
 diff --git a/apps/server/src/resourceTelemetry/HostResources.test.ts b/apps/server/src/resourceTelemetry/HostResources.test.ts
-index 3e5c636c5d..9b7f2bee9f 100644
+index 3e5c636c5d..a0f81808a2 100644
 --- a/apps/server/src/resourceTelemetry/HostResources.test.ts
 +++ b/apps/server/src/resourceTelemetry/HostResources.test.ts
 @@ -1,4 +1,6 @@
@@ -46,7 +46,17 @@ index 3e5c636c5d..9b7f2bee9f 100644
  import type * as NodeOS from "node:os";
  import * as HostProcess from "@t3tools/shared/HostProcess";
  import * as Effect from "effect/Effect";
-@@ -13,7 +15,11 @@ import { vi } from "vite-plus/test";
+@@ -6,14 +8,20 @@ import * as Fiber from "effect/Fiber";
+ import * as FileSystem from "effect/FileSystem";
+ import * as Layer from "effect/Layer";
+ import * as PlatformError from "effect/PlatformError";
+-import { ChildProcessSpawner } from "effect/process";
++import { ChildProcess, ChildProcessSpawner } from "effect/process";
++import * as Sink from "effect/Sink";
++import * as Stream from "effect/Stream";
+ import * as TestClock from "effect/testing/TestClock";
+ import { vi } from "vite-plus/test";
+ 
  import * as HostResources from "./HostResources.ts";
  
  // An 8-CPU host; every cpus() call advances each CPU by 100 ms at `host.busy` utilization.
@@ -59,7 +69,7 @@ index 3e5c636c5d..9b7f2bee9f 100644
  vi.mock("node:os", async (importOriginal) => {
    const actual = await importOriginal<typeof NodeOS>();
    return {
-@@ -32,9 +38,19 @@ vi.mock("node:os", async (importOriginal) => {
+@@ -32,9 +40,19 @@ vi.mock("node:os", async (importOriginal) => {
      },
    };
  });
@@ -79,16 +89,54 @@ index 3e5c636c5d..9b7f2bee9f 100644
  };
  
  const GiB = 1024 ** 3;
-@@ -87,7 +103,7 @@ const linuxHost = (files: Record<string, ReadonlyArray<string>>) => {
+@@ -84,10 +102,45 @@ const linuxHost = (files: Record<string, ReadonlyArray<string>>) => {
+   );
+ };
+ 
++// A macOS host whose sysctl answers `counts` (stdout) and counts how often it is asked.
++const darwinHost = (counts: string, asked = { sysctl: 0 }) =>
++  HostResources.layer.pipe(
++    Layer.provide(
++      Layer.mergeAll(
++        FileSystem.layerNoop({}),
++        Layer.succeed(HostProcess.Platform, "darwin"),
++        Layer.succeed(
++          ChildProcessSpawner.ChildProcessSpawner,
++          ChildProcessSpawner.make((command) => {
++            const standard = command as ChildProcess.StandardCommand;
++            const sysctl = standard.command.endsWith("sysctl");
++            if (sysctl) asked.sysctl++;
++            return Effect.succeed(
++              ChildProcessSpawner.makeHandle({
++                pid: ChildProcessSpawner.ProcessId(1),
++                exitCode: Effect.succeed(ChildProcessSpawner.ExitCode(sysctl && counts ? 0 : 1)),
++                isRunning: Effect.succeed(false),
++                kill: () => Effect.void,
++                unref: Effect.succeed(Effect.void),
++                stdin: Sink.drain,
++                stdout: Stream.make(new TextEncoder().encode(sysctl ? counts : "")),
++                stderr: Stream.empty,
++                all: Stream.empty,
++                getInputFd: () => Sink.drain,
++                getOutputFd: () => Stream.empty,
++              }),
++            );
++          }),
++        ),
++      ),
++    ),
++  );
++
  const read = Effect.gen(function* () {
    const host = yield* HostResources.HostResources;
    const fiber = yield* Effect.forkChild(host.read);
 -  yield* TestClock.adjust("200 millis");
-+  yield* TestClock.adjust("1200 millis");
++  // In steps, so the spawned process answers before the 1 s timeout on it fires.
++  for (let step = 0; step < 12; step++) yield* TestClock.adjust("100 millis");
    return yield* Fiber.join(fiber);
  });
  
-@@ -178,6 +194,71 @@ describe("HostResources.layer", () => {
+@@ -178,6 +231,92 @@ describe("HostResources.layer", () => {
      ),
    );
  
@@ -135,6 +183,27 @@ index 3e5c636c5d..9b7f2bee9f 100644
 +    }).pipe(Effect.provide(linuxHost(unlimitedCgroup))),
 +  );
 +
++  it.effect("reports one single-thread core per CPU on a macOS host without SMT", () =>
++    Effect.gen(function* () {
++      setup(0.5);
++      const snapshot = yield* read;
++
++      assert.deepStrictEqual(snapshot.cpuCoreUtilization, Array.from({ length: 8 }, () => [0.5]));
++    }).pipe(Effect.provide(darwinHost("8\n8\n"))),
++  );
++
++  it.effect("keeps omitting cores on macOS with Hyper-Threading or unreadable sysctl", () =>
++    Effect.gen(function* () {
++      setup();
++      for (const counts of ["4\n8\n", ""]) {
++        host.reads = 0;
++        const snapshot = yield* read.pipe(Effect.provide(darwinHost(counts)));
++        assert.strictEqual(snapshot.cpuCoreUtilization, undefined);
++        assert.strictEqual(snapshot.cpuCount, 8);
++      }
++    }),
++  );
++
 +  it.effect("leaves storage out when statfs throws, and the rest of the snapshot intact", () =>
 +    Effect.gen(function* () {
 +      setup();
@@ -161,7 +230,7 @@ index 3e5c636c5d..9b7f2bee9f 100644
      Effect.gen(function* () {
        setup();
 diff --git a/apps/server/src/resourceTelemetry/HostResources.ts b/apps/server/src/resourceTelemetry/HostResources.ts
-index 85c985f5a3..d9ff943545 100644
+index 85c985f5a3..26f5b79530 100644
 --- a/apps/server/src/resourceTelemetry/HostResources.ts
 +++ b/apps/server/src/resourceTelemetry/HostResources.ts
 @@ -1,3 +1,6 @@
@@ -197,7 +266,7 @@ index 85c985f5a3..d9ff943545 100644
    }
    return cpu.count > 0 ? cpu : null;
  }
-@@ -51,7 +61,34 @@ function readCpu() {
+@@ -51,7 +61,36 @@ function readCpu() {
      }),
      { idle: 0, total: 0 },
    );
@@ -216,6 +285,7 @@ index 85c985f5a3..d9ff943545 100644
 +  previous: ReadonlyMap<number, { idle: number; total: number }>,
 +  current: ReadonlyMap<number, { idle: number; total: number }>,
 +  siblings: ReadonlyMap<number, ReadonlySet<number> | null>,
++  noSmt: boolean,
 +) {
 +  const cores = new Map<number, number[]>();
 +  for (const [id, now] of current) {
@@ -223,8 +293,9 @@ index 85c985f5a3..d9ff943545 100644
 +    if (!before) return undefined;
 +    const total = now.total - before.total;
 +    const busy = total > 0 ? Math.min(1, Math.max(0, 1 - (now.idle - before.idle) / total)) : 0;
-+    // Without sibling data (off Linux) a core count would be a guess: SMT hosts would read 16C/16T.
-+    const group = siblings.get(id);
++    // Without sibling data a core count would be a guess (SMT hosts would read 16C/16T), unless
++    // the host is known to have no SMT: then every logical CPU is its own core.
++    const group = siblings.get(id) ?? (noSmt ? new Set([id]) : null);
 +    if (!group) return undefined;
 +    const core = Math.min(id, ...group);
 +    cores.set(core, [...(cores.get(core) ?? []), busy]);
@@ -233,15 +304,30 @@ index 85c985f5a3..d9ff943545 100644
  }
  
  function darwinAvailableMemory(output: string): number | null {
-@@ -75,6 +112,7 @@ const make = Effect.fn("makeHostResources")(function* () {
+@@ -65,6 +104,12 @@ function darwinAvailableMemory(output: string): number | null {
+   return Number.isSafeInteger(available) && Number(pageSize) > 0 ? available : null;
+ }
+ 
++// `sysctl -n hw.physicalcpu hw.logicalcpu` prints one number per line; equal means no SMT.
++function darwinHasNoSmt(output: string): boolean {
++  const [physical, logical] = output.trim().split(/\s+/).map(Number);
++  return Number.isInteger(physical) && physical! > 0 && physical === logical;
++}
++
+ function cgroupNumber(text: string, pattern: RegExp): number | null {
+   const value = pattern.exec(text)?.[1];
+   return value === undefined ? null : Number(value);
+@@ -75,6 +120,9 @@ const make = Effect.fn("makeHostResources")(function* () {
    const platform = yield* HostProcess.Platform;
    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
  
 +  const siblings = new Map<number, ReadonlySet<number> | null>();
++  // macOS only, read once: physical and logical CPU counts do not change while the server runs.
++  let darwinNoSmt: boolean | undefined;
    const readFile = (path: string) => fs.readFileString(path).pipe(Effect.orElseSucceed(() => ""));
  
    const sample = Effect.fn("HostResources.sample")(function* () {
-@@ -108,6 +146,16 @@ const make = Effect.fn("makeHostResources")(function* () {
+@@ -108,6 +156,30 @@ const make = Effect.fn("makeHostResources")(function* () {
          : Effect.sync(readCpu);
  
      const previousCpu = yield* sampleCpu();
@@ -255,10 +341,24 @@ index 85c985f5a3..d9ff943545 100644
 +        siblings.set(id, parseCpuList(list.trim()));
 +      }
 +    }
++    if (platform === "darwin" && darwinNoSmt === undefined) {
++      const output = yield* spawner
++        .string(
++          ChildProcess.make("/usr/sbin/sysctl", ["-n", "hw.physicalcpu", "hw.logicalcpu"], {
++            stdin: "ignore",
++            stderr: "ignore",
++          }),
++        )
++        .pipe(
++          Effect.timeout("1 second"),
++          Effect.orElseSucceed(() => ""),
++        );
++      darwinNoSmt = darwinHasNoSmt(output);
++    }
      const previousUsage = yield* readCpuUsage();
      const startedAt = yield* Clock.currentTimeMillis;
      yield* Effect.sleep("200 millis");
-@@ -138,6 +186,15 @@ const make = Effect.fn("makeHostResources")(function* () {
+@@ -138,6 +210,15 @@ const make = Effect.fn("makeHostResources")(function* () {
        cpuUtilization = idle === null ? null : Math.min(1, Math.max(0, 1 - idle / capacity));
      }
  
@@ -274,11 +374,11 @@ index 85c985f5a3..d9ff943545 100644
      let totalMemoryBytes = NodeOS.totalmem();
      // On Windows libuv returns GlobalMemoryStatusEx.ullAvailPhys, including standby memory.
      let availableMemoryBytes = NodeOS.freemem();
-@@ -178,6 +235,10 @@ const make = Effect.fn("makeHostResources")(function* () {
+@@ -178,6 +259,10 @@ const make = Effect.fn("makeHostResources")(function* () {
        cpuCount,
        availableMemoryBytes: Math.min(totalMemoryBytes, Math.max(0, availableMemoryBytes)),
        totalMemoryBytes,
-+      cpuCoreUtilization: coreUtilization(previousCpu.perCpu, cpu.perCpu, siblings),
++      cpuCoreUtilization: coreUtilization(previousCpu.perCpu, cpu.perCpu, siblings, darwinNoSmt === true),
 +      storage: stats
 +        ? { totalBytes: stats.blocks * stats.bsize, availableBytes: stats.bavail * stats.bsize }
 +        : undefined,
@@ -287,10 +387,10 @@ index 85c985f5a3..d9ff943545 100644
  
 diff --git a/apps/web/src/components/chat/ThreadDetailsHost.browser.test.tsx b/apps/web/src/components/chat/ThreadDetailsHost.browser.test.tsx
 new file mode 100644
-index 0000000000..26ff558ffb
+index 0000000000..04503c7560
 --- /dev/null
 +++ b/apps/web/src/components/chat/ThreadDetailsHost.browser.test.tsx
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,112 @@
 +import { EnvironmentId } from "@t3tools/contracts";
 +import { AsyncResult, Atom } from "effect/reactivity";
 +import { expect, it, vi } from "vite-plus/test";
@@ -340,12 +440,33 @@ index 0000000000..26ff558ffb
 +  await expect.element(page.getByText("Core 1")).not.toBeInTheDocument();
 +});
 +
++it("hovering the CPU row lists every core's threads even with the breakdown off", async () => {
++  state.cores = true;
++  await updateClientSettings({ threadDetailsHostCores: false });
++  await using _screen = await render(<ThreadDetailsHost environmentId={environmentId} />);
++  await page.getByLabelText("CPU 3C/5T: 37%").hover();
++  await expect.element(page.getByText("3 cores · 5 threads")).toBeVisible();
++  await expect.element(page.getByText("92 · 14%")).toBeVisible();
++  await expect.element(page.getByText("5%", { exact: true })).toBeVisible();
++});
++
 +it("counts only threads, never cores, when the host sends no core data", async () => {
 +  state.cores = false;
 +  await updateClientSettings({ threadDetailsHostCores: true });
 +  await using _screen = await render(<ThreadDetailsHost environmentId={environmentId} />);
 +  await expect.element(page.getByLabelText("CPU 5T: 37%")).toBeVisible();
 +  await expect.element(page.getByText("Core 1")).not.toBeInTheDocument();
++  await expect.element(page.getByText("Per-core load not available on this host")).toBeVisible();
++});
++
++it("shows no unavailable note when cores exist or the breakdown is off", async () => {
++  state.cores = true;
++  await updateClientSettings({ threadDetailsHostCores: true });
++  await using _screen = await render(<ThreadDetailsHost environmentId={environmentId} />);
++  await expect.element(page.getByLabelText("CPU 3C/5T: 37%")).toBeVisible();
++  await expect
++    .element(page.getByText("Per-core load not available on this host"))
++    .not.toBeInTheDocument();
 +});
 +
 +it("disables the core breakdown toggle while Host load is hidden", async () => {
@@ -384,10 +505,10 @@ index 0000000000..26ff558ffb
 +});
 diff --git a/apps/web/src/components/chat/ThreadDetailsHost.tsx b/apps/web/src/components/chat/ThreadDetailsHost.tsx
 new file mode 100644
-index 0000000000..023fd9b01d
+index 0000000000..1aa4c665ab
 --- /dev/null
 +++ b/apps/web/src/components/chat/ThreadDetailsHost.tsx
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,125 @@
 +import type { EnvironmentId } from "@t3tools/contracts";
 +import { useEffect } from "react";
 +
@@ -400,6 +521,11 @@ index 0000000000..023fd9b01d
 +
 +const HOST_REFRESH_MS = 5_000;
 +const percent = (share: number) => Math.round(share * 100);
++// One core's thread loads, shared by the inline rows and the CPU tooltip.
++const coreLoad = (core: ReadonlyArray<number>) => {
++  const busy = core.map(percent);
++  return { busy, text: `${busy.join(" · ")}%` };
++};
 +const toneOf = (used: number) => (used >= 90 ? "error" : used >= 80 ? "warning" : null);
 +
 +/** CPU, memory and storage of the host this thread's environment runs on. */
@@ -440,14 +566,28 @@ index 0000000000..023fd9b01d
 +          tone={cpu === null ? null : toneOf(cpu)}
 +          value={cpu === null ? "n/a" : `${cpu}%`}
 +          tooltip={
-+            <span className="text-foreground">
-+              {cores ? `${cores.length} cores, ${threads} threads` : `${threads} threads`}
-+            </span>
++            cores ? (
++              <span className="block text-foreground">
++                <span className="block">
++                  {cores.length} cores · {threads} threads
++                </span>
++                {cores.map((core, index) => (
++                  // Index is the core's position in the server's order, which does not change.
++                  // oxlint-disable-next-line react/no-array-index-key
++                  <span key={index} className="flex justify-between gap-3 font-mono tabular-nums">
++                    <span>Core {index + 1}</span>
++                    <span>{coreLoad(core).text}</span>
++                  </span>
++                ))}
++              </span>
++            ) : (
++              <span className="text-foreground">{threads} threads</span>
++            )
 +          }
 +        />
 +        {breakdown
 +          ? cores?.map((core, index) => {
-+              const busy = core.map(percent);
++              const { busy, text } = coreLoad(core);
 +              const label = `Core ${index + 1}`;
 +              return (
 +                <UsageRow
@@ -457,7 +597,7 @@ index 0000000000..023fd9b01d
 +                  fill={Math.max(...busy)}
 +                  tone={toneOf(Math.max(...busy))}
 +                  muted
-+                  value={`${busy.join(" · ")}%`}
++                  value={text}
 +                  tooltip={
 +                    <span className="text-foreground">
 +                      {core.length > 1 ? `Threads: ${busy.join("%, ")}%` : `${busy[0]}% busy`}
@@ -467,6 +607,11 @@ index 0000000000..023fd9b01d
 +              );
 +            })
 +          : null}
++        {breakdown && !cores ? (
++          <p className="col-span-3 text-muted-foreground">
++            Per-core load not available on this host
++          </p>
++        ) : null}
 +        <UsageRow
 +          label="Memory"
 +          fill={memory}
