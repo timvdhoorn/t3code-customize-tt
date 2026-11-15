@@ -15,6 +15,7 @@ What is live, what is in progress and what is open. Finished work leaves this pa
 - Build the Mac overlay before install-on-quit, so the first launch after an update opens the customized build (worker PR, not opened yet); see [Macs](machines/macs.md).
 - Worker popover on hover with a model line per agent (`patches-tt/0002`): PR open, not merged; see [docs/fork-changes.md](../docs/fork-changes.md).
 - Host load in thread details with a core breakdown toggle (`patches-tt/0014`): PR open, not merged; drop when pingdotgg/t3code#36693 merges; see [docs/fork-changes.md](../docs/fork-changes.md).
+- One-column picker, effort bar and row timer (`patches-tt/0015`, desktop and web): PR open, not merged; replaces the Macs' `claude` theme CSS once live; see [docs/fork-changes.md](../docs/fork-changes.md).
 
 ## Open
 - MacBook Pro: 4580 with patches; installs 4682 when T3 Code quits.
