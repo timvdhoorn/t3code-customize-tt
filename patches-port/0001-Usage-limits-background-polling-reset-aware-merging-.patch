@@ -27,10 +27,10 @@ Subject: [PATCH 1/2] Usage limits: background polling, reset-aware merging and
  19 files changed, 1839 insertions(+), 102 deletions(-)
 
 diff --git a/apps/server/src/provider/CodexProvider.ts b/apps/server/src/provider/CodexProvider.ts
-index df105d3ba2..7112174a5b 100644
+index 7dcf9079f8..48548c0f93 100644
 --- a/apps/server/src/provider/CodexProvider.ts
 +++ b/apps/server/src/provider/CodexProvider.ts
-@@ -60,6 +60,7 @@ const isCodexAppServerSpawnError = Schema.is(CodexErrors.CodexAppServerSpawnErro
+@@ -62,6 +62,7 @@ const isCodexAppServerSpawnError = Schema.is(CodexErrors.CodexAppServerSpawnErro
  
  type CodexRateLimitsProbe =
    | {
@@ -38,7 +38,7 @@ index df105d3ba2..7112174a5b 100644
        readonly snapshot: CodexRateLimitSnapshot;
        readonly rateLimitsByLimitId?:
          | Readonly<Record<string, CodexRateLimitSnapshot>>
-@@ -684,15 +685,20 @@ const readCodexRateLimits = (
+@@ -686,15 +687,20 @@ const readCodexRateLimits = (
    deadlineMs: number,
  ) =>
    withCodexDiscoveryDeadline(client.request("account/rateLimits/read", null), deadlineMs).pipe(
@@ -68,7 +68,7 @@ index df105d3ba2..7112174a5b 100644
      ),
      Effect.catch((error) =>
        Effect.logDebug("Codex rate-limit read failed.", { cause: error }).pipe(
-@@ -1059,7 +1065,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
+@@ -1107,7 +1113,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
              snapshot: snapshot.rateLimits.snapshot,
              rateLimitsByLimitId: snapshot.rateLimits.rateLimitsByLimitId,
              resetCredits: snapshot.rateLimits.resetCredits,
@@ -116,7 +116,7 @@ index d75b1cad86..46d2bc21fd 100644
          resolveMaintenance().pipe(
            Effect.flatMap((maintenanceCapabilities) =>
 diff --git a/apps/server/src/provider/Drivers/CodexDriver.ts b/apps/server/src/provider/Drivers/CodexDriver.ts
-index f8a753169b..18dacf1d4c 100644
+index 03245ba46d..667017de55 100644
 --- a/apps/server/src/provider/Drivers/CodexDriver.ts
 +++ b/apps/server/src/provider/Drivers/CodexDriver.ts
 @@ -1,5 +1,9 @@
@@ -168,7 +168,7 @@ index f8a753169b..18dacf1d4c 100644
          resolveMaintenance().pipe(
            Effect.flatMap((maintenanceCapabilities) =>
 diff --git a/apps/server/src/provider/ProviderRegistry.test.ts b/apps/server/src/provider/ProviderRegistry.test.ts
-index 564a90f40e..767a849968 100644
+index c42d78b237..6372f0ad9d 100644
 --- a/apps/server/src/provider/ProviderRegistry.test.ts
 +++ b/apps/server/src/provider/ProviderRegistry.test.ts
 @@ -525,7 +525,11 @@ it.layer(
@@ -1359,10 +1359,10 @@ index ba1263ef70..98e4c9b55b 100644
 +    : undefined;
 +}
 diff --git a/apps/server/src/provider/codexUsageLimits.test.ts b/apps/server/src/provider/codexUsageLimits.test.ts
-index b560aba5d3..5c2c893a15 100644
+index 3a5cae4a9d..24a051e9e8 100644
 --- a/apps/server/src/provider/codexUsageLimits.test.ts
 +++ b/apps/server/src/provider/codexUsageLimits.test.ts
-@@ -21,15 +21,13 @@ describe("codexRateLimitsToLimits", () => {
+@@ -24,15 +24,13 @@ describe("codexRateLimitsToLimits", () => {
        secondary: null,
        individualLimit: { remainingPercent: 99, resetsAt: 1_784_500_000 },
      };
@@ -1385,7 +1385,7 @@ index b560aba5d3..5c2c893a15 100644
  
      expect(
        codexRateLimitsToLimits({
-@@ -37,8 +35,10 @@ describe("codexRateLimitsToLimits", () => {
+@@ -40,8 +38,10 @@ describe("codexRateLimitsToLimits", () => {
          snapshot: { limitId: "spark" },
          rateLimitsByLimitId: { codex: snapshot },
        }),
@@ -1398,7 +1398,7 @@ index b560aba5d3..5c2c893a15 100644
    });
  
    it("keeps a seat-based workspace with a zero credit cap usable while its plan windows have room", () => {
-@@ -81,8 +81,8 @@ describe("codexRateLimitsToLimits", () => {
+@@ -84,8 +84,8 @@ describe("codexRateLimitsToLimits", () => {
          checkedAt,
          snapshot: {
            planType: "plus",
@@ -1409,7 +1409,7 @@ index b560aba5d3..5c2c893a15 100644
          },
        }),
      ).toEqual({
-@@ -92,17 +92,19 @@ describe("codexRateLimitsToLimits", () => {
+@@ -95,17 +95,19 @@ describe("codexRateLimitsToLimits", () => {
            id: "primary",
            kind: "session",
            label: "Session",
@@ -1431,7 +1431,7 @@ index b560aba5d3..5c2c893a15 100644
          },
        ],
      });
-@@ -119,6 +121,7 @@ describe("codexRateLimitsToLimits", () => {
+@@ -122,6 +124,7 @@ describe("codexRateLimitsToLimits", () => {
          id: "primary",
          kind: "monthly",
          label: "Monthly",
@@ -1439,7 +1439,7 @@ index b560aba5d3..5c2c893a15 100644
          usedPercent: 80,
          windowDurationMins: 43_200,
        },
-@@ -146,6 +149,7 @@ describe("codexRateLimitsToLimits", () => {
+@@ -149,6 +152,7 @@ describe("codexRateLimitsToLimits", () => {
          id: "secondary",
          kind: "weekly",
          label: "Weekly",
@@ -1447,7 +1447,7 @@ index b560aba5d3..5c2c893a15 100644
          usedPercent: 42,
          windowDurationMins: 10080,
        },
-@@ -198,6 +202,7 @@ describe("codexRateLimitsToUpdate", () => {
+@@ -201,6 +205,7 @@ describe("codexRateLimitsToUpdate", () => {
            id: "secondary",
            kind: "weekly",
            label: "Weekly",
@@ -1455,7 +1455,7 @@ index b560aba5d3..5c2c893a15 100644
            usedPercent: 51,
            windowDurationMins: 10080,
          },
-@@ -225,6 +230,7 @@ describe("codexRateLimitsToUpdate", () => {
+@@ -228,6 +233,7 @@ describe("codexRateLimitsToUpdate", () => {
          id: "secondary",
          kind: "weekly",
          label: "Weekly",
@@ -1463,7 +1463,7 @@ index b560aba5d3..5c2c893a15 100644
          usedPercent: 42,
          windowDurationMins: 10080,
        },
-@@ -262,6 +268,7 @@ describe("mergeCodexRateLimits", () => {
+@@ -265,6 +271,7 @@ describe("mergeCodexRateLimits", () => {
            id: "primary",
            kind: "session",
            label: "Session",
@@ -1471,7 +1471,7 @@ index b560aba5d3..5c2c893a15 100644
            usedPercent: 12,
            windowDurationMins: 300,
          },
-@@ -269,6 +276,7 @@ describe("mergeCodexRateLimits", () => {
+@@ -272,6 +279,7 @@ describe("mergeCodexRateLimits", () => {
            id: "individual",
            kind: "monthly",
            label: "Monthly credit limit",
@@ -1480,7 +1480,7 @@ index b560aba5d3..5c2c893a15 100644
            resetsAt: "2026-08-17T20:53:20.000Z",
          },
 diff --git a/apps/server/src/provider/codexUsageLimits.ts b/apps/server/src/provider/codexUsageLimits.ts
-index d4f9c62111..ac65395da2 100644
+index 5268523320..3dee33a461 100644
 --- a/apps/server/src/provider/codexUsageLimits.ts
 +++ b/apps/server/src/provider/codexUsageLimits.ts
 @@ -59,6 +59,7 @@ function labelForKind(kind: ServerProviderUsageWindow["kind"]): string {
@@ -1543,10 +1543,10 @@ index d4f9c62111..ac65395da2 100644
    return windows.reduce<string | null>(
      (latest, window) =>
 diff --git a/apps/server/src/usage/cliproxyApi.ts b/apps/server/src/usage/cliproxyApi.ts
-index 030983f50e..eb24dba974 100644
+index 537a2b436f..91b6bca6ed 100644
 --- a/apps/server/src/usage/cliproxyApi.ts
 +++ b/apps/server/src/usage/cliproxyApi.ts
-@@ -334,6 +334,7 @@ const HUB_PROVIDERS = new Map<string, HubProvider>([
+@@ -335,6 +335,7 @@ const HUB_PROVIDERS = new Map<string, HubProvider>([
            plan: "Claude Subscription",
            usageLimits: claudeUsageResponseToLimits({
              checkedAt,
