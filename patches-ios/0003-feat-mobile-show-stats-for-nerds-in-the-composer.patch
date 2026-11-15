@@ -23,14 +23,14 @@ thread compacts automatically comes from the provider thread.
  apps/mobile/src/state/composer-cache-usage.ts |  55 ++
  apps/mobile/src/state/use-composer-stats.ts   |  66 ++
  .../src/state/use-thread-composer-state.ts    |  34 +
- apps/web/src/lib/contextWindow.test.ts        |  56 +-
+ apps/web/src/lib/contextWindow.test.ts        |  60 +-
  apps/web/src/lib/contextWindow.ts             |  16 +-
  packages/client-runtime/package.json          |   4 +
  .../src/state/composerStats.test.ts           | 595 +++++++++++++++++
  .../client-runtime/src/state/composerStats.ts | 401 ++++++++++++
  .../src/state/contextWindow.test.ts           |  18 +-
  .../client-runtime/src/state/contextWindow.ts |  31 +-
- 21 files changed, 2300 insertions(+), 28 deletions(-)
+ 21 files changed, 2307 insertions(+), 25 deletions(-)
  create mode 100644 apps/mobile/src/features/threads/ComposerStats.tsx
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.test.ts
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.ts
@@ -727,10 +727,10 @@ index 201204a8a5..7eb84608cb 100644
          onSendMessage={handleStart}
          offersSideChat={false}
 diff --git a/apps/mobile/src/features/threads/ThreadComposer.tsx b/apps/mobile/src/features/threads/ThreadComposer.tsx
-index 3b1b927ef8..097e733712 100644
+index ce4e4b7fb0..f6d4cbee4f 100644
 --- a/apps/mobile/src/features/threads/ThreadComposer.tsx
 +++ b/apps/mobile/src/features/threads/ThreadComposer.tsx
-@@ -220,6 +220,8 @@ export interface ThreadComposerProps {
+@@ -234,6 +234,8 @@ export interface ThreadComposerProps {
    /** Arms a fresh session for the next message; absent where `/clear` is unavailable. */
    readonly onFreshSession?: () => void;
    readonly offersSideChat?: boolean;
@@ -739,7 +739,7 @@ index 3b1b927ef8..097e733712 100644
    readonly serverConfig: T3ServerConfig | null;
    readonly queueCount: number;
    readonly activeThreadBusy: boolean;
-@@ -1207,6 +1209,7 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
+@@ -1258,6 +1260,7 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
              This connection cannot control this task. You can still edit your draft.
            </Text>
          ) : null}
@@ -748,11 +748,11 @@ index 3b1b927ef8..097e733712 100644
  
        <VideoPreviewModal source={previewVideo} onRequestClose={closePreview} />
 diff --git a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
-index 5e4e90e0b6..7fd0ba5ad7 100644
+index 3e905bd220..3175d58737 100644
 --- a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
 +++ b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
-@@ -200,6 +200,9 @@ import {
-   ThreadComposer,
+@@ -202,6 +202,9 @@ import {
+   type ThreadComposerProps,
  } from "./ThreadComposer";
  import { ComposerPopoverHost } from "./ComposerPopoverHost";
 +import { composerCompactDisabledReason } from "@t3tools/client-runtime/state/composer-stats";
@@ -761,7 +761,7 @@ index 5e4e90e0b6..7fd0ba5ad7 100644
  import { ThreadFeed, type ThreadFeedHistoryControls } from "./ThreadFeed";
  import { WorkspaceMutationIdProvider } from "./WorkspaceMutationIdProvider";
  import { useThreadTurnSubagents } from "./ThreadAgentsSheet";
-@@ -310,6 +313,8 @@ export interface ThreadDetailScreenProps {
+@@ -307,6 +310,8 @@ export interface ThreadDetailScreenProps {
      ) => Promise<boolean | "responded">,
      onWillEnqueue?: () => void,
    ) => Promise<MessageId | null>;
@@ -770,7 +770,7 @@ index 5e4e90e0b6..7fd0ba5ad7 100644
    readonly onReconnectEnvironment: () => void;
    readonly canSwitchThreadProvider: boolean;
    readonly onRespondToApproval: ApprovalResponder;
-@@ -967,10 +972,16 @@ function ThreadDetailBody(
+@@ -945,10 +950,16 @@ function ThreadDetailBody(
      ) ||
      (props.historyControls?.hasMoreHistory === true &&
        props.selectedThread.latestUserMessageAt !== null);
@@ -787,7 +787,7 @@ index 5e4e90e0b6..7fd0ba5ad7 100644
        composerBottomInset;
    // The last collapse toggle; it only applies to the request it was made on.
    const [userInputToggle, setUserInputToggle] = useState<{
-@@ -1906,6 +1917,32 @@ function ThreadDetailBody(
+@@ -1871,6 +1882,32 @@ function ThreadDetailBody(
                            props.activePendingApproval === null &&
                            props.activePendingUserInput === null
                          }
@@ -821,10 +821,10 @@ index 5e4e90e0b6..7fd0ba5ad7 100644
                          queueCount={props.selectedThreadQueueCount}
                          activeThreadBusy={props.activeThreadBusy}
 diff --git a/apps/mobile/src/features/threads/ThreadRouteScreen.tsx b/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
-index 0bed5a25f0..1bd79c1142 100644
+index b60991731e..43c719dcb2 100644
 --- a/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
 +++ b/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
-@@ -1078,6 +1078,7 @@ function ThreadRouteContent(
+@@ -1097,6 +1097,7 @@ function ThreadRouteContent(
            onResumeQueue={composer.canResume ? handleResumeQueue : null}
            onSendMessage={composer.onSendMessage}
            offersSideChat={composer.sideChatUnavailableReason === null}
@@ -1227,10 +1227,10 @@ index f6f928a15f..ed95f5f142 100644
      mocks.setPreferencesJson(JSON.stringify({ baseFontSize: 15 }), 10);
      await mocks.setItemAsync(
 diff --git a/apps/mobile/src/persistence/mobile-preferences.ts b/apps/mobile/src/persistence/mobile-preferences.ts
-index f29fbc8c11..2ab6b05fa7 100644
+index 7a26fc2b8d..378da9e379 100644
 --- a/apps/mobile/src/persistence/mobile-preferences.ts
 +++ b/apps/mobile/src/persistence/mobile-preferences.ts
-@@ -122,6 +122,8 @@ export interface Preferences {
+@@ -131,6 +131,8 @@ export interface Preferences {
    readonly workingShelfEnabled?: boolean;
    readonly useLastProjectForNewThreads?: boolean;
    readonly lastThreadProject?: typeof ThreadProject.Type;
@@ -1239,7 +1239,7 @@ index f29fbc8c11..2ab6b05fa7 100644
    readonly modelFavorites?: ReadonlyArray<{
      readonly provider: ProviderInstanceId;
      readonly model: string;
-@@ -208,6 +210,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
+@@ -218,6 +220,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
      workingShelfEnabled?: boolean;
      useLastProjectForNewThreads?: boolean;
      lastThreadProject?: typeof ThreadProject.Type;
@@ -1247,7 +1247,7 @@ index f29fbc8c11..2ab6b05fa7 100644
      modelFavorites?: Preferences["modelFavorites"];
      threadListSettledShelfExpanded?: boolean;
      threadListSnoozedShelfExpanded?: boolean;
-@@ -337,6 +340,9 @@ function sanitizePreferences(parsed: Preferences): Preferences {
+@@ -351,6 +354,9 @@ function sanitizePreferences(parsed: Preferences): Preferences {
    if (isThreadProject(parsed.lastThreadProject)) {
      preferences.lastThreadProject = parsed.lastThreadProject;
    }
@@ -1391,7 +1391,7 @@ index 0000000000..3cc2cb612f
 +  }, [enabled, projection, environmentId, serverConfig, instanceId]);
 +}
 diff --git a/apps/mobile/src/state/use-thread-composer-state.ts b/apps/mobile/src/state/use-thread-composer-state.ts
-index a3a191d54c..0e8c2caa44 100644
+index 3eb19861d9..14b18056ee 100644
 --- a/apps/mobile/src/state/use-thread-composer-state.ts
 +++ b/apps/mobile/src/state/use-thread-composer-state.ts
 @@ -869,6 +869,39 @@ export function useThreadComposerState(input: {
@@ -1443,34 +1443,23 @@ index a3a191d54c..0e8c2caa44 100644
    };
  }
 diff --git a/apps/web/src/lib/contextWindow.test.ts b/apps/web/src/lib/contextWindow.test.ts
-index f3540d3738..afeab1444b 100644
+index 91cdf18682..9cba6cd468 100644
 --- a/apps/web/src/lib/contextWindow.test.ts
 +++ b/apps/web/src/lib/contextWindow.test.ts
-@@ -21,7 +21,7 @@ const decodeTokenUsage = Schema.decodeSync(OrchestrationV2ProviderTurnTokenUsage
+@@ -47,9 +47,28 @@ const compactionEntry = (providerThreadId: string | null) =>
  
  describe("V2 context window presentation", () => {
    it("uses retained compaction token data when available", () => {
--    const snapshot = deriveLatestContextWindowSnapshot([
+-    const snapshot = deriveLatestContextWindowSnapshot([compactionEntry(null)]);
++    const base = compactionEntry(null).item;
 +    const entries = [
-       {
-         item: {
-           id: "compaction-1" as never,
-@@ -35,8 +35,8 @@ describe("V2 context window presentation", () => {
-           ordinal: 1,
-           status: "completed",
-           title: null,
--          startedAt: null,
--          completedAt: null,
++      {
++        item: {
++          ...base,
 +          startedAt: DateTime.makeUnsafe("2026-06-19T23:59:00.000Z"),
 +          completedAt: DateTime.makeUnsafe("2026-06-20T00:00:00.000Z"),
-           updatedAt: DateTime.makeUnsafe("2026-06-20T00:00:00.000Z"),
-           type: "compaction",
-           driver: null,
-@@ -44,9 +44,19 @@ describe("V2 context window presentation", () => {
-           afterTokenCount: 2_000,
-         },
-       },
--    ]);
++        },
++      },
 +    ] as const;
 +    const snapshot = deriveLatestContextWindowSnapshot(entries);
 +    expect(snapshot?.updatedAt).toBe("2026-06-20T00:00:00.000Z");
@@ -1486,9 +1475,9 @@ index f3540d3738..afeab1444b 100644
 +    expect(snapshot?.totalProcessedTokens).toBeNull();
 +    expect(snapshot?.compactsAutomatically).toBeNull();
    });
- });
  
-@@ -207,3 +217,39 @@ describe("latestProviderTurnTokenUsage", () => {
+   it("ignores a retired provider thread's compaction after a provider switch", () => {
+@@ -263,3 +282,40 @@ describe("latestProviderTurnTokenUsage", () => {
      }
    });
  });
@@ -1503,6 +1492,7 @@ index f3540d3738..afeab1444b 100644
 +        updatedAt: "2026-10-10T12:00:00.000Z",
 +      },
 +      {
++        id: ProviderThreadId.make("provider-thread"),
 +        contextUsage: {
 +          usedTokens: 300_000,
 +          autoCompactThreshold: 400_000,
@@ -1550,7 +1540,7 @@ index 1cf3eee799..b4e8bb5647 100644
 -}
 +export * from "@t3tools/client-runtime/state/context-window";
 diff --git a/packages/client-runtime/package.json b/packages/client-runtime/package.json
-index 960d5e11ae..f961d211a8 100644
+index 85d0c6e073..f93ddd735b 100644
 --- a/packages/client-runtime/package.json
 +++ b/packages/client-runtime/package.json
 @@ -159,6 +159,10 @@
@@ -2606,10 +2596,10 @@ index 994d3d62a2..daa9c29c1c 100644
 +  });
 +});
 diff --git a/packages/client-runtime/src/state/contextWindow.ts b/packages/client-runtime/src/state/contextWindow.ts
-index 94be1e481a..c422647928 100644
+index a8f7e0f88c..569532d404 100644
 --- a/packages/client-runtime/src/state/contextWindow.ts
 +++ b/packages/client-runtime/src/state/contextWindow.ts
-@@ -105,8 +105,11 @@ export function deriveLatestContextWindowSnapshot(
+@@ -109,8 +109,11 @@ export function deriveLatestContextWindowSnapshot(
        lastReasoningOutputTokens: null,
        toolUses: null,
        durationMs: null,
@@ -2623,7 +2613,7 @@ index 94be1e481a..c422647928 100644
        cost: null,
        updatedAt: liveUsage.updatedAt,
      };
-@@ -148,7 +151,7 @@ export function deriveLatestContextWindowSnapshot(
+@@ -152,7 +155,7 @@ export function deriveLatestContextWindowSnapshot(
    }
    for (let index = entries.length - 1; index >= 0; index -= 1) {
      const entry = entries[index];
@@ -2632,7 +2622,7 @@ index 94be1e481a..c422647928 100644
        continue;
      }
      const payload = entry.item;
-@@ -166,7 +169,7 @@ export function deriveLatestContextWindowSnapshot(
+@@ -178,7 +181,7 @@ export function deriveLatestContextWindowSnapshot(
  
      return {
        usedTokens,
@@ -2641,7 +2631,7 @@ index 94be1e481a..c422647928 100644
        maxTokens,
        remainingTokens,
        usedPercentage,
-@@ -182,10 +185,10 @@ export function deriveLatestContextWindowSnapshot(
+@@ -194,10 +197,10 @@ export function deriveLatestContextWindowSnapshot(
        lastReasoningOutputTokens: null,
        toolUses: null,
        durationMs: null,
@@ -2654,7 +2644,7 @@ index 94be1e481a..c422647928 100644
      };
    }
  
-@@ -318,3 +321,19 @@ export function compactBeforeSendTokens(input: {
+@@ -330,3 +333,19 @@ export function compactBeforeSendTokens(input: {
      ? contextWindow.usedTokens
      : null;
  }

@@ -6,7 +6,7 @@
 What is live, what is in progress and what is open. Finished work leaves this page; its facts live on the owning page.
 
 ## Live
-- Patches ported to nightly 0.1.10-nightly.20261114.4682 on `main` (#107); see [Current port](porting/current-port.md).
+- Patches ported to nightly 0.1.10-nightly.20261115.4736 on `main`; see [Current port](porting/current-port.md).
 - Server build checks the `skip-shared.json` markers (`9a590e0`); see [devbox1](machines/devbox1.md).
 - MacBook Air: 4682 with the patches.
 
