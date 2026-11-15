@@ -1,0 +1,600 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t3code-customize <t3code-customize@localhost>
+Date: Sun, 15 Nov 2026 21:31:33 +0100
+Subject: [PATCH 14/14] feat(web): show host CPU, memory and storage in thread
+ details
+
+CPU groups hardware threads under their physical core; the core breakdown
+is a client setting toggled from the card's context menu. Extends
+server.getHostResources with optional fields; drop when pingdotgg/t3code#36693 merges.
+---
+ .../settings/DesktopClientSettings.test.ts    |   1 +
+ .../resourceTelemetry/HostResources.test.ts   |  85 ++++++++++++++-
+ .../src/resourceTelemetry/HostResources.ts    |  67 +++++++++++-
+ .../chat/ThreadDetailsHost.browser.test.tsx   |  91 ++++++++++++++++
+ .../src/components/chat/ThreadDetailsHost.tsx | 101 ++++++++++++++++++
+ .../chat/ThreadDetailsItemsMenu.tsx           |   8 ++
+ .../components/chat/ThreadDetailsPanel.tsx    |   3 +
+ .../components/chat/ThreadDetailsUsage.tsx    |   2 +-
+ .../src/components/chat/threadDetailsItems.ts |   1 +
+ packages/contracts/src/resourceTelemetry.ts   |   6 ++
+ packages/contracts/src/settings.ts            |   2 +
+ 11 files changed, 361 insertions(+), 6 deletions(-)
+ create mode 100644 apps/web/src/components/chat/ThreadDetailsHost.browser.test.tsx
+ create mode 100644 apps/web/src/components/chat/ThreadDetailsHost.tsx
+
+diff --git a/apps/desktop/src/settings/DesktopClientSettings.test.ts b/apps/desktop/src/settings/DesktopClientSettings.test.ts
+index 90c8740f83..74bf5d07af 100644
+--- a/apps/desktop/src/settings/DesktopClientSettings.test.ts
++++ b/apps/desktop/src/settings/DesktopClientSettings.test.ts
+@@ -65,6 +65,7 @@ const clientSettings: ClientSettings = {
+   boringSidebarMultilineRows: false,
+   threadDetailsUsageEnabled: false,
+   threadDetailsItems: {},
++  threadDetailsHostCores: false,
+   sidebarWorkingShelfEnabled: false,
+   loadBalancingEnabled: false,
+   loadBalancingWeights: { "environment-1": 75, "environment-2": 0 },
+diff --git a/apps/server/src/resourceTelemetry/HostResources.test.ts b/apps/server/src/resourceTelemetry/HostResources.test.ts
+index 3e5c636c5d..9b7f2bee9f 100644
+--- a/apps/server/src/resourceTelemetry/HostResources.test.ts
++++ b/apps/server/src/resourceTelemetry/HostResources.test.ts
+@@ -1,4 +1,6 @@
++// @effect-diagnostics nodeBuiltinImport:off
+ import { assert, describe, it } from "@effect/vitest";
++import type * as NodeFSP from "node:fs/promises";
+ import type * as NodeOS from "node:os";
+ import * as HostProcess from "@t3tools/shared/HostProcess";
+ import * as Effect from "effect/Effect";
+@@ -13,7 +15,11 @@ import { vi } from "vite-plus/test";
+ import * as HostResources from "./HostResources.ts";
+ 
+ // An 8-CPU host; every cpus() call advances each CPU by 100 ms at `host.busy` utilization.
+-const host = vi.hoisted(() => ({ busy: 0, reads: 0 }));
++const host = vi.hoisted(() => ({
++  busy: 0,
++  reads: 0,
++  statfs: "ok" as "ok" | "throw" | "hang",
++}));
+ vi.mock("node:os", async (importOriginal) => {
+   const actual = await importOriginal<typeof NodeOS>();
+   return {
+@@ -32,9 +38,19 @@ vi.mock("node:os", async (importOriginal) => {
+     },
+   };
+ });
++vi.mock("node:fs/promises", async (importOriginal) => ({
++  ...(await importOriginal<typeof NodeFSP>()),
++  statfs: () => {
++    if (host.statfs === "throw") throw new Error("statfs failed");
++    return host.statfs === "hang"
++      ? new Promise<never>(() => {})
++      : Promise.resolve({ blocks: 1000, bsize: 1024, bavail: 250 });
++  },
++}));
+ const setup = (busy = 0) => {
+   host.busy = busy;
+   host.reads = 0;
++  host.statfs = "ok";
+ };
+ 
+ const GiB = 1024 ** 3;
+@@ -87,7 +103,7 @@ const linuxHost = (files: Record<string, ReadonlyArray<string>>) => {
+ const read = Effect.gen(function* () {
+   const host = yield* HostResources.HostResources;
+   const fiber = yield* Effect.forkChild(host.read);
+-  yield* TestClock.adjust("200 millis");
++  yield* TestClock.adjust("1200 millis");
+   return yield* Fiber.join(fiber);
+ });
+ 
+@@ -178,6 +194,71 @@ describe("HostResources.layer", () => {
+     ),
+   );
+ 
++  it.effect("groups per-CPU load by physical core and reports the volume", () =>
++    Effect.gen(function* () {
++      setup();
++      const snapshot = yield* read;
++
++      // CPUs 0 and 2 are siblings (as on an SMT host where cpuN pairs with cpuN+8, not N+1).
++      assert.deepStrictEqual(snapshot.cpuCoreUtilization, [[1, 0], [0]]);
++      assert.deepStrictEqual(snapshot.storage, {
++        totalBytes: 1000 * 1024,
++        availableBytes: 250 * 1024,
++      });
++    }).pipe(
++      Effect.provide(
++        linuxHost({
++          ...unlimitedCgroup,
++          "/proc/self/status": ["Cpus_allowed_list:\t0-2\n"],
++          "/proc/stat": [0, 100].map((elapsed) =>
++            [0, 1, 2]
++              .map((id) =>
++                id === 0
++                  ? `cpu${id} ${elapsed} 0 0 0 0 0 0 0`
++                  : `cpu${id} 0 0 0 ${elapsed} 0 0 0 0`,
++              )
++              .join("\n"),
++          ),
++          "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list": ["0,2\n"],
++          "/sys/devices/system/cpu/cpu2/topology/thread_siblings_list": ["0,2\n"],
++          "/sys/devices/system/cpu/cpu1/topology/thread_siblings_list": ["1\n"],
++        }),
++      ),
++    ),
++  );
++
++  it.effect("reports no cores without sibling data, so SMT hosts never read as 16C/16T", () =>
++    Effect.gen(function* () {
++      setup();
++      const snapshot = yield* read;
++
++      assert.strictEqual(snapshot.cpuCoreUtilization, undefined);
++      assert.strictEqual(snapshot.cpuCount, 8);
++    }).pipe(Effect.provide(linuxHost(unlimitedCgroup))),
++  );
++
++  it.effect("leaves storage out when statfs throws, and the rest of the snapshot intact", () =>
++    Effect.gen(function* () {
++      setup();
++      host.statfs = "throw";
++      const snapshot = yield* read;
++
++      assert.strictEqual(snapshot.storage, undefined);
++      assert.strictEqual(snapshot.totalMemoryBytes, 4 * GiB);
++    }).pipe(Effect.provide(linuxHost(unlimitedCgroup))),
++  );
++
++  it.effect("gives up on a hanging statfs after a second", () =>
++    Effect.gen(function* () {
++      setup();
++      host.statfs = "hang";
++      const snapshot = yield* read;
++
++      assert.strictEqual(snapshot.storage, undefined);
++      assert.strictEqual(snapshot.cpuCount, 8);
++    }).pipe(Effect.provide(linuxHost(unlimitedCgroup))),
++  );
++
+   it.effect("keeps host memory when the cgroup's memory.current is unreadable", () =>
+     Effect.gen(function* () {
+       setup();
+diff --git a/apps/server/src/resourceTelemetry/HostResources.ts b/apps/server/src/resourceTelemetry/HostResources.ts
+index 85c985f5a3..d9ff943545 100644
+--- a/apps/server/src/resourceTelemetry/HostResources.ts
++++ b/apps/server/src/resourceTelemetry/HostResources.ts
+@@ -1,3 +1,6 @@
++// @effect-diagnostics nodeBuiltinImport:off
++// statfs has no Effect FileSystem counterpart.
++import * as NodeFSP from "node:fs/promises";
+ import * as NodeOS from "node:os";
+ import type { HostResourcesSnapshot } from "@t3tools/contracts";
+ import * as HostProcess from "@t3tools/shared/HostProcess";
+@@ -28,16 +31,23 @@ function parseCpuList(list: string): ReadonlySet<number> | null {
+ 
+ // os.cpus() compacts online CPUs, so its indices are not CPU ids; /proc/stat lines are keyed.
+ function pinnedCpu(stat: string, allowed: ReadonlySet<number>) {
+-  const cpu = { idle: 0, total: 0, count: 0 };
++  const cpu = {
++    idle: 0,
++    total: 0,
++    count: 0,
++    perCpu: new Map<number, { idle: number; total: number }>(),
++  };
+   for (const [, id, fields] of stat.matchAll(/^cpu(\d+) (.+)$/gm)) {
+     if (!allowed.has(Number(id))) continue;
+     const counters = (fields ?? "").trim().split(/\s+/).map(Number);
+     const at = (index: number) => counters[index] ?? 0;
+     // user nice system idle iowait irq softirq steal
+     const idle = at(3) + at(4);
++    const total = idle + at(0) + at(1) + at(2) + at(5) + at(6) + at(7);
+     cpu.idle += idle;
+-    cpu.total += idle + at(0) + at(1) + at(2) + at(5) + at(6) + at(7);
++    cpu.total += total;
+     cpu.count++;
++    cpu.perCpu.set(Number(id), { idle, total });
+   }
+   return cpu.count > 0 ? cpu : null;
+ }
+@@ -51,7 +61,34 @@ function readCpu() {
+     }),
+     { idle: 0, total: 0 },
+   );
+-  return { ...cpu, count: cpus.length };
++  const perCpu = new Map(
++    cpus.map(({ times }, id) => [
++      id,
++      { idle: times.idle, total: times.user + times.nice + times.sys + times.idle + times.irq },
++    ]),
++  );
++  return { ...cpu, count: cpus.length, perCpu };
++}
++
++// Hardware threads that share a physical core, by `thread_siblings_list` (not by adjacent ids).
++function coreUtilization(
++  previous: ReadonlyMap<number, { idle: number; total: number }>,
++  current: ReadonlyMap<number, { idle: number; total: number }>,
++  siblings: ReadonlyMap<number, ReadonlySet<number> | null>,
++) {
++  const cores = new Map<number, number[]>();
++  for (const [id, now] of current) {
++    const before = previous.get(id);
++    if (!before) return undefined;
++    const total = now.total - before.total;
++    const busy = total > 0 ? Math.min(1, Math.max(0, 1 - (now.idle - before.idle) / total)) : 0;
++    // Without sibling data (off Linux) a core count would be a guess: SMT hosts would read 16C/16T.
++    const group = siblings.get(id);
++    if (!group) return undefined;
++    const core = Math.min(id, ...group);
++    cores.set(core, [...(cores.get(core) ?? []), busy]);
++  }
++  return [...cores.values()];
+ }
+ 
+ function darwinAvailableMemory(output: string): number | null {
+@@ -75,6 +112,7 @@ const make = Effect.fn("makeHostResources")(function* () {
+   const platform = yield* HostProcess.Platform;
+   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+ 
++  const siblings = new Map<number, ReadonlySet<number> | null>();
+   const readFile = (path: string) => fs.readFileString(path).pipe(Effect.orElseSucceed(() => ""));
+ 
+   const sample = Effect.fn("HostResources.sample")(function* () {
+@@ -108,6 +146,16 @@ const make = Effect.fn("makeHostResources")(function* () {
+         : Effect.sync(readCpu);
+ 
+     const previousCpu = yield* sampleCpu();
++    if (platform === "linux") {
++      // Topology does not change while the server runs: read each CPU's siblings once.
++      for (const id of previousCpu.perCpu.keys()) {
++        if (siblings.has(id)) continue;
++        const list = yield* readFile(
++          `/sys/devices/system/cpu/cpu${id}/topology/thread_siblings_list`,
++        );
++        siblings.set(id, parseCpuList(list.trim()));
++      }
++    }
+     const previousUsage = yield* readCpuUsage();
+     const startedAt = yield* Clock.currentTimeMillis;
+     yield* Effect.sleep("200 millis");
+@@ -138,6 +186,15 @@ const make = Effect.fn("makeHostResources")(function* () {
+       cpuUtilization = idle === null ? null : Math.min(1, Math.max(0, 1 - idle / capacity));
+     }
+ 
++    // The home volume, where the server keeps its data and worktrees.
++    // A throwing or hanging mount must not break or block the snapshot.
++    const stats = yield* Effect.tryPromise({
++      try: () => NodeFSP.statfs(NodeOS.homedir()),
++      catch: () => "statfs-failed" as const,
++    }).pipe(
++      Effect.timeout("1 second"),
++      Effect.orElseSucceed(() => null),
++    );
+     let totalMemoryBytes = NodeOS.totalmem();
+     // On Windows libuv returns GlobalMemoryStatusEx.ullAvailPhys, including standby memory.
+     let availableMemoryBytes = NodeOS.freemem();
+@@ -178,6 +235,10 @@ const make = Effect.fn("makeHostResources")(function* () {
+       cpuCount,
+       availableMemoryBytes: Math.min(totalMemoryBytes, Math.max(0, availableMemoryBytes)),
+       totalMemoryBytes,
++      cpuCoreUtilization: coreUtilization(previousCpu.perCpu, cpu.perCpu, siblings),
++      storage: stats
++        ? { totalBytes: stats.blocks * stats.bsize, availableBytes: stats.bavail * stats.bsize }
++        : undefined,
+     };
+   });
+ 
+diff --git a/apps/web/src/components/chat/ThreadDetailsHost.browser.test.tsx b/apps/web/src/components/chat/ThreadDetailsHost.browser.test.tsx
+new file mode 100644
+index 0000000000..26ff558ffb
+--- /dev/null
++++ b/apps/web/src/components/chat/ThreadDetailsHost.browser.test.tsx
+@@ -0,0 +1,91 @@
++import { EnvironmentId } from "@t3tools/contracts";
++import { AsyncResult, Atom } from "effect/reactivity";
++import { expect, it, vi } from "vite-plus/test";
++import { page } from "vite-plus/test/browser";
++
++const state = vi.hoisted(() => ({ cores: true }));
++// 2 cores with 2 threads each (one thread of the first is hot), plus a core without SMT.
++vi.mock(import("~/state/server"), async (importOriginal) => {
++  const actual = await importOriginal();
++  const base = {
++    sampledAt: 0,
++    cpuUtilization: 0.37,
++    cpuCount: 5,
++    availableMemoryBytes: 12 * 1024 ** 3,
++    totalMemoryBytes: 16 * 1024 ** 3,
++    storage: { totalBytes: 100 * 1024 ** 3, availableBytes: 40 * 1024 ** 3 },
++  };
++  const withCores = Atom.make(
++    AsyncResult.success({ ...base, cpuCoreUtilization: [[0.92, 0.14], [0.1, 0.2], [0.05]] }),
++  );
++  // Off Linux the server has no sibling data and omits the cores.
++  const withoutCores = Atom.make(AsyncResult.success(base));
++  return {
++    ...actual,
++    serverEnvironment: {
++      ...actual.serverEnvironment,
++      hostResources: (() => (state.cores ? withCores : withoutCores)) as never,
++    },
++  };
++});
++
++import { render } from "../../../test/render";
++import { updateClientSettings } from "../../hooks/useSettings";
++import { Menu, MenuPopup } from "../ui/menu";
++import { ThreadDetailsHost } from "./ThreadDetailsHost";
++import { ThreadDetailsItemsMenuItems } from "./ThreadDetailsItemsMenu";
++
++const environmentId = EnvironmentId.make("environment");
++
++it("shows CPU with its cores and threads, memory and one storage volume", async () => {
++  state.cores = true;
++  await updateClientSettings({ threadDetailsHostCores: false });
++  await using _screen = await render(<ThreadDetailsHost environmentId={environmentId} />);
++  await expect.element(page.getByLabelText("CPU 3C/5T: 37%")).toBeVisible();
++  await expect.element(page.getByLabelText("Memory: 25% used")).toBeVisible();
++  await expect.element(page.getByLabelText("Storage: 60% used")).toBeVisible();
++  await expect.element(page.getByText("Core 1")).not.toBeInTheDocument();
++});
++
++it("counts only threads, never cores, when the host sends no core data", async () => {
++  state.cores = false;
++  await updateClientSettings({ threadDetailsHostCores: true });
++  await using _screen = await render(<ThreadDetailsHost environmentId={environmentId} />);
++  await expect.element(page.getByLabelText("CPU 5T: 37%")).toBeVisible();
++  await expect.element(page.getByText("Core 1")).not.toBeInTheDocument();
++});
++
++it("disables the core breakdown toggle while Host load is hidden", async () => {
++  state.cores = true;
++  await updateClientSettings({ threadDetailsItems: {} });
++  await using _screen = await render(
++    <Menu open>
++      <MenuPopup>
++        <ThreadDetailsItemsMenuItems />
++      </MenuPopup>
++    </Menu>,
++  );
++  await expect
++    .element(page.getByRole("menuitemcheckbox", { name: "Show core breakdown" }))
++    .toHaveAttribute("aria-disabled", "true");
++});
++
++it("toggles the core breakdown from the menu and keeps the choice in client settings", async () => {
++  state.cores = true;
++  await updateClientSettings({ threadDetailsItems: { host: true }, threadDetailsHostCores: false });
++  await using _screen = await render(
++    <>
++      <ThreadDetailsHost environmentId={environmentId} />
++      <Menu open>
++        <MenuPopup>
++          <ThreadDetailsItemsMenuItems />
++        </MenuPopup>
++      </Menu>
++    </>,
++  );
++  await page.getByRole("menuitemcheckbox", { name: "Show core breakdown" }).click();
++  await expect.element(page.getByLabelText("Core 1: 92 · 14%")).toBeVisible();
++  await expect.element(page.getByLabelText("Core 3: 5%")).toBeVisible();
++  await page.getByRole("menuitemcheckbox", { name: "Show core breakdown" }).click();
++  await expect.element(page.getByText("Core 1")).not.toBeInTheDocument();
++});
+diff --git a/apps/web/src/components/chat/ThreadDetailsHost.tsx b/apps/web/src/components/chat/ThreadDetailsHost.tsx
+new file mode 100644
+index 0000000000..023fd9b01d
+--- /dev/null
++++ b/apps/web/src/components/chat/ThreadDetailsHost.tsx
+@@ -0,0 +1,101 @@
++import type { EnvironmentId } from "@t3tools/contracts";
++import { useEffect } from "react";
++
++import { useClientSettings } from "../../hooks/useSettings";
++import { formatBytes } from "../../lib/formatBytes";
++import { serverEnvironment } from "../../state/server";
++import { useEnvironmentQuery } from "../../state/query";
++import { ThreadDetailsSection } from "./ThreadDetailsSection";
++import { UsageRow } from "./ThreadDetailsUsage";
++
++const HOST_REFRESH_MS = 5_000;
++const percent = (share: number) => Math.round(share * 100);
++const toneOf = (used: number) => (used >= 90 ? "error" : used >= 80 ? "warning" : null);
++
++/** CPU, memory and storage of the host this thread's environment runs on. */
++export function ThreadDetailsHost({ environmentId }: { readonly environmentId: EnvironmentId }) {
++  const { data, refresh } = useEnvironmentQuery(
++    serverEnvironment.hostResources({ environmentId, input: {} }),
++  );
++  // Poll here, not on the shared atom: load balancing reads it too and must not poll idle hosts.
++  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- a timer held while mounted
++  useEffect(() => {
++    const timer = setInterval(() => {
++      if (document.visibilityState === "visible") refresh();
++    }, HOST_REFRESH_MS);
++    return () => clearInterval(timer);
++  }, [refresh]);
++  const breakdown = useClientSettings((settings) => settings.threadDetailsHostCores);
++  if (!data) return null;
++
++  const cores = data.cpuCoreUtilization;
++  const threads = cores?.reduce((sum, core) => sum + core.length, 0) ?? data.cpuCount;
++  const cpu = data.cpuUtilization === null ? null : percent(data.cpuUtilization);
++  const memory = percent(1 - data.availableMemoryBytes / Math.max(1, data.totalMemoryBytes));
++  const volume = data.storage;
++  const storage = volume ? percent(1 - volume.availableBytes / Math.max(1, volume.totalBytes)) : 0;
++  const used = (total: number, available: number) =>
++    `${formatBytes(total - available)} / ${formatBytes(total)}`;
++
++  return (
++    <ThreadDetailsSection
++      headingId="thread-details-host-heading"
++      title="Host load"
++      showHeading={false}
++    >
++      <div className="grid grid-cols-[auto_minmax(3rem,1fr)_auto] gap-x-3 text-xs">
++        <UsageRow
++          label={cores ? `CPU ${cores.length}C/${threads}T` : `CPU ${threads}T`}
++          fill={cpu}
++          tone={cpu === null ? null : toneOf(cpu)}
++          value={cpu === null ? "n/a" : `${cpu}%`}
++          tooltip={
++            <span className="text-foreground">
++              {cores ? `${cores.length} cores, ${threads} threads` : `${threads} threads`}
++            </span>
++          }
++        />
++        {breakdown
++          ? cores?.map((core, index) => {
++              const busy = core.map(percent);
++              const label = `Core ${index + 1}`;
++              return (
++                <UsageRow
++                  // Index is the core's position in the server's order, which does not change.
++                  key={label}
++                  label={label}
++                  fill={Math.max(...busy)}
++                  tone={toneOf(Math.max(...busy))}
++                  muted
++                  value={`${busy.join(" · ")}%`}
++                  tooltip={
++                    <span className="text-foreground">
++                      {core.length > 1 ? `Threads: ${busy.join("%, ")}%` : `${busy[0]}% busy`}
++                    </span>
++                  }
++                />
++              );
++            })
++          : null}
++        <UsageRow
++          label="Memory"
++          fill={memory}
++          tone={toneOf(memory)}
++          value={used(data.totalMemoryBytes, data.availableMemoryBytes)}
++          ariaValue={`${memory}% used`}
++          tooltip={<span className="text-foreground">Memory: {memory}% used</span>}
++        />
++        {volume ? (
++          <UsageRow
++            label="Storage"
++            fill={storage}
++            tone={toneOf(storage)}
++            value={used(volume.totalBytes, volume.availableBytes)}
++            ariaValue={`${storage}% used`}
++            tooltip={<span className="text-foreground">Storage: {storage}% used</span>}
++          />
++        ) : null}
++      </div>
++    </ThreadDetailsSection>
++  );
++}
+diff --git a/apps/web/src/components/chat/ThreadDetailsItemsMenu.tsx b/apps/web/src/components/chat/ThreadDetailsItemsMenu.tsx
+index d84c13809e..e7a7125215 100644
+--- a/apps/web/src/components/chat/ThreadDetailsItemsMenu.tsx
++++ b/apps/web/src/components/chat/ThreadDetailsItemsMenu.tsx
+@@ -15,6 +15,7 @@ import {
+ /** Menu body that shows and hides thread details items. The card's context menu and Settings share it. */
+ export function ThreadDetailsItemsMenuItems() {
+   const visibility = useClientSettings(resolveThreadDetailsVisibility);
++  const hostCores = useClientSettings((settings) => settings.threadDetailsHostCores);
+   return (
+     <>
+       <MenuGroup>
+@@ -34,6 +35,13 @@ export function ThreadDetailsItemsMenuItems() {
+         ))}
+       </MenuGroup>
+       <MenuSeparator />
++      <MenuCheckboxItem
++        checked={hostCores}
++        disabled={!visibility.host}
++        onCheckedChange={(checked) => updateClientSettings({ threadDetailsHostCores: checked })}
++      >
++        Show core breakdown
++      </MenuCheckboxItem>
+       <MenuItem
+         disabled={isDefaultThreadDetailsVisibility(visibility)}
+         onClick={() => updateClientSettings(RESET_THREAD_DETAILS_ITEMS)}
+diff --git a/apps/web/src/components/chat/ThreadDetailsPanel.tsx b/apps/web/src/components/chat/ThreadDetailsPanel.tsx
+index 4942080dbb..8d4e5af213 100644
+--- a/apps/web/src/components/chat/ThreadDetailsPanel.tsx
++++ b/apps/web/src/components/chat/ThreadDetailsPanel.tsx
+@@ -31,6 +31,7 @@ import {
+   ThreadDetailsUsage,
+   type ThreadDetailsUsageInput,
+ } from "./ThreadDetailsUsage";
++import { ThreadDetailsHost } from "./ThreadDetailsHost";
+ import { ThreadDetailsItemsMenuItems } from "./ThreadDetailsItemsMenu";
+ import { resolveThreadDetailsVisibility, THREAD_DETAILS_ITEMS } from "./threadDetailsItems";
+ import { useClientSettings } from "../../hooks/useSettings";
+@@ -284,6 +285,8 @@ export function ThreadDetailsPanel(props: ThreadDetailsPanelProps) {
+                 />
+               ) : null}
+ 
++              {visible.host ? <ThreadDetailsHost environmentId={props.environmentId} /> : null}
++
+               {visible.usage ? <ThreadDetailsUsage {...props.usage} /> : null}
+ 
+               {visible.context && props.usage.contextWindow ? (
+diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.tsx b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
+index 0d6c012948..086967ecb4 100644
+--- a/apps/web/src/components/chat/ThreadDetailsUsage.tsx
++++ b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
+@@ -175,7 +175,7 @@ function LimitRow({
+ }
+ 
+ /** One label, hairline, and value row; the whole row opens the details tooltip. */
+-function UsageRow({
++export function UsageRow({
+   label,
+   fill,
+   tone,
+diff --git a/apps/web/src/components/chat/threadDetailsItems.ts b/apps/web/src/components/chat/threadDetailsItems.ts
+index e6f94cc4e1..05677dcf18 100644
+--- a/apps/web/src/components/chat/threadDetailsItems.ts
++++ b/apps/web/src/components/chat/threadDetailsItems.ts
+@@ -14,6 +14,7 @@ export const THREAD_DETAILS_ITEMS = [
+   { id: "sideChats", label: "Side chats", defaultVisible: true },
+   { id: "usage", label: "Usage limits", defaultVisible: false },
+   { id: "context", label: "Context window", defaultVisible: false },
++  { id: "host", label: "Host load", defaultVisible: false },
+ ] as const;
+ 
+ export type ThreadDetailsItemId = (typeof THREAD_DETAILS_ITEMS)[number]["id"];
+diff --git a/packages/contracts/src/resourceTelemetry.ts b/packages/contracts/src/resourceTelemetry.ts
+index e827ee1a12..effb3a9616 100644
+--- a/packages/contracts/src/resourceTelemetry.ts
++++ b/packages/contracts/src/resourceTelemetry.ts
+@@ -12,6 +12,12 @@ export const HostResourcesSnapshot = Schema.Struct({
+   cpuCount: NonNegativeInt,
+   availableMemoryBytes: NonNegativeInt,
+   totalMemoryBytes: NonNegativeInt,
++  // Busy share per physical core, one entry per hardware thread on it (SMT siblings).
++  cpuCoreUtilization: Schema.optional(Schema.Array(Schema.Array(Schema.Number))),
++  // The volume the server runs on.
++  storage: Schema.optional(
++    Schema.Struct({ totalBytes: NonNegativeInt, availableBytes: NonNegativeInt }),
++  ),
+ });
+ export type HostResourcesSnapshot = typeof HostResourcesSnapshot.Type;
+ 
+diff --git a/packages/contracts/src/settings.ts b/packages/contracts/src/settings.ts
+index 944625995a..ff74c04bf8 100644
+--- a/packages/contracts/src/settings.ts
++++ b/packages/contracts/src/settings.ts
+@@ -562,6 +562,7 @@ export const ClientSettingsSchema = Schema.Struct({
+   threadDetailsItems: Schema.Record(Schema.String, Schema.Boolean).pipe(
+     Schema.withDecodingDefault(Effect.succeed({})),
+   ),
++  threadDetailsHostCores: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+   sidebarWorkingShelfEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+   sidebarProjectGroupingMode: SidebarProjectGroupingMode.pipe(
+     Schema.withDecodingDefault(Effect.succeed(DEFAULT_SIDEBAR_PROJECT_GROUPING_MODE)),
+@@ -2112,6 +2113,7 @@ export const ClientSettingsPatch = Schema.Struct({
+   screenReaderWindowTitle: Schema.optionalKey(Schema.Boolean),
+   threadDetailsUsageEnabled: Schema.optionalKey(Schema.Boolean),
+   threadDetailsItems: Schema.optionalKey(Schema.Record(Schema.String, Schema.Boolean)),
++  threadDetailsHostCores: Schema.optionalKey(Schema.Boolean),
+   sidebarWorkingShelfEnabled: Schema.optionalKey(Schema.Boolean),
+   sidebarProjectGroupingMode: Schema.optionalKey(SidebarProjectGroupingMode),
+   sidebarProjectGroupingOverrides: Schema.optionalKey(

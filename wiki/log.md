@@ -2,6 +2,7 @@
 
 One line per change, newest first. Format: [RULES.md](RULES.md#formats).
 
+- 2026-11-15 change | Host load (CPU cores and threads, memory, storage) in thread details, core breakdown toggle (PR open) | status.md | docs/fork-changes.md, patches-tt/0014
 - 2026-11-15 change | Patches ported to nightly 4736; Open button now in Background work details | porting/current-port.md | patches-tt/
 - 2026-11-15 change | Worker popover opens on hover and shows each agent's model (PR open) | status.md | docs/fork-changes.md
 - 2026-11-14 fix | Manual port --resume opens no PR: docs corrected | porting/current-port.md | docs/porting.md
