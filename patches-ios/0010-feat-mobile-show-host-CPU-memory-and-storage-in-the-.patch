@@ -1,0 +1,385 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: timvdhoorn <timvdhoorn@gmail.com>
+Date: Sun, 15 Nov 2026 23:07:45 +0100
+Subject: [PATCH] feat(mobile): show host CPU, memory and storage in the thread
+ settings sheet
+
+---
+ .../src/features/threads/ThreadHostLoad.tsx   | 87 +++++++++++++++++++
+ .../features/threads/ThreadSettingsSheet.tsx  | 36 ++++++++
+ .../src/features/threads/hostLoad.test.ts     | 61 +++++++++++++
+ apps/mobile/src/features/threads/hostLoad.ts  | 67 ++++++++++++++
+ apps/mobile/src/lib/storage.test.ts           | 10 +++
+ .../src/persistence/mobile-preferences.ts     |  6 ++
+ 6 files changed, 267 insertions(+)
+ create mode 100644 apps/mobile/src/features/threads/ThreadHostLoad.tsx
+ create mode 100644 apps/mobile/src/features/threads/hostLoad.test.ts
+ create mode 100644 apps/mobile/src/features/threads/hostLoad.ts
+
+diff --git a/apps/mobile/src/features/threads/ThreadHostLoad.tsx b/apps/mobile/src/features/threads/ThreadHostLoad.tsx
+new file mode 100644
+index 0000000000..d958141e3b
+--- /dev/null
++++ b/apps/mobile/src/features/threads/ThreadHostLoad.tsx
+@@ -0,0 +1,87 @@
++import { useAtomSet, useAtomValue } from "@effect/atom-react";
++import type { EnvironmentId } from "@t3tools/contracts";
++import { AsyncResult } from "effect/reactivity";
++import { useEffect } from "react";
++import { View } from "react-native";
++
++import { AppText as Text } from "../../components/ui/AppText";
++import { ListSection } from "../../components/ui/ListSection";
++import { ScreenScrollView } from "../../components/ui/ScreenScrollView";
++import { useAppForeground } from "../../lib/appState";
++import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
++import { useEnvironmentQuery } from "../../state/query";
++import { serverEnvironment } from "../../state/server";
++import { SettingsSwitchRow } from "../settings/components/SettingsSwitchRow";
++import { hostLoadRows, hostLoadTone, type HostLoadRow } from "./hostLoad";
++
++const HOST_REFRESH_MS = 5_000;
++const FILL = { error: "bg-red-500", warning: "bg-amber-500", none: "bg-foreground" } as const;
++
++function LoadBar({ row }: { readonly row: HostLoadRow }) {
++  const percent = Math.min(100, Math.max(0, row.percent ?? 0));
++  return (
++    <View
++      accessible
++      accessibilityRole="progressbar"
++      accessibilityLabel={row.label}
++      accessibilityValue={{ min: 0, max: 100, now: percent }}
++      className="gap-1 px-4 py-2"
++    >
++      <View className="flex-row items-baseline justify-between gap-3">
++        <Text className={row.muted ? "text-sm text-foreground-muted" : "text-sm text-foreground"}>
++          {row.label}
++        </Text>
++        <Text className="text-sm tabular-nums text-foreground-muted">{row.value}</Text>
++      </View>
++      <View className="h-1.5 flex-row overflow-hidden rounded-full bg-subtle">
++        <View
++          className={`h-full rounded-full ${FILL[hostLoadTone(row.percent) ?? "none"]}`}
++          style={{ flex: percent }}
++        />
++        <View style={{ flex: 100 - percent }} />
++      </View>
++    </View>
++  );
++}
++
++/** CPU, memory and storage of the host the thread runs on; polled while shown and in the foreground. */
++export function ThreadHostLoad({ environmentId }: { readonly environmentId: EnvironmentId }) {
++  const { data, refresh } = useEnvironmentQuery(
++    serverEnvironment.hostResources({ environmentId, input: {} }),
++  );
++  const foreground = useAppForeground();
++  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- a timer held while the screen is mounted and the app is in the foreground
++  useEffect(() => {
++    if (!foreground) return;
++    const timer = setInterval(refresh, HOST_REFRESH_MS);
++    return () => clearInterval(timer);
++  }, [foreground, refresh]);
++  const preferences = useAtomValue(mobilePreferencesAtom);
++  const savePreferences = useAtomSet(updateMobilePreferencesAtom);
++  const showCores =
++    AsyncResult.isSuccess(preferences) && preferences.value.hostCoreBreakdownEnabled === true;
++
++  return (
++    <ScreenScrollView
++      contentInsetAdjustmentBehavior="automatic"
++      contentContainerClassName="gap-4 px-4 pt-4 pb-8"
++    >
++      <ListSection footer="Refreshes every 5 seconds while this screen is open.">
++        {data ? (
++          hostLoadRows(data, showCores).map((row) => <LoadBar key={row.key} row={row} />)
++        ) : (
++          <Text className="px-4 py-3 text-sm text-foreground-muted">Loading…</Text>
++        )}
++      </ListSection>
++      {data?.cpuCoreUtilization ? (
++        <ListSection footer="One row per core, with the load of each of its threads.">
++          <SettingsSwitchRow
++            label="Core breakdown"
++            value={showCores}
++            onValueChange={(value) => savePreferences({ hostCoreBreakdownEnabled: value })}
++          />
++        </ListSection>
++      ) : null}
++    </ScreenScrollView>
++  );
++}
+diff --git a/apps/mobile/src/features/threads/ThreadSettingsSheet.tsx b/apps/mobile/src/features/threads/ThreadSettingsSheet.tsx
+index 07eebd9e89..b8595a7179 100644
+--- a/apps/mobile/src/features/threads/ThreadSettingsSheet.tsx
++++ b/apps/mobile/src/features/threads/ThreadSettingsSheet.tsx
+@@ -78,6 +78,7 @@ import {
+   withRememberedModelOptions,
+ } from "../../state/use-model-option-memory";
+ import { ChatGptSharingStatus } from "./ChatGptSharingStatus";
++import { ThreadHostLoad } from "./ThreadHostLoad";
+ import { environmentCatalog } from "../../connection/catalog";
+ import { useEnvironmentQuery } from "../../state/query";
+ import { scopedThreadKey } from "../../lib/scopedEntities";
+@@ -853,6 +854,7 @@ function ThreadSettingsOptionsItem(props: {
+   readonly bottomInset: number;
+   readonly onOpenSubmenu: (submenu: ThreadSettingsSubmenuPage) => void;
+ }) {
++  const navigation = useNavigation<NativeStackNavigationProp<ThreadSettingsPickerStackParams>>();
+   const insets = useSafeAreaInsets();
+   const session = useThreadSettingsSession();
+   const configs = useAtomValue(environmentServerConfigsAtom);
+@@ -926,6 +928,20 @@ function ThreadSettingsOptionsItem(props: {
+         </Animated.View>
+       </Animated.View>
+ 
++      {session.environmentId ? (
++        <>
++          <Text className="px-5 pb-2 pt-7 text-sm font-t3-medium text-foreground-muted">Host</Text>
++          <View className="mx-4 overflow-hidden rounded-2xl bg-grouped-card">
++            <DisclosureRow
++              isLast
++              label="Host load"
++              value={undefined}
++              onPress={() => navigation.navigate("ThreadSettingsHostLoad")}
++            />
++          </View>
++        </>
++      ) : null}
++
+       <Text className="px-5 pb-2 pt-7 text-sm font-t3-medium text-foreground-muted">Catalog</Text>
+       <View className="mx-4 overflow-hidden rounded-2xl bg-grouped-card">
+         <SwitchRow
+@@ -1181,6 +1197,7 @@ function ThreadSettingsChoiceContent(props: {
+ type ThreadSettingsPickerStackParams = {
+   ThreadSettingsModels: undefined;
+   ThreadSettingsChoice: ThreadSettingsSubmenuPage & { readonly title: string };
++  ThreadSettingsHostLoad: undefined;
+ };
+ 
+ type ThreadSettingsPickerPresentation = {
+@@ -1313,6 +1330,20 @@ function ThreadSettingsChoiceScreen() {
+   );
+ }
+ 
++function ThreadSettingsHostLoadScreen() {
++  const navigation = useNavigation<NativeStackNavigationProp<ThreadSettingsPickerStackParams>>();
++  const session = useThreadSettingsSession();
++
++  return (
++    <>
++      <AppBar title="Host load" onBack={() => navigation.goBack()} hideBottomBorder />
++      <ScreenContent>
++        {session.environmentId ? <ThreadHostLoad environmentId={session.environmentId} /> : null}
++      </ScreenContent>
++    </>
++  );
++}
++
+ function ThreadSettingsPickerNavigator(props: ThreadSettingsPickerPresentation) {
+   const screenOptions = useSheetStackOptions();
+   const presentation = {
+@@ -1335,6 +1366,11 @@ function ThreadSettingsPickerNavigator(props: ThreadSettingsPickerPresentation)
+           component={ThreadSettingsChoiceScreen}
+           options={({ route }) => ({ title: route.params.title })}
+         />
++        <ThreadSettingsPickerStack.Screen
++          name="ThreadSettingsHostLoad"
++          component={ThreadSettingsHostLoadScreen}
++          options={{ title: "Host load" }}
++        />
+       </ThreadSettingsPickerStack.Navigator>
+     </ThreadSettingsPickerPresentationContext.Provider>
+   );
+diff --git a/apps/mobile/src/features/threads/hostLoad.test.ts b/apps/mobile/src/features/threads/hostLoad.test.ts
+new file mode 100644
+index 0000000000..38b0d5df8f
+--- /dev/null
++++ b/apps/mobile/src/features/threads/hostLoad.test.ts
+@@ -0,0 +1,61 @@
++import { describe, expect, it } from "vite-plus/test";
++
++import { hostLoadRows, hostLoadTone } from "./hostLoad";
++
++const GB = 1024 ** 3;
++const host = {
++  sampledAt: 0,
++  cpuUtilization: 0.42,
++  cpuCount: 16,
++  availableMemoryBytes: 8 * GB,
++  totalMemoryBytes: 32 * GB,
++  cpuCoreUtilization: [
++    [0.1, 0.3],
++    [0.95, 0.5],
++  ],
++  storage: { totalBytes: 500 * GB, availableBytes: 125 * GB },
++};
++
++describe("hostLoadRows", () => {
++  it("reads CPU as cores and threads, with memory and one storage volume", () => {
++    expect(hostLoadRows(host, false)).toEqual([
++      { key: "cpu", label: "CPU 2C/4T", percent: 42, value: "42%" },
++      { key: "memory", label: "Memory", percent: 75, value: "24.0 GB / 32.0 GB" },
++      { key: "storage", label: "Storage", percent: 75, value: "375.0 GB / 500.0 GB" },
++    ]);
++  });
++
++  it("adds one row per core with each thread's load when the breakdown is on", () => {
++    const rows = hostLoadRows(host, true);
++    expect(rows.map((row) => row.key)).toEqual(["cpu", "core-0", "core-1", "memory", "storage"]);
++    expect(rows[1]).toMatchObject({ label: "Core 1", percent: 30, value: "10 · 30%", muted: true });
++    expect(rows[2]).toMatchObject({ label: "Core 2", percent: 95, value: "95 · 50%" });
++  });
++
++  it("reads CPU as threads only, without core rows, when the host sends no core data", () => {
++    const rows = hostLoadRows({ ...host, cpuCoreUtilization: undefined, storage: undefined }, true);
++    expect(rows.map((row) => [row.key, row.label])).toEqual([
++      ["cpu", "CPU 16T"],
++      ["memory", "Memory"],
++    ]);
++  });
++
++  it("shows n/a while the host has no CPU sample", () => {
++    expect(hostLoadRows({ ...host, cpuUtilization: null }, false)[0]).toMatchObject({
++      percent: null,
++      value: "n/a",
++    });
++  });
++});
++
++describe("hostLoadTone", () => {
++  it("warns from 80% and errors from 90%", () => {
++    expect([null, 79, 80, 89, 90].map(hostLoadTone)).toEqual([
++      null,
++      null,
++      "warning",
++      "warning",
++      "error",
++    ]);
++  });
++});
+diff --git a/apps/mobile/src/features/threads/hostLoad.ts b/apps/mobile/src/features/threads/hostLoad.ts
+new file mode 100644
+index 0000000000..e38722e8c6
+--- /dev/null
++++ b/apps/mobile/src/features/threads/hostLoad.ts
+@@ -0,0 +1,67 @@
++import type { HostResourcesSnapshot } from "@t3tools/contracts";
++
++import { formatBytes } from "../../lib/formatBytes";
++
++export interface HostLoadRow {
++  readonly key: string;
++  readonly label: string;
++  /** Share of the bar to fill, 0 to 100; null when the host reports no figure. */
++  readonly percent: number | null;
++  readonly value: string;
++  /** A core row: one dimmed line per physical core. */
++  readonly muted?: boolean;
++}
++
++const percentOf = (share: number) => Math.round(share * 100);
++const used = (total: number, available: number) =>
++  `${formatBytes(total - available)} / ${formatBytes(total)}`;
++
++/** Bars turn amber from 80% and red from 90%, as on desktop. */
++export function hostLoadTone(percent: number | null): "warning" | "error" | null {
++  if (percent === null) return null;
++  return percent >= 90 ? "error" : percent >= 80 ? "warning" : null;
++}
++
++/** The rows of the Host load screen, mirroring desktop's `ThreadDetailsHost`. */
++export function hostLoadRows(host: HostResourcesSnapshot, showCores: boolean): HostLoadRow[] {
++  const cores = host.cpuCoreUtilization;
++  const threads = cores?.reduce((sum, core) => sum + core.length, 0) ?? host.cpuCount;
++  const cpu = host.cpuUtilization === null ? null : percentOf(host.cpuUtilization);
++  const memory = percentOf(1 - host.availableMemoryBytes / Math.max(1, host.totalMemoryBytes));
++  const rows: HostLoadRow[] = [
++    {
++      key: "cpu",
++      label: cores ? `CPU ${cores.length}C/${threads}T` : `CPU ${threads}T`,
++      percent: cpu,
++      value: cpu === null ? "n/a" : `${cpu}%`,
++    },
++  ];
++  if (showCores) {
++    cores?.forEach((core, index) => {
++      const busy = core.map(percentOf);
++      rows.push({
++        key: `core-${index}`,
++        label: `Core ${index + 1}`,
++        percent: Math.max(...busy),
++        value: `${busy.join(" · ")}%`,
++        muted: true,
++      });
++    });
++  }
++  rows.push({
++    key: "memory",
++    label: "Memory",
++    percent: memory,
++    value: used(host.totalMemoryBytes, host.availableMemoryBytes),
++  });
++  const volume = host.storage;
++  if (volume) {
++    rows.push({
++      key: "storage",
++      label: "Storage",
++      percent: percentOf(1 - volume.availableBytes / Math.max(1, volume.totalBytes)),
++      value: used(volume.totalBytes, volume.availableBytes),
++    });
++  }
++  return rows;
++}
+diff --git a/apps/mobile/src/lib/storage.test.ts b/apps/mobile/src/lib/storage.test.ts
+index 139a029490..652d74a75d 100644
+--- a/apps/mobile/src/lib/storage.test.ts
++++ b/apps/mobile/src/lib/storage.test.ts
+@@ -162,6 +162,16 @@ describe("mobile connection storage", () => {
+     await expect(loadPreferences()).resolves.toEqual({});
+   });
+ 
++  it("persists the host core breakdown preference and drops a non-boolean value", async () => {
++    await expect(savePreferencesPatch({ hostCoreBreakdownEnabled: true })).resolves.toEqual({
++      hostCoreBreakdownEnabled: true,
++    });
++    await expect(loadPreferences()).resolves.toEqual({ hostCoreBreakdownEnabled: true });
++
++    mocks.setPreferencesJson(JSON.stringify({ hostCoreBreakdownEnabled: "yes" }), 20);
++    await expect(loadPreferences()).resolves.toEqual({});
++  });
++
+   it("persists hidden child thread families and drops non-string keys", async () => {
+     await expect(
+       savePreferencesPatch({ threadListCollapsedChildThreadKeys: ["environment-1:thread-1"] }),
+diff --git a/apps/mobile/src/persistence/mobile-preferences.ts b/apps/mobile/src/persistence/mobile-preferences.ts
+index 6d453c55bc..7a4fdbe3ba 100644
+--- a/apps/mobile/src/persistence/mobile-preferences.ts
++++ b/apps/mobile/src/persistence/mobile-preferences.ts
+@@ -133,6 +133,8 @@ export interface Preferences {
+   readonly lastThreadProject?: typeof ThreadProject.Type;
+   /** Device-local counterpart of web's `statsForNerdsEnabled`; off by default. */
+   readonly statsForNerdsEnabled?: boolean;
++  /** Shows one row per CPU core in the thread's Host load screen; off by default. */
++  readonly hostCoreBreakdownEnabled?: boolean;
+   readonly modelFavorites?: ReadonlyArray<{
+     readonly provider: ProviderInstanceId;
+     readonly model: string;
+@@ -227,6 +229,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
+     useLastProjectForNewThreads?: boolean;
+     lastThreadProject?: typeof ThreadProject.Type;
+     statsForNerdsEnabled?: boolean;
++    hostCoreBreakdownEnabled?: boolean;
+     modelFavorites?: Preferences["modelFavorites"];
+     threadListSettledShelfExpanded?: boolean;
+     threadListSnoozedShelfExpanded?: boolean;
+@@ -366,6 +369,9 @@ function sanitizePreferences(parsed: Preferences): Preferences {
+   if (typeof parsed.statsForNerdsEnabled === "boolean") {
+     preferences.statsForNerdsEnabled = parsed.statsForNerdsEnabled;
+   }
++  if (typeof parsed.hostCoreBreakdownEnabled === "boolean") {
++    preferences.hostCoreBreakdownEnabled = parsed.hostCoreBreakdownEnabled;
++  }
+   if (Array.isArray(parsed.modelFavorites)) {
+     preferences.modelFavorites = parsed.modelFavorites.filter(
+       (favorite) =>
