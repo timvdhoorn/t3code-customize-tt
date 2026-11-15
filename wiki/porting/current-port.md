@@ -1,14 +1,14 @@
 # Current port
 
 > Source: `patches-port/base.txt`, `covered-nightly.txt`, `skip-shared.json`; `./t3code-customize status`
-> Updated: 2026-11-15
+> Updated: 2026-11-16
 
 Which nightly the patches cover and what a port of them has to watch for. The port loop itself is in [docs/porting.md](../../docs/porting.md).
 
 ## Coverage
 - Shared patches: `patches-port/` targets nightly 0.1.10-nightly.20261115.4749 (`295a0a7332aa`).
 - `patches/` is upstream's and stays untouched.
-- Own patches: `patches-tt/` (15) and `patches-ios/` (10); a port applies 2 shared commits (`patches-port/`, minus the skips) + 15 + 10 = 27 commits.
+- Own patches: `patches-tt/` (16) and `patches-ios/` (11); a port applies 2 shared commits (`patches-port/`, minus the skips) + 16 + 11 = 29 commits.
 - `covered-nightly.txt`: 0.1.10-nightly.20261115.4749.
 - Left out (`skip-shared.json`): desktop stats line and throughput, compaction settings, subscription switch.
 - Their bundle markers are replaced by `markers` in the same file.

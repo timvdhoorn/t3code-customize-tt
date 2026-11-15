@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: timvdhoorn <timvdhoorn@gmail.com>
 Date: Thu, 15 Oct 2026 20:14:40 +0200
-Subject: [PATCH 3/9] feat(mobile): show stats for nerds in the composer
+Subject: [PATCH 03/11] feat(mobile): show stats for nerds in the composer
 
 The stats logic lives in packages/client-runtime (composer-stats and
 context-window), so only the iOS app carries it; the desktop composer
@@ -29,8 +29,8 @@ thread compacts automatically comes from the provider thread.
  .../src/state/composerStats.test.ts           | 595 +++++++++++++++++
  .../client-runtime/src/state/composerStats.ts | 401 ++++++++++++
  .../src/state/contextWindow.test.ts           |  18 +-
- .../client-runtime/src/state/contextWindow.ts |  31 +-
- 21 files changed, 2307 insertions(+), 25 deletions(-)
+ .../client-runtime/src/state/contextWindow.ts |  33 +-
+ 21 files changed, 2308 insertions(+), 26 deletions(-)
  create mode 100644 apps/mobile/src/features/threads/ComposerStats.tsx
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.test.ts
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.ts
@@ -2596,24 +2596,26 @@ index 994d3d62a2..daa9c29c1c 100644
 +  });
 +});
 diff --git a/packages/client-runtime/src/state/contextWindow.ts b/packages/client-runtime/src/state/contextWindow.ts
-index a8f7e0f88c..569532d404 100644
+index fe5383ba5a..57f4bf39d4 100644
 --- a/packages/client-runtime/src/state/contextWindow.ts
 +++ b/packages/client-runtime/src/state/contextWindow.ts
-@@ -109,8 +109,11 @@ export function deriveLatestContextWindowSnapshot(
+@@ -110,9 +110,12 @@ export function deriveLatestContextWindowSnapshot(
        lastReasoningOutputTokens: null,
        toolUses: null,
        durationMs: null,
 -      compactsAutomatically: true,
 -      autoCompactThreshold: liveUsage.autoCompactThreshold ?? null,
+-      categories: liveUsage.categories ?? null,
 +      compactsAutomatically: providerThread?.contextUsage?.compactsAutomatically ?? null,
 +      autoCompactThreshold:
 +        liveUsage.autoCompactThreshold ??
 +        providerThread?.contextUsage?.autoCompactThreshold ??
 +        null,
++      categories: liveUsage.categories ?? providerThread?.contextUsage?.categories ?? null,
        cost: null,
        updatedAt: liveUsage.updatedAt,
      };
-@@ -152,7 +155,7 @@ export function deriveLatestContextWindowSnapshot(
+@@ -155,7 +158,7 @@ export function deriveLatestContextWindowSnapshot(
    }
    for (let index = entries.length - 1; index >= 0; index -= 1) {
      const entry = entries[index];
@@ -2622,7 +2624,7 @@ index a8f7e0f88c..569532d404 100644
        continue;
      }
      const payload = entry.item;
-@@ -178,7 +181,7 @@ export function deriveLatestContextWindowSnapshot(
+@@ -181,7 +184,7 @@ export function deriveLatestContextWindowSnapshot(
  
      return {
        usedTokens,
@@ -2631,22 +2633,23 @@ index a8f7e0f88c..569532d404 100644
        maxTokens,
        remainingTokens,
        usedPercentage,
-@@ -194,10 +197,10 @@ export function deriveLatestContextWindowSnapshot(
+@@ -197,11 +200,11 @@ export function deriveLatestContextWindowSnapshot(
        lastReasoningOutputTokens: null,
        toolUses: null,
        durationMs: null,
 -      compactsAutomatically: true,
 +      compactsAutomatically: null,
        autoCompactThreshold: null,
+       categories: null,
        cost: null,
 -      updatedAt: DateTime.formatIso(payload.startedAt ?? payload.updatedAt),
 +      updatedAt: DateTime.formatIso(payload.completedAt ?? payload.updatedAt),
      };
    }
  
-@@ -330,3 +333,19 @@ export function compactBeforeSendTokens(input: {
-     ? contextWindow.usedTokens
-     : null;
+@@ -404,3 +407,19 @@ export function contextCategoryRows(
+       };
+     });
  }
 +
 +export function formatContextWindowTokens(value: number | null): string {
