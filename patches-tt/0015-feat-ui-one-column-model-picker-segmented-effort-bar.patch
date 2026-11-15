@@ -5,19 +5,36 @@ Subject: [PATCH 15/15] feat(ui): one-column model picker, segmented effort bar
  and a live timer on running sidebar rows
 
 ---
- .../chat/ComposerModelEffort.browser.test.tsx | 17 ++++++
- .../components/chat/ComposerModelEffort.tsx   | 60 ++++++++++---------
+ .../chat/ComposerModelEffort.browser.test.tsx | 33 +++++++++-
+ .../components/chat/ComposerModelEffort.tsx   | 63 ++++++++++---------
  .../components/chat/ModelPickerContent.tsx    |  2 +-
  .../components/chat/ProviderModelPicker.tsx   |  7 +--
  .../SidebarThreadRow.branch.browser.test.tsx  | 32 +++++++++-
- .../components/sidebar/SidebarThreadRow.tsx   | 24 ++++++--
- 6 files changed, 103 insertions(+), 39 deletions(-)
+ .../components/sidebar/SidebarThreadRow.tsx   | 24 +++++--
+ 6 files changed, 120 insertions(+), 41 deletions(-)
 
 diff --git a/apps/web/src/components/chat/ComposerModelEffort.browser.test.tsx b/apps/web/src/components/chat/ComposerModelEffort.browser.test.tsx
-index ab7d560d5c..3bea14c978 100644
+index ab7d560d5c..587001f553 100644
 --- a/apps/web/src/components/chat/ComposerModelEffort.browser.test.tsx
 +++ b/apps/web/src/components/chat/ComposerModelEffort.browser.test.tsx
-@@ -122,3 +122,20 @@ it("draws an agent's reasoning as bars and keeps its mode out of the levels", as
+@@ -10,6 +10,7 @@ import { expect, it } from "vite-plus/test";
+ import { page, userEvent } from "vite-plus/test/browser";
+ 
+ import { render } from "../../../test/render";
++import { TooltipProvider } from "../ui/tooltip";
+ import { ComposerEffortColumn, describeComposerEffort } from "./ComposerModelEffort";
+ import type { TraitsSelectionInput } from "./TraitsPicker";
+ 
+@@ -39,7 +40,7 @@ const models: ReadonlyArray<ServerProviderModel> = [
+           role: "reasoning",
+           currentValue: "medium",
+           options: [
+-            { id: "low", label: "Low" },
++            { id: "low", label: "Low", isDefault: true },
+             { id: "medium", label: "Medium" },
+             { id: "high", label: "High" },
+           ],
+@@ -122,3 +123,33 @@ it("draws an agent's reasoning as bars and keeps its mode out of the levels", as
      .toBeInTheDocument();
    await expect.element(page.getByRole("menuitemradio")).not.toBeInTheDocument();
  });
@@ -38,8 +55,21 @@ index ab7d560d5c..3bea14c978 100644
 +    .element(screen.getByRole("radio", { name: "Medium" }))
 +    .not.toHaveAttribute("data-checked");
 +});
++
++it("names the default level in its tooltip", async () => {
++  await using screen = await render(
++    <TooltipProvider delay={0} closeDelay={0}>
++      <Column />
++    </TooltipProvider>,
++    { router: false },
++  );
++  await userEvent.hover(screen.getByRole("radio", { name: /^Low/ }));
++  await expect
++    .poll(() => document.querySelector("[data-slot=tooltip-popup]")?.textContent)
++    .toContain("Low · Default");
++});
 diff --git a/apps/web/src/components/chat/ComposerModelEffort.tsx b/apps/web/src/components/chat/ComposerModelEffort.tsx
-index f56997ff2a..51e816f2ef 100644
+index f56997ff2a..22654825b2 100644
 --- a/apps/web/src/components/chat/ComposerModelEffort.tsx
 +++ b/apps/web/src/components/chat/ComposerModelEffort.tsx
 @@ -7,7 +7,7 @@ import {
@@ -56,11 +86,11 @@ index f56997ff2a..51e816f2ef 100644
  function ColumnRow(props: {
    label: string;
 -  /** Shown on hover; the column is too narrow to print it under the label. */
-+  /** Shown on hover; a segment is too narrow to print it under the label. */
++  /** Shown on hover, with "Default" for the default level; a segment is too narrow for either. */
    description?: string | undefined;
    selected: boolean;
    /** The column's one tab stop: the selected level, else the first when none shows as selected. */
-@@ -199,29 +199,23 @@ function ColumnRow(props: {
+@@ -199,29 +199,24 @@ function ColumnRow(props: {
      "data-effort-row": true,
      // Focus lands on a level after a model pick.
      "data-effort-level": true,
@@ -86,16 +116,18 @@ index f56997ff2a..51e816f2ef 100644
 +      {props.isDefault ? <span className="sr-only">Default</span> : null}
      </>
    );
-   if (!props.description) return <button {...rowProps}>{content}</button>;
+-  if (!props.description) return <button {...rowProps}>{content}</button>;
++  if (!props.description && !props.isDefault) return <button {...rowProps}>{content}</button>;
    return (
      <Tooltip>
        <TooltipTrigger render={<button {...rowProps} />}>{content}</TooltipTrigger>
 -      <TooltipPopup side="right" className="max-w-56">
 +      <TooltipPopup side="top" className="max-w-56">
++        {props.isDefault ? <div>{props.label} · Default</div> : null}
          {props.description}
        </TooltipPopup>
      </Tooltip>
-@@ -304,7 +298,11 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
+@@ -304,7 +299,11 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
    const { descriptor } = control;
    if (control.kind === "boolean") {
      return (
@@ -108,7 +140,7 @@ index f56997ff2a..51e816f2ef 100644
          {([true, false] as const).map((value) => (
            <ColumnRow
              key={String(value)}
-@@ -323,25 +321,31 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
+@@ -323,25 +322,31 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
    // An "Ultrathink:" prefix selects a level the column does not offer.
    const shown = choices.some((option) => option.id === value);
    return (
