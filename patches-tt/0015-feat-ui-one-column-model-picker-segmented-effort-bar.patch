@@ -1,0 +1,305 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: t3code-customize <t3code-customize@localhost>
+Date: Sun, 15 Nov 2026 21:10:39 +0100
+Subject: [PATCH 15/15] feat(ui): one-column model picker, segmented effort bar
+ and a live timer on running sidebar rows
+
+---
+ .../chat/ComposerModelEffort.browser.test.tsx | 17 ++++++
+ .../components/chat/ComposerModelEffort.tsx   | 60 ++++++++++---------
+ .../components/chat/ModelPickerContent.tsx    |  2 +-
+ .../components/chat/ProviderModelPicker.tsx   |  7 +--
+ .../SidebarThreadRow.branch.browser.test.tsx  | 32 +++++++++-
+ .../components/sidebar/SidebarThreadRow.tsx   | 24 ++++++--
+ 6 files changed, 103 insertions(+), 39 deletions(-)
+
+diff --git a/apps/web/src/components/chat/ComposerModelEffort.browser.test.tsx b/apps/web/src/components/chat/ComposerModelEffort.browser.test.tsx
+index ab7d560d5c..3bea14c978 100644
+--- a/apps/web/src/components/chat/ComposerModelEffort.browser.test.tsx
++++ b/apps/web/src/components/chat/ComposerModelEffort.browser.test.tsx
+@@ -122,3 +122,20 @@ it("draws an agent's reasoning as bars and keeps its mode out of the levels", as
+     .toBeInTheDocument();
+   await expect.element(page.getByRole("menuitemradio")).not.toBeInTheDocument();
+ });
++
++it("lists the levels as one segmented bar with the current level highlighted", async () => {
++  await using screen = await render(<Column />, { router: false });
++  const radios = screen.getByRole("radiogroup", { name: "Thinking" }).getByRole("radio");
++  const boxes = radios.elements().map((radio) => radio.getBoundingClientRect());
++  expect(boxes).toHaveLength(3);
++  // One row: every segment sits at the same height, side by side.
++  expect(new Set(boxes.map((box) => box.top)).size).toBe(1);
++  await expect
++    .element(screen.getByRole("radio", { name: "Medium" }))
++    .toHaveAttribute("data-checked");
++  await screen.getByRole("radio", { name: "High" }).click();
++  await expect.element(screen.getByRole("radio", { name: "High" })).toHaveAttribute("data-checked");
++  await expect
++    .element(screen.getByRole("radio", { name: "Medium" }))
++    .not.toHaveAttribute("data-checked");
++});
+diff --git a/apps/web/src/components/chat/ComposerModelEffort.tsx b/apps/web/src/components/chat/ComposerModelEffort.tsx
+index f56997ff2a..51e816f2ef 100644
+--- a/apps/web/src/components/chat/ComposerModelEffort.tsx
++++ b/apps/web/src/components/chat/ComposerModelEffort.tsx
+@@ -7,7 +7,7 @@ import {
+ import type { ProviderOptionDescriptor, RuntimeMode } from "@t3tools/contracts";
+ import type { EffortDisplay } from "@t3tools/contracts/settings";
+ import { getProviderOptionCurrentLabel } from "@t3tools/shared/model";
+-import { CheckIcon, ChevronRightIcon, ChevronUpIcon, WorkflowIcon } from "lucide-react";
++import { ChevronRightIcon, ChevronUpIcon, WorkflowIcon } from "lucide-react";
+ import { type KeyboardEvent, type ReactNode, use, useRef, useState } from "react";
+ 
+ import { cn } from "~/lib/utils";
+@@ -182,7 +182,7 @@ const COLUMN_LABEL = "px-2 pt-1.5 pb-1 font-medium text-muted-foreground text-xs
+ 
+ function ColumnRow(props: {
+   label: string;
+-  /** Shown on hover; the column is too narrow to print it under the label. */
++  /** Shown on hover; a segment is too narrow to print it under the label. */
+   description?: string | undefined;
+   selected: boolean;
+   /** The column's one tab stop: the selected level, else the first when none shows as selected. */
+@@ -199,29 +199,23 @@ function ColumnRow(props: {
+     "data-effort-row": true,
+     // Focus lands on a level after a model pick.
+     "data-effort-level": true,
++    "data-checked": props.selected || undefined,
+     // Up and Down move between rows.
+     tabIndex: props.tabStop ? 0 : -1,
+-    className: COLUMN_ROW,
++    className: cn(FOOTER_SEGMENT, "h-7 min-w-0 flex-1"),
+     onClick: props.onPick,
+   } as const;
+   const content = (
+     <>
+-      <span className="min-w-0 flex-1 truncate">{props.label}</span>
+-      {props.selected ? (
+-        <>
+-          {props.isDefault ? <span className="sr-only">Default</span> : null}
+-          <CheckIcon aria-hidden="true" className="size-3.5" />
+-        </>
+-      ) : props.isDefault ? (
+-        <span className="text-muted-foreground/70 text-xs">Default</span>
+-      ) : null}
++      <span className="truncate">{props.label}</span>
++      {props.isDefault ? <span className="sr-only">Default</span> : null}
+     </>
+   );
+   if (!props.description) return <button {...rowProps}>{content}</button>;
+   return (
+     <Tooltip>
+       <TooltipTrigger render={<button {...rowProps} />}>{content}</TooltipTrigger>
+-      <TooltipPopup side="right" className="max-w-56">
++      <TooltipPopup side="top" className="max-w-56">
+         {props.description}
+       </TooltipPopup>
+     </Tooltip>
+@@ -304,7 +298,11 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
+   const { descriptor } = control;
+   if (control.kind === "boolean") {
+     return (
+-      <div role="radiogroup" aria-label={descriptor.label} className="flex flex-col gap-0.5">
++      <div
++        role="radiogroup"
++        aria-label={descriptor.label}
++        className="flex rounded-lg bg-input/40 p-0.5"
++      >
+         {([true, false] as const).map((value) => (
+           <ColumnRow
+             key={String(value)}
+@@ -323,25 +321,31 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
+   // An "Ultrathink:" prefix selects a level the column does not offer.
+   const shown = choices.some((option) => option.id === value);
+   return (
+-    <div role="radiogroup" aria-label={descriptor.label} className="flex flex-col gap-0.5">
++    <>
+       {locked ? (
+         <div className="px-2 pb-1.5 text-muted-foreground/80 text-xs">
+           {ULTRATHINK_IN_BODY_NOTE}
+         </div>
+       ) : null}
+-      {choices.map((option, index) => (
+-        <ColumnRow
+-          key={option.id}
+-          label={option.label}
+-          selected={option.id === value}
+-          tabStop={shown ? option.id === value : index === 0}
+-          description={option.description}
+-          isDefault={option.isDefault}
+-          disabled={locked}
+-          onPick={() => traits.changeSelect(control.descriptor, option.id)}
+-        />
+-      ))}
+-    </div>
++      <div
++        role="radiogroup"
++        aria-label={descriptor.label}
++        className="flex rounded-lg bg-input/40 p-0.5"
++      >
++        {choices.map((option, index) => (
++          <ColumnRow
++            key={option.id}
++            label={option.label}
++            selected={option.id === value}
++            tabStop={shown ? option.id === value : index === 0}
++            description={option.description}
++            isDefault={option.isDefault}
++            disabled={locked}
++            onPick={() => traits.changeSelect(control.descriptor, option.id)}
++          />
++        ))}
++      </div>
++    </>
+   );
+ }
+ 
+diff --git a/apps/web/src/components/chat/ModelPickerContent.tsx b/apps/web/src/components/chat/ModelPickerContent.tsx
+index 00ae666751..f73fb28849 100644
+--- a/apps/web/src/components/chat/ModelPickerContent.tsx
++++ b/apps/web/src/components/chat/ModelPickerContent.tsx
+@@ -845,7 +845,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+         ref={pickerContentRef}
+         className={cn(
+           "relative flex w-screen max-w-90 flex-row overflow-hidden",
+-          props.docked ? "max-sm:h-56 max-sm:w-full max-sm:max-w-none" : "max-h-86.5",
++          props.docked ? "h-56 w-full max-w-none" : "max-h-86.5",
+         )}
+         // Docked, the popup sets the height; a minimum here would overflow short windows.
+         style={
+diff --git a/apps/web/src/components/chat/ProviderModelPicker.tsx b/apps/web/src/components/chat/ProviderModelPicker.tsx
+index 094f0c7098..80f40e7654 100644
+--- a/apps/web/src/components/chat/ProviderModelPicker.tsx
++++ b/apps/web/src/components/chat/ProviderModelPicker.tsx
+@@ -462,13 +462,12 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
+         {props.effortColumn ? (
+           <DockedPickerContext value={{ modelLabel: triggerTitle }}>
+             <div className="flex max-h-(--available-height) flex-col">
+-              {/* One fixed height, so a model with more options never resizes the popup. Short
+-                  windows shrink it and keep the footer. */}
+-              <div className="flex h-86.5 min-h-0 max-sm:h-auto max-sm:flex-col">
++              {/* One column: the models, then the effort bar and options. */}
++              <div className="flex min-h-0 w-90 max-w-[calc(100vw-1.5rem)] flex-col">
+                 {picker}
+                 <div
+                   data-model-picker-effort
+-                  className="flex min-h-0 w-48 flex-col sm:shrink-0 border-l border-border/70 bg-muted/40 max-sm:h-64 max-sm:w-full max-sm:border-t max-sm:border-l-0"
++                  className="flex max-h-64 min-h-0 w-full flex-col border-t border-border/70 bg-muted/40"
+                   onKeyDown={(event) => {
+                     if (event.key !== "ArrowLeft" || event.altKey || event.ctrlKey || event.metaKey)
+                       return;
+diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.branch.browser.test.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.branch.browser.test.tsx
+index a0410821ad..2e7a290cab 100644
+--- a/apps/web/src/components/sidebar/SidebarThreadRow.branch.browser.test.tsx
++++ b/apps/web/src/components/sidebar/SidebarThreadRow.branch.browser.test.tsx
+@@ -4,7 +4,7 @@ import { page, userEvent } from "vite-plus/test/browser";
+ 
+ import "~/index.css";
+ 
+-import { render } from "../../../test/render";
++import { act, fakeTimers, render } from "../../../test/render";
+ import { useEnvironmentScope } from "../../state/session";
+ import { buildSidebarDelegatedWorkers } from "../Sidebar.childThreads";
+ import { TooltipProvider } from "../ui/tooltip";
+@@ -131,7 +131,10 @@ async function renderRows(variant: "card" | "folder-multiline") {
+         <ul className="flex flex-col gap-px">
+           <NestedThreadRow {...rowProps(shell("branch", "Met branch"), variant)} />
+           <NestedThreadRow
+-            {...rowProps(shell("none", "Zonder branch", { branch: null, worktreePath: null }), variant)}
++            {...rowProps(
++              shell("none", "Zonder branch", { branch: null, worktreePath: null }),
++              variant,
++            )}
+           />
+           <NestedThreadRow
+             {...rowProps(HEAD, variant)}
+@@ -178,3 +181,28 @@ describe("the sidebar row's meta line leaves the branch out", () => {
+     await expect.poll(() => document.body.textContent).toContain("2511");
+   });
+ });
++
++describe("a running thread's row shows a live timer", () => {
++  it("replaces the Working label with the elapsed time and ticks each second", async () => {
++    vi.mocked(useEnvironmentScope).mockReturnValue(true);
++    await page.viewport(1280, 800);
++    using _timers = fakeTimers({ now: Date.parse("2026-11-10T12:01:12.000Z") });
++    const running = shell("run", "Draait", {
++      runtime: { status: "running", activeRunId: "r", activityStartedAt: UPDATED_AT },
++    });
++    await using _screen = await render(
++      <TooltipProvider delay={0} closeDelay={0}>
++        <ul>
++          <NestedThreadRow {...rowProps(running, "card")} />
++        </ul>
++      </TooltipProvider>,
++    );
++    const item = rowItem("Draait");
++    const timer = () => item.querySelector("[aria-hidden] .tabular-nums")?.textContent;
++    expect(timer()).toBe("1m 12s");
++    await act(() => vi.advanceTimersByTime(1000));
++    expect(timer()).toBe("1m 13s");
++    // The word stays for screen readers only.
++    expect(item.querySelector(".sr-only")?.textContent).toBe("Working");
++  });
++});
+diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
+index c63d760901..2edcd6a641 100644
+--- a/apps/web/src/components/sidebar/SidebarThreadRow.tsx
++++ b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
+@@ -177,9 +177,14 @@ function WorkingDuration(props: { environmentId: EnvironmentId; startedAt: strin
+ // the shared tick lands every working row's update in the same frame.
+ function WorkingDurationLabel(props: { environmentId: EnvironmentId; startedMs: number }) {
+   const nowMs = useNowSecond();
++  const elapsedMs = toServerClock(props.environmentId, nowMs) - props.startedMs;
++  const seconds = Math.floor(elapsedMs / 1000);
++  // Under an hour the label keeps its seconds ("1m 12s"), so it still ticks after the first minute.
+   return (
+     <span className="tabular-nums">
+-      {formatWorkingDurationLabel(toServerClock(props.environmentId, nowMs) - props.startedMs)}
++      {seconds >= 60 && seconds < 3600
++        ? `${Math.floor(seconds / 60)}m ${seconds % 60}s`
++        : formatWorkingDurationLabel(elapsedMs)}
+     </span>
+   );
+ }
+@@ -746,6 +751,8 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+     isActive: props.isActive,
+     isSelected,
+   });
++  const runningTimer =
++    (status === "preparing" || status === "working") && resolveWorkingStartedAt(thread) !== null;
+   const topStatus =
+     status === "preparing" || status === "working"
+       ? {
+@@ -1307,7 +1314,9 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+           sortable?.isDragging && "relative z-20",
+         )}
+       >
+-        <Tooltip disabled={isRenaming || snoozeMenuOpen || workerPopoverOpen || sortable?.isDragging}>
++        <Tooltip
++          disabled={isRenaming || snoozeMenuOpen || workerPopoverOpen || sortable?.isDragging}
++        >
+           <TooltipTrigger
+             render={
+               <div
+@@ -1704,11 +1713,18 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+                             topStatus.className,
+                           )}
+                         >
+-                          <TopStatusIcon icon={topStatus.icon} className="size-4" />
++                          {/* A running thread shows its timer in place of the icon and word. */}
++                          {runningTimer ? null : (
++                            <TopStatusIcon icon={topStatus.icon} className="size-4" />
++                          )}
+                           {/* Not a live region: a collapsed sidebar is inert, so
+                             BackgroundThreadAnnouncer and the open thread's
+                             timeline speak status changes instead. */}
+-                          {topStatus.label}
++                          {runningTimer ? (
++                            <span className="sr-only">{topStatus.label}</span>
++                          ) : (
++                            topStatus.label
++                          )}
+                           {status === "preparing" || status === "working" ? (
+                             <span aria-hidden>
+                               <WorkingDuration
