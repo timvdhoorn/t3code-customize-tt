@@ -8,7 +8,7 @@ Which nightly the patches cover and what a port of them has to watch for. The po
 ## Coverage
 - Shared patches: `patches-port/` targets nightly 0.1.10-nightly.20261115.4736 (`7379f1969b0f`).
 - `patches/` is upstream's and stays untouched.
-- Own patches: `patches-tt/` (12) and `patches-ios/` (9); a port applies 2 shared commits (`patches-port/`, minus the skips) + 12 + 9 = 23 commits.
+- Own patches: `patches-tt/` (14) and `patches-ios/` (9); a port applies 2 shared commits (`patches-port/`, minus the skips) + 14 + 9 = 25 commits.
 - `covered-nightly.txt`: 0.1.10-nightly.20261115.4736.
 - Left out (`skip-shared.json`): desktop stats line and throughput, compaction settings, subscription switch.
 - Their bundle markers are replaced by `markers` in the same file.

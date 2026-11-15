@@ -14,6 +14,7 @@ What is live, what is in progress and what is open. Finished work leaves this pa
 - devbox1: the 4682 build with patches is staged; the restart waits until no thread works.
 - Build the Mac overlay before install-on-quit, so the first launch after an update opens the customized build (worker PR, not opened yet); see [Macs](machines/macs.md).
 - Worker popover on hover with a model line per agent (`patches-tt/0002`): PR open, not merged; see [docs/fork-changes.md](../docs/fork-changes.md).
+- Host load in thread details with a core breakdown toggle (`patches-tt/0014`): PR open, not merged; drop when pingdotgg/t3code#36693 merges; see [docs/fork-changes.md](../docs/fork-changes.md).
 
 ## Open
 - MacBook Pro: 4580 with patches; installs 4682 when T3 Code quits.
