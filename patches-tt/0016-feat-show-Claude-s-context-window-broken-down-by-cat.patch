@@ -1,19 +1,19 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: timvdhoorn <timvdhoorn@gmail.com>
 Date: Mon, 16 Nov 2026 00:40:42 +0100
-Subject: [PATCH] feat: show Claude's context window broken down by category in
- thread details
+Subject: [PATCH 16/16] feat: show Claude's context window broken down by
+ category in thread details
 
 ---
  .../Adapters/ClaudeAdapterV2.test.ts          | 156 +++++++++++++++++-
  .../Adapters/ClaudeAdapterV2.ts               | 113 ++++++++++---
  .../ThreadDetailsContext.browser.test.tsx     |  93 +++++++++++
- .../components/chat/ThreadDetailsUsage.tsx    | 109 ++++++++++--
- .../src/state/contextCategories.test.ts       |  44 +++++
- .../client-runtime/src/state/contextWindow.ts |  71 ++++++++
+ .../components/chat/ThreadDetailsUsage.tsx    | 117 +++++++++++--
+ .../src/state/contextCategories.test.ts       |  66 ++++++++
+ .../client-runtime/src/state/contextWindow.ts |  88 ++++++++++
  packages/contracts/src/orchestrationV2.ts     |   3 +-
  packages/contracts/src/providerRuntime.ts     |  10 ++
- 8 files changed, 563 insertions(+), 36 deletions(-)
+ 8 files changed, 610 insertions(+), 36 deletions(-)
  create mode 100644 apps/web/src/components/chat/ThreadDetailsContext.browser.test.tsx
  create mode 100644 packages/client-runtime/src/state/contextCategories.test.ts
 
@@ -465,7 +465,7 @@ index 0000000000..acd292df8f
 +  expect(screen.container.querySelector(".text-warning-foreground")).not.toBeNull();
 +});
 diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.tsx b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
-index 086967ecb4..11e11004d8 100644
+index 8717c2141a..c79fe19d5c 100644
 --- a/apps/web/src/components/chat/ThreadDetailsUsage.tsx
 +++ b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
 @@ -12,11 +12,16 @@ import {
@@ -509,7 +509,7 @@ index 086967ecb4..11e11004d8 100644
            value={
              maxTokens !== null
                ? `${usedTokens} / ${formatContextWindowTokens(maxTokens)}`
-@@ -130,14 +143,44 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
+@@ -130,14 +143,52 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
                    {formatContextWindowCompactionMessage(threshold)}
                  </span>
                ) : null}
@@ -531,8 +531,16 @@ index 086967ecb4..11e11004d8 100644
 +function ContextCategoryList({ rows }: { readonly rows: readonly ContextCategoryRow[] }) {
 +  return (
 +    <ul className="grid grid-cols-[auto_1fr_auto_auto] items-center gap-x-2 gap-y-0.5 text-xs">
-+      {rows.map((row) => (
-+        <li key={row.name} className="col-span-4 grid grid-cols-subgrid items-center">
++      {rows.map((row, index) => (
++        <li
++          key={row.name}
++          className={cn(
++            "col-span-4 grid grid-cols-subgrid items-center",
++            // A gap between groups, as in Claude Code's `/context`.
++            index > 0 && rows[index - 1]!.kind === "used" && row.kind !== "used" && "mt-2",
++            index > 0 && rows[index - 1]!.kind !== "deferred" && row.kind === "deferred" && "mt-2",
++          )}
++        >
 +          <span
 +            aria-hidden
 +            className={cn("size-2 rounded-full", row.kind !== "used" && "opacity-40")}
@@ -554,7 +562,7 @@ index 086967ecb4..11e11004d8 100644
  function LimitRow({
    window,
    now,
-@@ -184,6 +227,10 @@ export function UsageRow({
+@@ -184,6 +235,10 @@ export function UsageRow({
    ariaValue = value,
    tooltip,
    muted = false,
@@ -565,7 +573,7 @@ index 086967ecb4..11e11004d8 100644
  }: {
    readonly label: string;
    /** Bar fill from 0 to 100. Null hides the bar. */
-@@ -195,6 +242,13 @@ export function UsageRow({
+@@ -195,6 +250,13 @@ export function UsageRow({
    readonly ariaValue?: string;
    readonly tooltip: ReactNode;
    readonly muted?: boolean;
@@ -579,7 +587,7 @@ index 086967ecb4..11e11004d8 100644
  }) {
    return (
      <Tooltip>
-@@ -203,7 +257,23 @@ export function UsageRow({
+@@ -203,7 +265,23 @@ export function UsageRow({
            <div
              tabIndex={0}
              aria-label={`${label}: ${ariaValue}`}
@@ -604,7 +612,7 @@ index 086967ecb4..11e11004d8 100644
            />
          }
        >
-@@ -213,22 +283,35 @@ export function UsageRow({
+@@ -213,22 +291,35 @@ export function UsageRow({
              {fill > 0 ? (
                <span
                  className={cn(
@@ -652,10 +660,10 @@ index 086967ecb4..11e11004d8 100644
              ) : null}
 diff --git a/packages/client-runtime/src/state/contextCategories.test.ts b/packages/client-runtime/src/state/contextCategories.test.ts
 new file mode 100644
-index 0000000000..edcee034f8
+index 0000000000..f2a6af363a
 --- /dev/null
 +++ b/packages/client-runtime/src/state/contextCategories.test.ts
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,66 @@
 +import { describe, expect, it } from "vite-plus/test";
 +
 +import { contextCategoryPercentText, contextCategoryRows } from "./contextWindow.ts";
@@ -693,6 +701,28 @@ index 0000000000..edcee034f8
 +  });
 +});
 +
++it("orders like Claude Code: used rows largest first, then buffer and free, then deferred", () => {
++  const rows = contextCategoryRows(
++    [
++      { name: "System prompt", tokens: 4_800, color: "promptBorder", kind: "used" },
++      { name: "MCP tools (deferred)", tokens: 170_000, color: "cyan", kind: "deferred" },
++      { name: "Skills", tokens: 11_000, color: "warning", kind: "used" },
++      { name: "Messages", tokens: 47_000, color: "purple", kind: "used" },
++      { name: "Autocompact buffer", tokens: 33_000, color: "inactive", kind: "buffer" },
++      { name: "Free space", tokens: 180_000, color: "promptBorder", kind: "free" },
++    ],
++    300_000,
++  );
++  expect(rows.map((row) => row.name)).toEqual([
++    "Messages",
++    "Skills",
++    "System prompt",
++    "Autocompact buffer",
++    "Free space",
++    "MCP tools (deferred)",
++  ]);
++});
++
 +describe("contextCategoryPercentText", () => {
 +  it("rounds, floors tiny shares to <1% and hides a missing one", () => {
 +    expect(contextCategoryPercentText({ percent: 16.6 })).toBe("17%");
@@ -701,7 +731,7 @@ index 0000000000..edcee034f8
 +  });
 +});
 diff --git a/packages/client-runtime/src/state/contextWindow.ts b/packages/client-runtime/src/state/contextWindow.ts
-index a8f7e0f88c..58a0b27924 100644
+index a8f7e0f88c..9f36d9c9d0 100644
 --- a/packages/client-runtime/src/state/contextWindow.ts
 +++ b/packages/client-runtime/src/state/contextWindow.ts
 @@ -1,5 +1,6 @@
@@ -735,7 +765,7 @@ index a8f7e0f88c..58a0b27924 100644
        cost: null,
        updatedAt: DateTime.formatIso(payload.startedAt ?? payload.updatedAt),
      };
-@@ -330,3 +334,70 @@ export function compactBeforeSendTokens(input: {
+@@ -330,3 +334,87 @@ export function compactBeforeSendTokens(input: {
      ? contextWindow.usedTokens
      : null;
  }
@@ -783,7 +813,18 @@ index a8f7e0f88c..58a0b27924 100644
 +  return row.percent < 1 ? "<1%" : `${Math.round(row.percent)}%`;
 +}
 +
-+/** The `/context` rows with a drawable color and their share of the window. Empty rows drop out. */
++// Claude Code's `/context` order: what fills the window, then buffer and free space, then deferred.
++const CONTEXT_KIND_ORDER: Record<ContextUsageCategory["kind"], number> = {
++  used: 0,
++  buffer: 1,
++  free: 1,
++  deferred: 2,
++};
++
++/**
++ * The `/context` rows with a drawable color and their share of the window, in Claude Code's order:
++ * used rows largest first, then buffer and free space, then deferred rows. Empty rows drop out.
++ */
 +export function contextCategoryRows(
 +  categories: ReadonlyArray<ContextUsageCategory> | null | undefined,
 +  maxTokens: number | null,
@@ -804,7 +845,13 @@ index a8f7e0f88c..58a0b27924 100644
 +            ? (category.tokens / maxTokens) * 100
 +            : null,
 +      };
-+    });
++    })
++    // `.map` made a new array; `sort` because Hermes on mobile lacks `toSorted`.
++    .sort(
++      (a, b) =>
++        CONTEXT_KIND_ORDER[a.kind] - CONTEXT_KIND_ORDER[b.kind] ||
++        (a.kind === "used" ? b.tokens - a.tokens : 0),
++    );
 +}
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
 index 1e98cb7e81..53517b6b06 100644
