@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: timvdhoorn <timvdhoorn@gmail.com>
+Date: Mon, 16 Nov 2026 00:41:39 +0100
+Subject: [PATCH 11/11] feat(mobile): show Claude's context categories in the
+ context sheet
+
+---
+ .../src/features/threads/ComposerStats.tsx    | 52 +++++++++++++++++--
+ .../features/threads/composerStatsRow.test.ts | 16 ++++++
+ .../src/features/threads/composerStatsRow.ts  | 14 ++++-
+ 3 files changed, 76 insertions(+), 6 deletions(-)
+
+diff --git a/apps/mobile/src/features/threads/ComposerStats.tsx b/apps/mobile/src/features/threads/ComposerStats.tsx
+index 3e8e4d29fb..175b0143b4 100644
+--- a/apps/mobile/src/features/threads/ComposerStats.tsx
++++ b/apps/mobile/src/features/threads/ComposerStats.tsx
+@@ -14,7 +14,11 @@ import {
+   type ComposerStatsData,
+   type ComposerStatsTone,
+ } from "@t3tools/client-runtime/state/composer-stats";
+-import { formatContextWindowTokens } from "@t3tools/client-runtime/state/context-window";
++import {
++  type ContextCategoryRow,
++  contextCategoryRows,
++  formatContextWindowTokens,
++} from "@t3tools/client-runtime/state/context-window";
+ import { formatDuration } from "@t3tools/shared/orchestrationTiming";
+ import { formatResetsIn } from "@t3tools/shared/usageLimits";
+ import * as DateTime from "effect/DateTime";
+@@ -30,6 +34,7 @@ import { RowPressable } from "../../components/ui/RowPressable";
+ import { cn } from "../../lib/cn";
+ import {
+   chooseComposerStatsRowLayout,
++  contextCategoryDetail,
+   deriveComposerStatsRow,
+   type ComposerStatsRow,
+ } from "./composerStatsRow";
+@@ -132,7 +137,12 @@ function Meter(props: {
+   );
+ }
+ 
+-function Bar(props: { readonly percent: number; readonly dimmed?: boolean }) {
++function Bar(props: {
++  readonly percent: number;
++  readonly dimmed?: boolean;
++  /** Colored parts of the fill, sized by tokens. */
++  readonly segments?: ReadonlyArray<ContextCategoryRow>;
++}) {
+   return (
+     <View
+       className={cn(
+@@ -141,9 +151,16 @@ function Bar(props: { readonly percent: number; readonly dimmed?: boolean }) {
+       )}
+     >
+       <View
+-        className="h-full bg-foreground-muted"
++        className={cn("h-full flex-row", !props.segments?.length && "bg-foreground-muted")}
+         style={{ width: `${Math.max(0, Math.min(100, props.percent))}%` }}
+-      />
++      >
++        {props.segments?.map((segment) => (
++          <View
++            key={segment.name}
++            style={{ flexGrow: segment.tokens, flexBasis: 0, backgroundColor: segment.color }}
++          />
++        ))}
++      </View>
+     </View>
+   );
+ }
+@@ -323,6 +340,7 @@ function ContextSheet(props: {
+     props.stats.configuredClaudeThreshold,
+   );
+   const compactBlocked = props.compactDisabled || props.isCompacting;
++  const categories = contextCategoryRows(context?.categories, context?.maxTokens ?? null);
+   return (
+     <Sheet title="Context usage" onClose={props.onClose}>
+       <SheetBody>
+@@ -335,7 +353,12 @@ function ContextSheet(props: {
+                 : "Not reported"
+             }
+           />
+-          {context?.usedPercentage != null ? <Bar percent={context.usedPercentage} /> : null}
++          {context?.usedPercentage != null ? (
++            <Bar
++              percent={context.usedPercentage}
++              segments={categories.filter((row) => row.kind === "used")}
++            />
++          ) : null}
+           <Separated>
+             {[
+               <Detail
+@@ -384,6 +407,25 @@ function ContextSheet(props: {
+             ]}
+           </Separated>
+         </ListSection>
++        {categories.length > 0 ? (
++          <ListSection title="Categories">
++            <Separated>
++              {categories.map((row) => (
++                <ListRowLayout
++                  key={row.name}
++                  leading={
++                    <View
++                      className={cn("size-3 rounded-full", row.kind !== "used" && "opacity-40")}
++                      style={{ backgroundColor: row.color }}
++                    />
++                  }
++                  label={row.name}
++                  detail={contextCategoryDetail(row)}
++                />
++              ))}
++            </Separated>
++          </ListSection>
++        ) : null}
+         {compaction.source === "configured" ? (
+           <Note>
+             Claude's current setting applies when a query starts. A running query may use an earlier
+diff --git a/apps/mobile/src/features/threads/composerStatsRow.test.ts b/apps/mobile/src/features/threads/composerStatsRow.test.ts
+index d5b42e657c..84a4857801 100644
+--- a/apps/mobile/src/features/threads/composerStatsRow.test.ts
++++ b/apps/mobile/src/features/threads/composerStatsRow.test.ts
+@@ -6,6 +6,7 @@ import { describe, expect, it } from "vite-plus/test";
+ import {
+   chooseComposerStatsRowLayout,
+   composerStatsRowText,
++  contextCategoryDetail,
+   deriveComposerStatsRow,
+ } from "./composerStatsRow";
+ import {
+@@ -219,3 +220,18 @@ describe("mobile composer stats row", () => {
+     });
+   });
+ });
++
++describe("contextCategoryDetail", () => {
++  const row = { name: "Messages", color: "#a45cf0", kind: "used" } as const;
++
++  it("shows tokens and the share of the window", () => {
++    expect(contextCategoryDetail({ ...row, tokens: 34_000, percent: 17 })).toBe("34k · 17%");
++    expect(contextCategoryDetail({ ...row, tokens: 900, percent: 0.4 })).toBe("900 · <1%");
++  });
++
++  it("shows only tokens for a row outside the window", () => {
++    expect(contextCategoryDetail({ ...row, kind: "deferred", tokens: 12_000, percent: null })).toBe(
++      "12k",
++    );
++  });
++});
+diff --git a/apps/mobile/src/features/threads/composerStatsRow.ts b/apps/mobile/src/features/threads/composerStatsRow.ts
+index 362e7deacb..8eaf825795 100644
+--- a/apps/mobile/src/features/threads/composerStatsRow.ts
++++ b/apps/mobile/src/features/threads/composerStatsRow.ts
+@@ -8,7 +8,11 @@ import {
+   type ComposerStatsTone,
+ } from "@t3tools/client-runtime/state/composer-stats";
+ import type { MobileComposerStats } from "../../state/composer-cache-usage";
+-import { formatContextWindowTokens } from "@t3tools/client-runtime/state/context-window";
++import {
++  type ContextCategoryRow,
++  contextCategoryPercentText,
++  formatContextWindowTokens,
++} from "@t3tools/client-runtime/state/context-window";
+ 
+ /**
+  * How the row fits its width: the full row when it fits, else shorter meters and labels,
+@@ -138,3 +142,11 @@ export function composerStatsRowText(row: ComposerStatsRow): string {
+     `${row.cache.value} ${row.cache.label}`,
+   ].join(" ");
+ }
++
++/** The right side of a `/context` row in the sheet: tokens, then the share of the window. */
++export function contextCategoryDetail(row: ContextCategoryRow): string {
++  const percent = contextCategoryPercentText(row);
++  return percent === ""
++    ? formatContextWindowTokens(row.tokens)
++    : `${formatContextWindowTokens(row.tokens)} · ${percent}`;
++}

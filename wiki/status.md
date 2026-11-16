@@ -1,7 +1,7 @@
 # Status
 
 > Source: `./t3code-customize status` on each machine; GitHub PRs of `timvdhoorn/t3code-customize-tt`
-> Updated: 2026-11-15
+> Updated: 2026-11-16
 
 What is live, what is in progress and what is open. Finished work leaves this page; its facts live on the owning page.
 
@@ -16,6 +16,7 @@ What is live, what is in progress and what is open. Finished work leaves this pa
 - Worker popover on hover with a model line per agent (`patches-tt/0002`): PR open, not merged; see [docs/fork-changes.md](../docs/fork-changes.md).
 - Host load in thread details with a core breakdown toggle (`patches-tt/0014`): PR open, not merged; drop when pingdotgg/t3code#36693 merges; see [docs/fork-changes.md](../docs/fork-changes.md).
 - One-column picker, effort bar and row timer (`patches-tt/0015`, desktop and web): PR open, not merged; replaces the Macs' `claude` theme CSS once live; see [docs/fork-changes.md](../docs/fork-changes.md).
+- Context categories for Claude threads in the thread details card (`patches-tt/0016`) and the iOS context sheet (`patches-ios/0011`): PR open, not merged; see [docs/fork-changes.md](../docs/fork-changes.md).
 
 ## Open
 - MacBook Pro: 4580 with patches; installs 4682 when T3 Code quits.
