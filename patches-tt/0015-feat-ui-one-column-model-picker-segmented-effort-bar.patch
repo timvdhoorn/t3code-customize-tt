@@ -1,18 +1,18 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Sun, 15 Nov 2026 21:10:39 +0100
-Subject: [PATCH 15/15] feat(ui): one-column model picker, segmented effort bar
+Subject: [PATCH 15/16] feat(ui): one-column model picker, segmented effort bar
  and a live timer on running sidebar rows
 
 ---
  .../chat/ComposerModelEffort.browser.test.tsx | 55 +++++++++++++-
  .../components/chat/ComposerModelEffort.tsx   | 73 +++++++++++--------
  .../components/chat/ModelPickerContent.tsx    |  2 +-
- .../chat/ProviderModelPicker.browser.test.tsx |  5 ++
- .../components/chat/ProviderModelPicker.tsx   |  6 +-
+ .../chat/ProviderModelPicker.browser.test.tsx | 48 ++++++++++++
+ .../components/chat/ProviderModelPicker.tsx   |  8 +-
  .../SidebarThreadRow.branch.browser.test.tsx  | 50 ++++++++++++-
  .../components/sidebar/SidebarThreadRow.tsx   | 20 ++++-
- 7 files changed, 172 insertions(+), 39 deletions(-)
+ 7 files changed, 216 insertions(+), 40 deletions(-)
 
 diff --git a/apps/web/src/components/chat/ComposerModelEffort.browser.test.tsx b/apps/web/src/components/chat/ComposerModelEffort.browser.test.tsx
 index ab7d560d5c..b408bb4eb5 100644
@@ -95,7 +95,7 @@ index ab7d560d5c..b408bb4eb5 100644
 +  expect(bubbled.mock.calls[0]![0].defaultPrevented).toBe(false);
 +});
 diff --git a/apps/web/src/components/chat/ComposerModelEffort.tsx b/apps/web/src/components/chat/ComposerModelEffort.tsx
-index f56997ff2a..7b42c1ca77 100644
+index f56997ff2a..1ce6f1e800 100644
 --- a/apps/web/src/components/chat/ComposerModelEffort.tsx
 +++ b/apps/web/src/components/chat/ComposerModelEffort.tsx
 @@ -7,7 +7,7 @@ import {
@@ -131,7 +131,7 @@ index f56997ff2a..7b42c1ca77 100644
 -    className: COLUMN_ROW,
 +    className: cn(
 +      FOOTER_SEGMENT,
-+      "h-7 min-w-0 flex-1 disabled:cursor-not-allowed disabled:opacity-64",
++      "h-7 min-w-0 flex-auto disabled:cursor-not-allowed disabled:opacity-64",
 +    ),
      onClick: props.onPick,
    } as const;
@@ -234,7 +234,7 @@ index f56997ff2a..7b42c1ca77 100644
  }
  
 diff --git a/apps/web/src/components/chat/ModelPickerContent.tsx b/apps/web/src/components/chat/ModelPickerContent.tsx
-index 00ae666751..f73fb28849 100644
+index 00ae666751..1ee464e9d1 100644
 --- a/apps/web/src/components/chat/ModelPickerContent.tsx
 +++ b/apps/web/src/components/chat/ModelPickerContent.tsx
 @@ -845,7 +845,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
@@ -242,12 +242,12 @@ index 00ae666751..f73fb28849 100644
          className={cn(
            "relative flex w-screen max-w-90 flex-row overflow-hidden",
 -          props.docked ? "max-sm:h-56 max-sm:w-full max-sm:max-w-none" : "max-h-86.5",
-+          props.docked ? "h-56 w-full max-w-none" : "max-h-86.5",
++          props.docked ? "min-h-0 w-full max-w-none flex-1" : "max-h-86.5",
          )}
          // Docked, the popup sets the height; a minimum here would overflow short windows.
          style={
 diff --git a/apps/web/src/components/chat/ProviderModelPicker.browser.test.tsx b/apps/web/src/components/chat/ProviderModelPicker.browser.test.tsx
-index bf196f5254..29692c9844 100644
+index bf196f5254..a7228f3107 100644
 --- a/apps/web/src/components/chat/ProviderModelPicker.browser.test.tsx
 +++ b/apps/web/src/components/chat/ProviderModelPicker.browser.test.tsx
 @@ -169,7 +169,12 @@ it("keeps a docked picker open after a pick and hands focus to that model's effo
@@ -263,8 +263,55 @@ index bf196f5254..29692c9844 100644
    await page.getByRole("option", { name: /Second model/ }).click();
    await expect.element(page.getByRole("radio", { name: "Medium" })).toHaveFocus();
    await userEvent.keyboard("{Escape}");
+@@ -275,3 +280,46 @@ it("keeps the touch keyboard down while choosing a provider", async () => {
+   await expect.element(page.getByRole("option", { name: /Claude model/ })).toBeVisible();
+   await expect.element(search).not.toHaveFocus();
+ });
++
++it("gives a docked picker's list the height its options leave", async () => {
++  const instanceId = ProviderInstanceId.make("codex");
++  const entries = deriveProviderInstanceEntries([
++    {
++      instanceId,
++      driver: ProviderDriverKind.make("codex"),
++      enabled: true,
++      installed: true,
++      version: null,
++      status: "ready",
++      auth: { status: "authenticated" },
++      checkedAt: "2026-01-01T00:00:00.000Z",
++      models: [],
++      slashCommands: [],
++      skills: [],
++    },
++  ]);
++  const options = new Map([[instanceId, [{ slug: "only", name: "Only model" }]]]);
++  await using screen = await render(
++    <ProviderModelPicker
++      environmentId={null}
++      activeInstanceId={instanceId}
++      model="only"
++      lockedProvider={null}
++      instanceEntries={entries}
++      modelOptionsByInstance={options}
++      triggerAriaLabel="Choose model"
++      onInstanceModelChange={() => {}}
++      effortColumn={
++        <button type="button" role="radio" aria-checked data-effort-row data-effort-level>
++          Medium
++        </button>
++      }
++    />,
++  );
++  await screen.getByRole("button", { name: "Choose model" }).click();
++  const effort = document.querySelector<HTMLElement>("[data-model-picker-effort]")!;
++  const list = document.querySelector<HTMLElement>("[data-model-picker-content]")!;
++  // A short options panel leaves no empty band; the list takes the rest of the fixed height.
++  expect(effort.offsetHeight).toBeLessThan(100);
++  expect(list.offsetHeight + effort.offsetHeight).toBe(effort.parentElement!.offsetHeight);
++});
 diff --git a/apps/web/src/components/chat/ProviderModelPicker.tsx b/apps/web/src/components/chat/ProviderModelPicker.tsx
-index 094f0c7098..4fe36fb7d5 100644
+index 094f0c7098..9179829d3a 100644
 --- a/apps/web/src/components/chat/ProviderModelPicker.tsx
 +++ b/apps/web/src/components/chat/ProviderModelPicker.tsx
 @@ -462,13 +462,13 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
@@ -272,15 +319,16 @@ index 094f0c7098..4fe36fb7d5 100644
            <DockedPickerContext value={{ modelLabel: triggerTitle }}>
              <div className="flex max-h-(--available-height) flex-col">
 -              {/* One fixed height, so a model with more options never resizes the popup. Short
-+              {/* One column at a fixed height, so a model with more options never resizes the popup. Short
-                   windows shrink it and keep the footer. */}
+-                  windows shrink it and keep the footer. */}
 -              <div className="flex h-86.5 min-h-0 max-sm:h-auto max-sm:flex-col">
-+              <div className="flex min-h-0 w-90 max-w-[calc(100vw-1.5rem)] flex-col">
++              {/* One column at a fixed height, so a model with more options never resizes the popup:
++                  the list takes what the options leave. Short windows shrink it and keep the footer. */}
++              <div className="flex h-120 min-h-0 w-90 max-w-[calc(100vw-1.5rem)] flex-col">
                  {picker}
                  <div
                    data-model-picker-effort
 -                  className="flex min-h-0 w-48 flex-col sm:shrink-0 border-l border-border/70 bg-muted/40 max-sm:h-64 max-sm:w-full max-sm:border-t max-sm:border-l-0"
-+                  className="flex h-64 min-h-0 w-full flex-col border-t border-border/70 bg-muted/40"
++                  className="flex max-h-64 min-h-0 w-full shrink-0 flex-col border-t border-border/70 bg-muted/40"
                    onKeyDown={(event) => {
                      if (event.key !== "ArrowLeft" || event.altKey || event.ctrlKey || event.metaKey)
                        return;
