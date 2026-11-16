@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: timvdhoorn <timvdhoorn@gmail.com>
 Date: Thu, 15 Oct 2026 14:33:02 +0200
-Subject: [PATCH 02/15] feat: nest agent-opened child threads under their
+Subject: [PATCH 02/16] feat: nest agent-opened child threads under their
  opener in the sidebar
 
 Ports the server side of pingdotgg/t3code#16699 (openedByThreadId on
@@ -37,9 +37,9 @@ guide line, context-menu collapse and a summary stub.
  ...lationshipsControl.opened.browser.test.tsx |  373 +++++
  .../chat/ThreadRelationshipsControl.tsx       |  338 +++-
  .../components/sidebar/SidebarThreadRow.tsx   |  196 ++-
- .../SidebarThreadRow.workers.browser.test.tsx |  889 +++++++++++
+ .../SidebarThreadRow.workers.browser.test.tsx |  933 +++++++++++
  .../web/src/components/sidebar/routeReveal.ts |   18 +-
- .../src/components/sidebar/threadModel.tsx    |   94 ++
+ .../src/components/sidebar/threadModel.tsx    |  118 ++
  .../components/threadActionMenu.logic.test.ts |   33 +
  .../src/components/threadActionMenu.logic.ts  |   39 +
  apps/web/src/components/ui/tooltip.tsx        |   10 +-
@@ -66,7 +66,7 @@ guide line, context-menu collapse and a summary stub.
  packages/contracts/src/orchestrationV2.ts     |   32 +
  packages/contracts/src/orchestratorMcp.ts     |    6 +
  .../src/server/subagentProjection.ts          |    9 +-
- 57 files changed, 7259 insertions(+), 218 deletions(-)
+ 57 files changed, 7327 insertions(+), 218 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.childThreads.browser.test.tsx
  create mode 100644 apps/web/src/components/Sidebar.childThreads.test.ts
  create mode 100644 apps/web/src/components/Sidebar.childThreads.tsx
@@ -6326,10 +6326,10 @@ index 641bc0cfa0..5100b32e5b 100644
            terminalProcessCount={runningTerminalIds.length}
 diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx
 new file mode 100644
-index 0000000000..30e5fc7498
+index 0000000000..d45c034bcd
 --- /dev/null
 +++ b/apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx
-@@ -0,0 +1,889 @@
+@@ -0,0 +1,933 @@
 +import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 +import { describe, expect, it, vi } from "vite-plus/test";
 +import { cdp, page, userEvent } from "vite-plus/test/browser";
@@ -6837,6 +6837,50 @@ index 0000000000..30e5fc7498
 +      .toHaveTextContent("Opus 5.5 · Claude Tim");
 +  });
 +
++  it("adds the worker's effort after its model, as the composer's model trigger does", async () => {
++    const effort = {
++      id: "effort",
++      label: "Effort",
++      type: "select",
++      options: [
++        { id: "medium", label: "Medium", isDefault: true },
++        { id: "high", label: "High" },
++      ],
++    };
++    using _entries = withProviderEntries([
++      {
++        ...modelEntry("claude", "Claude Tim"),
++        models: [
++          {
++            slug: "claude-opus-5-5",
++            name: "Claude Opus 5.5",
++            shortName: "Opus 5.5",
++            capabilities: { optionDescriptors: [effort] },
++          },
++        ],
++      } as unknown as ReturnType<typeof modelEntry>,
++    ]);
++    await using _screen = await renderRow(1280, 800, vi.fn(), noop, [
++      HEAD,
++      worker("high", "W: high", {
++        modelSelection: {
++          instanceId: "claude",
++          model: "claude-opus-5-5",
++          options: [{ id: "effort", value: "high" }],
++        },
++        runtime: { status: "running" },
++      }),
++      worker("default", "W: default", { runtime: { status: "running" } }),
++    ]);
++    await userEvent.click(page.getByTestId("sidebar-delegated-workers"));
++    const lines = [
++      ...document.querySelectorAll('[data-testid="sidebar-delegated-worker-model"]'),
++    ].map((line) => line.textContent);
++    expect(lines).toContain("Opus 5.5 High · Claude Tim");
++    // Without a stated level the model's default shows.
++    expect(lines).toContain("Opus 5.5 Medium · Claude Tim");
++  });
++
 +  it("falls back to the runtime's provider name without a provider entry, and shows no line without a model", async () => {
 +    await using _screen = await renderRow(1280, 800, vi.fn(), noop, [
 +      HEAD,
@@ -7257,10 +7301,17 @@ index a565cefd06..2446ccc815 100644
  }
 diff --git a/apps/web/src/components/sidebar/threadModel.tsx b/apps/web/src/components/sidebar/threadModel.tsx
 new file mode 100644
-index 0000000000..417cfcc47a
+index 0000000000..9d3d60d0d6
 --- /dev/null
 +++ b/apps/web/src/components/sidebar/threadModel.tsx
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,118 @@
++import type { ProviderOptionSelection } from "@t3tools/contracts";
++import { isReasoningSelect } from "@t3tools/client-runtime/model-traits";
++import {
++  getProviderOptionCurrentLabel,
++  getProviderOptionDescriptors,
++} from "@t3tools/shared/model";
++
 +import { getTriggerDisplayModelName } from "../chat/providerIconUtils";
 +import { ProviderInstanceIcon } from "../chat/ProviderInstanceIcon";
 +import { shouldShowInstanceBadge, type ProviderInstanceEntry } from "../../providerInstances";
@@ -7287,6 +7338,8 @@ index 0000000000..417cfcc47a
 +  /** Several instances share the driver (or this one has an accent), so the instance is named. */
 +  readonly showInstanceBadge: boolean;
 +  readonly modelLabel: string;
++  /** The reasoning level the thread selected ("Medium"), as the composer's model trigger shows it. */
++  readonly effortLabel: string | null;
 +  /** The instance's name: its provider entry's, else the live runtime's; null when neither is known. */
 +  readonly instanceName: string | null;
 +}
@@ -7301,7 +7354,11 @@ index 0000000000..417cfcc47a
 +        }
 +      | null
 +      | undefined;
-+    readonly modelSelection: { readonly instanceId: string; readonly model: string };
++    readonly modelSelection: {
++      readonly instanceId: string;
++      readonly model: string;
++      readonly options?: ReadonlyArray<ProviderOptionSelection> | undefined;
++    };
 +  },
 +  providerEntryByInstanceId: ReadonlyMap<string, SidebarProviderEntry>,
 +): ThreadModelDisplay {
@@ -7316,12 +7373,20 @@ index 0000000000..417cfcc47a
 +  const modelLabel = selectedModel
 +    ? getTriggerDisplayModelName(selectedModel, providerEntry?.driverKind)
 +    : thread.modelSelection.model;
++  const reasoning = selectedModel?.capabilities
++    ? getProviderOptionDescriptors({
++        caps: selectedModel.capabilities,
++        selections: thread.modelSelection.options,
++      }).find(isReasoningSelect)
++    : undefined;
++  // A select only: a reasoning on/off toggle would read "Opus 5.5 On", which says nothing.
++  const effortLabel = getProviderOptionCurrentLabel(reasoning) ?? null;
 +  const instanceName = providerEntry?.displayName ?? thread.runtime?.providerName ?? null;
-+  return { instanceId, providerEntry, showInstanceBadge, modelLabel, instanceName };
++  return { instanceId, providerEntry, showInstanceBadge, modelLabel, effortLabel, instanceName };
 +}
 +
 +/**
-+ * "Opus 5.5 · Claude Tim": the model, then its instance. The hover card names the instance only
++ * "Opus 5.5 Medium · Claude Tim": the model and its effort, then its instance. The hover card names the instance only
 + * when it needs telling apart (`showInstanceBadge`); `nameInstance: "always"` names it every time.
 + */
 +export function formatThreadModel(
@@ -7334,7 +7399,10 @@ index 0000000000..417cfcc47a
 +      : display.showInstanceBadge && display.providerEntry
 +        ? display.providerEntry.displayName
 +        : null;
-+  return named === null ? display.modelLabel : `${display.modelLabel} · ${named}`;
++  const model = display.effortLabel
++    ? `${display.modelLabel} ${display.effortLabel}`
++    : display.modelLabel;
++  return named === null ? model : `${model} · ${named}`;
 +}
 +
 +/** The provider's icon, in the hover card's muted style; nothing for an unknown instance. */
