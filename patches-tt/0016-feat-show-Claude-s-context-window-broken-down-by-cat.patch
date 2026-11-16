@@ -5,20 +5,20 @@ Subject: [PATCH] feat: show Claude's context window broken down by category in
  thread details
 
 ---
- .../Adapters/ClaudeAdapterV2.test.ts          | 90 ++++++++++++++++-
- .../Adapters/ClaudeAdapterV2.ts               | 42 +++++++-
- .../ThreadDetailsContext.browser.test.tsx     | 69 +++++++++++++
- .../components/chat/ThreadDetailsUsage.tsx    | 97 ++++++++++++++++---
- .../src/state/contextCategories.test.ts       | 43 ++++++++
- .../client-runtime/src/state/contextWindow.ts | 74 ++++++++++++++
- packages/contracts/src/orchestrationV2.ts     |  3 +-
- packages/contracts/src/providerRuntime.ts     | 10 ++
- 8 files changed, 413 insertions(+), 15 deletions(-)
+ .../Adapters/ClaudeAdapterV2.test.ts          | 156 +++++++++++++++++-
+ .../Adapters/ClaudeAdapterV2.ts               | 113 ++++++++++---
+ .../ThreadDetailsContext.browser.test.tsx     |  93 +++++++++++
+ .../components/chat/ThreadDetailsUsage.tsx    | 109 ++++++++++--
+ .../src/state/contextCategories.test.ts       |  44 +++++
+ .../client-runtime/src/state/contextWindow.ts |  71 ++++++++
+ packages/contracts/src/orchestrationV2.ts     |   3 +-
+ packages/contracts/src/providerRuntime.ts     |  10 ++
+ 8 files changed, 563 insertions(+), 36 deletions(-)
  create mode 100644 apps/web/src/components/chat/ThreadDetailsContext.browser.test.tsx
  create mode 100644 packages/client-runtime/src/state/contextCategories.test.ts
 
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-index 96c9e5c914..777650afd4 100644
+index 96c9e5c914..0c3c254e1f 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
 @@ -3570,6 +3570,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
@@ -39,7 +39,7 @@ index 96c9e5c914..777650afd4 100644
                  readMcpResource:
                    options?.mcp?.readMcpResource ??
                    (() => Effect.die("unexpected MCP resource read")),
-@@ -9722,6 +9726,86 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+@@ -9722,6 +9726,152 @@ describe("ClaudeAdapterV2 background wake turns", () => {
      ),
    );
  
@@ -48,85 +48,151 @@ index 96c9e5c914..777650afd4 100644
 +    { name: "Messages", tokens: 35_123, color: "purple_FOR_SUBAGENTS_ONLY", kind: "used" as const },
 +    { name: "Free space", tokens: 120_000, color: "promptBorder", kind: "free" as const },
 +  ];
-+  const finalUsageFrames = () => [
-+    usageStreamFrame({ type: "message_start", message: { id: "msg_ctx", usage: zeroUsage } }),
-+    usageSnapshotFrame("msg_ctx", "00000000-0000-4000-8000-000000000680", {
-+      ...zeroUsage,
-+      input_tokens: 38_000,
-+      output_tokens: 123,
-+    }),
-+    makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000681", result: "Done." }),
-+  ];
++  const settledUsage = { ...zeroUsage, input_tokens: 38_000, output_tokens: 123 };
 +  const categoriesOf = (events: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>) =>
 +    events.flatMap((event) =>
 +      event.type === "provider_turn.updated" && event.providerTurn.tokenUsage
 +        ? [event.providerTurn.tokenUsage.categories]
 +        : [],
 +    );
++  // Offers one settled usage (twice when asked), lets the `/context` call finish, then ends the turn.
 +  const runContextTurn = (
-+    contextCategories: ClaudeAdapterV2.ClaudeAgentSdkQuerySession["contextCategories"],
++    harness: Effect.Success<typeof makeWakeHarness>,
++    attempt: string,
++    uuid: string,
++    snapshots = 1,
 +  ) =>
 +    Effect.gen(function* () {
-+      const harness = yield* makeWakeHarnessWithOptions({ contextCategories });
 +      yield* harness.runtime.startTurn(
 +        makeClaudeTestTurnInput({
 +          threadId: harness.threadId,
 +          providerThread: harness.providerThread,
 +          now: yield* DateTime.now,
-+          attemptId: RunAttemptId.make("attempt-context-categories"),
++          attemptId: RunAttemptId.make(attempt),
 +          text: "Continue.",
 +          attachments: [],
 +        }),
 +      );
-+      for (const frame of finalUsageFrames()) yield* Queue.offer(harness.sdkMessages, frame);
-+      // Lets the 2 s timeout of a call that never answers elapse.
-+      yield* Effect.forkScoped(
-+        Effect.forever(Effect.andThen(TestClock.adjust("1 second"), Effect.yieldNow)),
++      yield* Queue.offer(
++        harness.sdkMessages,
++        usageStreamFrame({ type: "message_start", message: { id: "msg_ctx", usage: zeroUsage } }),
++      );
++      for (let index = 0; index < snapshots; index += 1) {
++        yield* Queue.offer(
++          harness.sdkMessages,
++          usageSnapshotFrame(`msg_ctx${index}`, `${uuid}${index}`, settledUsage),
++        );
++      }
++      // Lets the 2 s timeout of a call that never answers elapse, and the forked call finish.
++      for (let tick = 0; tick < 50; tick += 1) {
++        yield* TestClock.adjust("100 millis");
++        yield* Effect.yieldNow;
++      }
++      yield* Queue.offer(
++        harness.sdkMessages,
++        makeResultFrame({ uuid: `${uuid}f`, result: "Done." }),
 +      );
 +      const terminal = yield* Queue.take(harness.terminalReceipts);
 +      assert.equal(terminal.status, "completed");
-+      return harness.events;
-+    }).pipe(
-+      Effect.provide(
-+        Layer.mergeAll(
-+          IdAllocator.layer,
-+          McpProviderSessions.layer,
-+          NodeServices.layer,
-+          NodeCrypto.layer,
-+        ),
-+      ),
-+    );
-+
-+  it.effect("attaches Claude's context categories to the settled usage", () =>
-+    Effect.gen(function* () {
-+      const events = yield* runContextTurn(Effect.succeed(contextRows));
-+      assert.deepEqual(reportedContextTokens(events), [38_123]);
-+      assert.deepEqual(categoriesOf(events), [contextRows]);
-+    }),
++    });
++  const withContextLayers = Effect.provide(
++    Layer.mergeAll(
++      IdAllocator.layer,
++      McpProviderSessions.layer,
++      NodeServices.layer,
++      NodeCrypto.layer,
++    ),
 +  );
 +
-+  it.effect("keeps the usage when the context categories fail or time out", () =>
++  it.effect("sends Claude's context categories as a second usage update, once per usage", () =>
 +    Effect.gen(function* () {
-+      const failed = yield* runContextTurn(
++      let calls = 0;
++      const harness = yield* makeWakeHarnessWithOptions({
++        contextCategories: Effect.sync(() => {
++          calls += 1;
++          return contextRows;
++        }),
++      });
++      // The same usage twice: the second snapshot does not ask again.
++      yield* runContextTurn(harness, "attempt-context-1", "00000000-0000-4000-8000-00000000068", 2);
++      assert.deepEqual(reportedContextTokens(harness.events), [38_123, 38_123, 38_123]);
++      assert.deepEqual(categoriesOf(harness.events), [undefined, undefined, contextRows]);
++      assert.equal(calls, 1);
++    }).pipe(withContextLayers),
++  );
++
++  it.effect("keeps the usage when the context categories fail or never arrive", () =>
++    Effect.gen(function* () {
++      for (const contextCategories of [
 +        Effect.fail(
 +          new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({
 +            method: "getContextUsage",
 +            cause: "boom",
 +          }),
 +        ),
-+      );
-+      assert.deepEqual(reportedContextTokens(failed), [38_123]);
-+      assert.deepEqual(categoriesOf(failed), [undefined]);
-+      const slow = yield* runContextTurn(Effect.never);
-+      assert.deepEqual(reportedContextTokens(slow), [38_123]);
-+      assert.deepEqual(categoriesOf(slow), [undefined]);
-+    }),
++        Effect.never,
++      ]) {
++        const harness = yield* makeWakeHarnessWithOptions({ contextCategories });
++        yield* runContextTurn(harness, "attempt-context-2", "00000000-0000-4000-8000-00000000069");
++        assert.deepEqual(reportedContextTokens(harness.events), [38_123]);
++        assert.deepEqual(categoriesOf(harness.events), [undefined]);
++      }
++    }).pipe(withContextLayers),
 +  );
++
++  it.effect("draws the last categories from the first usage of the next turn", () =>
++    Effect.gen(function* () {
++      const harness = yield* makeWakeHarnessWithOptions({
++        contextCategories: Effect.succeed(contextRows),
++      });
++      yield* runContextTurn(harness, "attempt-context-3", "00000000-0000-4000-8000-00000000070");
++      const before = harness.events.length;
++      yield* harness.runtime.startTurn(
++        makeClaudeTestTurnInput({
++          threadId: harness.threadId,
++          providerThread: harness.providerThread,
++          now: yield* DateTime.now,
++          attemptId: RunAttemptId.make("attempt-context-4"),
++          text: "Again.",
++          attachments: [],
++        }),
++      );
++      yield* Queue.offer(
++        harness.sdkMessages,
++        usageStreamFrame({
++          type: "message_start",
++          message: { id: "msg_next", usage: { ...zeroUsage, input_tokens: 40_000 } },
++        }),
++      );
++      // The frames are handled in order: once the turn ends, the message_start has been.
++      yield* Queue.offer(
++        harness.sdkMessages,
++        makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000071", result: "Done." }),
++      );
++      yield* Queue.take(harness.terminalReceipts);
++      assert.deepEqual(categoriesOf(harness.events.slice(before)).slice(0, 1), [contextRows]);
++    }).pipe(withContextLayers),
++  );
++
++  it("keeps only the CLI rows that fit the contract", () => {
++    assert.deepEqual(
++      ClaudeAdapterV2.claudeContextCategories([
++        { name: "Messages", tokens: 10.4, color: "purple", kind: "used" },
++        { name: "Future", tokens: 5, color: "red", kind: "somethingNew" },
++        { name: "No kind", tokens: 5, color: "red" },
++        { name: "", tokens: 5, color: "red", kind: "used" },
++        { name: "Long color", tokens: 5, color: "x".repeat(41), kind: "used" },
++        null,
++      ]),
++      [{ name: "Messages", tokens: 10, color: "purple", kind: "used" }],
++    );
++    assert.deepEqual(ClaudeAdapterV2.claudeContextCategories(undefined), []);
++  });
 +
    it.effect("measures a model outside the catalog against the window Claude reports", () =>
      Effect.gen(function* () {
        const harness = yield* makeWakeHarness;
-@@ -10170,7 +10254,11 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+@@ -10170,7 +10320,11 @@ describe("ClaudeAdapterV2 background wake turns", () => {
  
    it.effect.each([
      { autoCompactWindow: "", userSettings: '{"autoCompactWindow":300000}', maxTokens: 300_000 },
@@ -140,18 +206,41 @@ index 96c9e5c914..777650afd4 100644
    ])(
      "reports the context window as $maxTokens, capped by the resolved autoCompactWindow",
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-index af6021815a..a4b3a8308c 100644
+index af6021815a..7c26b1cb72 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 @@ -100,6 +100,7 @@ import {
    defaultInstanceIdForDriver,
    isCompactionCommandMessage,
    parseGoalCommand,
-+  type ContextUsageCategory,
++  ContextUsageCategory,
    type MessageId,
    type ModelSelection,
    type OrchestrationV2ConversationMessage,
-@@ -695,6 +696,11 @@ export interface ClaudeAgentSdkQuerySession {
+@@ -349,6 +350,22 @@ export function claudeProviderTurnTokenUsage(
+ 
+ type ClaudeMessageUsage = Parameters<typeof claudeProviderTurnTokenUsage>[0];
+ 
++const decodeContextUsageCategory = Schema.decodeUnknownOption(ContextUsageCategory);
++
++/** The CLI's `/context` rows that fit the contract; an unknown kind, empty name or long color drops its row. */
++export function claudeContextCategories(raw: unknown): ReadonlyArray<ContextUsageCategory> {
++  if (!Array.isArray(raw)) return [];
++  return raw.flatMap((row: unknown) => {
++    const tokens = (row as { tokens?: unknown } | null)?.tokens;
++    return Option.toArray(
++      decodeContextUsageCategory({
++        ...(row as object),
++        ...(typeof tokens === "number" ? { tokens: Math.max(0, Math.round(tokens)) } : {}),
++      }),
++    );
++  });
++}
++
+ // message_delta usage is per-message cumulative; null or absent fields retain message_start values and zeros replace them.
+ function mergeClaudeStreamUsage(
+   current: ClaudeMessageUsage,
+@@ -695,6 +712,11 @@ export interface ClaudeAgentSdkQuerySession {
      ReadonlyArray<ClaudeMcpServerStatus>,
      ClaudeAgentSdkQueryRunnerError
    >;
@@ -163,79 +252,128 @@ index af6021815a..a4b3a8308c 100644
    readonly readMcpResource: (input: {
      readonly server: string;
      readonly uri: string;
-@@ -1847,6 +1853,18 @@ export const layerQueryRunner: Layer.Layer<
+@@ -1847,6 +1869,13 @@ export const layerQueryRunner: Layer.Layer<
                try: () => queryRuntime.mcpServerStatus(),
                catch: (cause) => queryRunnerError(cause, "mcpServerStatus"),
              }),
 +            contextCategories: Effect.tryPromise({
 +              try: async () =>
-+                (await queryRuntime.getContextUsage({ detail: "summary" })).categories.map(
-+                  ({ name, tokens, color, kind }) => ({
-+                    name: name.slice(0, 80),
-+                    tokens: Math.max(0, Math.round(tokens)),
-+                    color,
-+                    kind,
-+                  }),
++                claudeContextCategories(
++                  (await queryRuntime.getContextUsage({ detail: "summary" })).categories,
 +                ),
 +              catch: (cause) => queryRunnerError(cause, "getContextUsage"),
 +            }),
              readMcpResource: ({ server, uri }) =>
                Effect.tryPromise({
                  try: () => queryRuntime.readMcpResource(server, uri),
-@@ -4915,6 +4933,11 @@ interface ActiveClaudeTurnContext {
-   readonly queryPolicy: ClaudeRuntimeQueryPolicy;
-   readonly input: ProviderAdapter.ProviderAdapterV2TurnInput;
-   readonly autoCompactWindow: string;
-+  // The `/context` rows measured for `usedTokens`; asked again only when that changes.
-+  contextCategories?: {
-+    readonly usedTokens: number;
-+    readonly rows: ReadonlyArray<ContextUsageCategory>;
-+  };
-   readonly nativeThreadId: string;
-   readonly nativeTurnId: string;
-   nativeMessageCursor: string | null;
-@@ -6287,6 +6310,23 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -5887,6 +5916,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+         const lastProviderThreadByNativeThread = yield* Ref.make(
+           new Map<string, OrchestrationV2ProviderThread>(),
+         );
++        // The latest `/context` rows per native thread, so a new turn keeps them until fresh ones
++        // arrive; `requestedFor` is the `usedTokens` they were last asked for.
++        const contextCategoriesByNativeThread = new Map<
++          string,
++          { requestedFor: number; rows?: ReadonlyArray<ContextUsageCategory> }
++        >();
+         const goalsByNativeThread = new Map<string, OrchestrationV2ProviderGoal | null>();
+         // The title T3 last applied to each native session, so a turn renames it only when the
+         // thread title changed. A native `/rename` T3 never applied survives later turns.
+@@ -6287,28 +6322,64 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
              if (claudeMessageInputTokens(usage) <= 0) return;
              context.compactionTokens = undefined;
            }
-+          // Best effort: a slow or failing `/context` call never delays or drops the usage.
-+          // message_start carries a partial count, so only a settled one is measured.
+-          yield* emitProviderEvent({
+-            type: "provider_turn.updated",
+-            driver: CLAUDE_PROVIDER,
+-            threadId: context.input.threadId,
+-            providerTurn: {
+-              id: context.providerTurnId,
+-              providerThreadId: context.input.providerThread.id,
+-              nodeId: context.input.rootNodeId,
+-              runAttemptId: context.input.attemptId,
+-              nativeTurnRef: {
+-                driver: CLAUDE_PROVIDER,
+-                nativeId: context.nativeTurnId,
+-                strength: "strong",
++          const publish = (categories: ReadonlyArray<ContextUsageCategory> | undefined) =>
++            emitProviderEvent({
++              type: "provider_turn.updated",
++              driver: CLAUDE_PROVIDER,
++              threadId: context.input.threadId,
++              providerTurn: {
++                id: context.providerTurnId,
++                providerThreadId: context.input.providerThread.id,
++                nodeId: context.input.rootNodeId,
++                runAttemptId: context.input.attemptId,
++                nativeTurnRef: {
++                  driver: CLAUDE_PROVIDER,
++                  nativeId: context.nativeTurnId,
++                  strength: "strong",
++                },
++                ordinal: context.providerTurnOrdinal,
++                status: "running",
++                startedAt: context.startedAt,
++                completedAt: null,
++                tokenUsage: categories === undefined ? tokenUsage : { ...tokenUsage, categories },
++                ...(context.executedModel === undefined ? {} : { model: context.executedModel }),
+               },
+-              ordinal: context.providerTurnOrdinal,
+-              status: "running",
+-              startedAt: context.startedAt,
+-              completedAt: null,
+-              tokenUsage,
+-              ...(context.executedModel === undefined ? {} : { model: context.executedModel }),
+-            },
+-          });
++            });
++          const known = contextCategoriesByNativeThread.get(context.nativeThreadId);
++          yield* publish(known?.rows);
++          // Best effort, off the message loop: the rows follow as a second update. message_start
++          // carries a partial count, so only a settled one is measured, once per `usedTokens`.
 +          const live = yield* Ref.get(queryContext);
 +          if (
 +            !requestStarted &&
 +            live?.query.contextCategories !== undefined &&
-+            context.contextCategories?.usedTokens !== tokenUsage.usedTokens
++            known?.requestedFor !== tokenUsage.usedTokens
 +          ) {
-+            const rows = yield* live.query.contextCategories.pipe(
++            contextCategoriesByNativeThread.set(context.nativeThreadId, {
++              ...known,
++              requestedFor: tokenUsage.usedTokens,
++            });
++            yield* live.query.contextCategories.pipe(
 +              Effect.timeoutOption("2 seconds"),
 +              Effect.orElseSucceed(() => Option.none()),
++              Effect.flatMap((rows) => {
++                if (Option.isNone(rows) || rows.value.length === 0) return Effect.void;
++                const current = contextCategoriesByNativeThread.get(context.nativeThreadId);
++                contextCategoriesByNativeThread.set(context.nativeThreadId, {
++                  requestedFor: tokenUsage.usedTokens,
++                  ...current,
++                  rows: rows.value,
++                });
++                // A finished turn is never reopened; its rows wait for the next one.
++                return Ref.get(activeTurn).pipe(
++                  Effect.flatMap((active) =>
++                    active === context ? publish(rows.value) : Effect.void,
++                  ),
++                );
++              }),
++              Effect.forkIn(sessionScope),
 +            );
-+            if (Option.isSome(rows) && rows.value.length > 0) {
-+              context.contextCategories = { usedTokens: tokenUsage.usedTokens, rows: rows.value };
-+            }
 +          }
-+          const categories = context.contextCategories?.rows;
-           yield* emitProviderEvent({
-             type: "provider_turn.updated",
-             driver: CLAUDE_PROVIDER,
-@@ -6305,7 +6345,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
-               status: "running",
-               startedAt: context.startedAt,
-               completedAt: null,
--              tokenUsage,
-+              tokenUsage: categories === undefined ? tokenUsage : { ...tokenUsage, categories },
-               ...(context.executedModel === undefined ? {} : { model: context.executedModel }),
-             },
-           });
+         });
+ 
+         // Claude has no recovered frame; the next assistant message proves recovery.
 diff --git a/apps/web/src/components/chat/ThreadDetailsContext.browser.test.tsx b/apps/web/src/components/chat/ThreadDetailsContext.browser.test.tsx
 new file mode 100644
-index 0000000000..8f137cefbb
+index 0000000000..acd292df8f
 --- /dev/null
 +++ b/apps/web/src/components/chat/ThreadDetailsContext.browser.test.tsx
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,93 @@
 +import type { ContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
 +import { expect, it } from "vite-plus/test";
-+import { page } from "vite-plus/test/browser";
++import { page, userEvent } from "vite-plus/test/browser";
 +
 +import { render } from "../../../test/render";
 +import { ThreadDetailsContext } from "./ThreadDetailsUsage";
@@ -276,7 +414,7 @@ index 0000000000..8f137cefbb
 +
 +it("draws one bar segment per used category and lists them on hover", async () => {
 +  await using screen = await render(<ThreadDetailsContext usage={usage(categories)} />);
-+  expect(screen.container.querySelectorAll("[style*='flex: ']")).toHaveLength(2);
++  expect(screen.container.querySelectorAll("[data-context-segment]")).toHaveLength(2);
 +  await page.getByLabelText("Context: 20% used").hover();
 +  await expect.element(page.getByText("System prompt")).toBeVisible();
 +  await expect.element(page.getByText("Free space")).toBeVisible();
@@ -296,14 +434,38 @@ index 0000000000..8f137cefbb
 +
 +it("keeps the plain bar and no button without categories", async () => {
 +  await using screen = await render(<ThreadDetailsContext usage={usage(null)} />);
-+  expect(screen.container.querySelectorAll("[style*='flex: ']")).toHaveLength(0);
++  expect(screen.container.querySelectorAll("[data-context-segment]")).toHaveLength(0);
 +  await expect
 +    .element(page.getByRole("button", { name: "Context: 20% used" }))
 +    .not.toBeInTheDocument();
 +  await expect.element(page.getByLabelText("Context: 20% used")).toBeVisible();
 +});
++
++it("toggles with Enter and Space, ignores key repeat and points at the list", async () => {
++  await using _screen = await render(<ThreadDetailsContext usage={usage(categories)} />);
++  const row = page.getByRole("button", { name: "Context: 20% used" });
++  (row.element() as HTMLElement).focus();
++  await userEvent.keyboard("{Enter}");
++  await expect.element(row).toHaveAttribute("aria-expanded", "true");
++  const listId = row.element().getAttribute("aria-controls");
++  expect(listId).toBeTruthy();
++  expect(document.getElementById(listId!)?.textContent).toContain("Autocompact buffer");
++  await userEvent.keyboard(" ");
++  await expect.element(row).toHaveAttribute("aria-expanded", "false");
++  row.element().dispatchEvent(new KeyboardEvent("keydown", { key: " ", repeat: true, bubbles: true }));
++  await expect.element(row).toHaveAttribute("aria-expanded", "false");
++});
++
++it("keeps the category colors and tints the compact tick and value at 80% and up", async () => {
++  await using screen = await render(
++    <ThreadDetailsContext usage={{ ...usage(categories), usedPercentage: 85 }} />,
++  );
++  expect(screen.container.querySelectorAll("[data-context-segment]")).toHaveLength(2);
++  expect(screen.container.querySelector(".bg-warning")).not.toBeNull();
++  expect(screen.container.querySelector(".text-warning-foreground")).not.toBeNull();
++});
 diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.tsx b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
-index 086967ecb4..b7633e4903 100644
+index 086967ecb4..11e11004d8 100644
 --- a/apps/web/src/components/chat/ThreadDetailsUsage.tsx
 +++ b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
 @@ -12,11 +12,16 @@ import {
@@ -311,7 +473,7 @@ index 086967ecb4..b7633e4903 100644
    remainingPercent,
  } from "@t3tools/shared/usageLimits";
 -import type { ReactNode } from "react";
-+import { type ReactNode, useState } from "react";
++import { type ReactNode, useId, useState } from "react";
  
  import { usePrimarySettings } from "../../hooks/useSettings";
  import { useNowMinute } from "../../hooks/useNowMinute";
@@ -325,27 +487,29 @@ index 086967ecb4..b7633e4903 100644
  import { formatContextWindowTokens } from "../../lib/contextWindow";
  import { cn } from "../../lib/utils";
  import { formatUpcomingTimestamp } from "../../timestampFormat";
-@@ -95,6 +100,9 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
+@@ -95,6 +100,10 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
        ? (threshold / maxTokens) * 100
        : null;
    const usedTokens = formatContextWindowTokens(usage.usedTokens);
 +  const [expanded, setExpanded] = useState(false);
++  const listId = useId();
 +  const categories = contextCategoryRows(usage.categories, maxTokens);
 +  const hasCategories = categories.length > 0;
    return (
      <ThreadDetailsSection
        headingId="thread-details-context-heading"
-@@ -108,6 +116,9 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
+@@ -108,6 +117,10 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
            tone={used === null ? null : used >= 90 ? "error" : used >= 80 ? "warning" : null}
            tick={tick}
            muted
 +          segments={categories.filter((row) => row.kind === "used")}
 +          expanded={hasCategories ? expanded : undefined}
++          controls={hasCategories ? listId : undefined}
 +          onToggle={hasCategories ? () => setExpanded((open) => !open) : undefined}
            value={
              maxTokens !== null
                ? `${usedTokens} / ${formatContextWindowTokens(maxTokens)}`
-@@ -130,14 +141,44 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
+@@ -130,14 +143,44 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
                    {formatContextWindowCompactionMessage(threshold)}
                  </span>
                ) : null}
@@ -354,7 +518,7 @@ index 086967ecb4..b7633e4903 100644
            }
          />
 +        {hasCategories && expanded ? (
-+          <div className="col-span-3 px-2.5 pt-1 pb-1.5">
++          <div id={listId} className="col-span-3 px-2.5 pt-1 pb-1.5">
 +            <ContextCategoryList rows={categories} />
 +          </div>
 +        ) : null}
@@ -390,17 +554,18 @@ index 086967ecb4..b7633e4903 100644
  function LimitRow({
    window,
    now,
-@@ -184,6 +225,9 @@ export function UsageRow({
+@@ -184,6 +227,10 @@ export function UsageRow({
    ariaValue = value,
    tooltip,
    muted = false,
 +  segments,
 +  expanded,
++  controls,
 +  onToggle,
  }: {
    readonly label: string;
    /** Bar fill from 0 to 100. Null hides the bar. */
-@@ -195,6 +239,11 @@ export function UsageRow({
+@@ -195,6 +242,13 @@ export function UsageRow({
    readonly ariaValue?: string;
    readonly tooltip: ReactNode;
    readonly muted?: boolean;
@@ -408,11 +573,13 @@ index 086967ecb4..b7633e4903 100644
 +  readonly segments?: ReadonlyArray<ContextCategoryRow>;
 +  /** With `onToggle` the row is a button that expands more detail below it. */
 +  readonly expanded?: boolean | undefined;
++  /** The id of what the row expands, for `aria-controls`. */
++  readonly controls?: string | undefined;
 +  readonly onToggle?: (() => void) | undefined;
  }) {
    return (
      <Tooltip>
-@@ -203,7 +252,22 @@ export function UsageRow({
+@@ -203,7 +257,23 @@ export function UsageRow({
            <div
              tabIndex={0}
              aria-label={`${label}: ${ariaValue}`}
@@ -421,11 +588,12 @@ index 086967ecb4..b7633e4903 100644
 +              ? {
 +                  role: "button",
 +                  "aria-expanded": expanded ?? false,
++                  "aria-controls": controls,
 +                  onClick: onToggle,
 +                  onKeyDown: (event: React.KeyboardEvent) => {
 +                    if (event.key !== "Enter" && event.key !== " ") return;
 +                    event.preventDefault();
-+                    onToggle();
++                    if (!event.repeat) onToggle();
 +                  },
 +                }
 +              : {})}
@@ -436,7 +604,7 @@ index 086967ecb4..b7633e4903 100644
            />
          }
        >
-@@ -213,17 +277,26 @@ export function UsageRow({
+@@ -213,22 +283,35 @@ export function UsageRow({
              {fill > 0 ? (
                <span
                  className={cn(
@@ -464,6 +632,7 @@ index 086967ecb4..b7633e4903 100644
 +                {segments?.map((segment) => (
 +                  <span
 +                    key={segment.name}
++                    data-context-segment=""
 +                    className="h-full min-w-px"
 +                    style={{ flex: `${segment.tokens} 0 0`, backgroundColor: segment.color }}
 +                  />
@@ -472,18 +641,27 @@ index 086967ecb4..b7633e4903 100644
              ) : null}
              {tick !== null ? (
                <span
+                 aria-hidden
+-                className="absolute -top-[3px] h-[9px] w-px -translate-x-1/2 bg-foreground/60"
++                className={cn(
++                  "absolute -top-[3px] h-[9px] w-px -translate-x-1/2",
++                  tone === "error" ? "bg-error" : tone === "warning" ? "bg-warning" : "bg-foreground/60",
++                )}
+                 style={{ left: `${tick}%` }}
+               />
+             ) : null}
 diff --git a/packages/client-runtime/src/state/contextCategories.test.ts b/packages/client-runtime/src/state/contextCategories.test.ts
 new file mode 100644
-index 0000000000..78dc3caf5d
+index 0000000000..edcee034f8
 --- /dev/null
 +++ b/packages/client-runtime/src/state/contextCategories.test.ts
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,44 @@
 +import { describe, expect, it } from "vite-plus/test";
 +
 +import { contextCategoryPercentText, contextCategoryRows } from "./contextWindow.ts";
 +
 +describe("contextCategoryRows", () => {
-+  it("maps Claude's theme color names, keeps CSS colors and drops empty rows", () => {
++  it("maps Claude's theme color names, falls back for others and drops empty rows", () => {
 +    const rows = contextCategoryRows(
 +      [
 +        { name: "Messages", tokens: 40_000, color: "purple_FOR_SUBAGENTS_ONLY", kind: "used" },
@@ -495,7 +673,8 @@ index 0000000000..78dc3caf5d
 +    );
 +    expect(rows.map((row) => row.name)).toEqual(["Messages", "Custom", "Unknown"]);
 +    expect(rows[0]?.color).toBe("#a45cf0");
-+    expect(rows[1]?.color).toBe("#112233");
++    expect(rows[1]?.color).toMatch(/^#[0-9a-f]{6}$/);
++    expect(rows[1]?.color).not.toBe("#112233");
 +    expect(rows[2]?.color).toMatch(/^#[0-9a-f]{6}$/);
 +    expect(rows[0]?.percent).toBe(20);
 +  });
@@ -522,7 +701,7 @@ index 0000000000..78dc3caf5d
 +  });
 +});
 diff --git a/packages/client-runtime/src/state/contextWindow.ts b/packages/client-runtime/src/state/contextWindow.ts
-index a8f7e0f88c..fe5383ba5a 100644
+index a8f7e0f88c..58a0b27924 100644
 --- a/packages/client-runtime/src/state/contextWindow.ts
 +++ b/packages/client-runtime/src/state/contextWindow.ts
 @@ -1,5 +1,6 @@
@@ -556,7 +735,7 @@ index a8f7e0f88c..fe5383ba5a 100644
        cost: null,
        updatedAt: DateTime.formatIso(payload.startedAt ?? payload.updatedAt),
      };
-@@ -330,3 +334,73 @@ export function compactBeforeSendTokens(input: {
+@@ -330,3 +334,70 @@ export function compactBeforeSendTokens(input: {
      ? contextWindow.usedTokens
      : null;
  }
@@ -618,10 +797,7 @@ index a8f7e0f88c..fe5383ba5a 100644
 +        name: category.name,
 +        tokens: category.tokens,
 +        color:
-+          named ??
-+          (/^(#|rgb)/i.test(raw)
-+            ? raw
-+            : CONTEXT_CATEGORY_FALLBACK[index % CONTEXT_CATEGORY_FALLBACK.length]!),
++          named ?? CONTEXT_CATEGORY_FALLBACK[index % CONTEXT_CATEGORY_FALLBACK.length]!,
 +        kind: category.kind,
 +        percent:
 +          maxTokens !== null && maxTokens > 0 && category.kind !== "deferred"
