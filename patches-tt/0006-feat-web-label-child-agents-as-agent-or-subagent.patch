@@ -1,32 +1,32 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Fri, 16 Oct 2026 22:01:23 +0200
-Subject: [PATCH 06/15] feat(web): label child agents as agent or subagent
+Subject: [PATCH 06/16] feat(web): label child agents as agent or subagent
 
 ---
  .../orchestration-v2/ProjectionStore.test.ts  |   8 +-
  apps/web/src/components/ChatView.tsx          |   4 +
  .../components/chat/BackgroundWorkDetails.tsx |   4 +-
- .../chat/MessagesTimeline.browser.test.tsx    |  22 +++
+ .../chat/MessagesTimeline.browser.test.tsx    |  22 ++
  .../src/components/chat/MessagesTimeline.tsx  |   6 +-
- .../chat/SubagentTooltipContent.tsx           |   5 +
- .../components/chat/ThreadActivityBanners.tsx |  49 +++--
- ...RelationshipsControl.kind.browser.test.tsx | 164 +++++++++++++++++
+ .../chat/SubagentTooltipContent.tsx           |  25 +-
+ .../components/chat/ThreadActivityBanners.tsx |  49 +++-
+ ...RelationshipsControl.kind.browser.test.tsx | 214 ++++++++++++++++++
  .../chat/ThreadRelationshipsControl.logic.ts  |  39 ++++
- .../chat/ThreadRelationshipsControl.tsx       |  42 +++--
+ .../chat/ThreadRelationshipsControl.tsx       |  42 ++--
  .../components/chat/TimelineV2EventRow.tsx    |   4 +-
- .../chat/V2LifecycleRow.kind.test.tsx         |  85 +++++++++
- .../src/components/chat/V2LifecycleRow.tsx    | 167 ++++++++++++++----
- .../src/state/subagentDisplay.kind.test.ts    |  57 ++++++
- .../src/state/subagentDisplay.ts              |  40 ++++-
- .../src/state/threadExecution.kind.test.ts    |  95 ++++++++++
- .../src/state/threadExecution.ts              |  83 +++++----
- .../src/state/threadShell.kind.test.ts        |  23 +++
+ .../chat/V2LifecycleRow.kind.test.tsx         |  85 +++++++
+ .../src/components/chat/V2LifecycleRow.tsx    | 167 +++++++++++---
+ .../src/state/subagentDisplay.kind.test.ts    |  57 +++++
+ .../src/state/subagentDisplay.ts              |  40 +++-
+ .../src/state/threadExecution.kind.test.ts    |  95 ++++++++
+ .../src/state/threadExecution.ts              |  83 ++++---
+ .../src/state/threadShell.kind.test.ts        |  23 ++
  .../src/state/threadShell.test.ts             |   2 +-
- .../client-runtime/src/state/threadShell.ts   |  22 ++-
+ .../client-runtime/src/state/threadShell.ts   |  22 +-
  packages/contracts/src/orchestrationV2.ts     |   1 +
  .../orchestrationV2PendingBackgroundWork.ts   |   2 +
- 22 files changed, 811 insertions(+), 113 deletions(-)
+ 22 files changed, 876 insertions(+), 118 deletions(-)
  create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.kind.browser.test.tsx
  create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.logic.ts
  create mode 100644 apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx
@@ -145,18 +145,27 @@ index b9653da6b3..9e08bcf11a 100644
                parentThreadLink.environmentLabel === undefined
                  ? parentThreadLink.title
 diff --git a/apps/web/src/components/chat/SubagentTooltipContent.tsx b/apps/web/src/components/chat/SubagentTooltipContent.tsx
-index 50b50273ba..4c35712977 100644
+index 50b50273ba..c31076a9fa 100644
 --- a/apps/web/src/components/chat/SubagentTooltipContent.tsx
 +++ b/apps/web/src/components/chat/SubagentTooltipContent.tsx
-@@ -10,6 +10,7 @@ import type {
+@@ -10,9 +10,14 @@ import type {
  import {
    resolveSubagentMetadata,
    subagentDetailPreview,
 +  subagentKindLabel,
  } from "@t3tools/client-runtime/state/subagent-display";
- import { REASONING_EFFORT_OPTION_IDS } from "@t3tools/client-runtime/state/thread-execution";
- import { getModelSelectionStringOptionValue, resolveSelectableModel } from "@t3tools/shared/model";
-@@ -50,6 +51,7 @@ export function SubagentTooltipContent(props: {
+-import { REASONING_EFFORT_OPTION_IDS } from "@t3tools/client-runtime/state/thread-execution";
+-import { getModelSelectionStringOptionValue, resolveSelectableModel } from "@t3tools/shared/model";
++import { isReasoningSelect } from "@t3tools/client-runtime/model-traits";
++import {
++  getProviderOptionCurrentLabel,
++  getProviderOptionDescriptors,
++  resolveSelectableModel,
++} from "@t3tools/shared/model";
+ import { getTraitsSpeedDisplay, TraitsSpeedIcon } from "./TraitsSpeed";
+ import type { ReactNode } from "react";
+ import {
+@@ -50,6 +55,7 @@ export function SubagentTooltipContent(props: {
    result?: string | null | undefined;
    progress?: string | null | undefined;
  }) {
@@ -164,7 +173,26 @@ index 50b50273ba..4c35712977 100644
    const childSelection =
      props.modelSelection ??
      (props.origin === "app_owned" ? props.childThread?.modelSelection : undefined);
-@@ -164,6 +166,9 @@ export function SubagentTooltipContent(props: {
+@@ -72,9 +78,15 @@ export function SubagentTooltipContent(props: {
+     childModel === modelSlug && childSelection?.instanceId === props.providerInstanceId
+       ? childSelection
+       : undefined;
+-  const effort = REASONING_EFFORT_OPTION_IDS.map((id) =>
+-    getModelSelectionStringOptionValue(matchingSelection, id),
+-  ).find(Boolean);
++  // The model's default effort when the agent set none, as in the worker popover.
++  const effort = providerModel?.capabilities
++    ? getProviderOptionCurrentLabel(
++        getProviderOptionDescriptors({
++          caps: providerModel.capabilities,
++          selections: matchingSelection?.options,
++        }).find(isReasoningSelect),
++      )
++    : undefined;
+   const speed = provider
+     ? providerModel?.capabilities?.optionDescriptors
+         ?.map((descriptor) => {
+@@ -164,6 +176,9 @@ export function SubagentTooltipContent(props: {
          >
            <StatusIcon aria-hidden className="size-3 shrink-0" />
            {props.status.replaceAll("_", " ")}
@@ -298,12 +326,12 @@ index 308be5a138..148c0a383a 100644
      ),
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.kind.browser.test.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.kind.browser.test.tsx
 new file mode 100644
-index 0000000000..64736aefef
+index 0000000000..cbd219a81d
 --- /dev/null
 +++ b/apps/web/src/components/chat/ThreadRelationshipsControl.kind.browser.test.tsx
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,214 @@
 +import { cloneElement, type ReactElement, type ReactNode } from "react";
-+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
++import { EnvironmentId, ProviderInstanceId, ThreadId, type ServerProvider } from "@t3tools/contracts";
 +import * as DateTime from "effect/DateTime";
 +import { expect, it, vi } from "vite-plus/test";
 +import "~/index.css";
@@ -353,6 +381,7 @@ index 0000000000..64736aefef
 +});
 +import { ThreadRelationshipsPanel } from "./ThreadRelationshipsControl";
 +import { relationshipLabel } from "./ThreadRelationshipsControl.logic";
++import { SubagentTooltipContent } from "./SubagentTooltipContent";
 +const agent = (input: { id: string; title: string; origin: "app_owned" | "provider_native" }) => ({
 +  id: input.id,
 +  origin: input.origin,
@@ -465,6 +494,55 @@ index 0000000000..64736aefef
 +  expect(text(container)).toMatch(/Explore the sidebar.*Stop subagent Port the patches.*Stop agent$/);
 +  await act(async () => stop!.click());
 +  expect(state.toast).toHaveBeenCalledWith({ type: "error", title: "Could not stop agent" });
++});
++it("shows the agent's effort in its hover card, or the model's default without one", async () => {
++  const provider = {
++    instanceId: "claudeAgent",
++    driver: "claudeAgent",
++    displayName: "Claude",
++    models: [
++      {
++        slug: "claude-opus-5-5",
++        name: "Claude Opus 5.5",
++        shortName: "Opus 5.5",
++        capabilities: {
++          optionDescriptors: [
++            {
++              id: "effort",
++              label: "Effort",
++              type: "select",
++              options: [
++                { id: "medium", label: "Medium", isDefault: true },
++                { id: "high", label: "High" },
++              ],
++            },
++          ],
++        },
++      },
++    ],
++  } as unknown as ServerProvider;
++  const card = (options?: ReadonlyArray<{ id: string; value: string }>) => (
++    <SubagentTooltipContent
++      title="Port the patches"
++      model="claude-opus-5-5"
++      providerInstanceId={ProviderInstanceId.make("claudeAgent")}
++      origin="app_owned"
++      modelSelection={{
++        instanceId: ProviderInstanceId.make("claudeAgent"),
++        model: "claude-opus-5-5",
++        ...(options ? { options } : {}),
++      }}
++      provider={provider}
++      status="running"
++    />
++  );
++  {
++    await using screen = await render(card([{ id: "effort", value: "high" }]));
++    expect(text(screen.container)).toMatch(/· High/);
++  }
++  await using screen = await render(card());
++  expect(text(screen.container)).toMatch(/· Medium/);
++  expect(text(screen.container)).toMatch(/running · agent/);
 +});
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.logic.ts b/apps/web/src/components/chat/ThreadRelationshipsControl.logic.ts
 new file mode 100644
