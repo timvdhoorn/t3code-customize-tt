@@ -11,7 +11,7 @@ thread compacts automatically comes from the provider thread.
 ---
  .../settings/SettingsFollowUpRouteScreen.tsx  |  17 +
  .../src/features/settings/settings-search.ts  |   9 +-
- .../src/features/threads/ComposerStats.tsx    | 607 ++++++++++++++++++
+ .../src/features/threads/ComposerStats.tsx    | 605 ++++++++++++++++++
  .../features/threads/NewTaskDraftScreen.tsx   |   1 +
  .../src/features/threads/ThreadComposer.tsx   |   3 +
  .../features/threads/ThreadDetailScreen.tsx   |  37 ++
@@ -26,11 +26,11 @@ thread compacts automatically comes from the provider thread.
  apps/web/src/lib/contextWindow.test.ts        |  60 +-
  apps/web/src/lib/contextWindow.ts             |  16 +-
  packages/client-runtime/package.json          |   4 +
- .../src/state/composerStats.test.ts           | 595 +++++++++++++++++
- .../client-runtime/src/state/composerStats.ts | 401 ++++++++++++
+ .../src/state/composerStats.test.ts           | 598 +++++++++++++++++
+ .../client-runtime/src/state/composerStats.ts | 403 ++++++++++++
  .../src/state/contextWindow.test.ts           |  18 +-
  .../client-runtime/src/state/contextWindow.ts |  31 +-
- 21 files changed, 2307 insertions(+), 25 deletions(-)
+ 21 files changed, 2310 insertions(+), 25 deletions(-)
  create mode 100644 apps/mobile/src/features/threads/ComposerStats.tsx
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.test.ts
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.ts
@@ -82,10 +82,10 @@ index a7cd04f5f5..016cdbfcfe 100644
    );
  
 diff --git a/apps/mobile/src/features/settings/settings-search.ts b/apps/mobile/src/features/settings/settings-search.ts
-index 49e1a8dbe0..7e0c8adb47 100644
+index 77fbdfd7be..7bb96e93e5 100644
 --- a/apps/mobile/src/features/settings/settings-search.ts
 +++ b/apps/mobile/src/features/settings/settings-search.ts
-@@ -76,7 +76,14 @@ const SETTINGS_SEARCH_TERMS = {
+@@ -79,7 +79,14 @@ const SETTINGS_SEARCH_TERMS = {
      "auto-resume",
      "thread behavior",
    ],
@@ -103,10 +103,10 @@ index 49e1a8dbe0..7e0c8adb47 100644
      "provider accounts",
 diff --git a/apps/mobile/src/features/threads/ComposerStats.tsx b/apps/mobile/src/features/threads/ComposerStats.tsx
 new file mode 100644
-index 0000000000..3e8e4d29fb
+index 0000000000..0375ea33de
 --- /dev/null
 +++ b/apps/mobile/src/features/threads/ComposerStats.tsx
-@@ -0,0 +1,607 @@
+@@ -0,0 +1,605 @@
 +import {
 +  COMPOSER_STATS_CLOCK_MS,
 +  composerLimitDisplay,
@@ -316,11 +316,9 @@ index 0000000000..3e8e4d29fb
 +              <ListRowLayout
 +                label={window.label}
 +                detail={
-+                  display.resetPending
-+                    ? "0% used"
-+                    : display.freshness.status === "expired"
-+                      ? "–"
-+                      : `${Math.round(window.usedPercent)}% used`
++                  display.freshness.status === "expired" && !display.resetPending
++                    ? "–"
++                    : `${display.displayPercent}% left`
 +                }
 +              />
 +              <Bar percent={display.displayPercent ?? 0} dimmed={display.dimmed} />
@@ -337,7 +335,7 @@ index 0000000000..3e8e4d29fb
 +          {freshness.ageMins === null
 +            ? " Check time unavailable."
 +            : ` Checked ${freshness.ageMins === 0 ? "just now" : `${freshness.ageMins} min ago`}.`}{" "}
-+          At reset time a window shows 0% until a new reading arrives.
++          At reset time a window shows 100% left until a new reading arrives.
 +        </Note>
 +      </SheetBody>
 +    </Sheet>
@@ -715,10 +713,10 @@ index 0000000000..3e8e4d29fb
 +  );
 +}
 diff --git a/apps/mobile/src/features/threads/NewTaskDraftScreen.tsx b/apps/mobile/src/features/threads/NewTaskDraftScreen.tsx
-index 201204a8a5..7eb84608cb 100644
+index ef279152d2..b3b1450cf3 100644
 --- a/apps/mobile/src/features/threads/NewTaskDraftScreen.tsx
 +++ b/apps/mobile/src/features/threads/NewTaskDraftScreen.tsx
-@@ -1025,6 +1025,7 @@ export function NewTaskDraftScreen(props: {
+@@ -1021,6 +1021,7 @@ export function NewTaskDraftScreen(props: {
          onNativePasteText={handleNativePasteText}
          onRemoveDraftImage={flow.removeAttachment}
          onStopThread={() => {}}
@@ -727,10 +725,10 @@ index 201204a8a5..7eb84608cb 100644
          onSendMessage={handleStart}
          offersSideChat={false}
 diff --git a/apps/mobile/src/features/threads/ThreadComposer.tsx b/apps/mobile/src/features/threads/ThreadComposer.tsx
-index ce4e4b7fb0..f6d4cbee4f 100644
+index b1f2553618..b0a9e2863b 100644
 --- a/apps/mobile/src/features/threads/ThreadComposer.tsx
 +++ b/apps/mobile/src/features/threads/ThreadComposer.tsx
-@@ -234,6 +234,8 @@ export interface ThreadComposerProps {
+@@ -149,6 +149,8 @@ export interface ThreadComposerProps {
    /** Arms a fresh session for the next message; absent where `/clear` is unavailable. */
    readonly onFreshSession?: () => void;
    readonly offersSideChat?: boolean;
@@ -739,7 +737,7 @@ index ce4e4b7fb0..f6d4cbee4f 100644
    readonly serverConfig: T3ServerConfig | null;
    readonly queueCount: number;
    readonly activeThreadBusy: boolean;
-@@ -1258,6 +1260,7 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
+@@ -1095,6 +1097,7 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
              This connection cannot control this task. You can still edit your draft.
            </Text>
          ) : null}
@@ -748,10 +746,10 @@ index ce4e4b7fb0..f6d4cbee4f 100644
  
        <VideoPreviewModal source={previewVideo} onRequestClose={closePreview} />
 diff --git a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
-index 25b8894cc8..947cb5dc0a 100644
+index 228713f07e..b0c4dda083 100644
 --- a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
 +++ b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
-@@ -202,6 +202,9 @@ import {
+@@ -196,6 +196,9 @@ import {
    type ThreadComposerProps,
  } from "./ThreadComposer";
  import { ComposerPopoverHost } from "./ComposerPopoverHost";
@@ -761,7 +759,7 @@ index 25b8894cc8..947cb5dc0a 100644
  import { ThreadFeed, type ThreadFeedHistoryControls } from "./ThreadFeed";
  import { WorkspaceMutationIdProvider } from "./WorkspaceMutationIdProvider";
  import { useThreadTurnSubagents } from "./ThreadAgentsSheet";
-@@ -307,6 +310,8 @@ export interface ThreadDetailScreenProps {
+@@ -299,6 +302,8 @@ export interface ThreadDetailScreenProps {
      ) => Promise<boolean | "responded">,
      onWillEnqueue?: () => void,
    ) => Promise<MessageId | null>;
@@ -770,7 +768,7 @@ index 25b8894cc8..947cb5dc0a 100644
    readonly onReconnectEnvironment: () => void;
    readonly canSwitchThreadProvider: boolean;
    readonly onRespondToApproval: ApprovalResponder;
-@@ -951,10 +956,16 @@ function ThreadDetailBody(
+@@ -897,10 +902,16 @@ function ThreadDetailBody(
      ) ||
      (props.historyControls?.hasMoreHistory === true &&
        props.selectedThread.latestUserMessageAt !== null);
@@ -787,7 +785,7 @@ index 25b8894cc8..947cb5dc0a 100644
        composerBottomInset;
    // The last collapse toggle; it only applies to the request it was made on.
    const [userInputToggle, setUserInputToggle] = useState<{
-@@ -1877,6 +1888,32 @@ function ThreadDetailBody(
+@@ -1819,6 +1830,32 @@ function ThreadDetailBody(
                            props.activePendingApproval === null &&
                            props.activePendingUserInput === null
                          }
@@ -821,10 +819,10 @@ index 25b8894cc8..947cb5dc0a 100644
                          queueCount={props.selectedThreadQueueCount}
                          activeThreadBusy={props.activeThreadBusy}
 diff --git a/apps/mobile/src/features/threads/ThreadRouteScreen.tsx b/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
-index 4d814d3a8a..e64ee086b9 100644
+index 735e169a72..7cfce7cc15 100644
 --- a/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
 +++ b/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
-@@ -1100,6 +1100,7 @@ function ThreadRouteContent(
+@@ -1106,6 +1106,7 @@ function ThreadRouteContent(
            onResumeQueue={composer.canResume ? handleResumeQueue : null}
            onSendMessage={composer.onSendMessage}
            offersSideChat={composer.sideChatUnavailableReason === null}
@@ -834,7 +832,7 @@ index 4d814d3a8a..e64ee086b9 100644
            onRespondToApproval={requests.onRespondToApproval}
 diff --git a/apps/mobile/src/features/threads/composerStatsRow.test.ts b/apps/mobile/src/features/threads/composerStatsRow.test.ts
 new file mode 100644
-index 0000000000..d5b42e657c
+index 0000000000..cdeb563af5
 --- /dev/null
 +++ b/apps/mobile/src/features/threads/composerStatsRow.test.ts
 @@ -0,0 +1,221 @@
@@ -913,13 +911,13 @@ index 0000000000..d5b42e657c
 +describe("mobile composer stats row", () => {
 +  it("shows limits, context and cache, never the output rate", () => {
 +    const text = composerStatsRowText(row());
-+    expect(text).toBe("5h 12% Week 3% 15% context 96% cached");
++    expect(text).toBe("5h 88% Week 97% 15% context 96% cached");
 +    expect(text).not.toMatch(/tok\/s|Tokens/);
 +  });
 +
 +  it("shortens the context label in the compact form and keeps the cache rate", () => {
 +    expect(row(true).compact).toBe(true);
-+    expect(composerStatsRowText(row(true))).toBe("5h 12% Week 3% 15% ctx 96% cached");
++    expect(composerStatsRowText(row(true))).toBe("5h 88% Week 97% 15% ctx 96% cached");
 +  });
 +
 +  it("uses the full row while it fits, then the compact one, then wraps", () => {
@@ -969,7 +967,7 @@ index 0000000000..d5b42e657c
 +      { showContext: true, nowMs, compact: false },
 +    );
 +    expect(noCache.cache).toEqual({ value: "–%", label: "cached", openable: true });
-+    expect(composerStatsRowText(noCache)).toBe("5h 12% Week 3% 15% context –% cached");
++    expect(composerStatsRowText(noCache)).toBe("5h 88% Week 97% 15% context –% cached");
 +    expect(composerStatsRowText(noCache)).not.toMatch(/tokens/);
 +    // With a cache figure the chip shows it and opens the turn sheet.
 +    expect(row().cache).toEqual({ value: "96%", label: "cached", openable: true });
@@ -989,7 +987,7 @@ index 0000000000..d5b42e657c
 +      } as unknown as ComposerStatsData["turn"]),
 +    ]) {
 +      expect(noTurn.cache).toEqual({ value: "–%", label: "cached", openable: false });
-+      expect(composerStatsRowText(noTurn)).toBe("5h 12% Week 3% 15% ctx –% cached");
++      expect(composerStatsRowText(noTurn)).toBe("5h 88% Week 97% 15% ctx –% cached");
 +    }
 +  });
 +
@@ -1019,7 +1017,7 @@ index 0000000000..d5b42e657c
 +        { showContext: true, nowMs, compact: false },
 +      );
 +      expect(reentered.cache.value).toBe("96%");
-+      expect(composerStatsRowText(reentered)).toBe("5h 12% Week 3% 15% context 96% cached");
++      expect(composerStatsRowText(reentered)).toBe("5h 88% Week 97% 15% context 96% cached");
 +    });
 +
 +    it("is not tappable without a turn, even with a remembered figure", () => {
@@ -1206,11 +1204,11 @@ index 0000000000..362e7deacb
 +  ].join(" ");
 +}
 diff --git a/apps/mobile/src/lib/storage.test.ts b/apps/mobile/src/lib/storage.test.ts
-index f6f928a15f..ed95f5f142 100644
+index 726eea9edf..432ca71113 100644
 --- a/apps/mobile/src/lib/storage.test.ts
 +++ b/apps/mobile/src/lib/storage.test.ts
-@@ -152,6 +152,16 @@ describe("mobile connection storage", () => {
-     expect(fallback.updatedAt).toEqual(expect.any(Number));
+@@ -193,6 +193,16 @@ describe("mobile connection storage", () => {
+     });
    });
  
 +  it("persists the stats for nerds preference and drops a non-boolean value", async () => {
@@ -1227,10 +1225,10 @@ index f6f928a15f..ed95f5f142 100644
      mocks.setPreferencesJson(JSON.stringify({ baseFontSize: 15 }), 10);
      await mocks.setItemAsync(
 diff --git a/apps/mobile/src/persistence/mobile-preferences.ts b/apps/mobile/src/persistence/mobile-preferences.ts
-index 7a26fc2b8d..378da9e379 100644
+index 71d095b0b4..f1975dd022 100644
 --- a/apps/mobile/src/persistence/mobile-preferences.ts
 +++ b/apps/mobile/src/persistence/mobile-preferences.ts
-@@ -131,6 +131,8 @@ export interface Preferences {
+@@ -171,6 +171,8 @@ export interface Preferences {
    readonly workingShelfEnabled?: boolean;
    readonly useLastProjectForNewThreads?: boolean;
    readonly lastThreadProject?: typeof ThreadProject.Type;
@@ -1239,7 +1237,7 @@ index 7a26fc2b8d..378da9e379 100644
    readonly modelFavorites?: ReadonlyArray<{
      readonly provider: ProviderInstanceId;
      readonly model: string;
-@@ -218,6 +220,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
+@@ -261,6 +263,7 @@ function sanitizePreferences(parsed: Preferences): Preferences {
      workingShelfEnabled?: boolean;
      useLastProjectForNewThreads?: boolean;
      lastThreadProject?: typeof ThreadProject.Type;
@@ -1247,7 +1245,7 @@ index 7a26fc2b8d..378da9e379 100644
      modelFavorites?: Preferences["modelFavorites"];
      threadListSettledShelfExpanded?: boolean;
      threadListSnoozedShelfExpanded?: boolean;
-@@ -351,6 +354,9 @@ function sanitizePreferences(parsed: Preferences): Preferences {
+@@ -400,6 +403,9 @@ function sanitizePreferences(parsed: Preferences): Preferences {
    if (isThreadProject(parsed.lastThreadProject)) {
      preferences.lastThreadProject = parsed.lastThreadProject;
    }
@@ -1391,10 +1389,10 @@ index 0000000000..3cc2cb612f
 +  }, [enabled, projection, environmentId, serverConfig, instanceId]);
 +}
 diff --git a/apps/mobile/src/state/use-thread-composer-state.ts b/apps/mobile/src/state/use-thread-composer-state.ts
-index 5796535029..9c429e0ae5 100644
+index 58f2da087e..fd691c52b2 100644
 --- a/apps/mobile/src/state/use-thread-composer-state.ts
 +++ b/apps/mobile/src/state/use-thread-composer-state.ts
-@@ -877,6 +877,39 @@ export function useThreadComposerState(input: {
+@@ -888,6 +888,39 @@ export function useThreadComposerState(input: {
      return null;
    })();
  
@@ -1434,7 +1432,7 @@ index 5796535029..9c429e0ae5 100644
    const onChangeDraftMessage = (value: string) => {
      if (!selectedThreadShell) {
        return;
-@@ -950,6 +983,7 @@ export function useThreadComposerState(input: {
+@@ -961,6 +994,7 @@ export function useThreadComposerState(input: {
      onNativePasteText,
      onRemoveDraftImage,
      onSendMessage,
@@ -1540,10 +1538,10 @@ index 1cf3eee799..b4e8bb5647 100644
 -}
 +export * from "@t3tools/client-runtime/state/context-window";
 diff --git a/packages/client-runtime/package.json b/packages/client-runtime/package.json
-index 85d0c6e073..f93ddd735b 100644
+index d3a249a1fe..d706c95f87 100644
 --- a/packages/client-runtime/package.json
 +++ b/packages/client-runtime/package.json
-@@ -159,6 +159,10 @@
+@@ -167,6 +167,10 @@
        "types": "./src/relay/index.ts",
        "default": "./src/relay/index.ts"
      },
@@ -1556,10 +1554,10 @@ index 85d0c6e073..f93ddd735b 100644
        "default": "./src/state/auth.ts"
 diff --git a/packages/client-runtime/src/state/composerStats.test.ts b/packages/client-runtime/src/state/composerStats.test.ts
 new file mode 100644
-index 0000000000..90e31ec97b
+index 0000000000..615d9ca5db
 --- /dev/null
 +++ b/packages/client-runtime/src/state/composerStats.test.ts
-@@ -0,0 +1,595 @@
+@@ -0,0 +1,598 @@
 +import {
 +  NodeId,
 +  ProviderDriverKind,
@@ -1891,7 +1889,7 @@ index 0000000000..90e31ec97b
 +    windowDurationMins: 300,
 +  };
 +
-+  it("shows zero and waits for a new reading after the reset", () => {
++  it("shows the full quota left and waits for a new reading after the reset", () => {
 +    expect(
 +      composerLimitDisplay(
 +        {
@@ -1905,17 +1903,20 @@ index 0000000000..90e31ec97b
 +    ).toEqual({
 +      freshness: { status: "fresh", ageMins: 0, checkedAt: "2026-10-04T11:59:30Z" },
 +      resetPending: true,
-+      displayPercent: 0,
-+      percentText: "0%",
++      displayPercent: 100,
++      percentText: "100%",
 +      dimmed: true,
 +    });
 +  });
 +
-+  it("shows the reading age inline while a value is stale", () => {
-+    expect(
-+      composerLimitDisplay({ ...window, checkedAt: "2026-10-04T11:53:00Z" }, undefined, now)
-+        .percentText,
-+    ).toBe("63% · 7m");
++  it("shows the quota left with the reading age inline while a value is stale", () => {
++    const display = composerLimitDisplay(
++      { ...window, checkedAt: "2026-10-04T11:53:00Z" },
++      undefined,
++      now,
++    );
++    expect(display.displayPercent).toBe(37);
++    expect(display.percentText).toBe("37% · 7m");
 +  });
 +
 +  it("hides a percentage once the reading is expired", () => {
@@ -2152,15 +2153,15 @@ index 0000000000..90e31ec97b
 +        "2026-10-03T10:00:00.000Z",
 +        nowMs,
 +      ).percentText,
-+    ).toBe("40%");
++    ).toBe("60%");
 +  });
 +});
 diff --git a/packages/client-runtime/src/state/composerStats.ts b/packages/client-runtime/src/state/composerStats.ts
 new file mode 100644
-index 0000000000..bd2233b716
+index 0000000000..9a0ab35473
 --- /dev/null
 +++ b/packages/client-runtime/src/state/composerStats.ts
-@@ -0,0 +1,401 @@
+@@ -0,0 +1,403 @@
 +import type {
 +  OrchestrationV2ProviderTurn,
 +  OrchestrationV2ThreadProjection,
@@ -2169,6 +2170,7 @@ index 0000000000..bd2233b716
 +  ServerProviderUsageWindow,
 +  TurnTokenUsage,
 +} from "@t3tools/contracts";
++import { remainingPercent } from "@t3tools/shared/usageLimits";
 +import * as DateTime from "effect/DateTime";
 +import { deriveLatestContextWindowSnapshot, type ContextWindowSnapshot } from "./contextWindow.ts";
 +
@@ -2356,6 +2358,7 @@ index 0000000000..bd2233b716
 +  return source === "account" ? "account" : source === "turn" ? "turn" : "CLI estimate";
 +}
 +
++/** Quota left, as on the desktop's usage bars (`remainingPercent`). */
 +export function composerLimitDisplay(
 +  window: ServerProviderUsageWindow,
 +  fallbackCheckedAt: string | undefined,
@@ -2373,8 +2376,8 @@ index 0000000000..bd2233b716
 +    return {
 +      freshness,
 +      resetPending: true,
-+      displayPercent: 0,
-+      percentText: "0%",
++      displayPercent: 100,
++      percentText: "100%",
 +      dimmed: true,
 +    };
 +  }
@@ -2392,8 +2395,8 @@ index 0000000000..bd2233b716
 +  return {
 +    freshness,
 +    resetPending: false,
-+    displayPercent: window.usedPercent,
-+    percentText: `${Math.round(window.usedPercent)}%${age}`,
++    displayPercent: remainingPercent(window),
++    percentText: `${remainingPercent(window)}%${age}`,
 +    dimmed: freshness.status !== "fresh",
 +  };
 +}

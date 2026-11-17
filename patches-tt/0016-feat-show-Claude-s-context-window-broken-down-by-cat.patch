@@ -18,7 +18,7 @@ Subject: [PATCH 16/16] feat: show Claude's context window broken down by
  create mode 100644 packages/client-runtime/src/state/contextCategories.test.ts
 
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-index 96c9e5c914..0c3c254e1f 100644
+index c830387565..5276654009 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
 @@ -3570,6 +3570,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
@@ -39,7 +39,7 @@ index 96c9e5c914..0c3c254e1f 100644
                  readMcpResource:
                    options?.mcp?.readMcpResource ??
                    (() => Effect.die("unexpected MCP resource read")),
-@@ -9722,6 +9726,152 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+@@ -9750,6 +9754,152 @@ describe("ClaudeAdapterV2 background wake turns", () => {
      ),
    );
  
@@ -192,7 +192,7 @@ index 96c9e5c914..0c3c254e1f 100644
    it.effect("measures a model outside the catalog against the window Claude reports", () =>
      Effect.gen(function* () {
        const harness = yield* makeWakeHarness;
-@@ -10170,7 +10320,11 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+@@ -10285,7 +10435,11 @@ describe("ClaudeAdapterV2 background wake turns", () => {
  
    it.effect.each([
      { autoCompactWindow: "", userSettings: '{"autoCompactWindow":300000}', maxTokens: 300_000 },
@@ -206,7 +206,7 @@ index 96c9e5c914..0c3c254e1f 100644
    ])(
      "reports the context window as $maxTokens, capped by the resolved autoCompactWindow",
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-index af6021815a..7c26b1cb72 100644
+index fac4413e15..2fd44688c8 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 @@ -100,6 +100,7 @@ import {
@@ -240,7 +240,7 @@ index af6021815a..7c26b1cb72 100644
  // message_delta usage is per-message cumulative; null or absent fields retain message_start values and zeros replace them.
  function mergeClaudeStreamUsage(
    current: ClaudeMessageUsage,
-@@ -695,6 +712,11 @@ export interface ClaudeAgentSdkQuerySession {
+@@ -698,6 +715,11 @@ export interface ClaudeAgentSdkQuerySession {
      ReadonlyArray<ClaudeMcpServerStatus>,
      ClaudeAgentSdkQueryRunnerError
    >;
@@ -252,21 +252,21 @@ index af6021815a..7c26b1cb72 100644
    readonly readMcpResource: (input: {
      readonly server: string;
      readonly uri: string;
-@@ -1847,6 +1869,13 @@ export const layerQueryRunner: Layer.Layer<
-               try: () => queryRuntime.mcpServerStatus(),
-               catch: (cause) => queryRunnerError(cause, "mcpServerStatus"),
-             }),
-+            contextCategories: Effect.tryPromise({
-+              try: async () =>
-+                claudeContextCategories(
-+                  (await queryRuntime.getContextUsage({ detail: "summary" })).categories,
-+                ),
-+              catch: (cause) => queryRunnerError(cause, "getContextUsage"),
-+            }),
-             readMcpResource: ({ server, uri }) =>
-               Effect.tryPromise({
-                 try: () => queryRuntime.readMcpResource(server, uri),
-@@ -5887,6 +5916,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -1870,6 +1892,13 @@ export const layerQueryRunner: Layer.Layer<
+           try: () => queryRuntime.mcpServerStatus(),
+           catch: (cause) => queryRunnerError(cause, "mcpServerStatus"),
+         }),
++        contextCategories: Effect.tryPromise({
++          try: async () =>
++            claudeContextCategories(
++              (await queryRuntime.getContextUsage({ detail: "summary" })).categories,
++            ),
++          catch: (cause) => queryRunnerError(cause, "getContextUsage"),
++        }),
+         readMcpResource: ({ server, uri }) =>
+           Effect.tryPromise({
+             try: () => queryRuntime.readMcpResource(server, uri),
+@@ -5938,6 +5967,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
          const lastProviderThreadByNativeThread = yield* Ref.make(
            new Map<string, OrchestrationV2ProviderThread>(),
          );
@@ -279,7 +279,7 @@ index af6021815a..7c26b1cb72 100644
          const goalsByNativeThread = new Map<string, OrchestrationV2ProviderGoal | null>();
          // The title T3 last applied to each native session, so a turn renames it only when the
          // thread title changed. A native `/rename` T3 never applied survives later turns.
-@@ -6287,28 +6322,64 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -6338,28 +6373,64 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
              if (claudeMessageInputTokens(usage) <= 0) return;
              context.compactionTokens = undefined;
            }
@@ -854,10 +854,10 @@ index a8f7e0f88c..9f36d9c9d0 100644
 +    );
 +}
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
-index 1e98cb7e81..53517b6b06 100644
+index 169bbde951..1ef44a52a9 100644
 --- a/packages/contracts/src/orchestrationV2.ts
 +++ b/packages/contracts/src/orchestrationV2.ts
-@@ -85,7 +85,7 @@ import {
+@@ -86,7 +86,7 @@ import {
    ToolActivityIcon,
    ToolActivitySource,
  } from "./providerRuntime.ts";
@@ -866,7 +866,7 @@ index 1e98cb7e81..53517b6b06 100644
  
  export const OrchestrationV2Actor = Schema.Literals(["user", "agent", "system"]);
  export type OrchestrationV2Actor = typeof OrchestrationV2Actor.Type;
-@@ -236,6 +236,7 @@ export const OrchestrationV2ProviderTurnTokenUsage = Schema.Struct({
+@@ -237,6 +237,7 @@ export const OrchestrationV2ProviderTurnTokenUsage = Schema.Struct({
    reasoningOutputTokens: Schema.optional(NonNegativeInt),
    promptCacheTtlMs: Schema.optional(PositiveInt),
    autoCompactThreshold: Schema.optional(PositiveInt),

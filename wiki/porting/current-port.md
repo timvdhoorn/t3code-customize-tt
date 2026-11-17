@@ -1,15 +1,15 @@
 # Current port
 
 > Source: `patches-port/base.txt`, `covered-nightly.txt`, `skip-shared.json`; `./t3code-customize status`
-> Updated: 2026-11-16
+> Updated: 2026-11-17
 
 Which nightly the patches cover and what a port of them has to watch for. The port loop itself is in [docs/porting.md](../../docs/porting.md).
 
 ## Coverage
-- Shared patches: `patches-port/` targets nightly 0.1.10-nightly.20261115.4749 (`295a0a7332aa`).
+- Shared patches: `patches-port/` targets nightly 0.1.11-nightly.20261117.4838 (`ea6d3fc30fb0`).
 - `patches/` is upstream's and stays untouched.
 - Own patches: `patches-tt/` (16) and `patches-ios/` (11); a port applies 2 shared commits (`patches-port/`, minus the skips) + 16 + 11 = 29 commits.
-- `covered-nightly.txt`: 0.1.10-nightly.20261115.4749.
+- `covered-nightly.txt`: 0.1.11-nightly.20261117.4838.
 - Left out (`skip-shared.json`): desktop stats line and throughput, compaction settings, subscription switch.
 - Their bundle markers are replaced by `markers` in the same file.
 
@@ -23,3 +23,5 @@ Which nightly the patches cover and what a port of them has to watch for. The po
 - Commit them as `chore: port patches to nightly <version>` on a branch and open the PR yourself.
 - 4749 conflict: upstream sized the swipe actions from the measured row (`compactActions`, `rowHeight`, label constants) in `thread-swipe-actions.tsx`; `patches-ios/0004` keeps both and adds `iconOnlyActions`.
 - Upstream PRs named in `docs/fork-changes.md`: #16699 is open, so the child-threads patch stays.
+- 4838: upstream dropped `resolveSidebarRowThreadId`; `patches-tt/0002` keeps `resolveSidebarRowThreadKey`, iOS keeps `resolveThreadListV2RowKey` over upstream's `useSidebarRowThreadKey`.
+- 4838: upstream refreshes the update check before a download (#37476, `downloadAvailableUpdate(refresh)`); the automatic covered download in `patches-tt/0005` passes `false` so it never fetches an uncovered nightly.
