@@ -1,15 +1,15 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: t3code-customize <t3code-customize@localhost>
 Date: Fri, 16 Oct 2026 21:55:48 +0200
-Subject: [PATCH 05/15] feat(desktop): download nightlies and install them on
+Subject: [PATCH 05/16] feat(desktop): download nightlies and install them on
  quit in customized builds
 
 ---
  .../updates/DesktopUpdateAutomation.test.ts   | 257 ++++++++++++++++++
  .../src/updates/DesktopUpdateAutomation.ts    | 110 ++++++++
- apps/desktop/src/updates/DesktopUpdates.ts    | 125 ++++++++-
+ apps/desktop/src/updates/DesktopUpdates.ts    | 126 ++++++++-
  .../desktop/src/updates/updatesTestHarness.ts |  38 ++-
- 4 files changed, 522 insertions(+), 8 deletions(-)
+ 4 files changed, 523 insertions(+), 8 deletions(-)
  create mode 100644 apps/desktop/src/updates/DesktopUpdateAutomation.test.ts
  create mode 100644 apps/desktop/src/updates/DesktopUpdateAutomation.ts
 
@@ -393,7 +393,7 @@ index 0000000000..4d9cf61454
 +/** How often a download that waits for its customized build looks for it. */
 +export const PREBUILT_POLL_INTERVAL = "1 minute";
 diff --git a/apps/desktop/src/updates/DesktopUpdates.ts b/apps/desktop/src/updates/DesktopUpdates.ts
-index 055c657439..e87934f48c 100644
+index 775a9ff6b0..b5d3fad080 100644
 --- a/apps/desktop/src/updates/DesktopUpdates.ts
 +++ b/apps/desktop/src/updates/DesktopUpdates.ts
 @@ -39,6 +39,15 @@ import * as IpcChannels from "../ipc/channels.ts";
@@ -445,7 +445,7 @@ index 055c657439..e87934f48c 100644
    const readAppUpdateYml = fileSystem.readFileString(environment.appUpdateYmlPath, "utf-8").pipe(
      Effect.option,
      Effect.flatMap(
-@@ -611,14 +639,97 @@ export const make = Effect.gen(function* () {
+@@ -618,14 +646,98 @@ export const make = Effect.gen(function* () {
        );
      });
  
@@ -494,7 +494,8 @@ index 055c657439..e87934f48c 100644
 +        // electron-updater reads this flag when the download ends (macOS then hands the file to
 +        // Squirrel), so only this covered download installs on quit.
 +        yield* electronUpdater.setAutoInstallOnAppQuit(prebuilt);
-+        const result = yield* downloadAvailableUpdate;
++        // Not refreshed: the check that found this version also cleared its coverage.
++        const result = yield* downloadAvailableUpdate(false);
 +        if (automation.installOnQuit && !prebuilt && result.completed) {
 +          yield* installOnQuitWhenPrebuilt(version);
 +        }
@@ -546,16 +547,16 @@ index 055c657439..e87934f48c 100644
 +    },
 +  );
 +
-   const downloadAvailableUpdate = Effect.gen(function* () {
-     const admission = yield* Effect.scoped(
-       admitAfterCheck(
-@@ -1357,6 +1468,8 @@ export const make = Effect.gen(function* () {
+   // Install refreshes before downloading, and a second check could pick a stale, older release.
+   const downloadAvailableUpdate = Effect.fn("desktop.updates.downloadAvailableUpdate")(function* (
+     refresh: boolean,
+@@ -1423,6 +1535,8 @@ export const make = Effect.gen(function* () {
        };
      }),
      download: Effect.gen(function* () {
 +      // A download the user clicks never installs on its own: it waits for "Restart to update".
 +      yield* electronUpdater.setAutoInstallOnAppQuit(false);
-       const result = yield* downloadAvailableUpdate;
+       const result = yield* downloadAvailableUpdate(true);
        return {
          accepted: result.accepted,
 diff --git a/apps/desktop/src/updates/updatesTestHarness.ts b/apps/desktop/src/updates/updatesTestHarness.ts

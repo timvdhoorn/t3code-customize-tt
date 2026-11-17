@@ -27,10 +27,10 @@ Subject: [PATCH 1/2] Usage limits: background polling, reset-aware merging and
  19 files changed, 1839 insertions(+), 102 deletions(-)
 
 diff --git a/apps/server/src/provider/CodexProvider.ts b/apps/server/src/provider/CodexProvider.ts
-index 7dcf9079f8..48548c0f93 100644
+index 63154f4e99..bd32a81ba2 100644
 --- a/apps/server/src/provider/CodexProvider.ts
 +++ b/apps/server/src/provider/CodexProvider.ts
-@@ -62,6 +62,7 @@ const isCodexAppServerSpawnError = Schema.is(CodexErrors.CodexAppServerSpawnErro
+@@ -63,6 +63,7 @@ const isCodexAppServerSpawnError = Schema.is(CodexErrors.CodexAppServerSpawnErro
  
  type CodexRateLimitsProbe =
    | {
@@ -38,7 +38,7 @@ index 7dcf9079f8..48548c0f93 100644
        readonly snapshot: CodexRateLimitSnapshot;
        readonly rateLimitsByLimitId?:
          | Readonly<Record<string, CodexRateLimitSnapshot>>
-@@ -686,15 +687,20 @@ const readCodexRateLimits = (
+@@ -709,15 +710,20 @@ const readCodexRateLimits = (
    deadlineMs: number,
  ) =>
    withCodexDiscoveryDeadline(client.request("account/rateLimits/read", null), deadlineMs).pipe(
@@ -68,7 +68,7 @@ index 7dcf9079f8..48548c0f93 100644
      ),
      Effect.catch((error) =>
        Effect.logDebug("Codex rate-limit read failed.", { cause: error }).pipe(
-@@ -1107,7 +1113,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
+@@ -1145,7 +1151,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
              snapshot: snapshot.rateLimits.snapshot,
              rateLimitsByLimitId: snapshot.rateLimits.rateLimitsByLimitId,
              resetCredits: snapshot.rateLimits.resetCredits,
@@ -168,10 +168,10 @@ index 03245ba46d..667017de55 100644
          resolveMaintenance().pipe(
            Effect.flatMap((maintenanceCapabilities) =>
 diff --git a/apps/server/src/provider/ProviderRegistry.test.ts b/apps/server/src/provider/ProviderRegistry.test.ts
-index 27c1cd15a8..2b9c7de720 100644
+index 021c3ddb57..f21a54a170 100644
 --- a/apps/server/src/provider/ProviderRegistry.test.ts
 +++ b/apps/server/src/provider/ProviderRegistry.test.ts
-@@ -654,7 +654,11 @@ it.layer(
+@@ -655,7 +655,11 @@ it.layer(
            checkCodexProviderStatus(defaultCodexSettings, () =>
              Effect.succeed(
                makeCodexProbeSnapshot({
