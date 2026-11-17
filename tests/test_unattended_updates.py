@@ -920,6 +920,18 @@ class IosAfterUpdateTest(unittest.TestCase):
         ios.assert_called_once_with(args)
 
 
+    def test_an_installed_nightly_older_than_the_patches_still_builds_the_download_ahead(self):
+        # cmd_build waits (no patch set for the installed nightly); the covered download is built anyway.
+        args = argparse.Namespace(app=None, fix=None, background=True, ios=True)
+        with patch.object(customize, 'MAC', True), patch.object(customize, 'app_settled', return_value=True), \
+                patch.object(customize, 'installed_app'), \
+                patch.object(customize, 'cmd_build', side_effect=customize.Waiting('older than the patches')), \
+                patch.object(customize, 'prebuild_quietly', return_value=True) as prebuild, \
+                patch.object(customize, 'say'), patch.object(customize, 'update_ios') as ios:
+            customize.cmd_update(args)
+        prebuild.assert_called_once_with(args)
+        ios.assert_not_called()
+
 class IosStatusTest(unittest.TestCase):
     def status_line(self, ios_state, recipe, bundle='n2'):
         with patch.object(customize, 'ios_recipe_hash', return_value=recipe):
