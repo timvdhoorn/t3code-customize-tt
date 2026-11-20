@@ -18,7 +18,7 @@ This folder records how this project's systems work and their **current state**,
 | `raw/<area>/` (repo root) | Verbatim copies from the live system, dated, never edited. |
 | `scripts/<area>/` (repo root) | Our own scripts and SQL. |
 | Human docs (outside this folder) | Customer-facing notes, procedures, minutes, change records. Pages link to them; they never copy them. |
-| `GLOSSARY.md`, `docs/solutions/` (repo root, when present) | What a term means, how a bug was solved. Their own skills write them. The reason for a non-obvious choice is a short comment at its code, never a page here. Pages use the glossary's terms, state the resulting current state and link there; these rules change nothing in them. |
+| `docs/solutions/` (repo root, when present) | How a bug was solved. Its own skill writes it. The reason for a non-obvious choice is a short comment at its code, never a page here. Pages state the resulting current state and link there; these rules change nothing in it. |
 
 ## Write
 

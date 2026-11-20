@@ -127,7 +127,3 @@ GitHub Issues on the fork `timvdhoorn/t3code-customize-tt`, via `gh`. See `docs/
 ### Triage labels
 
 The five default labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
-
-### Domain docs
-
-Single-context: `GLOSSARY.md` at the repo root, created when needed. See `docs/agents/domain.md`.
