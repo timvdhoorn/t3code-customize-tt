@@ -11,15 +11,15 @@ reader: once the session's app-server connection is initialized it asks
 account/rateLimits/read, times out after 3 seconds and never spawns or
 initializes anything itself.
 ---
- .../Adapters/CodexAdapterV2.test.ts           | 80 +++++++++++++++++++
- .../Adapters/CodexAdapterV2.ts                | 28 ++++++-
- 2 files changed, 107 insertions(+), 1 deletion(-)
+ .../Adapters/CodexAdapterV2.test.ts           | 85 +++++++++++++++++++
+ .../Adapters/CodexAdapterV2.ts                | 29 ++++++-
+ 2 files changed, 113 insertions(+), 1 deletion(-)
 
 diff --git a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
-index f0f09e87ed..1b8f0b7ee5 100644
+index 67189ae9d7..6ce025b886 100644
 --- a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.test.ts
-@@ -1469,6 +1469,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
+@@ -1529,6 +1529,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
      promptSuggestions: Effect.Effect<boolean> = Effect.succeed(false),
      onNotification: (method: string) => Effect.Effect<void> = () => Effect.void,
      models?: CodexAdapterV2.CodexAdapterV2Options["models"],
@@ -27,7 +27,7 @@ index f0f09e87ed..1b8f0b7ee5 100644
    ) =>
      Effect.gen(function* () {
        const fileSystem = yield* FileSystem.FileSystem;
-@@ -1534,6 +1535,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
+@@ -1594,6 +1595,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
          ...(onUsageLimits ? { onUsageLimits } : {}),
          ...(models ? { models } : {}),
          digest: yield* Digest.Digest,
@@ -35,7 +35,7 @@ index f0f09e87ed..1b8f0b7ee5 100644
          fileSystem,
          idAllocator,
          serverConfig,
-@@ -2082,6 +2084,84 @@ describe("CodexAdapterV2 post-settle continuation", () => {
+@@ -2311,6 +2313,89 @@ describe("CodexAdapterV2 post-settle continuation", () => {
        ),
    );
  
@@ -103,7 +103,12 @@ index f0f09e87ed..1b8f0b7ee5 100644
 +        const limits = yield* reader!;
 +        assert.strictEqual(limits?.windows[0]?.usedPercent, 60);
 +        assert.strictEqual(limits?.checkedAt, "1970-01-01T00:01:00.000Z");
-+        assert.deepStrictEqual(methods, ["initialize", "thread/start", "account/rateLimits/read"]);
++        assert.deepStrictEqual(methods, [
++          "initialize",
++          "config/read",
++          "thread/start",
++          "account/rateLimits/read",
++        ]);
 +      }).pipe(
 +        Effect.provide(
 +          Layer.mergeAll(
@@ -121,10 +126,10 @@ index f0f09e87ed..1b8f0b7ee5 100644
      "delivers native history with %s app-server protocol",
      (response) =>
 diff --git a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
-index abea674b5e..2754190142 100644
+index 1ed40351e6..bda2a22ea1 100644
 --- a/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts
-@@ -24,6 +24,7 @@ import {
+@@ -25,6 +25,7 @@ import {
  } from "../../provider/CodexProvider.ts";
  import {
    codexRateLimitsToUpdate,
@@ -132,7 +137,7 @@ index abea674b5e..2754190142 100644
    mergeCodexRateLimits,
    codexMessageResetAt,
    codexTimeZone,
-@@ -80,6 +81,7 @@ import type {
+@@ -81,6 +82,7 @@ import type {
    ProviderThreadId,
    ProviderTurnId,
    ProviderInstanceId,
@@ -140,7 +145,7 @@ index abea674b5e..2754190142 100644
    RuntimeMode,
  } from "@t3tools/contracts";
  import * as CodexClient from "effect-codex-app-server/client";
-@@ -1832,7 +1834,11 @@ export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapter
+@@ -1867,7 +1869,11 @@ export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapter
    { instanceId, environment, enabled, config }: ProviderAdapterDriverCreateInput<CodexSettings>,
    hooks: Pick<
      CodexAdapterV2Options,
@@ -153,7 +158,7 @@ index abea674b5e..2754190142 100644
    > = {},
  ) {
    const clientFactory = yield* CodexAppServerClientFactory;
-@@ -1880,6 +1886,9 @@ export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapter
+@@ -1916,6 +1922,9 @@ export const createCodexAdapterV2 = Effect.fn("CodexAdapterV2.createCodexAdapter
  });
  
  export interface CodexAdapterV2Options {
@@ -163,10 +168,11 @@ index abea674b5e..2754190142 100644
    readonly instanceId: ProviderInstanceId;
    readonly settings: CodexSettings;
    readonly environment: NodeJS.ProcessEnv;
-@@ -2059,6 +2068,23 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
-         );
-         // A failed open is discarded, so the next turn spawns the updated binary.
-         if (adapterOptions.compatibility !== undefined) yield* ensureInitialized;
+@@ -2112,6 +2121,24 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
+               ),
+             ),
+           );
++
 +        if (adapterOptions.registerUsageLimitsReader) {
 +          yield* adapterOptions.registerUsageLimitsReader(
 +            Effect.gen(function* () {

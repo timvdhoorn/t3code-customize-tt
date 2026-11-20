@@ -11,9 +11,9 @@ Subject: [PATCH 04/11] feat(mobile): nest child threads under their opener in
  .../features/home/thread-swipe-actions.tsx    |  48 +-
  .../src/features/home/useThreadListActions.ts |  18 +
  .../threads/ThreadNavigationSidebar.tsx       | 103 ++-
- .../features/threads/thread-list-v2-items.tsx | 641 ++++++++++++-
+ .../features/threads/thread-list-v2-items.tsx | 659 +++++++++++++-
  .../src/features/threads/threadListV2.test.ts | 564 ++++++++++++
- .../src/features/threads/threadListV2.ts      | 857 ++++++++++++++----
+ .../src/features/threads/threadListV2.ts      | 859 ++++++++++++++----
  .../use-thread-list-v2-shelf-preferences.ts   | 123 +++
  .../src/features/threads/useThreadListV2.ts   |  13 +-
  apps/mobile/src/lib/storage.test.ts           |  20 +
@@ -26,7 +26,7 @@ Subject: [PATCH 04/11] feat(mobile): nest child threads under their opener in
  .../src/state/childThreadFamilies.ts          | 431 +++++++++
  .../src/state/threadShell.test.ts             |  37 +
  .../client-runtime/src/state/threadShell.ts   |  24 +
- 21 files changed, 3314 insertions(+), 625 deletions(-)
+ 21 files changed, 3334 insertions(+), 625 deletions(-)
  create mode 100644 packages/client-runtime/src/state/childThreadFamilies.test.ts
  create mode 100644 packages/client-runtime/src/state/childThreadFamilies.ts
 
@@ -51,10 +51,10 @@ index 5333af3ea5..550598da9b 100644
    house: IconHome,
    "info.circle": IconInfoCircle,
 diff --git a/apps/mobile/src/features/home/HomeRouteScreen.tsx b/apps/mobile/src/features/home/HomeRouteScreen.tsx
-index 05ef660af4..edea007714 100644
+index 2550f96508..918dd7d630 100644
 --- a/apps/mobile/src/features/home/HomeRouteScreen.tsx
 +++ b/apps/mobile/src/features/home/HomeRouteScreen.tsx
-@@ -10,7 +10,7 @@ import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell
+@@ -11,7 +11,7 @@ import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell
  import { pickableProjectGroups } from "@t3tools/client-runtime/state/project-grouping";
  
  import { useProjects } from "../../state/entities";
@@ -63,7 +63,7 @@ index 05ef660af4..edea007714 100644
  import { useLaunchingThreads, usePendingNewTasks } from "../../state/use-pending-new-tasks";
  import { useWorkspaceState } from "../../state/workspace";
  import { useSavedRemoteConnections } from "../../state/use-remote-environment-registry";
-@@ -50,7 +50,7 @@ export function HomeRouteScreen() {
+@@ -53,7 +53,7 @@ export function HomeRouteScreen() {
    // Stop rebuilding the streaming thread list while Thread covers Home.
    const visible = useHomeRouteVisible();
    const threads = useLaunchingThreads(
@@ -72,7 +72,7 @@ index 05ef660af4..edea007714 100644
    );
    const { environments: workspaceEnvironments, state: catalogState } = useWorkspaceState();
    const { savedConnectionsById } = useSavedRemoteConnections();
-@@ -101,6 +101,7 @@ export function HomeRouteScreen() {
+@@ -104,6 +104,7 @@ export function HomeRouteScreen() {
      moveThread,
      renameThread,
      regenerateThreadTitle,
@@ -80,7 +80,7 @@ index 05ef660af4..edea007714 100644
      unsettleThread,
    } = useThreadListActions();
    const pendingTasks = usePendingNewTasks();
-@@ -195,6 +196,7 @@ export function HomeRouteScreen() {
+@@ -204,6 +205,7 @@ export function HomeRouteScreen() {
            onMoveThread={moveThread}
            onRenameThread={renameThread}
            onRegenerateThreadTitle={regenerateThreadTitle}
@@ -89,10 +89,10 @@ index 05ef660af4..edea007714 100644
            onProjectChange={setSelectedProjectKey}
            onOpenSettings={() => selectTab("settings")}
 diff --git a/apps/mobile/src/features/home/HomeScreen.tsx b/apps/mobile/src/features/home/HomeScreen.tsx
-index c2946c59ed..736521b10e 100644
+index f1b6469cd7..e590627159 100644
 --- a/apps/mobile/src/features/home/HomeScreen.tsx
 +++ b/apps/mobile/src/features/home/HomeScreen.tsx
-@@ -18,6 +18,7 @@ import { type EnvironmentId, type SidebarProjectGroupingMode } from "@t3tools/co
+@@ -20,6 +20,7 @@ import { type EnvironmentId, type SidebarProjectGroupingMode } from "@t3tools/co
  import { useAtomValue } from "@effect/atom-react";
  import {
    use,
@@ -100,7 +100,7 @@ index c2946c59ed..736521b10e 100644
    useEffect,
    useLayoutEffect,
    useMemo,
-@@ -71,6 +72,7 @@ import { threadListEnvironmentsAtom } from "../../state/presentation";
+@@ -73,6 +74,7 @@ import { threadListEnvironmentsAtom } from "../../state/presentation";
  import type { PendingNewTask } from "../../state/use-pending-new-tasks";
  import { useQueuedThreadKeys } from "../../state/use-thread-outbox";
  import {
@@ -108,7 +108,7 @@ index c2946c59ed..736521b10e 100644
    ThreadListV2PendingRow,
    ThreadListV2Row,
    ThreadListV2SettledShelfHeader,
-@@ -86,6 +88,7 @@ import {
+@@ -88,6 +90,7 @@ import {
    THREAD_LIST_V2_SETTLED_INITIAL_COUNT,
    THREAD_LIST_V2_SETTLED_PAGE_COUNT,
    type ThreadListV2ListItem,
@@ -116,7 +116,7 @@ index c2946c59ed..736521b10e 100644
  } from "../threads/threadListV2";
  import { useThreadListV2ShelfPreferences } from "../threads/use-thread-list-v2-shelf-preferences";
  import type { HomeListFilterMenuEnvironment } from "./home-list-filter-menu";
-@@ -147,6 +150,7 @@ interface HomeScreenProps {
+@@ -149,6 +152,7 @@ interface HomeScreenProps {
    ) => Promise<boolean>;
    readonly onRenameThread: (thread: EnvironmentThreadShell) => void;
    readonly onRegenerateThreadTitle: (thread: EnvironmentThreadShell) => Promise<boolean>;
@@ -124,7 +124,7 @@ index c2946c59ed..736521b10e 100644
    readonly onSelectPendingTask: (pendingTask: PendingNewTask) => void;
    readonly onDeletePendingTask: (pendingTask: PendingNewTask) => void;
    readonly onNewThreadOnBranch: (thread: EnvironmentThreadShell) => void;
-@@ -366,6 +370,7 @@ export function HomeScreen(props: HomeScreenProps) {
+@@ -373,6 +377,7 @@ export function HomeScreen(props: HomeScreenProps) {
    const handleUnpinThread = props.onUnpinThread;
    const handleSetThreadAutoSettle = props.onSetThreadAutoSettle;
    const handleRegenerateThreadTitle = props.onRegenerateThreadTitle;
@@ -132,7 +132,7 @@ index c2946c59ed..736521b10e 100644
    const handleRenameThread = props.onRenameThread;
    const handleDeleteThread = props.onDeleteThread;
    const handleUnsettleThread = props.onUnsettleThread;
-@@ -386,6 +391,11 @@ export function HomeScreen(props: HomeScreenProps) {
+@@ -393,6 +398,11 @@ export function HomeScreen(props: HomeScreenProps) {
      snoozedShelfExpanded,
      workingShelfEnabled,
      workingShelfExpanded,
@@ -144,7 +144,7 @@ index c2946c59ed..736521b10e 100644
      toggleSettledShelf,
      toggleSnoozedShelf,
      toggleWorkingShelf,
-@@ -406,11 +416,29 @@ export function HomeScreen(props: HomeScreenProps) {
+@@ -413,11 +423,29 @@ export function HomeScreen(props: HomeScreenProps) {
    } = listEnvironments;
    const resolveProviderInstance = useThreadRowProviderInstanceResolver(providersByEnvironmentId);
    const pendingOrder = usePendingThreadOrder();
@@ -174,7 +174,7 @@ index c2946c59ed..736521b10e 100644
    } = useThreadListV2({
      threads: props.threads,
      pendingTasks: props.pendingTasks,
-@@ -431,6 +459,8 @@ export function HomeScreen(props: HomeScreenProps) {
+@@ -438,6 +466,8 @@ export function HomeScreen(props: HomeScreenProps) {
      workingShelfExpanded,
      snoozedShelfExpanded,
      settledShelfExpanded,
@@ -183,7 +183,7 @@ index c2946c59ed..736521b10e 100644
      selectedThreadKey,
    });
    // Called as `props.onSelectThread(...)`, the compiler would cache this handler on the whole
-@@ -490,6 +520,29 @@ export function HomeScreen(props: HomeScreenProps) {
+@@ -497,6 +527,29 @@ export function HomeScreen(props: HomeScreenProps) {
          />
        );
      }
@@ -213,7 +213,7 @@ index c2946c59ed..736521b10e 100644
      if (item.type === "v2-working-shelf") {
        return (
          <ThreadListV2WorkingShelfHeader
-@@ -563,6 +616,7 @@ export function HomeScreen(props: HomeScreenProps) {
+@@ -570,6 +623,7 @@ export function HomeScreen(props: HomeScreenProps) {
          onArchiveThread={props.onArchiveThread}
          onRenameThread={handleRenameThread}
          onRegenerateThreadTitle={handleRegenerateThreadTitle}
@@ -221,7 +221,7 @@ index c2946c59ed..736521b10e 100644
          titleRegenerationSupported={titleRegenerationEnvironmentIds.has(thread.environmentId)}
          settlementSupported={settlementEnvironmentIds.has(thread.environmentId)}
          onSettleThread={handleSettleThread}
-@@ -577,6 +631,16 @@ export function HomeScreen(props: HomeScreenProps) {
+@@ -584,6 +638,16 @@ export function HomeScreen(props: HomeScreenProps) {
          }
          canMoveUp={item.canMoveUp}
          canMoveDown={item.canMoveDown}
@@ -238,7 +238,7 @@ index c2946c59ed..736521b10e 100644
          onSnoozeThread={handleSnoozeThread}
          onUnsnoozeThread={handleUnsnoozeThread}
          onUnsettleThread={handleUnsettleThread}
-@@ -779,6 +843,7 @@ export function HomeScreen(props: HomeScreenProps) {
+@@ -794,6 +858,7 @@ export function HomeScreen(props: HomeScreenProps) {
                    settledShelfExpanded && threadListV2Layout.hiddenSettledCount > 0 ? (
                      <ThreadListV2ShowMoreRow
                        hiddenCount={threadListV2Layout.hiddenSettledCount}
@@ -247,10 +247,10 @@ index c2946c59ed..736521b10e 100644
                          ? { state: "loading" as const }
                          : olderSettledShelf.failed
 diff --git a/apps/mobile/src/features/home/thread-swipe-actions.tsx b/apps/mobile/src/features/home/thread-swipe-actions.tsx
-index 40c7c58f15..12ff63f1a2 100644
+index ba2e30479a..2ec25c53dd 100644
 --- a/apps/mobile/src/features/home/thread-swipe-actions.tsx
 +++ b/apps/mobile/src/features/home/thread-swipe-actions.tsx
-@@ -230,6 +230,9 @@ interface ThreadSwipeableProps {
+@@ -234,6 +234,9 @@ interface ThreadSwipeableProps {
    readonly backgroundColor: ColorValue;
    readonly children: (close: () => void) => ReactNode;
    readonly compactActions?: boolean;
@@ -260,7 +260,7 @@ index 40c7c58f15..12ff63f1a2 100644
    readonly containerStyle?: StyleProp<ViewStyle>;
    readonly enabled?: boolean;
    readonly enableTrackpadSwipe?: boolean;
-@@ -467,6 +470,7 @@ export function ThreadSwipeable(props: ThreadSwipeableProps) {
+@@ -472,6 +475,7 @@ export function ThreadSwipeable(props: ThreadSwipeableProps) {
    const compactActions =
      props.compactActions === true ||
      (measuredRowHeight > 0 && measuredRowHeight < fullActionsHeight);
@@ -268,7 +268,7 @@ index 40c7c58f15..12ff63f1a2 100644
    const { secondaryAction, threadTitle } = props;
    // Swipeable calls this on every render; returning the previous element while nothing it shows
    // changed keeps a selection change from re-rendering the hidden actions.
-@@ -484,6 +488,7 @@ export function ThreadSwipeable(props: ThreadSwipeableProps) {
+@@ -489,6 +493,7 @@ export function ThreadSwipeable(props: ThreadSwipeableProps) {
        backgroundColor,
        compactActions,
        measuredRowHeight,
@@ -276,7 +276,7 @@ index 40c7c58f15..12ff63f1a2 100644
        fullSwipeAction,
        fullSwipeThreshold,
        handleFullSwipeArmedChange,
-@@ -508,6 +513,7 @@ export function ThreadSwipeable(props: ThreadSwipeableProps) {
+@@ -513,6 +518,7 @@ export function ThreadSwipeable(props: ThreadSwipeableProps) {
            backgroundColor={backgroundColor}
            compact={compactActions}
            rowHeight={measuredRowHeight}
@@ -284,7 +284,7 @@ index 40c7c58f15..12ff63f1a2 100644
            fullSwipeAction={fullSwipeAction}
            fullSwipeThreshold={fullSwipeThreshold}
            onFullSwipeArmedChange={handleFullSwipeArmedChange}
-@@ -581,6 +587,7 @@ function SwipeActionButton(props: {
+@@ -587,6 +593,7 @@ function SwipeActionButton(props: {
    readonly actionsWidth: number;
    readonly tone: "primary" | "secondary" | "danger";
    readonly compact: boolean;
@@ -292,7 +292,7 @@ index 40c7c58f15..12ff63f1a2 100644
    readonly entryRange: readonly [number, number];
    readonly fullSwipeThreshold: number;
    readonly icon: ComponentProps<typeof SymbolView>["name"];
-@@ -745,25 +752,27 @@ function SwipeActionButton(props: {
+@@ -751,25 +758,27 @@ function SwipeActionButton(props: {
          </Animated.View>
        </View>
        {/* An offset, not padding: padding would grow the box and move the circle at 1x. */}
@@ -338,7 +338,7 @@ index 40c7c58f15..12ff63f1a2 100644
      </Pressable>
    );
  
-@@ -799,6 +808,7 @@ function SwipeActionButton(props: {
+@@ -805,6 +814,7 @@ function SwipeActionButton(props: {
  function ThreadSwipeActions(props: {
    readonly backgroundColor: ColorValue;
    readonly compact: boolean;
@@ -346,7 +346,7 @@ index 40c7c58f15..12ff63f1a2 100644
    readonly fullSwipeAction?: "delete" | "primary";
    readonly fullSwipeThreshold: number;
    readonly onFullSwipeArmedChange: (armed: boolean) => void;
-@@ -834,6 +844,7 @@ function ThreadSwipeActions(props: {
+@@ -840,6 +850,7 @@ function ThreadSwipeActions(props: {
          actionsWidth={actionsWidth}
          tone={props.primaryAction.destructive === true ? "danger" : "primary"}
          compact={props.compact}
@@ -354,7 +354,7 @@ index 40c7c58f15..12ff63f1a2 100644
          entryRange={
            secondaryAction === null
              ? [8, ACTION_ITEM_WIDTH * 0.72]
-@@ -853,6 +864,7 @@ function ThreadSwipeActions(props: {
+@@ -859,6 +870,7 @@ function ThreadSwipeActions(props: {
            actionsWidth={actionsWidth}
            tone={secondaryAction.tone}
            compact={props.compact}
@@ -363,10 +363,10 @@ index 40c7c58f15..12ff63f1a2 100644
            fullSwipeThreshold={props.fullSwipeThreshold}
            icon={secondaryAction.icon}
 diff --git a/apps/mobile/src/features/home/useThreadListActions.ts b/apps/mobile/src/features/home/useThreadListActions.ts
-index b100b6aa5e..e00503846b 100644
+index 8a70854e5b..fa0f410972 100644
 --- a/apps/mobile/src/features/home/useThreadListActions.ts
 +++ b/apps/mobile/src/features/home/useThreadListActions.ts
-@@ -235,6 +235,7 @@ export function useThreadListActions(): {
+@@ -246,6 +246,7 @@ export function useThreadListActions(): {
    ) => Promise<boolean>;
    readonly renameThread: (thread: EnvironmentThreadShell) => void;
    readonly regenerateThreadTitle: (thread: EnvironmentThreadShell) => Promise<boolean>;
@@ -374,7 +374,7 @@ index b100b6aa5e..e00503846b 100644
  } {
    const executeAction = useThreadActionExecutor();
    const snoozeMutation = useAtomCommand(threadEnvironment.snooze, { reportFailure: false });
-@@ -575,6 +576,22 @@ export function useThreadListActions(): {
+@@ -620,6 +621,22 @@ export function useThreadListActions(): {
      titleRegenerationInFlightThreadKeys.current.delete(key);
      return succeeded;
    };
@@ -387,17 +387,17 @@ index b100b6aa5e..e00503846b 100644
 +      if (result._tag === "Success") return;
 +      const error = Cause.squash(result.cause);
 +      Dialog.alert(
-+        "Could not make main thread",
++        m(msg("Could not make main thread")),
 +        error instanceof Error && error.message.trim().length > 0
 +          ? error.message
-+          : "The thread could not be moved out of its family.",
++          : m(msg("The thread could not be moved out of its family.")),
 +      );
 +    });
 +  };
    const renameThread = (thread: EnvironmentThreadShell) => {
      const commit = (title: string) => {
        const resolution = resolveThreadTitleRename({ title, originalTitle: thread.title });
-@@ -770,6 +787,7 @@ export function useThreadListActions(): {
+@@ -820,6 +837,7 @@ export function useThreadListActions(): {
      moveThread,
      renameThread: (thread) => renameThread(liveThread(thread)),
      regenerateThreadTitle: (thread) => regenerateThreadTitle(liveThread(thread)),
@@ -406,10 +406,10 @@ index b100b6aa5e..e00503846b 100644
  }
  
 diff --git a/apps/mobile/src/features/threads/ThreadNavigationSidebar.tsx b/apps/mobile/src/features/threads/ThreadNavigationSidebar.tsx
-index 6de4c54d6d..fe85087a81 100644
+index f973d0c2fd..3e9d4a6e8e 100644
 --- a/apps/mobile/src/features/threads/ThreadNavigationSidebar.tsx
 +++ b/apps/mobile/src/features/threads/ThreadNavigationSidebar.tsx
-@@ -14,7 +14,8 @@ import { threadSearchMatchKey } from "@t3tools/client-runtime/state/thread-searc
+@@ -15,7 +15,8 @@ import { threadSearchMatchKey } from "@t3tools/client-runtime/state/thread-searc
  import { AnimatedLegendList } from "@legendapp/list/reanimated";
  import { THREAD_LIST_ROW_LAYOUT } from "./threadListAnimations";
  import { useAtomValue } from "@effect/atom-react";
@@ -419,7 +419,7 @@ index 6de4c54d6d..fe85087a81 100644
  import { Platform, StyleSheet, View } from "react-native";
  import { GestureDetector, useNativeGesture } from "react-native-gesture-handler";
  import type { SwipeableMethods } from "react-native-gesture-handler/ReanimatedSwipeable";
-@@ -25,9 +26,12 @@ import { AppText as Text } from "../../components/ui/AppText";
+@@ -26,9 +27,12 @@ import { AppText as Text } from "../../components/ui/AppText";
  import { Button } from "../../components/ui/Button";
  import { scopedProjectKey, scopedThreadKey } from "../../lib/scopedEntities";
  import { useProjects } from "../../state/entities";
@@ -434,7 +434,7 @@ index 6de4c54d6d..fe85087a81 100644
  import { useThreadListNow } from "./use-thread-list-now";
  import { usePendingThreadOrder } from "../../state/thread-order";
  import { threadListEnvironmentsAtom } from "../../state/presentation";
-@@ -40,7 +44,6 @@ import { useQueuedThreadKeys } from "../../state/use-thread-outbox";
+@@ -41,7 +45,6 @@ import { useQueuedThreadKeys } from "../../state/use-thread-outbox";
  import { useWorkspaceState } from "../../state/workspace";
  import { useSavedRemoteConnections } from "../../state/use-remote-environment-registry";
  import { useThreadListV2 } from "./useThreadListV2";
@@ -442,7 +442,7 @@ index 6de4c54d6d..fe85087a81 100644
  import { useThreadJumpShortcuts } from "../keyboard/threadKeyboardShortcuts";
  import { requestThreadMessageJump } from "./threadMessageJump";
  import { useThreadListSearchMatches } from "./useThreadListSearchMatches";
-@@ -61,6 +64,7 @@ import { useFabScroll } from "../home/FabScrollContext";
+@@ -62,6 +65,7 @@ import { useFabScroll } from "../home/FabScrollContext";
  import { WorkspaceListHeader } from "../layout/workspace/WorkspaceListHeader";
  import { WorkspaceSidebarColumn } from "../layout/workspace/WorkspaceSidebarColumn";
  import {
@@ -450,7 +450,7 @@ index 6de4c54d6d..fe85087a81 100644
    ThreadListV2PendingRow,
    ThreadListV2Row,
    ThreadListV2SettledShelfHeader,
-@@ -73,10 +77,12 @@ import type { ThreadPrPresentation } from "../../state/thread-pr-presentation";
+@@ -74,10 +78,12 @@ import type { ThreadPrPresentation } from "../../state/thread-pr-presentation";
  import { ThreadPrDemandProvider } from "../../state/thread-pr-demand";
  import {
    isThreadListV2ListItem,
@@ -463,7 +463,7 @@ index 6de4c54d6d..fe85087a81 100644
  } from "./threadListV2";
  import { useSelectWorkspaceDetail } from "../layout/workspace/useSelectWorkspaceDetail";
  import { NativeScrollView } from "../../native/NativeScrollViewMarker";
-@@ -88,6 +94,7 @@ type SidebarListItem =
+@@ -89,6 +95,7 @@ type SidebarListItem =
        readonly key: string;
        readonly hiddenCount: number;
        readonly state?: "loading" | "failed";
@@ -471,7 +471,7 @@ index 6de4c54d6d..fe85087a81 100644
      };
  
  interface ThreadNavigationSidebarProps {
-@@ -127,8 +134,16 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -130,8 +137,16 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
    const insets = useSafeAreaInsets();
    const { fabClearance, fabSize } = useAndroidControlSizing();
    const projects = useProjects();
@@ -490,7 +490,7 @@ index 6de4c54d6d..fe85087a81 100644
    const { environments: workspaceEnvironments, state: catalogState } = useWorkspaceState();
    const { savedConnectionsById } = useSavedRemoteConnections();
    const openSwipeableRef = useRef<SwipeableMethods | null>(null);
-@@ -146,6 +161,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -149,6 +164,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
      moveThread,
      renameThread,
      regenerateThreadTitle,
@@ -498,7 +498,7 @@ index 6de4c54d6d..fe85087a81 100644
    } = useThreadListActions();
    const pendingTasks = usePendingNewTasks();
    const launchingThreads = useLaunchingThreads(threads);
-@@ -245,6 +261,11 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -251,6 +267,11 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
      snoozedShelfExpanded,
      workingShelfEnabled,
      workingShelfExpanded,
@@ -510,7 +510,7 @@ index 6de4c54d6d..fe85087a81 100644
      toggleSettledShelf,
      toggleSnoozedShelf,
      toggleWorkingShelf,
-@@ -265,11 +286,28 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -271,11 +292,28 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
    } = listEnvironments;
    const resolveProviderInstance = useThreadRowProviderInstanceResolver(providersByEnvironmentId);
    const pendingOrder = usePendingThreadOrder();
@@ -539,7 +539,7 @@ index 6de4c54d6d..fe85087a81 100644
    } = useThreadListV2({
      threads: launchingThreads,
      pendingTasks,
-@@ -290,7 +328,9 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -296,7 +334,9 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
      workingShelfExpanded,
      snoozedShelfExpanded,
      settledShelfExpanded,
@@ -550,7 +550,7 @@ index 6de4c54d6d..fe85087a81 100644
    });
    const listItems: readonly SidebarListItem[] =
      settledShelfExpanded && threadListV2Layout.hiddenSettledCount > 0
-@@ -300,6 +340,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -306,6 +346,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
              type: "v2-show-more",
              key: "v2-show-more",
              hiddenCount: threadListV2Layout.hiddenSettledCount,
@@ -558,7 +558,7 @@ index 6de4c54d6d..fe85087a81 100644
              ...(olderSettledShelf.loading
                ? { state: "loading" as const }
                : olderSettledShelf.failed
-@@ -353,7 +394,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -359,7 +400,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
    // Recycle equality needs project/search data for titles and favicons; keep the minute clock on items to limit updates.
    const listExtraData = {
      activeNewTask,
@@ -567,7 +567,7 @@ index 6de4c54d6d..fe85087a81 100644
      projectByKey,
      projectTitleByProjectKey,
      savedConnectionsById,
-@@ -367,7 +408,11 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -373,7 +414,11 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
        return threadListV2ListItemsAreEqual(previous, item);
      }
      if (previous.type === "v2-show-more" && item.type === "v2-show-more") {
@@ -580,7 +580,7 @@ index 6de4c54d6d..fe85087a81 100644
      }
      return false;
    };
-@@ -387,7 +432,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -393,7 +438,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
                  scopedThreadKey(
                    item.pendingTask.environmentId,
                    item.pendingTask.message.threadId,
@@ -589,7 +589,7 @@ index 6de4c54d6d..fe85087a81 100644
              }
              project={projectByKey.get(pendingScopeKey) ?? null}
              environmentLabel={
-@@ -407,6 +452,29 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -413,6 +458,29 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
            />
          );
        }
@@ -619,7 +619,7 @@ index 6de4c54d6d..fe85087a81 100644
        case "v2-thread": {
          const thread = item.item.thread;
          const scopeKey = scopedProjectKey(thread.environmentId, thread.projectId);
-@@ -447,8 +515,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -453,8 +521,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
              searchQuery={threadSearch.query}
              pane="sidebar"
              selected={
@@ -629,7 +629,7 @@ index 6de4c54d6d..fe85087a81 100644
              }
              fullSwipeWidth={props.width - 20}
              onSelectThread={handleSelectThread}
-@@ -457,6 +524,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -463,6 +530,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
              onArchiveThread={archiveThread}
              onRenameThread={renameThread}
              onRegenerateThreadTitle={regenerateThreadTitle}
@@ -637,7 +637,7 @@ index 6de4c54d6d..fe85087a81 100644
              titleRegenerationSupported={titleRegenerationEnvironmentIds.has(thread.environmentId)}
              settlementSupported={settlementEnvironmentIds.has(thread.environmentId)}
              onSettleThread={settleThread}
-@@ -471,6 +539,16 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -477,6 +545,16 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
              }
              canMoveUp={item.canMoveUp}
              canMoveDown={item.canMoveDown}
@@ -654,7 +654,7 @@ index 6de4c54d6d..fe85087a81 100644
              onSnoozeThread={snoozeThread}
              onUnsnoozeThread={unsnoozeThread}
              onUnsettleThread={unsettleThread}
-@@ -519,6 +597,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
+@@ -525,6 +603,7 @@ function ThreadNavigationSidebarPane(props: ThreadNavigationSidebarProps) {
            <ThreadListV2ShowMoreRow
              pane="sidebar"
              hiddenCount={item.hiddenCount}
@@ -663,7 +663,7 @@ index 6de4c54d6d..fe85087a81 100644
              onPress={() => {
                olderSettledShelf.retry();
 diff --git a/apps/mobile/src/features/threads/thread-list-v2-items.tsx b/apps/mobile/src/features/threads/thread-list-v2-items.tsx
-index d304bc87ed..22e919ed3a 100644
+index 7a18e14299..2ffff83fc9 100644
 --- a/apps/mobile/src/features/threads/thread-list-v2-items.tsx
 +++ b/apps/mobile/src/features/threads/thread-list-v2-items.tsx
 @@ -25,6 +25,17 @@ import {
@@ -684,7 +684,7 @@ index d304bc87ed..22e919ed3a 100644
  import {
    AuthOrchestrationOperateScope,
    type EnvironmentId,
-@@ -63,6 +74,7 @@ import {
+@@ -65,6 +76,7 @@ import {
  } from "../../state/pending-new-tasks-model";
  import { useBranches } from "../../state/queries";
  import { useNewTaskProjectDefaults } from "./use-new-task-project-defaults";
@@ -692,16 +692,16 @@ index d304bc87ed..22e919ed3a 100644
  import {
    resolveThreadPrBadgeAction,
    type ThreadPrPresentation,
-@@ -74,7 +86,7 @@ import { buildThreadTitleRegenerationMenuItems } from "./thread-title-regenerati
- import { canTurnThreadIntoProject, turnThreadIntoProject } from "./turnThreadIntoProject";
+@@ -77,7 +89,7 @@ import { canTurnThreadIntoProject, turnThreadIntoProject } from "./turnThreadInt
  import { threadCanArchive } from "../home/threadArchive";
+ import { useCanShareWithGuest } from "./useCanShareWithGuest";
  import {
 -  THREAD_LIST_V2_SETTLED_PAGE_COUNT,
 +  formatThreadListV2WorkerAge,
    resolveThreadListV2SnoozeGateExpiryMs,
    resolveThreadListV2SnoozeMenuSelection,
    resolveThreadListV2SnoozePresets,
-@@ -85,6 +97,8 @@ import {
+@@ -88,6 +100,8 @@ import {
    resolveThreadListV2SwipeActions,
    layoutThreadListV2RowMenuActions,
    threadListV2RowAccessibilityLabel,
@@ -710,14 +710,22 @@ index d304bc87ed..22e919ed3a 100644
    type ThreadListV2Status,
  } from "./threadListV2";
  import { QueuedMessageIcon } from "./queued-message-icon";
-@@ -152,6 +166,220 @@ const DONE_STATUS_LABEL: StatusLabel = {
+@@ -96,6 +110,7 @@ import { ThreadSearchMatchExcerpt } from "./thread-search-match";
+ import { useScaledTextRole } from "../settings/appearance/useScaledTextRole";
+ import { PullRequestGlyph } from "../pull-requests/pullRequestGlyphs";
+ import { pullRequestStatus } from "../pull-requests/pullRequestStatus";
++import type { MessageResolver } from "../../i18n/messages";
+ 
+ interface StatusLabel {
+   // Null when the icon and timer carry the status on their own.
+@@ -155,6 +170,228 @@ const DONE_STATUS_LABEL: StatusLabel = {
    iconTintClassName: "accent-adaptive-emerald-700-300",
  };
  
 +// A family's chips and child rows (childThreadSummary.ts), in the row status colours.
 +const CHILD_THREAD_KIND_STATUS: Record<ChildThreadKind, StatusLabel> = {
 +  "needs-you": {
-+    label: "Needs you",
++    label: msg("Needs you", { $context: "child thread status" }),
 +    icon: "questionmark.bubble",
 +    className: "text-warning-foreground",
 +    iconTintClassName: "accent-warning-foreground",
@@ -725,7 +733,7 @@ index d304bc87ed..22e919ed3a 100644
 +  failed: STATUS_LABEL_BY_STATUS.failed!,
 +  // Green like done: an unseen result is finished work, not a call to act; the dot marks unseen.
 +  new: {
-+    label: "New",
++    label: msg("New", { $context: "child thread status, unseen result" }),
 +    icon: "circle.fill",
 +    className: DONE_STATUS_LABEL.className,
 +    iconTintClassName: DONE_STATUS_LABEL.iconTintClassName,
@@ -733,7 +741,7 @@ index d304bc87ed..22e919ed3a 100644
 +  working: STATUS_LABEL_BY_STATUS.working!,
 +  done: DONE_STATUS_LABEL,
 +  settled: {
-+    label: "Settled",
++    label: msg("Settled", { $context: "child thread status" }),
 +    icon: "checkmark.circle",
 +    className: "text-foreground-tertiary",
 +    iconTintClassName: "accent-foreground-tertiary",
@@ -758,11 +766,17 @@ index d304bc87ed..22e919ed3a 100644
 +};
 +
 +/** A child's status icon: its own status while it runs or failed, else its kind. */
-+function childThreadRowStatus(kind: ChildThreadKind, statusLabel: StatusLabel | undefined) {
-+  return statusLabel !== undefined &&
-+    (kind === "needs-you" || kind === "working" || kind === "failed")
-+    ? statusLabel
-+    : CHILD_THREAD_KIND_STATUS[kind];
++/** `statusLabel` comes resolved; a kind's own label is resolved here. */
++function childThreadRowStatus(
++  kind: ChildThreadKind,
++  statusLabel: StatusLabel | undefined,
++  resolve: MessageResolver,
++): StatusLabel {
++  if (statusLabel !== undefined && (kind === "needs-you" || kind === "working" || kind === "failed")) {
++    return statusLabel;
++  }
++  const status = CHILD_THREAD_KIND_STATUS[kind];
++  return { ...status, label: status.label === null ? null : resolve(status.label) };
 +}
 +
 +function ChildThreadRoleSymbol(props: {
@@ -816,10 +830,12 @@ index d304bc87ed..22e919ed3a 100644
 +  const { workers, environmentLabelOf, parentEnvironmentId, onSelectThread, onMakeMainThread } =
 +    props;
 +  const setShownAsSubthread = useSetThreadListSubthread();
++  const gt = useGT();
++  const m = useMessages();
 +  const actions = useMemo<MenuAction[]>(() => {
 +    const subtitleOf = (worker: ThreadListV2DelegatedWorkers["workers"][number]) =>
 +      [
-+        CHILD_THREAD_KIND_STATUS[worker.kind].label,
++        m(CHILD_THREAD_KIND_STATUS[worker.kind].label ?? ""),
 +        formatThreadListV2WorkerAge(worker.thread),
 +        worker.thread.environmentId === parentEnvironmentId
 +          ? null
@@ -841,7 +857,7 @@ index d304bc87ed..22e919ed3a 100644
 +      },
 +      {
 +        id: "workers-subthread",
-+        title: "Show as subthread",
++        title: gt("Show as subthread"),
 +        image: "increase.indent",
 +        subactions: workers.workers.map((worker) => ({
 +          id: `worker-subthread:${workerKeyOf(worker.thread)}`,
@@ -853,7 +869,7 @@ index d304bc87ed..22e919ed3a 100644
 +        ? [
 +            {
 +              id: "workers-make-main",
-+              title: "Make main thread",
++              title: gt("Make main thread"),
 +              image: "arrow.up.left",
 +              subactions: workers.workers.map((worker) => ({
 +                id: `worker-main:${workerKeyOf(worker.thread)}`,
@@ -864,7 +880,7 @@ index d304bc87ed..22e919ed3a 100644
 +          ]
 +        : []),
 +    ];
-+  }, [environmentLabelOf, parentEnvironmentId, props.canMakeMainThread, workers]);
++  }, [environmentLabelOf, gt, m, parentEnvironmentId, props.canMakeMainThread, workers]);
 +  const handleAction = useCallback(
 +    ({ nativeEvent }: { readonly nativeEvent: { readonly event: string } }) => {
 +      const [kind, ...rest] = nativeEvent.event.split(":");
@@ -886,8 +902,8 @@ index d304bc87ed..22e919ed3a 100644
 +        <Pressable
 +          className="flex-row items-center gap-1"
 +          accessibilityRole="button"
-+          accessibilityLabel={`${workers.label} for ${props.parentTitle}`}
-+          accessibilityHint="Lists the agents and opens one."
++          accessibilityLabel={gt("{workers} for {title}", { workers: workers.label, title: props.parentTitle })}
++          accessibilityHint={gt("Lists the agents and opens one.")}
 +          testID="thread-row-delegated-workers"
 +          // Handle long-press so opening the iOS row menu cannot also open the list on release.
 +          onLongPress={() => undefined}
@@ -931,7 +947,7 @@ index d304bc87ed..22e919ed3a 100644
  // DM Sans has no tabular figures, so a ticking timer in it reflows the row every second.
  const TABULAR_DURATION_STYLE = {
    fontFamily: Platform.OS === "ios" ? "System" : "sans-serif",
-@@ -329,11 +557,180 @@ export const ThreadListV2SettledShelfHeader = memo(function ThreadListV2SettledS
+@@ -386,11 +623,181 @@ export const ThreadListV2SettledShelfHeader = memo(function ThreadListV2SettledS
    return <ThreadListV2ShelfHeader {...props} kind="settled" />;
  });
  
@@ -1017,17 +1033,18 @@ index d304bc87ed..22e919ed3a 100644
 +  readonly pane?: "screen" | "sidebar";
 +  readonly onToggle: (place: ChildThreadFoldPlace) => void;
 +}) {
++  const gt = useGT();
 +  const sidebarPane = props.pane === "sidebar";
 +  return (
 +    <Pressable
 +      accessibilityHint={
 +        props.kind === "settled"
 +          ? props.collapsed
-+            ? "Shows the settled child threads."
-+            : "Hides the settled child threads."
++            ? gt("Shows the settled child threads.")
++            : gt("Hides the settled child threads.")
 +          : props.collapsed
-+            ? "Shows the child threads."
-+            : "Hides the child threads."
++            ? gt("Shows the child threads.")
++            : gt("Hides the child threads.")
 +      }
 +      accessibilityLabel={props.accessibilityLabel}
 +      accessibilityRole="button"
@@ -1111,19 +1128,19 @@ index d304bc87ed..22e919ed3a 100644
 +  readonly nextCount: number;
    readonly onPress: () => void;
  }) {
-   const label =
-@@ -346,9 +743,7 @@ export const ThreadListV2ShowMoreRow = memo(function ThreadListV2ShowMoreRow(pro
-     <Pressable
-       accessibilityRole="button"
-       accessibilityLabel={
--        props.state === undefined
--          ? `Show ${Math.min(props.hiddenCount, THREAD_LIST_V2_SETTLED_PAGE_COUNT)} more settled threads`
--          : label
-+        props.state === undefined ? `Show ${props.nextCount} more settled threads` : label
+   const gt = useGT();
+@@ -410,9 +817,7 @@ export const ThreadListV2ShowMoreRow = memo(function ThreadListV2ShowMoreRow(pro
+         props.state === undefined
+           ? gt(
+               "{count, plural, one {Show {count} more settled threads} other {Show {count} more settled threads}}",
+-              {
+-                count: Math.min(props.hiddenCount, THREAD_LIST_V2_SETTLED_PAGE_COUNT),
+-              },
++              { count: props.nextCount },
+             )
+           : label
        }
-       disabled={props.state === "loading"}
-       onPress={props.onPress}
-@@ -678,6 +1073,13 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -770,6 +1175,13 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
    readonly onNewThreadOnBranch: (thread: EnvironmentThreadShell) => void;
    readonly onRenameThread: (thread: EnvironmentThreadShell) => void;
    readonly onRegenerateThreadTitle: (thread: EnvironmentThreadShell) => void;
@@ -1137,7 +1154,7 @@ index d304bc87ed..22e919ed3a 100644
    readonly onSettleThread: (thread: EnvironmentThreadShell) => Promise<boolean>;
    readonly onSnoozeThread: (thread: EnvironmentThreadShell, snoozedUntil: string) => void;
    readonly onUnsnoozeThread: (thread: EnvironmentThreadShell) => void;
-@@ -699,6 +1101,17 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -791,6 +1203,17 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
    ) => void;
    readonly canMoveUp?: boolean;
    readonly canMoveDown?: boolean;
@@ -1155,7 +1172,7 @@ index d304bc87ed..22e919ed3a 100644
    readonly onSwipeableWillOpen: (methods: SwipeableMethods) => void;
    readonly onSwipeableClose: (methods: SwipeableMethods) => void;
    readonly activationKey?: string;
-@@ -725,6 +1138,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -819,6 +1242,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
      onDeleteThread,
      onRenameThread,
      onRegenerateThreadTitle,
@@ -1163,27 +1180,27 @@ index d304bc87ed..22e919ed3a 100644
      onNewThreadOnBranch,
      onSettleThread,
      onSnoozeThread,
-@@ -884,7 +1298,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1000,7 +1424,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
    );
    const reorderMenuItems = useMemo<MenuAction[]>(
      () =>
 -      props.reorderSupported === true
 +      props.reorderSupported === true && props.nested !== true
          ? [
-             { id: "arrange", title: "Arrange threads…", image: "line.3.horizontal" },
+             { id: "arrange", title: gt("Arrange threads…"), image: "line.3.horizontal" },
              {
-@@ -901,7 +1315,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1017,7 +1441,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
              } satisfies MenuAction,
            ]
          : [],
--    [props.canMoveDown, props.canMoveUp, props.reorderSupported],
-+    [props.canMoveDown, props.canMoveUp, props.nested, props.reorderSupported],
+-    [gt, props.canMoveDown, props.canMoveUp, props.reorderSupported],
++    [gt, props.canMoveDown, props.canMoveUp, props.nested, props.reorderSupported],
    );
    const pinMenuItems = useMemo<MenuAction[]>(
      () =>
-@@ -961,6 +1375,34 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1095,6 +1519,34 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+       isRegeneratingTitle,
      ],
-     [canTurnIntoProject, props.titleRegenerationSupported, thread.runtime, isRegeneratingTitle],
    );
 +  const { headOf, onToggleChildThreads } = props;
 +  // Undefined when the row heads no family.
@@ -1200,39 +1217,39 @@ index d304bc87ed..22e919ed3a 100644
 +        : [
 +            {
 +              id: "toggle-child-threads",
-+              title: headCollapsed ? "Show child threads" : "Hide child threads",
++              title: headCollapsed ? gt("Show child threads") : gt("Hide child threads"),
 +              image: "list.bullet.indent",
 +            },
 +          ]),
 +      ...(shownAsSubthread && canBecomeMainThread
-+        ? [{ id: "hide-subthread", title: "Hide subthread", image: "decrease.indent" }]
++        ? [{ id: "hide-subthread", title: gt("Hide subthread"), image: "decrease.indent" }]
 +        : []),
 +      ...(canBecomeMainThread && canOperateThread
-+        ? [{ id: "make-main-thread", title: "Make main thread", image: "arrow.up.left" }]
++        ? [{ id: "make-main-thread", title: gt("Make main thread"), image: "arrow.up.left" }]
 +        : []),
 +    ],
-+    [canBecomeMainThread, canOperateThread, headCollapsed, shownAsSubthread],
++    [canBecomeMainThread, canOperateThread, gt, headCollapsed, shownAsSubthread],
 +  );
    const menuActions = useMemo<MenuAction[]>(() => {
      const nested = Platform.OS === "ios";
-     const direct: MenuAction[] = [
-@@ -975,6 +1417,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+     const localized = (action: MenuAction): MenuAction => ({ ...action, title: m(action.title) });
+@@ -1113,6 +1565,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+       ...(canShareWithGuest
+         ? [{ id: "share-guest", title: gt("Share with guest"), image: "person.badge.plus" }]
          : []),
-       { id: "copy-thread", title: "Copy thread", image: "text.bubble" },
-       { id: "copy-thread-id", title: "Copy thread ID", image: "doc.on.doc" },
 +      ...childThreadMenuItems,
      ];
      if (snoozedRow) {
-       return layoutThreadListV2RowMenuActions({
-@@ -1036,6 +1479,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
-   }, [
+       return layoutThreadListV2RowMenuActions(
+@@ -1194,6 +1647,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
      autoSettleMenuItems,
+     canShareWithGuest,
      canUnsettle,
 +    childThreadMenuItems,
      pinMenuItems,
      props.settlementSupported,
      reorderMenuItems,
-@@ -1048,6 +1492,9 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1208,6 +1662,9 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
    const handleMenuAction = useCallback(
      ({ nativeEvent }: { readonly nativeEvent: { readonly event: string } }) => {
        if (nativeEvent.event === "new-thread-on-branch") onNewThreadOnBranch(thread);
@@ -1242,7 +1259,7 @@ index d304bc87ed..22e919ed3a 100644
        if (nativeEvent.event === "settle") handleSettle();
        if (nativeEvent.event === "unsettle") handleUnsettle();
        if (nativeEvent.event === "unsnooze") handleUnsnooze();
-@@ -1061,6 +1508,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1221,6 +1678,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
        if (nativeEvent.event === "archive") handleArchive();
        if (nativeEvent.event === "rename") handleRename();
        if (nativeEvent.event === "regenerate-title") handleRegenerateTitle();
@@ -1251,20 +1268,20 @@ index d304bc87ed..22e919ed3a 100644
        if (nativeEvent.event === "turn-into-project") void turnThreadIntoProject(thread);
        if (nativeEvent.event === "mark-unread") {
          void markThreadUnread({
-@@ -1102,6 +1551,10 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
-     },
-     [
+@@ -1272,6 +1731,10 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+       gt,
+       m,
        onNewThreadOnBranch,
 +      onMakeMainThread,
 +      setShownAsSubthread,
 +      onToggleChildThreads,
 +      headOf,
        thread,
+       navigation,
        handleArchive,
-       handleDelete,
-@@ -1183,6 +1636,21 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
-       ? `Opens the thread. Swipe left to ${primaryAction.label.toLowerCase()}.`
-       : `Opens the thread. Swipe left for ${primaryAction.label.toLowerCase()} and snooze actions.`;
+@@ -1363,6 +1826,21 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+       ? primaryAction.swipeHint
+       : primaryAction.swipeSnoozeHint;
  
 +  const workerChips =
 +    props.delegatedWorkers === undefined ? null : (
@@ -1284,7 +1301,7 @@ index d304bc87ed..22e919ed3a 100644
    const titleTextInset = props.project ? projectIconSize + 8 : 0;
    const cardContent = (
      <>
-@@ -1363,6 +1831,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1543,6 +2021,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
          ) : (
            <View className="flex-1" />
          )}
@@ -1292,16 +1309,24 @@ index d304bc87ed..22e919ed3a 100644
          {pr ? (
            <Pressable
              // Padding cancelled by negative margin grows the touch target into
-@@ -1451,8 +1920,123 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1631,8 +2110,131 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
      cardContent
    );
  
 +  // A child row leads with its status and role icons and keeps the age on the right.
 +  const childStatus =
 +    props.nested === true && props.childKind !== undefined
-+      ? childThreadRowStatus(props.childKind, statusLabel)
++      ? childThreadRowStatus(props.childKind, statusLabel, m)
 +      : null;
-+  const nestedAccessibilityLabel = `Child of ${props.headTitle ?? "its parent thread"}, ${thread.title}${childStatus !== null ? `, ${childStatus.label}` : ""}`;
++  const nestedAccessibilityLabel = [
++    props.headTitle === undefined
++      ? gt("Child of its parent thread")
++      : gt("Child of {title}", { title: props.headTitle }),
++    thread.title,
++    childStatus?.label ?? null,
++  ]
++    .filter((part): part is string => part !== null)
++    .join(", ");
    const rowContent = (close: () => void) =>
 -    variant === "card" ? (
 +    props.nested === true ? (
@@ -1312,7 +1337,7 @@ index d304bc87ed..22e919ed3a 100644
 +        accessibilityHint={swipeAccessibilityHint}
 +        accessibilityLabel={
 +          props.hasQueuedMessages
-+            ? `${nestedAccessibilityLabel}, messages queued to send`
++            ? gt("{label}, messages queued to send", { label: nestedAccessibilityLabel })
 +            : nestedAccessibilityLabel
 +        }
 +        accessibilityRole="button"
@@ -1340,7 +1365,7 @@ index d304bc87ed..22e919ed3a 100644
 +          {childStatus !== null ? (
 +            <SymbolView
 +              name={childStatus.icon}
-+              size={childStatus === CHILD_THREAD_KIND_STATUS.new ? 8 : 14}
++              size={props.childKind === "new" ? 8 : 14}
 +              tintColorClassName={
 +                selected ? selectedThreadRowColors.iconTintClassName : childStatus.iconTintClassName
 +              }
@@ -1417,7 +1442,7 @@ index d304bc87ed..22e919ed3a 100644
        <RowPressable
          key={`${thread.environmentId}:${thread.id}`}
          interactionClassName={rowAppearance.interactionClassName}
-@@ -1555,6 +2139,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1735,6 +2337,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
                />
              ) : null}
            </View>
@@ -1425,7 +1450,7 @@ index d304bc87ed..22e919ed3a 100644
            {props.hasQueuedMessages ? <QueuedMessageIcon selected={selected} /> : null}
            <Text
              className={cn(
-@@ -1575,8 +2160,39 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1753,8 +2356,39 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
        </RowPressable>
      );
  
@@ -1467,7 +1492,7 @@ index d304bc87ed..22e919ed3a 100644
  
    return (
      <View collapsable={false}>
-@@ -1587,8 +2203,10 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1765,8 +2399,10 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
          dormant={dormant}
          threadKey={`${thread.environmentId}:${thread.id}`}
          backgroundColor={rowAppearance.swipeBackgroundColor}
@@ -1480,7 +1505,7 @@ index d304bc87ed..22e919ed3a 100644
          enableTrackpadSwipe
          fullSwipeAction="primary"
          fullSwipeWidth={props.fullSwipeWidth ?? windowWidth - 32}
-@@ -1613,6 +2231,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
+@@ -1791,6 +2427,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
            </Menu>
          )}
        </ThreadSwipeable>
@@ -2073,10 +2098,10 @@ index 16ef19a329..0ef9d4c4b9 100644
 +  });
 +});
 diff --git a/apps/mobile/src/features/threads/threadListV2.ts b/apps/mobile/src/features/threads/threadListV2.ts
-index 5aad60e7b1..1c6f2e08bf 100644
+index b8029d3b0b..be3e72e8cf 100644
 --- a/apps/mobile/src/features/threads/threadListV2.ts
 +++ b/apps/mobile/src/features/threads/threadListV2.ts
-@@ -19,6 +19,36 @@ import {
+@@ -20,6 +20,36 @@ import {
    threadSearchSubject,
  } from "@t3tools/client-runtime/state/thread-search";
  import { foldSearchQuery, rankSearchItems, scoreThreadSearch } from "@t3tools/shared/paletteSearch";
@@ -2113,7 +2138,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
  import {
    createInboxReturnTracker,
    isThreadWorking,
-@@ -358,6 +388,193 @@ function sortThreadsForListV2<
+@@ -370,6 +400,193 @@ function sortThreadsForListV2<
    return sortActiveThreadsByOrderKey(threads);
  }
  
@@ -2307,7 +2332,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
  export function getThreadListV2OrderedSection(input: {
    readonly threads: readonly EnvironmentThreadShell[];
    readonly section: "pinned" | "active";
-@@ -367,24 +584,7 @@ export function getThreadListV2OrderedSection(input: {
+@@ -379,24 +596,7 @@ export function getThreadListV2OrderedSection(input: {
    readonly snoozeEnvironmentIds?: ReadonlySet<EnvironmentId>;
    readonly queuedThreadKeys?: ReadonlySet<string>;
  }): EnvironmentThreadShell[] {
@@ -2333,7 +2358,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
    const ordered =
      input.section === "pinned"
        ? sortPinnedThreadsByOrderKey(threads)
-@@ -396,6 +596,43 @@ export function getThreadListV2OrderedSection(input: {
+@@ -408,6 +608,43 @@ export function getThreadListV2OrderedSection(input: {
    return applyPendingThreadOrder(ordered, input.section, pending);
  }
  
@@ -2377,7 +2402,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
  export interface ThreadListV2Item {
    readonly thread: EnvironmentThreadShell;
    readonly variant: "card" | "slim";
-@@ -403,6 +640,118 @@ export interface ThreadListV2Item {
+@@ -415,6 +652,118 @@ export interface ThreadListV2Item {
    readonly pinned: boolean;
    readonly wokeAt: string | null;
    readonly isLast: boolean;
@@ -2496,7 +2521,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
  }
  
  export interface ThreadListV2Layout {
-@@ -410,6 +759,8 @@ export interface ThreadListV2Layout {
+@@ -422,6 +771,8 @@ export interface ThreadListV2Layout {
    readonly hiddenSettledCount: number;
    /** The settled rows the shelf may list, before its visible limit. */
    readonly listedSettledThreads: ReadonlyArray<EnvironmentThreadShell>;
@@ -2505,7 +2530,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
    readonly workingCount: number;
    readonly workingShelfHeaderIndex: number | null;
    readonly snoozedCount: number;
-@@ -436,6 +787,30 @@ export interface ThreadListV2ThreadListItem {
+@@ -448,6 +799,30 @@ export interface ThreadListV2ThreadListItem {
    readonly canMoveDown: boolean;
  }
  
@@ -2536,7 +2561,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
  export interface ThreadListV2PendingListItem {
    readonly type: "v2-pending";
    readonly key: string;
-@@ -471,6 +846,7 @@ export interface ThreadListV2SettledShelfListItem {
+@@ -483,6 +858,7 @@ export interface ThreadListV2SettledShelfListItem {
  
  export type ThreadListV2ListItem =
    | ThreadListV2ThreadListItem
@@ -2544,7 +2569,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
    | ThreadListV2PendingListItem
    | ThreadListV2WorkingShelfListItem
    | ThreadListV2SnoozedShelfListItem
-@@ -481,6 +857,7 @@ export function isThreadListV2ListItem(value: {
+@@ -493,6 +869,7 @@ export function isThreadListV2ListItem(value: {
  }): value is ThreadListV2ListItem {
    return (
      value.type === "v2-thread" ||
@@ -2552,7 +2577,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
      value.type === "v2-pending" ||
      value.type === "v2-working-shelf" ||
      value.type === "v2-snoozed-shelf" ||
-@@ -488,6 +865,8 @@ export function isThreadListV2ListItem(value: {
+@@ -500,6 +877,8 @@ export function isThreadListV2ListItem(value: {
    );
  }
  
@@ -2561,7 +2586,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
  /** Compare rebuilt items by content so minute ticks and partition runs do not re-render every mounted row. */
  export function threadListV2ListItemsAreEqual(
    previous: ThreadListV2ListItem,
-@@ -503,6 +882,16 @@ export function threadListV2ListItemsAreEqual(
+@@ -515,6 +894,16 @@ export function threadListV2ListItemsAreEqual(
          previous.item.snoozed === item.item.snoozed &&
          previous.item.pinned === item.item.pinned &&
          previous.item.wokeAt === item.item.wokeAt &&
@@ -2578,7 +2603,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
          previous.snoozeWakeLabelText === item.snoozeWakeLabelText &&
          previous.timeLabel === item.timeLabel &&
          previous.snoozePresetMinute === item.snoozePresetMinute &&
-@@ -511,6 +900,23 @@ export function threadListV2ListItemsAreEqual(
+@@ -523,6 +912,23 @@ export function threadListV2ListItemsAreEqual(
          previous.canMoveUp === item.canMoveUp &&
          previous.canMoveDown === item.canMoveDown
        );
@@ -2602,7 +2627,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
      case "v2-pending":
        return (
          previous.type === "v2-pending" &&
-@@ -563,6 +969,11 @@ function resolveThreadListV2ItemTimeLabel(
+@@ -578,6 +984,11 @@ function resolveThreadListV2ItemTimeLabel(
    );
  }
  
@@ -2614,9 +2639,9 @@ index 5aad60e7b1..1c6f2e08bf 100644
  export function buildThreadListV2ListItems(input: {
    readonly items: ReadonlyArray<ThreadListV2Item>;
    readonly pendingTasks: ReadonlyArray<PendingNewTask>;
-@@ -582,7 +993,9 @@ export function buildThreadListV2ListItems(input: {
-   readonly shelfPreferencesLoading?: boolean;
+@@ -599,7 +1010,9 @@ export function buildThreadListV2ListItems(input: {
  }): ThreadListV2ListItem[] {
+   const resolve = input.resolve ?? m;
    const queuedThreadKeys = input.queuedThreadKeys?.size ? input.queuedThreadKeys : undefined;
 -  const threadItems = input.items.map((item): ThreadListV2ListItem => {
 +  // A row and the disclosure that follows a family's head, so shelf header
@@ -2624,8 +2649,8 @@ index 5aad60e7b1..1c6f2e08bf 100644
 +  const threadItemGroups = input.items.map((item): ThreadListV2ListItem[] => {
      const snoozeWakeLabelText =
        item.snoozed && item.thread.snoozedUntil != null && input.snoozeLabelNow !== undefined
-         ? snoozeWakeLabel(item.thread.snoozedUntil, { now: input.snoozeLabelNow })
-@@ -599,7 +1012,7 @@ export function buildThreadListV2ListItems(input: {
+         ? snoozeWakeLabel(item.thread.snoozedUntil, { now: input.snoozeLabelNow }, resolve)
+@@ -616,7 +1029,7 @@ export function buildThreadListV2ListItems(input: {
        item.variant === "card"
          ? input.moveAvailability?.get(`${item.thread.environmentId}:${item.thread.id}`)
          : undefined;
@@ -2634,7 +2659,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
        type: "v2-thread",
        key: `v2-thread:${item.thread.environmentId}:${item.thread.id}`,
        item,
-@@ -612,7 +1025,57 @@ export function buildThreadListV2ListItems(input: {
+@@ -629,7 +1042,59 @@ export function buildThreadListV2ListItems(input: {
        canMoveUp: move?.canMoveUp === true,
        canMoveDown: move?.canMoveDown === true,
      };
@@ -2668,7 +2693,9 @@ index 5aad60e7b1..1c6f2e08bf 100644
 +        key: `v2-child-settled:${item.settledAfter.place.headKey}`,
 +        kind: "settled",
 +        place: item.settledAfter.place,
-+        label: item.settledAfter.shown ? "Show less" : `+${item.settledAfter.count} settled`,
++        label: item.settledAfter.shown
++          ? resolve(msg("Show less"))
++          : resolve(msg("+{count} settled", { count: item.settledAfter.count })),
 +        chips: [],
 +        roles: item.settledAfter.shown ? [] : item.settledAfter.roles,
 +        alone: item.settledAfter.alone,
@@ -2692,7 +2719,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
    const pendingItems = input.pendingTasks.map((pendingTask, index): ThreadListV2ListItem => ({
      type: "v2-pending",
      key: `v2-${pendingTask.key}`,
-@@ -626,10 +1089,10 @@ export function buildThreadListV2ListItems(input: {
+@@ -643,10 +1108,10 @@ export function buildThreadListV2ListItems(input: {
    const snoozedShelfHeaderIndex = input.snoozedShelfHeaderIndex ?? null;
    const settledCount = input.settledCount ?? 0;
    const settledShelfHeaderIndex = input.settledShelfHeaderIndex ?? null;
@@ -2705,7 +2732,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
    const shelfDisabled = input.shelfPreferencesLoading === true;
    if (workingShelfHeaderIndex !== null && workingCount > 0) {
      result.push({
-@@ -639,7 +1102,7 @@ export function buildThreadListV2ListItems(input: {
+@@ -656,7 +1121,7 @@ export function buildThreadListV2ListItems(input: {
        expanded: input.workingShelfExpanded === true,
        disabled: shelfDisabled,
      });
@@ -2714,7 +2741,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
    }
    if (snoozedShelfHeaderIndex !== null && snoozedCount > 0) {
      result.push({
-@@ -649,7 +1112,7 @@ export function buildThreadListV2ListItems(input: {
+@@ -666,7 +1131,7 @@ export function buildThreadListV2ListItems(input: {
        expanded: input.snoozedShelfExpanded === true,
        disabled: shelfDisabled,
      });
@@ -2723,7 +2750,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
    }
    if (settledShelfHeaderIndex !== null && settledCount > 0) {
      result.push({
-@@ -659,13 +1122,24 @@ export function buildThreadListV2ListItems(input: {
+@@ -676,13 +1141,24 @@ export function buildThreadListV2ListItems(input: {
        expanded: input.settledShelfExpanded !== false,
        disabled: shelfDisabled,
      });
@@ -2751,7 +2778,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
      return showTrailingDivider === entry.showTrailingDivider
        ? entry
        : { ...entry, showTrailingDivider };
-@@ -720,6 +1194,14 @@ export function buildThreadListV2Items(input: {
+@@ -737,6 +1213,14 @@ export function buildThreadListV2Items(input: {
    readonly isListedSettled?: (thread: EnvironmentThreadShell) => boolean;
    /** Settled threads in scope that are not local (older settled threads not loaded). */
    readonly unloadedSettledCount?: number;
@@ -2766,7 +2793,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
  }): ThreadListV2Layout {
    const now = input.now;
    const pending =
-@@ -733,76 +1215,31 @@ export function buildThreadListV2Items(input: {
+@@ -750,76 +1234,31 @@ export function buildThreadListV2Items(input: {
              pendingOrder: null,
            }),
          );
@@ -2865,7 +2892,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
  
    if (rankedMatches !== null) {
      // Searching lists every match by rank across shelves, as the palette and
-@@ -830,8 +1267,10 @@ export function buildThreadListV2Items(input: {
+@@ -847,8 +1286,10 @@ export function buildThreadListV2Items(input: {
          pinned: pinnedThreads.has(thread),
          wokeAt: slim.has(thread) ? null : resolveThreadListV2WokeAt(thread, { now }),
          isLast: index === results.length - 1,
@@ -2876,7 +2903,7 @@ index 5aad60e7b1..1c6f2e08bf 100644
        listedSettledThreads: [],
        workingCount: 0,
        workingShelfHeaderIndex: null,
-@@ -866,95 +1305,185 @@ export function buildThreadListV2Items(input: {
+@@ -883,95 +1324,185 @@ export function buildThreadListV2Items(input: {
            (thread) => `${thread.environmentId}:${thread.id}` === selectedThreadKey,
          );
    const orderedSettled = sortSettledThreadsReusingLast(settled);
@@ -3133,11 +3160,11 @@ index 5aad60e7b1..1c6f2e08bf 100644
      workingCount: orderedWorking.length,
      workingShelfHeaderIndex,
 diff --git a/apps/mobile/src/features/threads/use-thread-list-v2-shelf-preferences.ts b/apps/mobile/src/features/threads/use-thread-list-v2-shelf-preferences.ts
-index 4348908e53..3bd9545f21 100644
+index 13ba59cce2..5a80e759f3 100644
 --- a/apps/mobile/src/features/threads/use-thread-list-v2-shelf-preferences.ts
 +++ b/apps/mobile/src/features/threads/use-thread-list-v2-shelf-preferences.ts
-@@ -1,8 +1,80 @@
- import { useAtomSet, useAtomValue } from "@effect/atom-react";
+@@ -1,9 +1,81 @@
+ import { useAtomValue } from "@effect/atom-react";
  import { AsyncResult } from "effect/reactivity";
 +import {
 +  pruneChildThreadFolds,
@@ -3152,7 +3179,8 @@ index 4348908e53..3bd9545f21 100644
 +const NO_CHILD_THREAD_KEYS: readonly string[] = [];
 +
 +import type { Preferences } from "../../persistence/mobile-preferences";
- import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
+ import { mobilePreferencesAtom, saveMobilePreferences } from "../../state/preferences";
+ import { useAtomCommand } from "../../state/use-atom-command";
  
 +function childThreadFoldsOf(preferences: Preferences): ChildThreadFolds {
 +  return {
@@ -3169,11 +3197,11 @@ index 4348908e53..3bd9545f21 100644
 + * them, so every row can hold it.
 + */
 +export function useSetThreadListSubthread() {
-+  const savePreferences = useAtomSet(updateMobilePreferencesAtom);
++  const savePreferences = useAtomCommand(saveMobilePreferences);
 +  return useCallback(
 +    (thread: { readonly environmentId: string; readonly id: string }, shown: boolean) => {
 +      const key = `${thread.environmentId}:${thread.id}`;
-+      savePreferences({
++      void savePreferences({
 +        transform: (current) => {
 +          const without = (current.threadListSubthreadKeys ?? NO_CHILD_THREAD_KEYS).filter(
 +            (candidate) => candidate !== key,
@@ -3193,7 +3221,7 @@ index 4348908e53..3bd9545f21 100644
 + */
 +export function useThreadListSubthreads(threads?: readonly SubthreadThread[]) {
 +  const preferencesResult = useAtomValue(mobilePreferencesAtom);
-+  const savePreferences = useAtomSet(updateMobilePreferencesAtom);
++  const savePreferences = useAtomCommand(saveMobilePreferences);
 +  const loaded = AsyncResult.isSuccess(preferencesResult);
 +  const keys =
 +    (loaded ? preferencesResult.value.threadListSubthreadKeys : undefined) ?? NO_CHILD_THREAD_KEYS;
@@ -3202,7 +3230,7 @@ index 4348908e53..3bd9545f21 100644
 +  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- prunes persisted subthread keys as threads change.
 +  useEffect(() => {
 +    if (!loaded || threads === undefined || pruneSubthreadKeys(keys, threads) === keys) return;
-+    savePreferences({
++    void savePreferences({
 +      transform: (current) => ({
 +        threadListSubthreadKeys: pruneSubthreadKeys(
 +          current.threadListSubthreadKeys ?? NO_CHILD_THREAD_KEYS,
@@ -3216,8 +3244,8 @@ index 4348908e53..3bd9545f21 100644
 +
  export function useThreadListV2ShelfPreferences() {
    const preferencesResult = useAtomValue(mobilePreferencesAtom);
-   const savePreferences = useAtomSet(updateMobilePreferencesAtom);
-@@ -14,6 +86,7 @@ export function useThreadListV2ShelfPreferences() {
+   const savePreferences = useAtomCommand(saveMobilePreferences);
+@@ -15,6 +87,7 @@ export function useThreadListV2ShelfPreferences() {
    const workingShelfEnabled = loaded && preferencesResult.value.workingShelfEnabled !== false;
    const workingShelfExpanded =
      loaded && preferencesResult.value.threadListWorkingShelfExpanded === true;
@@ -3225,14 +3253,14 @@ index 4348908e53..3bd9545f21 100644
  
    // Transforms read optimistic state so same-frame presses toggle twice.
    const toggleSnoozedShelf = () => {
-@@ -40,9 +113,59 @@ export function useThreadListV2ShelfPreferences() {
+@@ -41,9 +114,59 @@ export function useThreadListV2ShelfPreferences() {
        }),
      });
    };
 +  /** Folds or unfolds a family where its head renders (childThreadFamilies.ts). */
 +  const toggleChildThreads = (place: ChildThreadFoldPlace) => {
 +    if (!loaded) return;
-+    savePreferences({
++    void savePreferences({
 +      transform: (current) => {
 +        const next = toggleChildThreadFamily(childThreadFoldsOf(current), place);
 +        return place.section === "settled"
@@ -3248,7 +3276,7 @@ index 4348908e53..3bd9545f21 100644
 +    if (!loaded) return;
 +    // Most calls change nothing; skip the write when the rendered folds are already pruned.
 +    if (pruneChildThreadFolds(childThreadFolds, stateOf) === childThreadFolds) return;
-+    savePreferences({
++    void savePreferences({
 +      transform: (current) => {
 +        const folds = childThreadFoldsOf(current);
 +        const next = pruneChildThreadFolds(folds, stateOf);
@@ -3286,10 +3314,10 @@ index 4348908e53..3bd9545f21 100644
      snoozedShelfExpanded,
      workingShelfEnabled,
 diff --git a/apps/mobile/src/features/threads/useThreadListV2.ts b/apps/mobile/src/features/threads/useThreadListV2.ts
-index fcf1048d2b..1051f82570 100644
+index 3322dd3bd7..7a70de9f4a 100644
 --- a/apps/mobile/src/features/threads/useThreadListV2.ts
 +++ b/apps/mobile/src/features/threads/useThreadListV2.ts
-@@ -13,6 +13,7 @@ import {
+@@ -14,6 +14,7 @@ import {
    threadListV2LayoutTime,
  } from "./threadListV2";
  import { computeThreadMoveAvailability } from "./threadOrder";
@@ -3297,7 +3325,7 @@ index fcf1048d2b..1051f82570 100644
  
  /**
   * Screens' select handlers read the content-only key set; a fresh one per list rebuild gave
-@@ -65,8 +66,12 @@ export function useThreadListV2(input: {
+@@ -66,8 +67,12 @@ export function useThreadListV2(input: {
    readonly snoozedShelfExpanded: boolean;
    readonly settledShelfExpanded: boolean;
    readonly selectedThreadKey: string | null;
@@ -3310,7 +3338,7 @@ index fcf1048d2b..1051f82570 100644
    const layoutTime = useMemo(
      () => threadListV2LayoutTime({ threads, now: input.now, searchQuery: input.searchQuery }),
      [threads, input.now, input.searchQuery],
-@@ -152,6 +157,9 @@ export function useThreadListV2(input: {
+@@ -153,6 +158,9 @@ export function useThreadListV2(input: {
          snoozedShelfExpanded: input.snoozedShelfExpanded,
          settledShelfExpanded: input.settledShelfExpanded,
          selectedThreadKey: input.selectedThreadKey,
@@ -3320,7 +3348,7 @@ index fcf1048d2b..1051f82570 100644
          isListedSettled: isListed,
          unloadedSettledCount: unloadedCount(
            threads.filter(
-@@ -184,6 +192,9 @@ export function useThreadListV2(input: {
+@@ -185,6 +193,9 @@ export function useThreadListV2(input: {
        input.snoozedShelfExpanded,
        input.settledShelfExpanded,
        input.selectedThreadKey,
@@ -3330,7 +3358,7 @@ index fcf1048d2b..1051f82570 100644
        isListed,
        unloadedCount,
        scopes,
-@@ -242,7 +253,7 @@ export function useThreadListV2(input: {
+@@ -244,7 +255,7 @@ export function useThreadListV2(input: {
        input.shelfPreferencesLoaded,
      ],
    );
@@ -3446,16 +3474,16 @@ index bf2013aef5..d4ea378d7d 100644
    childThreadInputsAtom: environmentThreadShells.childThreadInputsAtom,
    pendingRequestsAtom: environmentThreadDetails.pendingRequestsAtom,
 diff --git a/apps/web/src/components/Sidebar.childThreads.tsx b/apps/web/src/components/Sidebar.childThreads.tsx
-index 4f216f2b41..44f4845863 100644
+index ebceb139a7..5c0f75a00d 100644
 --- a/apps/web/src/components/Sidebar.childThreads.tsx
 +++ b/apps/web/src/components/Sidebar.childThreads.tsx
 @@ -1,4 +1,4 @@
 -// Child threads in the sidebar (patches-tt/0003). Family rules live in Sidebar.families.ts;
 +// Child threads in the sidebar (patches-tt/0003). Family rules live in childThreadFamilies.ts;
  // this module holds the sidebar's state and rendering so Sidebar.tsx only calls into it.
+ import { msg, T, useGT, useMessages } from "gt-react";
  import { observeResize } from "~/lib/observeResize";
- import type { EnvironmentServerConfig } from "@t3tools/client-runtime/connection";
-@@ -11,11 +11,9 @@ import {
+@@ -12,11 +12,9 @@ import {
    collectDelegatedWorkers,
    resolveListedAncestorKey,
    canShowAsSubthread,
@@ -3467,7 +3495,7 @@ index 4f216f2b41..44f4845863 100644
    type ChildThreadChip,
    type DelegatedWorker,
    type ChildThreadKind,
-@@ -77,11 +75,13 @@ import {
+@@ -78,11 +76,13 @@ import {
    placeChildThreadSections,
    pruneChildThreadFolds,
    settledEntryOf,
@@ -3482,7 +3510,7 @@ index 4f216f2b41..44f4845863 100644
  import {
    COMPLETED_STATUS_COLOR_CLASS,
    hasUnseenCompletion,
-@@ -103,7 +103,7 @@ import { Popover, PopoverPopup, PopoverTrigger } from "./ui/popover";
+@@ -104,7 +104,7 @@ import { Popover, PopoverPopup, PopoverTrigger } from "./ui/popover";
  import { RelativeTimeLabel } from "./sidebar/SidebarThreadRow";
  import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
  
@@ -3491,7 +3519,7 @@ index 4f216f2b41..44f4845863 100644
  // collapsed outside Settled, and `<head key>@<settled entry>` for families the
  // user expanded during their current stay in Settled, where they start
  // collapsed.
-@@ -171,21 +171,7 @@ export function sidebarChildThreadKindOf(
+@@ -172,21 +172,7 @@ export function sidebarChildThreadKindOf(
   * A thread the user can make a main thread: a child that nests under its opener, or a
   * `delegate_task` worker (also one another environment delegated), which then lists on its own.
   */
@@ -3514,7 +3542,7 @@ index 4f216f2b41..44f4845863 100644
  
  /**
   * The subthread entry of a thread's context menu: "hidden" for a worker or launched thread its
-@@ -201,23 +187,13 @@ export function subthreadMenuStateOf(
+@@ -202,23 +188,13 @@ export function subthreadMenuStateOf(
    return subthreadKeys.has(threadShellKey(thread)) ? "shown" : "hidden";
  }
  
@@ -3541,7 +3569,7 @@ index 4f216f2b41..44f4845863 100644
   */
  export function placeSidebarChildThreads(input: {
    readonly live: readonly EnvironmentThreadShell[][];
-@@ -479,7 +455,7 @@ export function useSidebarChildThreads(input: {
+@@ -480,7 +456,7 @@ export function useSidebarChildThreads(input: {
    const [shownSettledChildThreadKeys, setShownSettledChildThreadKeys] = useState<
      ReadonlySet<string>
    >(() => new Set());
@@ -3940,10 +3968,10 @@ index 59570d8e8c..c36543a6f6 100644
 +// the mobile thread list nest threads the same way.
 +export * from "@t3tools/client-runtime/state/thread-families";
 diff --git a/packages/client-runtime/package.json b/packages/client-runtime/package.json
-index d706c95f87..7120cb6b12 100644
+index c47cb2916b..377e3fa0f0 100644
 --- a/packages/client-runtime/package.json
 +++ b/packages/client-runtime/package.json
-@@ -379,6 +379,10 @@
+@@ -411,6 +411,10 @@
        "types": "./src/state/threadSort.ts",
        "default": "./src/state/threadSort.ts"
      },
@@ -4965,10 +4993,10 @@ index 7775347927..9de0e81b90 100644
      const { registry, threads, snapshotAtom } = makeHarness();
      const root = v2ThreadShell;
 diff --git a/packages/client-runtime/src/state/threadShell.ts b/packages/client-runtime/src/state/threadShell.ts
-index 1ef6672c36..3e31f4b4b3 100644
+index 44afac77b9..ccd63bd7eb 100644
 --- a/packages/client-runtime/src/state/threadShell.ts
 +++ b/packages/client-runtime/src/state/threadShell.ts
-@@ -775,6 +775,29 @@ export function createEnvironmentThreadShellAtoms(input: {
+@@ -803,6 +803,29 @@ export function createEnvironmentThreadShellAtoms(input: {
      return next;
    }).pipe(Atom.withLabel("environment-navigation-thread-shells"));
  
@@ -4998,7 +5026,7 @@ index 1ef6672c36..3e31f4b4b3 100644
    return {
      environmentThreadsAtom,
      environmentThreadIndexAtom,
-@@ -789,6 +812,7 @@ export function createEnvironmentThreadShellAtoms(input: {
+@@ -817,6 +840,7 @@ export function createEnvironmentThreadShellAtoms(input: {
      navigationThreadShellsAtom,
      delegatedUnderParentAtom,
      pendingSubagentRequestsAtom,

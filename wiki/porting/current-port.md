@@ -1,15 +1,15 @@
 # Current port
 
 > Source: `patches-port/base.txt`, `covered-nightly.txt`, `skip-shared.json`; `./t3code-customize status`
-> Updated: 2026-11-17
+> Updated: 2026-11-20
 
 Which nightly the patches cover and what a port of them has to watch for. The port loop itself is in [docs/porting.md](../../docs/porting.md).
 
 ## Coverage
-- Shared patches: `patches-port/` targets nightly 0.1.11-nightly.20261117.4838 (`ea6d3fc30fb0`).
+- Shared patches: `patches-port/` targets nightly 0.1.12-nightly.20261120.5009 (`f0a2aa10f516`).
 - `patches/` is upstream's and stays untouched.
 - Own patches: `patches-tt/` (16) and `patches-ios/` (11); a port applies 2 shared commits (`patches-port/`, minus the skips) + 16 + 11 = 29 commits.
-- `covered-nightly.txt`: 0.1.11-nightly.20261117.4838.
+- `covered-nightly.txt`: 0.1.12-nightly.20261120.5009.
 - Left out (`skip-shared.json`): desktop stats line and throughput, compaction settings, subscription switch.
 - Their bundle markers are replaced by `markers` in the same file.
 
@@ -25,3 +25,9 @@ Which nightly the patches cover and what a port of them has to watch for. The po
 - Upstream PRs named in `docs/fork-changes.md`: #16699 is open, so the child-threads patch stays.
 - 4838: upstream dropped `resolveSidebarRowThreadId`; `patches-tt/0002` keeps `resolveSidebarRowThreadKey`, iOS keeps `resolveThreadListV2RowKey` over upstream's `useSidebarRowThreadKey`.
 - 4838: upstream refreshes the update check before a download (#37476, `downloadAvailableUpdate(refresh)`); the automatic covered download in `patches-tt/0005` passes `false` so it never fetches an uncovered nightly.
+- 5009: upstream translated the app with gt-react (#37893); the `no-untranslated-copy` lint in `checks` fails on bare copy.
+- Patch copy goes through `msg()` (resolved with `m`/a `MessageResolver`), `useGT()` (`gt("…")`) or `<T>`/`<Var>`. Call `useGT()` before an early return.
+- A web unit test rendering a `useGT` component needs `initializeGT` from `gt-react` plus `<GTProvider locale="en">`.
+- `initializeGTSPA` throws under Node; see `V2LifecycleRow.kind.test.tsx`.
+- 5009: patch strings are not in the GT catalogs, so other locales show English; upstream's `i18n:check` is not part of our checks.
+- 5009: `ProviderHost` needs `compatibility` (`noCompatibilityPolicy` in test fixtures); Codex reads `config/read` before `thread/start`.

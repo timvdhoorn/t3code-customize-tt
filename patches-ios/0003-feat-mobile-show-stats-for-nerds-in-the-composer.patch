@@ -9,15 +9,15 @@ has no stats line in this fork. It includes the context-window fixes
 the stats read: compaction counts only once completed, and whether a
 thread compacts automatically comes from the provider thread.
 ---
- .../settings/SettingsFollowUpRouteScreen.tsx  |  17 +
- .../src/features/settings/settings-search.ts  |   9 +-
- .../src/features/threads/ComposerStats.tsx    | 605 ++++++++++++++++++
+ .../settings/SettingsFollowUpRouteScreen.tsx  |  19 +
+ .../src/features/settings/settings-search.ts  |   2 +
+ .../src/features/threads/ComposerStats.tsx    | 638 ++++++++++++++++++
  .../features/threads/NewTaskDraftScreen.tsx   |   1 +
  .../src/features/threads/ThreadComposer.tsx   |   3 +
- .../features/threads/ThreadDetailScreen.tsx   |  37 ++
+ .../features/threads/ThreadDetailScreen.tsx   |  40 +-
  .../features/threads/ThreadRouteScreen.tsx    |   1 +
- .../features/threads/composerStatsRow.test.ts | 221 +++++++
- .../src/features/threads/composerStatsRow.ts  | 140 ++++
+ .../features/threads/composerStatsRow.test.ts | 221 ++++++
+ .../src/features/threads/composerStatsRow.ts  | 141 ++++
  apps/mobile/src/lib/storage.test.ts           |  10 +
  .../src/persistence/mobile-preferences.ts     |   6 +
  apps/mobile/src/state/composer-cache-usage.ts |  55 ++
@@ -26,11 +26,11 @@ thread compacts automatically comes from the provider thread.
  apps/web/src/lib/contextWindow.test.ts        |  60 +-
  apps/web/src/lib/contextWindow.ts             |  16 +-
  packages/client-runtime/package.json          |   4 +
- .../src/state/composerStats.test.ts           | 598 +++++++++++++++++
- .../client-runtime/src/state/composerStats.ts | 403 ++++++++++++
+ .../src/state/composerStats.test.ts           | 598 ++++++++++++++++
+ .../client-runtime/src/state/composerStats.ts | 422 ++++++++++++
  .../src/state/contextWindow.test.ts           |  18 +-
- .../client-runtime/src/state/contextWindow.ts |  31 +-
- 21 files changed, 2310 insertions(+), 25 deletions(-)
+ .../client-runtime/src/state/contextWindow.ts |  46 +-
+ 21 files changed, 2366 insertions(+), 35 deletions(-)
  create mode 100644 apps/mobile/src/features/threads/ComposerStats.tsx
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.test.ts
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.ts
@@ -40,10 +40,10 @@ thread compacts automatically comes from the provider thread.
  create mode 100644 packages/client-runtime/src/state/composerStats.ts
 
 diff --git a/apps/mobile/src/features/settings/SettingsFollowUpRouteScreen.tsx b/apps/mobile/src/features/settings/SettingsFollowUpRouteScreen.tsx
-index a7cd04f5f5..016cdbfcfe 100644
+index cfc5783e24..31436a7a32 100644
 --- a/apps/mobile/src/features/settings/SettingsFollowUpRouteScreen.tsx
 +++ b/apps/mobile/src/features/settings/SettingsFollowUpRouteScreen.tsx
-@@ -10,6 +10,7 @@ import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/
+@@ -12,6 +12,7 @@ import { useAtomCommand } from "../../state/use-atom-command";
  import { ListChoiceRow as SettingsChoiceRow } from "../../components/ui/ListChoiceRow";
  import { SettingsSection } from "./components/SettingsSection";
  import { SettingsScreen } from "./components/SettingsScreen";
@@ -51,7 +51,7 @@ index a7cd04f5f5..016cdbfcfe 100644
  
  const FOLLOW_UP_OPTIONS: ReadonlyArray<{
    readonly behavior: FollowUpBehavior;
-@@ -36,6 +37,9 @@ export function SettingsFollowUpRouteScreen() {
+@@ -40,6 +41,9 @@ export function SettingsFollowUpRouteScreen() {
    const selectedBehavior = AsyncResult.isSuccess(preferencesResult)
      ? (preferencesResult.value.followUpBehavior ?? DEFAULT_FOLLOW_UP_BEHAVIOR)
      : null;
@@ -61,52 +61,47 @@ index a7cd04f5f5..016cdbfcfe 100644
  
    const content = (
      <ScrollView
-@@ -62,6 +66,19 @@ export function SettingsFollowUpRouteScreen() {
-         Long-press the send button to use the other option for a single message. With a hardware
-         keyboard, hold {Platform.OS === "android" ? "Ctrl" : "Command"} while sending.
+@@ -70,6 +74,21 @@ export function SettingsFollowUpRouteScreen() {
+           keyboard, hold <Var>{Platform.OS === "android" ? "Ctrl" : "Command"}</Var> while sending.
+         </T>
        </Text>
 +      {/* Device-local counterpart of web's Settings → Chat → Stats for nerds. */}
-+      <SettingsSection title="Composer">
++      <SettingsSection title={gt("Composer")}>
 +        <SettingsSwitchRow
 +          icon="chart.bar.xaxis"
-+          label="Stats for nerds"
++          label={gt("Stats for nerds")}
 +          value={statsForNerdsEnabled}
-+          onValueChange={(value) => savePreferences({ statsForNerdsEnabled: value })}
++          onValueChange={(value) => void savePreferences({ statsForNerdsEnabled: value })}
 +        />
 +      </SettingsSection>
 +      <Text className="px-2 text-sm text-foreground-muted">
-+        Show reported context, main-agent turn tokens, cache rate, and elapsed time below the
-+        composer. Available stats depend on the provider.
++        <T>
++          Show reported context, main-agent turn tokens, cache rate, and elapsed time below the
++          composer. Available stats depend on the provider.
++        </T>
 +      </Text>
      </ScrollView>
    );
  
 diff --git a/apps/mobile/src/features/settings/settings-search.ts b/apps/mobile/src/features/settings/settings-search.ts
-index 77fbdfd7be..7bb96e93e5 100644
+index 9b83346412..1dfaab53ee 100644
 --- a/apps/mobile/src/features/settings/settings-search.ts
 +++ b/apps/mobile/src/features/settings/settings-search.ts
-@@ -79,7 +79,14 @@ const SETTINGS_SEARCH_TERMS = {
-     "auto-resume",
-     "thread behavior",
+@@ -119,6 +119,8 @@ const SETTINGS_SEARCH_TERMS = {
+     msg("queue", { $context: "settings search keyword" }),
+     msg("steer", { $context: "settings search keyword" }),
+     msg("while the agent is running", { $context: "settings search keyword" }),
++    msg("stats for nerds", { $context: "settings search keyword" }),
++    msg("composer", { $context: "settings search keyword" }),
    ],
--  SettingsFollowUp: ["follow-ups", "queue", "steer", "while the agent is running"],
-+  SettingsFollowUp: [
-+    "follow-ups",
-+    "queue",
-+    "steer",
-+    "while the agent is running",
-+    "stats for nerds",
-+    "composer",
-+  ],
-   SettingsArchive: ["archive", "archived", "restore", "unarchive"],
-   SettingsProviderAccounts: [
-     "provider accounts",
+   SettingsArchive: [
+     msg("archive", { $context: "settings search keyword" }),
 diff --git a/apps/mobile/src/features/threads/ComposerStats.tsx b/apps/mobile/src/features/threads/ComposerStats.tsx
 new file mode 100644
-index 0000000000..0375ea33de
+index 0000000000..8cc1887ce9
 --- /dev/null
 +++ b/apps/mobile/src/features/threads/ComposerStats.tsx
-@@ -0,0 +1,605 @@
+@@ -0,0 +1,638 @@
 +import {
 +  COMPOSER_STATS_CLOCK_MS,
 +  composerLimitDisplay,
@@ -125,8 +120,9 @@ index 0000000000..0375ea33de
 +} from "@t3tools/client-runtime/state/composer-stats";
 +import { formatContextWindowTokens } from "@t3tools/client-runtime/state/context-window";
 +import { formatDuration } from "@t3tools/shared/orchestrationTiming";
-+import { formatResetsIn } from "@t3tools/shared/usageLimits";
++import { formatResetsIn } from "@t3tools/shared/usageLimitsCopy";
 +import * as DateTime from "effect/DateTime";
++import { T, useGT, useMessages, Var } from "gt-react-native";
 +import { Children, useEffect, useState, type ReactNode } from "react";
 +import { Pressable, ScrollView, View } from "react-native";
 +import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -295,22 +291,26 @@ index 0000000000..0375ea33de
 +  readonly now: number;
 +  readonly onClose: () => void;
 +}) {
++  const gt = useGT();
++  const m = useMessages();
 +  const { limits, providerName } = props.limits;
-+  const chips = selectComposerLimitWindows(limits);
++  const chips = selectComposerLimitWindows(limits, m);
 +  const freshness = composerLimitsFreshness(
 +    chips.map(({ window }) => window.checkedAt ?? limits.checkedAt),
 +    props.now,
 +  );
 +  return (
-+    <Sheet title="Usage limits" onClose={props.onClose}>
++    <Sheet title={gt("Usage limits")} onClose={props.onClose}>
 +      <SheetBody>
 +        {limits.windows.map((window) => {
 +          const display = composerLimitDisplay(window, limits.checkedAt, props.now);
 +          const resets = display.resetPending
 +            ? window.resetsAt
-+              ? `Reset at ${formatUsageTimestamp(window.resetsAt)}, waiting for a new reading`
-+              : "Waiting for a new reading"
-+            : formatResetsIn(window, props.now);
++              ? gt("Reset at {time}, waiting for a new reading", {
++                  time: formatUsageTimestamp(window.resetsAt),
++                })
++              : gt("Waiting for a new reading")
++            : formatResetsIn(window, props.now, m);
 +          return (
 +            <ListSection key={window.id}>
 +              <ListRowLayout
@@ -318,7 +318,7 @@ index 0000000000..0375ea33de
 +                detail={
 +                  display.freshness.status === "expired" && !display.resetPending
 +                    ? "–"
-+                    : `${display.displayPercent}% left`
++                    : gt("{percent}% left", { percent: display.displayPercent })
 +                }
 +              />
 +              <Bar percent={display.displayPercent ?? 0} dimmed={display.dimmed} />
@@ -330,12 +330,17 @@ index 0000000000..0375ea33de
 +          );
 +        })}
 +        <Note>
-+          {providerName}. Usage comes from account and turn readings, with CLI estimates filling
-+          gaps. Stale values show their age; readings older than 15 minutes are hidden.
++          <T>
++            <Var>{providerName}</Var>. Usage comes from account and turn readings, with CLI
++            estimates filling gaps. Stale values show their age; readings older than 15 minutes are
++            hidden.
++          </T>{" "}
 +          {freshness.ageMins === null
-+            ? " Check time unavailable."
-+            : ` Checked ${freshness.ageMins === 0 ? "just now" : `${freshness.ageMins} min ago`}.`}{" "}
-+          At reset time a window shows 100% left until a new reading arrives.
++            ? gt("Check time unavailable.")
++            : freshness.ageMins === 0
++              ? gt("Checked just now.")
++              : gt("Checked {minutes} min ago.", { minutes: freshness.ageMins })}{" "}
++          <T>At reset time a window shows 100% left until a new reading arrives.</T>
 +        </Note>
 +      </SheetBody>
 +    </Sheet>
@@ -347,6 +352,8 @@ index 0000000000..0375ea33de
 +  readonly now: number;
 +  readonly onClose: () => void;
 +}) {
++  const gt = useGT();
++  const m = useMessages();
 +  const { turn } = props;
 +  const usage = turn.turnTokenUsage;
 +  const available = usage?.usageStatus !== "unavailable" ? usage : undefined;
@@ -354,60 +361,68 @@ index 0000000000..0375ea33de
 +  const elapsed = deriveTurnElapsedMs(turn, props.now);
 +  return (
 +    <Sheet
-+      title={`${turn.status === "running" ? "Current" : "Latest"} turn`}
++      title={turn.status === "running" ? gt("Current turn") : gt("Latest turn")}
 +      onClose={props.onClose}
 +    >
 +      <SheetBody>
 +        <ListSection>
 +          <Separated>
 +            {[
-+              <Detail key="status" label="Status" value={turn.status} />,
++              <Detail key="status" label={gt("Status")} value={turn.status} />,
 +              ...(elapsed !== null
 +                ? [
 +                    <Detail
 +                      key="elapsed"
-+                      label="Elapsed wall time"
++                      label={gt("Elapsed wall time")}
 +                      value={formatDuration(elapsed)}
 +                    />,
 +                  ]
 +                : []),
 +              ...(cache !== null
-+                ? [<Detail key="cache" label="Cached input" value={formatCachePercentage(cache)} />]
++                ? [
++                    <Detail
++                      key="cache"
++                      label={gt("Cached input")}
++                      value={formatCachePercentage(cache)}
++                    />,
++                  ]
 +                : []),
 +              <Detail
 +                key="in"
-+                label="Input tokens"
-+                value={formatStatCount(available?.inputTokens)}
++                label={gt("Input tokens")}
++                value={formatStatCount(available?.inputTokens, m)}
 +              />,
 +              <Detail
 +                key="reads"
-+                label="Cache reads"
-+                value={formatStatCount(available?.cachedInputTokens)}
++                label={gt("Cache reads")}
++                value={formatStatCount(available?.cachedInputTokens, m)}
 +              />,
 +              <Detail
 +                key="writes"
-+                label="Cache writes"
-+                value={formatStatCount(available?.cacheCreationTokens)}
++                label={gt("Cache writes")}
++                value={formatStatCount(available?.cacheCreationTokens, m)}
 +              />,
 +              <Detail
 +                key="out"
-+                label="Output tokens"
-+                value={formatStatCount(available?.outputTokens)}
++                label={gt("Output tokens")}
++                value={formatStatCount(available?.outputTokens, m)}
 +              />,
 +              <Detail
 +                key="reasoning"
-+                label="Reasoning tokens"
-+                value={formatStatCount(available?.reasoningTokens)}
++                label={gt("Reasoning tokens")}
++                value={formatStatCount(available?.reasoningTokens, m)}
 +              />,
 +            ]}
 +          </Separated>
 +        </ListSection>
 +        <Note>
-+          Main-agent turn only. Input includes cache reads and writes; output includes reasoning.
-+          Elapsed time includes tools and waits. Child-agent usage is excluded.
-+          {usage?.hasSubagents ? " This turn used subagents." : ""}
++          <T>
++            Main-agent turn only. Input includes cache reads and writes; output includes reasoning.
++            Elapsed time includes tools and waits. Child-agent usage is excluded.
++          </T>
++          {usage?.hasSubagents ? ` ${gt("This turn used subagents.")}` : ""}
 +          {available?.usageStatus === "partial"
-+            ? " Partial report: counts cover only the usage this provider reported."
++            ? ` ${gt("Partial report: counts cover only the usage this provider reported.")}`
 +            : ""}
 +        </Note>
 +      </SheetBody>
@@ -423,6 +438,8 @@ index 0000000000..0375ea33de
 +  readonly isCompacting: boolean;
 +  readonly onClose: () => void;
 +}) {
++  const gt = useGT();
++  const m = useMessages();
 +  const { context, compactions } = props.stats;
 +  const compaction = deriveContextCompaction(
 +    context,
@@ -431,15 +448,15 @@ index 0000000000..0375ea33de
 +  );
 +  const compactBlocked = props.compactDisabled || props.isCompacting;
 +  return (
-+    <Sheet title="Context usage" onClose={props.onClose}>
++    <Sheet title={gt("Context usage")} onClose={props.onClose}>
 +      <SheetBody>
 +        <ListSection>
 +          <ListRowLayout
-+            label="Context window"
++            label={gt("Context window")}
 +            detail={
 +              context?.usedPercentage != null
-+                ? `${Math.round(context.usedPercentage)}% of window`
-+                : "Not reported"
++                ? gt("{percent}% of window", { percent: Math.round(context.usedPercentage) })
++                : gt("Not reported")
 +            }
 +          />
 +          {context?.usedPercentage != null ? <Bar percent={context.usedPercentage} /> : null}
@@ -447,45 +464,47 @@ index 0000000000..0375ea33de
 +            {[
 +              <Detail
 +                key="used"
-+                label="Used tokens"
-+                value={context ? formatStatCount(context.usedTokens) : "Not reported"}
++                label={gt("Used tokens")}
++                value={context ? formatStatCount(context.usedTokens, m) : gt("Not reported")}
 +              />,
 +              <Detail
 +                key="size"
-+                label="Window size"
-+                value={formatStatCount(context?.maxTokens ?? undefined)}
++                label={gt("Window size")}
++                value={formatStatCount(context?.maxTokens ?? undefined, m)}
 +              />,
 +              <Detail
 +                key="remaining"
-+                label="Window remaining"
-+                value={formatStatCount(context?.remainingTokens ?? undefined)}
++                label={gt("Window remaining")}
++                value={formatStatCount(context?.remainingTokens ?? undefined, m)}
 +              />,
-+              <Detail key="auto" label="Auto-compact" value={compaction.status} />,
++              <Detail key="auto" label={gt("Auto-compact")} value={compaction.status} />,
 +              ...(compaction.threshold !== null
 +                ? [
 +                    <Detail
 +                      key="threshold"
 +                      label={
 +                        compaction.source === "configured"
-+                          ? "Configured threshold"
-+                          : "Reported threshold"
++                          ? gt("Configured threshold")
++                          : gt("Reported threshold")
 +                      }
-+                      value={`${formatStatCount(compaction.threshold)} tokens`}
++                      value={gt("{count} tokens", {
++                        count: formatStatCount(compaction.threshold, m),
++                      })}
 +                    />,
 +                    <Detail
 +                      key="toThreshold"
-+                      label="Tokens to threshold"
++                      label={gt("Tokens to threshold")}
 +                      value={
 +                        compaction.remainingTokens === null
-+                          ? "Not reported"
-+                          : formatStatCount(compaction.remainingTokens)
++                          ? gt("Not reported")
++                          : formatStatCount(compaction.remainingTokens, m)
 +                      }
 +                    />,
 +                  ]
 +                : []),
 +              <Detail
 +                key="count"
-+                label="Recorded compactions"
++                label={gt("Recorded compactions")}
 +                value={String(compactions.length)}
 +              />,
 +            ]}
@@ -493,25 +512,28 @@ index 0000000000..0375ea33de
 +        </ListSection>
 +        {compaction.source === "configured" ? (
 +          <Note>
-+            Claude's current setting applies when a query starts. A running query may use an earlier
-+            setting. Tokens to threshold use the latest context report, not a countdown.
++            <T>
++              Claude's current setting applies when a query starts. A running query may use an
++              earlier setting. Tokens to threshold use the latest context report, not a countdown.
++            </T>
 +          </Note>
 +        ) : null}
 +        {compactions.length > 0 ? (
-+          <ListSection title="Recent compactions">
++          <ListSection title={gt("Recent compactions")}>
 +            <Separated>
 +              {compactions.slice(-3).map((item) => (
 +                <ListRowLayout
 +                  key={item.id}
-+                  label={`${
-+                    item.beforeTokenCount !== undefined
-+                      ? formatContextWindowTokens(item.beforeTokenCount)
-+                      : "Unknown"
-+                  } → ${
-+                    item.afterTokenCount !== undefined
-+                      ? formatContextWindowTokens(item.afterTokenCount)
-+                      : "Unknown"
-+                  } tokens`}
++                  label={gt("{before} → {after} tokens", {
++                    before:
++                      item.beforeTokenCount !== undefined
++                        ? formatContextWindowTokens(item.beforeTokenCount)
++                        : gt("Unknown"),
++                    after:
++                      item.afterTokenCount !== undefined
++                        ? formatContextWindowTokens(item.afterTokenCount)
++                        : gt("Unknown"),
++                  })}
 +                  detail={
 +                    item.completedAt != null
 +                      ? new Date(DateTime.toEpochMillis(item.completedAt)).toLocaleTimeString([], {
@@ -544,18 +566,22 @@ index 0000000000..0375ea33de
 +          >
 +            <ListRowLayout
 +              icon="arrow.down.right.and.arrow.up.left"
-+              label={props.isCompacting ? "Compacting…" : "Compact now"}
++              label={props.isCompacting ? gt("Compacting…") : gt("Compact now")}
 +              disabled={compactBlocked}
 +            />
 +          </RowPressable>
 +        </ListSection>
 +        <Note>
 +          {context
-+            ? "Latest provider report, not a live token estimate or a quality score."
-+            : "This provider has not reported context occupancy yet."}{" "}
-+          Compactions count completed events in the loaded main-agent history for this provider
-+          session.
-+          {context ? ` Reported ${new Date(context.updatedAt).toLocaleString()}.` : ""}
++            ? gt("Latest provider report, not a live token estimate or a quality score.")
++            : gt("This provider has not reported context occupancy yet.")}{" "}
++          <T>
++            Compactions count completed events in the loaded main-agent history for this provider
++            session.
++          </T>
++          {context
++            ? ` ${gt("Reported {time}.", { time: new Date(context.updatedAt).toLocaleString() })}`
++            : ""}
 +        </Note>
 +      </SheetBody>
 +    </Sheet>
@@ -566,11 +592,12 @@ index 0000000000..0375ea33de
 +  readonly row: ComposerStatsRow;
 +  readonly onOpen: (sheet: SheetKind) => void;
 +}) {
++  const gt = useGT();
 +  const { row, onOpen } = props;
 +  return (
 +    <>
 +      {row.limits.length > 0 ? (
-+        <Chip label="Usage limit details" onPress={() => onOpen("limits")}>
++        <Chip label={gt("Usage limit details")} onPress={() => onOpen("limits")}>
 +          <View className={cn("flex-row items-center", row.compact ? "gap-x-3" : "gap-x-4")}>
 +            {row.limits.map((limit) => (
 +              <Meter
@@ -588,7 +615,7 @@ index 0000000000..0375ea33de
 +      ) : null}
 +      <View className="ml-auto flex-row items-center gap-x-2.5">
 +        {row.context ? (
-+          <Chip label="Context usage details" onPress={() => onOpen("context")}>
++          <Chip label={gt("Context usage details")} onPress={() => onOpen("context")}>
 +            <StatText
 +              className={row.context.tone ? TONE_TEXT[row.context.tone] : "text-foreground"}
 +            >
@@ -600,8 +627,8 @@ index 0000000000..0375ea33de
 +        <Chip
 +          label={
 +            row.cache.value === "–%"
-+              ? "Cache and turn details, no cache figure yet"
-+              : `Cache and turn details, ${row.cache.value} cached`
++              ? gt("Cache and turn details, no cache figure yet")
++              : gt("Cache and turn details, {value} cached", { value: row.cache.value })
 +          }
 +          onPress={row.cache.openable ? () => onOpen("turn") : undefined}
 +          dimmed={!row.cache.openable}
@@ -664,6 +691,7 @@ index 0000000000..0375ea33de
 +  readonly compactDisabledReason: string | null;
 +  readonly isCompacting: boolean;
 +}) {
++  const gt = useGT();
 +  const { stats } = props;
 +  const { context, turn, compactions, usageLimits } = stats;
 +  const [sheet, setSheet] = useState<SheetKind | null>(null);
@@ -681,7 +709,7 @@ index 0000000000..0375ea33de
 +  return (
 +    <>
 +      <View
-+        accessibilityLabel="Stats for nerds"
++        accessibilityLabel={gt("Stats for nerds")}
 +        className={cn(
 +          "flex-row items-center gap-x-4 overflow-hidden px-1 pt-1",
 +          layout === "wrap" && "flex-wrap",
@@ -713,10 +741,10 @@ index 0000000000..0375ea33de
 +  );
 +}
 diff --git a/apps/mobile/src/features/threads/NewTaskDraftScreen.tsx b/apps/mobile/src/features/threads/NewTaskDraftScreen.tsx
-index ef279152d2..b3b1450cf3 100644
+index 7438bb1b06..0c14a184ab 100644
 --- a/apps/mobile/src/features/threads/NewTaskDraftScreen.tsx
 +++ b/apps/mobile/src/features/threads/NewTaskDraftScreen.tsx
-@@ -1021,6 +1021,7 @@ export function NewTaskDraftScreen(props: {
+@@ -1090,6 +1090,7 @@ export function NewTaskDraftScreen(props: {
          onNativePasteText={handleNativePasteText}
          onRemoveDraftImage={flow.removeAttachment}
          onStopThread={() => {}}
@@ -725,10 +753,10 @@ index ef279152d2..b3b1450cf3 100644
          onSendMessage={handleStart}
          offersSideChat={false}
 diff --git a/apps/mobile/src/features/threads/ThreadComposer.tsx b/apps/mobile/src/features/threads/ThreadComposer.tsx
-index b1f2553618..b0a9e2863b 100644
+index 50e67bcbed..6a6c65a5b8 100644
 --- a/apps/mobile/src/features/threads/ThreadComposer.tsx
 +++ b/apps/mobile/src/features/threads/ThreadComposer.tsx
-@@ -149,6 +149,8 @@ export interface ThreadComposerProps {
+@@ -154,6 +154,8 @@ export interface ThreadComposerProps {
    /** Arms a fresh session for the next message; absent where `/clear` is unavailable. */
    readonly onFreshSession?: () => void;
    readonly offersSideChat?: boolean;
@@ -737,8 +765,8 @@ index b1f2553618..b0a9e2863b 100644
    readonly serverConfig: T3ServerConfig | null;
    readonly queueCount: number;
    readonly activeThreadBusy: boolean;
-@@ -1095,6 +1097,7 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
-             This connection cannot control this task. You can still edit your draft.
+@@ -1142,6 +1144,7 @@ export const ThreadComposer = function ThreadComposer(props: ThreadComposerProps
+             <T>This connection cannot control this task. You can still edit your draft.</T>
            </Text>
          ) : null}
 +        {props.footer}
@@ -746,10 +774,19 @@ index b1f2553618..b0a9e2863b 100644
  
        <VideoPreviewModal source={previewVideo} onRequestClose={closePreview} />
 diff --git a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
-index 228713f07e..b0c4dda083 100644
+index 7df9f595d8..43f588e999 100644
 --- a/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
 +++ b/apps/mobile/src/features/threads/ThreadDetailScreen.tsx
-@@ -196,6 +196,9 @@ import {
+@@ -89,7 +89,7 @@ import {
+   useState,
+   useSyncExternalStore,
+ } from "react";
+-import { useGT, useMessages } from "gt-react-native";
++import { msg, useGT, useMessages } from "gt-react-native";
+ import { m } from "../../i18n/messages";
+ import {
+   AppState,
+@@ -211,6 +211,9 @@ import {
    type ThreadComposerProps,
  } from "./ThreadComposer";
  import { ComposerPopoverHost } from "./ComposerPopoverHost";
@@ -759,16 +796,16 @@ index 228713f07e..b0c4dda083 100644
  import { ThreadFeed, type ThreadFeedHistoryControls } from "./ThreadFeed";
  import { WorkspaceMutationIdProvider } from "./WorkspaceMutationIdProvider";
  import { useThreadTurnSubagents } from "./ThreadAgentsSheet";
-@@ -299,6 +302,8 @@ export interface ThreadDetailScreenProps {
-     ) => Promise<boolean | "responded">,
-     onWillEnqueue?: () => void,
+@@ -317,6 +320,8 @@ export interface ThreadDetailScreenProps {
    ) => Promise<MessageId | null>;
+   /** Queues a standalone text command, such as `/goal clear`, without touching the draft. */
+   readonly onSendCommand: (text: string) => Promise<MessageId | null>;
 +  /** Sends "/compact" without touching the draft. */
 +  readonly onCompactContext: () => void;
    readonly onReconnectEnvironment: () => void;
    readonly canSwitchThreadProvider: boolean;
    readonly onRespondToApproval: ApprovalResponder;
-@@ -897,10 +902,16 @@ function ThreadDetailBody(
+@@ -976,10 +981,16 @@ function ThreadDetailBody(
      ) ||
      (props.historyControls?.hasMoreHistory === true &&
        props.selectedThread.latestUserMessageAt !== null);
@@ -785,7 +822,7 @@ index 228713f07e..b0c4dda083 100644
        composerBottomInset;
    // The last collapse toggle; it only applies to the request it was made on.
    const [userInputToggle, setUserInputToggle] = useState<{
-@@ -1819,6 +1830,32 @@ function ThreadDetailBody(
+@@ -1930,6 +1941,33 @@ function ThreadDetailBody(
                            props.activePendingApproval === null &&
                            props.activePendingUserInput === null
                          }
@@ -807,10 +844,11 @@ index 228713f07e..b0c4dda083 100644
 +                                hasPendingUserInput: props.activePendingUserInput !== null,
 +                                isWorking: props.activeThreadBusy,
 +                                fallback: !props.canOperateThread
-+                                  ? "This connection cannot control this task."
++                                  ? m(msg("This connection cannot control this task."))
 +                                  : !hasCompactableConversation
-+                                    ? "Nothing to compact yet."
++                                    ? m(msg("Nothing to compact yet."))
 +                                    : null,
++                                resolve: m,
 +                              })}
 +                            />
 +                          ) : null
@@ -819,13 +857,13 @@ index 228713f07e..b0c4dda083 100644
                          queueCount={props.selectedThreadQueueCount}
                          activeThreadBusy={props.activeThreadBusy}
 diff --git a/apps/mobile/src/features/threads/ThreadRouteScreen.tsx b/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
-index 735e169a72..7cfce7cc15 100644
+index 9d9cddd644..b7701f18ee 100644
 --- a/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
 +++ b/apps/mobile/src/features/threads/ThreadRouteScreen.tsx
-@@ -1106,6 +1106,7 @@ function ThreadRouteContent(
-           onResumeQueue={composer.canResume ? handleResumeQueue : null}
+@@ -1126,6 +1126,7 @@ function ThreadRouteContent(
            onSendMessage={composer.onSendMessage}
            offersSideChat={composer.sideChatUnavailableReason === null}
+           onSendCommand={composer.onSendCommand}
 +          onCompactContext={composer.onCompactContext}
            onReconnectEnvironment={handleReconnectEnvironment}
            canSwitchThreadProvider={composer.canSwitchThreadProvider}
@@ -1059,10 +1097,10 @@ index 0000000000..cdeb563af5
 +});
 diff --git a/apps/mobile/src/features/threads/composerStatsRow.ts b/apps/mobile/src/features/threads/composerStatsRow.ts
 new file mode 100644
-index 0000000000..362e7deacb
+index 0000000000..f83f958e3b
 --- /dev/null
 +++ b/apps/mobile/src/features/threads/composerStatsRow.ts
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,141 @@
 +import {
 +  composerLimitDisplay,
 +  deriveContextCompaction,
@@ -1074,6 +1112,7 @@ index 0000000000..362e7deacb
 +} from "@t3tools/client-runtime/state/composer-stats";
 +import type { MobileComposerStats } from "../../state/composer-cache-usage";
 +import { formatContextWindowTokens } from "@t3tools/client-runtime/state/context-window";
++import { m } from "../../i18n/messages";
 +
 +/**
 + * How the row fits its width: the full row when it fits, else shorter meters and labels,
@@ -1144,7 +1183,7 @@ index 0000000000..362e7deacb
 +  const { context, turn, usageLimits } = stats;
 +  const { compact } = input;
 +  const limits = usageLimits
-+    ? selectComposerLimitWindows(usageLimits.limits).map(({ window, shortLabel }) => {
++    ? selectComposerLimitWindows(usageLimits.limits, m).map(({ window, shortLabel }) => {
 +        const display = composerLimitDisplay(window, usageLimits.limits.checkedAt, input.nowMs);
 +        return {
 +          id: window.id,
@@ -1389,12 +1428,12 @@ index 0000000000..3cc2cb612f
 +  }, [enabled, projection, environmentId, serverConfig, instanceId]);
 +}
 diff --git a/apps/mobile/src/state/use-thread-composer-state.ts b/apps/mobile/src/state/use-thread-composer-state.ts
-index 58f2da087e..fd691c52b2 100644
+index 48e7fc02b5..692b48b680 100644
 --- a/apps/mobile/src/state/use-thread-composer-state.ts
 +++ b/apps/mobile/src/state/use-thread-composer-state.ts
-@@ -888,6 +888,39 @@ export function useThreadComposerState(input: {
-     return null;
-   })();
+@@ -1023,6 +1023,39 @@ export function useThreadComposerState(input: {
+     return messageId;
+   };
  
 +  /** Sends "/compact" the way the slash command does, leaving the user's draft untouched. */
 +  const onCompactContext = () => {
@@ -1424,7 +1463,7 @@ index 58f2da087e..fd691c52b2 100644
 +    }).catch((error: unknown) => {
 +      setThreadComposerError(
 +        threadKey,
-+        error instanceof Error ? error.message : "Failed to save the queued message.",
++        error instanceof Error ? error.message : m(msg("Failed to save the queued message.")),
 +      );
 +    });
 +  };
@@ -1432,16 +1471,16 @@ index 58f2da087e..fd691c52b2 100644
    const onChangeDraftMessage = (value: string) => {
      if (!selectedThreadShell) {
        return;
-@@ -961,6 +994,7 @@ export function useThreadComposerState(input: {
-     onNativePasteText,
+@@ -1097,6 +1130,7 @@ export function useThreadComposerState(input: {
      onRemoveDraftImage,
      onSendMessage,
+     onSendCommand,
 +    onCompactContext,
      sideChatUnavailableReason,
    };
  }
 diff --git a/apps/web/src/lib/contextWindow.test.ts b/apps/web/src/lib/contextWindow.test.ts
-index 91cdf18682..9cba6cd468 100644
+index a9bef5448f..d5d7128789 100644
 --- a/apps/web/src/lib/contextWindow.test.ts
 +++ b/apps/web/src/lib/contextWindow.test.ts
 @@ -47,9 +47,28 @@ const compactionEntry = (providerThreadId: string | null) =>
@@ -1475,7 +1514,7 @@ index 91cdf18682..9cba6cd468 100644
    });
  
    it("ignores a retired provider thread's compaction after a provider switch", () => {
-@@ -263,3 +282,40 @@ describe("latestProviderTurnTokenUsage", () => {
+@@ -308,3 +327,40 @@ describe("latestProviderTurnTokenUsage", () => {
      }
    });
  });
@@ -1538,10 +1577,10 @@ index 1cf3eee799..b4e8bb5647 100644
 -}
 +export * from "@t3tools/client-runtime/state/context-window";
 diff --git a/packages/client-runtime/package.json b/packages/client-runtime/package.json
-index d3a249a1fe..d706c95f87 100644
+index 832fbc116c..c47cb2916b 100644
 --- a/packages/client-runtime/package.json
 +++ b/packages/client-runtime/package.json
-@@ -167,6 +167,10 @@
+@@ -195,6 +195,10 @@
        "types": "./src/relay/index.ts",
        "default": "./src/relay/index.ts"
      },
@@ -2158,10 +2197,10 @@ index 0000000000..615d9ca5db
 +});
 diff --git a/packages/client-runtime/src/state/composerStats.ts b/packages/client-runtime/src/state/composerStats.ts
 new file mode 100644
-index 0000000000..9a0ab35473
+index 0000000000..2b8784c2c4
 --- /dev/null
 +++ b/packages/client-runtime/src/state/composerStats.ts
-@@ -0,0 +1,403 @@
+@@ -0,0 +1,422 @@
 +import type {
 +  OrchestrationV2ProviderTurn,
 +  OrchestrationV2ThreadProjection,
@@ -2173,6 +2212,8 @@ index 0000000000..9a0ab35473
 +import { remainingPercent } from "@t3tools/shared/usageLimits";
 +import * as DateTime from "effect/DateTime";
 +import { deriveLatestContextWindowSnapshot, type ContextWindowSnapshot } from "./contextWindow.ts";
++import { mFallback, msg } from "gt-i18n";
++import type { MFunctionType } from "gt-i18n/types";
 +
 +// These run on Hermes in the mobile app, which has no ES2023 `toSorted`: sort the
 +// copies `filter` and `flatMap` already return instead.
@@ -2288,15 +2329,26 @@ index 0000000000..9a0ab35473
 +    .sort((a, b) => DateTime.toEpochMillis(a.updatedAt) - DateTime.toEpochMillis(b.updatedAt));
 +}
 +
-+function windowShortLabel(window: ServerProviderUsageWindow): string {
++function windowShortLabel(
++  window: ServerProviderUsageWindow,
++  resolve: MFunctionType = mFallback,
++): string {
 +  const mins = window.windowDurationMins;
 +  if (mins !== undefined && mins > 0) {
-+    if (mins % 10_080 === 0) return mins === 10_080 ? "Week" : `${mins / 10_080}wk`;
++    if (mins % 10_080 === 0) {
++      return mins === 10_080
++        ? resolve(msg("Week"))
++        : resolve(msg("{weeks}wk", { weeks: mins / 10_080 }));
++    }
 +    if (mins % 1_440 === 0) return `${mins / 1_440}d`;
 +    if (mins % 60 === 0) return `${mins / 60}h`;
 +    return `${mins}m`;
 +  }
-+  return window.kind === "session" ? "Session" : window.kind === "weekly" ? "Week" : window.label;
++  return window.kind === "session"
++    ? resolve(msg("Session"))
++    : window.kind === "weekly"
++      ? resolve(msg("Week"))
++      : window.label;
 +}
 +
 +/**
@@ -2306,11 +2358,12 @@ index 0000000000..9a0ab35473
 + */
 +export function selectComposerLimitWindows(
 +  limits: ServerProviderUsageLimits | undefined,
++  resolve: MFunctionType = mFallback,
 +): ReadonlyArray<{ readonly window: ServerProviderUsageWindow; readonly shortLabel: string }> {
 +  if (!limits || limits.unavailable?.reason === "unsupported") return [];
 +  return (["session", "weekly"] as const).flatMap((kind) => {
 +    const window = limits.windows.find((candidate) => candidate.kind === kind);
-+    return window ? [{ window, shortLabel: windowShortLabel(window) }] : [];
++    return window ? [{ window, shortLabel: windowShortLabel(window, resolve) }] : [];
 +  });
 +}
 +
@@ -2458,8 +2511,11 @@ index 0000000000..9a0ab35473
 +  return usedPercent >= 90 ? "critical" : usedPercent >= 75 ? "warning" : "normal";
 +}
 +
-+export function formatStatCount(value: number | undefined): string {
-+  return value === undefined ? "Not reported" : value.toLocaleString("en-US");
++export function formatStatCount(
++  value: number | undefined,
++  resolve: MFunctionType = mFallback,
++): string {
++  return value === undefined ? resolve(msg("Not reported")) : value.toLocaleString("en-US");
 +}
 +
 +export function formatUsageTimestamp(value: string | undefined): string {
@@ -2497,13 +2553,15 @@ index 0000000000..9a0ab35473
 +  readonly hasPendingUserInput: boolean;
 +  readonly isWorking: boolean;
 +  readonly fallback: string | null;
++  readonly resolve?: MFunctionType;
 +}): string | null {
++  const resolve = input.resolve ?? mFallback;
 +  return input.hasPendingApproval
-+    ? "Resolve the pending approval first."
++    ? resolve(msg("Resolve the pending approval first."))
 +    : input.hasPendingUserInput
-+      ? "Answer the pending question first."
++      ? resolve(msg("Answer the pending question first."))
 +      : input.isWorking
-+        ? "Wait for the current turn to finish."
++        ? resolve(msg("Wait for the current turn to finish."))
 +        : input.fallback;
 +}
 +
@@ -2599,10 +2657,27 @@ index 994d3d62a2..daa9c29c1c 100644
 +  });
 +});
 diff --git a/packages/client-runtime/src/state/contextWindow.ts b/packages/client-runtime/src/state/contextWindow.ts
-index 9f36d9c9d0..941bc92606 100644
+index d21e85e756..d683e36755 100644
 --- a/packages/client-runtime/src/state/contextWindow.ts
 +++ b/packages/client-runtime/src/state/contextWindow.ts
-@@ -110,8 +110,11 @@ export function deriveLatestContextWindowSnapshot(
+@@ -148,7 +148,15 @@ export function deriveLatestContextWindowSnapshot(
+     );
+     // Usage reported before the compaction describes the context it just discarded; usage at
+     // the same instant is the provider's own post-compaction report.
+-    if (usageUpdatedAt === null || Date.parse(compactedAt) > Date.parse(usageUpdatedAt)) {
++    if (usageUpdatedAt === null) {
++      // Without any usage report the compaction alone says nothing about the total processed
++      // or whether the provider compacts by itself (a typed /compact looks the same).
++      const snapshot = compactionSnapshot(latestCompletedCompaction, null, compactedAt);
++      return snapshot === null
++        ? null
++        : { ...snapshot, totalProcessedTokens: null, compactsAutomatically: null };
++    }
++    if (Date.parse(compactedAt) > Date.parse(usageUpdatedAt)) {
+       return compactionSnapshot(
+         latestCompletedCompaction,
+         liveUsage?.maxTokens ?? asFiniteNumber(providerThread?.contextUsage?.maxTokens),
+@@ -183,8 +191,11 @@ export function deriveLatestContextWindowSnapshot(
        lastReasoningOutputTokens: null,
        toolUses: null,
        durationMs: null,
@@ -2616,39 +2691,27 @@ index 9f36d9c9d0..941bc92606 100644
        categories: liveUsage.categories ?? null,
        cost: null,
        updatedAt: liveUsage.updatedAt,
-@@ -155,7 +158,7 @@ export function deriveLatestContextWindowSnapshot(
-   }
-   for (let index = entries.length - 1; index >= 0; index -= 1) {
-     const entry = entries[index];
--    if (!entry || entry.item.type !== "compaction") {
-+    if (!entry || entry.item.type !== "compaction" || entry.item.status !== "completed") {
-       continue;
-     }
-     const payload = entry.item;
-@@ -181,7 +184,7 @@ export function deriveLatestContextWindowSnapshot(
- 
-     return {
-       usedTokens,
--      totalProcessedTokens: asFiniteNumber(payload.beforeTokenCount),
-+      totalProcessedTokens: null,
-       maxTokens,
-       remainingTokens,
-       usedPercentage,
-@@ -197,11 +200,11 @@ export function deriveLatestContextWindowSnapshot(
-       lastReasoningOutputTokens: null,
-       toolUses: null,
-       durationMs: null,
--      compactsAutomatically: true,
-+      compactsAutomatically: null,
-       autoCompactThreshold: null,
-       categories: null,
-       cost: null,
--      updatedAt: DateTime.formatIso(payload.startedAt ?? payload.updatedAt),
-+      updatedAt: DateTime.formatIso(payload.completedAt ?? payload.updatedAt),
+@@ -226,19 +237,6 @@ export function deriveLatestContextWindowSnapshot(
+       updatedAt: DateTime.formatIso(providerUsageUpdatedAt),
      };
    }
+-  for (let index = entries.length - 1; index >= 0; index -= 1) {
+-    const item = entries[index]?.item;
+-    if (item?.type !== "compaction" || isRetiredProviderThreadItem(item, providerThread)) {
+-      continue;
+-    }
+-    const snapshot = compactionSnapshot(
+-      item,
+-      null,
+-      DateTime.formatIso(item.startedAt ?? item.updatedAt),
+-    );
+-    if (snapshot !== null) return snapshot;
+-  }
+-
+   return null;
+ }
  
-@@ -418,3 +421,19 @@ export function contextCategoryRows(
+@@ -452,3 +450,19 @@ export function contextCategoryRows(
          (a.kind === "used" ? b.tokens - a.tokens : 0),
      );
  }

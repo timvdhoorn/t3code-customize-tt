@@ -5,24 +5,25 @@ Subject: [PATCH 10/11] feat(mobile): show host CPU, memory and storage in the
  thread settings sheet
 
 ---
- .../src/features/threads/ThreadHostLoad.tsx   | 94 +++++++++++++++++++
- .../features/threads/ThreadSettingsSheet.tsx  | 51 +++++++++-
+ .../src/features/threads/ThreadHostLoad.tsx   | 98 +++++++++++++++++++
+ .../features/threads/ThreadSettingsSheet.tsx  | 54 +++++++++-
  .../src/features/threads/hostLoad.test.ts     | 78 +++++++++++++++
- apps/mobile/src/features/threads/hostLoad.ts  | 72 ++++++++++++++
+ apps/mobile/src/features/threads/hostLoad.ts  | 86 ++++++++++++++++
  apps/mobile/src/lib/storage.test.ts           | 10 ++
  .../src/persistence/mobile-preferences.ts     |  6 ++
- 6 files changed, 309 insertions(+), 2 deletions(-)
+ 6 files changed, 330 insertions(+), 2 deletions(-)
  create mode 100644 apps/mobile/src/features/threads/ThreadHostLoad.tsx
  create mode 100644 apps/mobile/src/features/threads/hostLoad.test.ts
  create mode 100644 apps/mobile/src/features/threads/hostLoad.ts
 
 diff --git a/apps/mobile/src/features/threads/ThreadHostLoad.tsx b/apps/mobile/src/features/threads/ThreadHostLoad.tsx
 new file mode 100644
-index 0000000000..9d7661d730
+index 0000000000..758ea65b85
 --- /dev/null
 +++ b/apps/mobile/src/features/threads/ThreadHostLoad.tsx
-@@ -0,0 +1,94 @@
-+import { useAtomSet, useAtomValue } from "@effect/atom-react";
+@@ -0,0 +1,98 @@
++import { useAtomValue } from "@effect/atom-react";
++import { useGT, useMessages } from "gt-react-native";
 +import type { EnvironmentId } from "@t3tools/contracts";
 +import { AsyncResult } from "effect/reactivity";
 +import { useEffect } from "react";
@@ -32,7 +33,8 @@ index 0000000000..9d7661d730
 +import { ListSection } from "../../components/ui/ListSection";
 +import { ScreenScrollView } from "../../components/ui/ScreenScrollView";
 +import { useAppForeground } from "../../lib/appState";
-+import { mobilePreferencesAtom, updateMobilePreferencesAtom } from "../../state/preferences";
++import { mobilePreferencesAtom, saveMobilePreferences } from "../../state/preferences";
++import { useAtomCommand } from "../../state/use-atom-command";
 +import { useEnvironmentQuery } from "../../state/query";
 +import { serverEnvironment } from "../../state/server";
 +import { SettingsSwitchRow } from "../settings/components/SettingsSwitchRow";
@@ -70,6 +72,8 @@ index 0000000000..9d7661d730
 +
 +/** CPU, memory and storage of the host the thread runs on; polled while shown and in the foreground. */
 +export function ThreadHostLoad({ environmentId }: { readonly environmentId: EnvironmentId }) {
++  const gt = useGT();
++  const m = useMessages();
 +  const { data, error, refresh } = useEnvironmentQuery(
 +    serverEnvironment.hostResources({ environmentId, input: {} }),
 +  );
@@ -81,11 +85,11 @@ index 0000000000..9d7661d730
 +    return () => clearInterval(timer);
 +  }, [foreground, refresh]);
 +  const preferences = useAtomValue(mobilePreferencesAtom);
-+  const savePreferences = useAtomSet(updateMobilePreferencesAtom);
++  const savePreferences = useAtomCommand(saveMobilePreferences);
 +  const showCores =
 +    AsyncResult.isSuccess(preferences) && preferences.value.hostCoreBreakdownEnabled === true;
 +
-+  const empty = hostLoadEmptyState(error);
++  const empty = hostLoadEmptyState(error, m);
 +
 +  return (
 +    <ScreenScrollView
@@ -94,7 +98,7 @@ index 0000000000..9d7661d730
 +    >
 +      <ListSection footer="Refreshes every 5 seconds while this screen is open.">
 +        {data ? (
-+          hostLoadRows(data, showCores).map((row) => <LoadBar key={row.key} row={row} />)
++          hostLoadRows(data, showCores, m).map((row) => <LoadBar key={row.key} row={row} />)
 +        ) : (
 +          <View className="gap-1 px-4 py-3">
 +            <Text className="text-sm text-foreground-muted">{empty.title}</Text>
@@ -107,9 +111,9 @@ index 0000000000..9d7661d730
 +      {data?.cpuCoreUtilization ? (
 +        <ListSection footer="One row per core, with the load of each of its threads.">
 +          <SettingsSwitchRow
-+            label="Core breakdown"
++            label={gt("Core breakdown")}
 +            value={showCores}
-+            onValueChange={(value) => savePreferences({ hostCoreBreakdownEnabled: value })}
++            onValueChange={(value) => void savePreferences({ hostCoreBreakdownEnabled: value })}
 +          />
 +        </ListSection>
 +      ) : null}
@@ -117,10 +121,10 @@ index 0000000000..9d7661d730
 +  );
 +}
 diff --git a/apps/mobile/src/features/threads/ThreadSettingsSheet.tsx b/apps/mobile/src/features/threads/ThreadSettingsSheet.tsx
-index 07eebd9e89..7ffd016892 100644
+index 56be7cd27d..e000459360 100644
 --- a/apps/mobile/src/features/threads/ThreadSettingsSheet.tsx
 +++ b/apps/mobile/src/features/threads/ThreadSettingsSheet.tsx
-@@ -78,6 +78,7 @@ import {
+@@ -80,6 +80,7 @@ import {
    withRememberedModelOptions,
  } from "../../state/use-model-option-memory";
  import { ChatGptSharingStatus } from "./ChatGptSharingStatus";
@@ -128,26 +132,28 @@ index 07eebd9e89..7ffd016892 100644
  import { environmentCatalog } from "../../connection/catalog";
  import { useEnvironmentQuery } from "../../state/query";
  import { scopedThreadKey } from "../../lib/scopedEntities";
-@@ -853,6 +854,8 @@ function ThreadSettingsOptionsItem(props: {
+@@ -975,6 +976,8 @@ function ThreadSettingsOptionsItem(props: {
    readonly bottomInset: number;
    readonly onOpenSubmenu: (submenu: ThreadSettingsSubmenuPage) => void;
  }) {
 +  const navigation = useNavigation<NativeStackNavigationProp<ThreadSettingsPickerStackParams>>();
 +  const presentation = useThreadSettingsPickerPresentation();
    const insets = useSafeAreaInsets();
-   const session = useThreadSettingsSession();
-   const configs = useAtomValue(environmentServerConfigsAtom);
-@@ -926,6 +929,20 @@ function ThreadSettingsOptionsItem(props: {
+   const gt = useGT();
+   const m = useMessages();
+@@ -1054,6 +1057,22 @@ function ThreadSettingsOptionsItem(props: {
          </Animated.View>
        </Animated.View>
  
 +      {presentation.showHostLoad && session.environmentId ? (
 +        <>
-+          <Text className="px-5 pb-2 pt-7 text-sm font-t3-medium text-foreground-muted">Host</Text>
++          <Text className="px-5 pb-2 pt-7 text-sm font-t3-medium text-foreground-muted">
++            {gt("Host", { $context: "section heading for the host load" })}
++          </Text>
 +          <View className="mx-4 overflow-hidden rounded-2xl bg-grouped-card">
 +            <DisclosureRow
 +              isLast
-+              label="Host load"
++              label={gt("Host load")}
 +              value={undefined}
 +              onPress={() => navigation.navigate("ThreadSettingsHostLoad")}
 +            />
@@ -155,10 +161,10 @@ index 07eebd9e89..7ffd016892 100644
 +        </>
 +      ) : null}
 +
-       <Text className="px-5 pb-2 pt-7 text-sm font-t3-medium text-foreground-muted">Catalog</Text>
-       <View className="mx-4 overflow-hidden rounded-2xl bg-grouped-card">
-         <SwitchRow
-@@ -1181,10 +1198,13 @@ function ThreadSettingsChoiceContent(props: {
+       <Text className="px-5 pb-2 pt-7 text-sm font-t3-medium text-foreground-muted">
+         {gt("Catalog", { $context: "section heading for the model catalog" })}
+       </Text>
+@@ -1320,10 +1339,13 @@ function ThreadSettingsChoiceContent(props: {
  type ThreadSettingsPickerStackParams = {
    ThreadSettingsModels: undefined;
    ThreadSettingsChoice: ThreadSettingsSubmenuPage & { readonly title: string };
@@ -172,17 +178,18 @@ index 07eebd9e89..7ffd016892 100644
  };
  
  const ThreadSettingsPickerStack = createNativeStackNavigator<ThreadSettingsPickerStackParams>();
-@@ -1313,10 +1333,25 @@ function ThreadSettingsChoiceScreen() {
+@@ -1455,11 +1477,27 @@ function ThreadSettingsChoiceScreen() {
    );
  }
  
 +function ThreadSettingsHostLoadScreen() {
 +  const navigation = useNavigation<NativeStackNavigationProp<ThreadSettingsPickerStackParams>>();
 +  const session = useThreadSettingsSession();
++  const gt = useGT();
 +
 +  return (
 +    <>
-+      <AppBar title="Host load" onBack={() => navigation.goBack()} hideBottomBorder />
++      <AppBar title={gt("Host load")} onBack={() => navigation.goBack()} hideBottomBorder />
 +      <ScreenContent>
 +        {session.environmentId ? <ThreadHostLoad environmentId={session.environmentId} /> : null}
 +      </ScreenContent>
@@ -192,20 +199,21 @@ index 07eebd9e89..7ffd016892 100644
 +
  function ThreadSettingsPickerNavigator(props: ThreadSettingsPickerPresentation) {
    const screenOptions = useSheetStackOptions();
+   const gt = useGT();
    const presentation = {
      onClose: props.onClose,
 +    showHostLoad: props.showHostLoad,
    };
  
    return (
-@@ -1335,17 +1370,28 @@ function ThreadSettingsPickerNavigator(props: ThreadSettingsPickerPresentation)
+@@ -1478,17 +1516,28 @@ function ThreadSettingsPickerNavigator(props: ThreadSettingsPickerPresentation)
            component={ThreadSettingsChoiceScreen}
            options={({ route }) => ({ title: route.params.title })}
          />
 +        <ThreadSettingsPickerStack.Screen
 +          name="ThreadSettingsHostLoad"
 +          component={ThreadSettingsHostLoadScreen}
-+          options={{ title: "Host load" }}
++          options={{ title: gt("Host load") }}
 +        />
        </ThreadSettingsPickerStack.Navigator>
      </ThreadSettingsPickerPresentationContext.Provider>
@@ -229,7 +237,7 @@ index 07eebd9e89..7ffd016892 100644
      </ThreadSettingsSessionProvider>
    );
  }
-@@ -1400,6 +1446,7 @@ export function ExistingThreadSettingsRouteScreen({
+@@ -1543,6 +1592,7 @@ export function ExistingThreadSettingsRouteScreen({
  
    return (
      <ThreadSettingsPickerScreen
@@ -323,12 +331,15 @@ index 0000000000..e87861d476
 +});
 diff --git a/apps/mobile/src/features/threads/hostLoad.ts b/apps/mobile/src/features/threads/hostLoad.ts
 new file mode 100644
-index 0000000000..10cc9f7795
+index 0000000000..5a5e4ab901
 --- /dev/null
 +++ b/apps/mobile/src/features/threads/hostLoad.ts
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,86 @@
 +import type { HostResourcesSnapshot } from "@t3tools/contracts";
 +
++import { msg } from "gt-react-native";
++
++import { m, type MessageResolver } from "../../i18n/messages";
 +import { formatBytes } from "../../lib/formatBytes";
 +
 +export interface HostLoadRow {
@@ -352,12 +363,21 @@ index 0000000000..10cc9f7795
 +}
 +
 +/** What the screen says while it has no snapshot: still loading, or the host cannot be read. */
-+export function hostLoadEmptyState(error: string | null): { title: string; detail?: string } {
-+  return error ? { title: "Host load unavailable", detail: error } : { title: "Loading…" };
++export function hostLoadEmptyState(
++  error: string | null,
++  resolve: MessageResolver = m,
++): { title: string; detail?: string } {
++  return error
++    ? { title: resolve(msg("Host load unavailable")), detail: error }
++    : { title: resolve(msg("Loading…")) };
 +}
 +
 +/** The rows of the Host load screen, mirroring desktop's `ThreadDetailsHost`. */
-+export function hostLoadRows(host: HostResourcesSnapshot, showCores: boolean): HostLoadRow[] {
++export function hostLoadRows(
++  host: HostResourcesSnapshot,
++  showCores: boolean,
++  resolve: MessageResolver = m,
++): HostLoadRow[] {
 +  const cores = host.cpuCoreUtilization;
 +  const threads = cores?.reduce((sum, core) => sum + core.length, 0) ?? host.cpuCount;
 +  const cpu = host.cpuUtilization === null ? null : percentOf(host.cpuUtilization);
@@ -365,7 +385,9 @@ index 0000000000..10cc9f7795
 +  const rows: HostLoadRow[] = [
 +    {
 +      key: "cpu",
-+      label: cores ? `CPU ${cores.length}C/${threads}T` : `CPU ${threads}T`,
++      label: cores
++        ? resolve(msg("CPU {cores}C/{threads}T", { cores: cores.length, threads }))
++        : resolve(msg("CPU {threads}T", { threads })),
 +      percent: cpu,
 +      value: cpu === null ? "n/a" : `${cpu}%`,
 +    },
@@ -375,7 +397,7 @@ index 0000000000..10cc9f7795
 +      const busy = core.map(percentOf);
 +      rows.push({
 +        key: `core-${index}`,
-+        label: `Core ${index + 1}`,
++        label: resolve(msg("Core {number}", { number: index + 1 })),
 +        percent: busy.length ? Math.max(...busy) : null,
 +        value: busy.length ? `${busy.join(" · ")}%` : "n/a",
 +        muted: true,
@@ -384,7 +406,7 @@ index 0000000000..10cc9f7795
 +  }
 +  rows.push({
 +    key: "memory",
-+    label: "Memory",
++    label: resolve(msg("Memory")),
 +    percent: memory,
 +    value: used(host.totalMemoryBytes, host.availableMemoryBytes),
 +  });
@@ -392,7 +414,7 @@ index 0000000000..10cc9f7795
 +  if (volume) {
 +    rows.push({
 +      key: "storage",
-+      label: "Storage",
++      label: resolve(msg("Storage")),
 +      percent: percentOf(1 - volume.availableBytes / Math.max(1, volume.totalBytes)),
 +      value: used(volume.totalBytes, volume.availableBytes),
 +    });

@@ -9,7 +9,7 @@ Subject: [PATCH 1/2] Usage limits: background polling, reset-aware merging and
  .../src/provider/Drivers/ClaudeDriver.ts      |  13 +-
  .../src/provider/Drivers/CodexDriver.ts       |  22 +-
  .../src/provider/ProviderRegistry.test.ts     |   6 +-
- .../src/provider/claudeResetCredits.test.ts   | 534 ++++++++++++++++++
+ .../src/provider/claudeResetCredits.test.ts   | 536 ++++++++++++++++++
  .../server/src/provider/claudeResetCredits.ts | 152 +++++
  .../src/provider/claudeUsageLimits.test.ts    | 165 +++++-
  apps/server/src/provider/claudeUsageLimits.ts | 140 ++++-
@@ -24,7 +24,7 @@ Subject: [PATCH 1/2] Usage limits: background polling, reset-aware merging and
  .../provider-cursor/src/server/usageLimits.ts |   1 +
  .../provider-grok/src/server/usageLimits.ts   |   1 +
  .../src/server/usageLimits.ts                 |   3 +
- 19 files changed, 1839 insertions(+), 102 deletions(-)
+ 19 files changed, 1841 insertions(+), 102 deletions(-)
 
 diff --git a/apps/server/src/provider/CodexProvider.ts b/apps/server/src/provider/CodexProvider.ts
 index 63154f4e99..bd32a81ba2 100644
@@ -116,7 +116,7 @@ index 5bedffe924..def4bb4686 100644
          resolveMaintenance().pipe(
            Effect.flatMap((maintenanceCapabilities) =>
 diff --git a/apps/server/src/provider/Drivers/CodexDriver.ts b/apps/server/src/provider/Drivers/CodexDriver.ts
-index 03245ba46d..667017de55 100644
+index ee7716e59e..9ea5f526b1 100644
 --- a/apps/server/src/provider/Drivers/CodexDriver.ts
 +++ b/apps/server/src/provider/Drivers/CodexDriver.ts
 @@ -1,5 +1,9 @@
@@ -130,7 +130,7 @@ index 03245ba46d..667017de55 100644
  import * as Digest from "effect/crypto/Digest";
  import * as SecureRandom from "effect/crypto/SecureRandom";
  import type * as Signature from "effect/crypto/Signature";
-@@ -238,6 +242,7 @@ export const CodexDriver: ProviderDriver<
+@@ -240,6 +244,7 @@ export const CodexDriver: ProviderDriver<
          Effect.map((capabilities) => withCodexNativeLatestVersion(capabilities, httpClient)),
        );
  
@@ -138,7 +138,7 @@ index 03245ba46d..667017de55 100644
      const orchestrationAdapter = yield* createCodexAdapterV2(
        {
          instanceId,
-@@ -253,6 +258,14 @@ export const CodexDriver: ProviderDriver<
+@@ -255,6 +260,14 @@ export const CodexDriver: ProviderDriver<
            Effect.map((value) => value.models),
          ),
          compatibility: installation.compatibility,
@@ -153,7 +153,7 @@ index 03245ba46d..667017de55 100644
        },
      ).pipe(
        Effect.mapError(
-@@ -294,6 +307,13 @@ export const CodexDriver: ProviderDriver<
+@@ -296,6 +309,13 @@ export const CodexDriver: ProviderDriver<
            (draft, catalog) => stampIdentity(applyCodexModelCatalog(draft, catalog)),
          ),
        checkProvider,
@@ -168,7 +168,7 @@ index 03245ba46d..667017de55 100644
          resolveMaintenance().pipe(
            Effect.flatMap((maintenanceCapabilities) =>
 diff --git a/apps/server/src/provider/ProviderRegistry.test.ts b/apps/server/src/provider/ProviderRegistry.test.ts
-index 021c3ddb57..f21a54a170 100644
+index e4ec16b77d..c05439c242 100644
 --- a/apps/server/src/provider/ProviderRegistry.test.ts
 +++ b/apps/server/src/provider/ProviderRegistry.test.ts
 @@ -655,7 +655,11 @@ it.layer(
@@ -185,10 +185,10 @@ index 021c3ddb57..f21a54a170 100644
              ),
            );
 diff --git a/apps/server/src/provider/claudeResetCredits.test.ts b/apps/server/src/provider/claudeResetCredits.test.ts
-index a3a1110d87..7adbb29804 100644
+index a3a1110d87..858913697d 100644
 --- a/apps/server/src/provider/claudeResetCredits.test.ts
 +++ b/apps/server/src/provider/claudeResetCredits.test.ts
-@@ -1,14 +1,34 @@
+@@ -1,14 +1,35 @@
  import * as NodeServices from "@effect/platform-node/NodeServices";
  import { it as effectIt } from "@effect/vitest";
 +import {
@@ -215,6 +215,7 @@ index a3a1110d87..7adbb29804 100644
  
  import * as ClaudeResetCredits from "./claudeResetCredits.ts";
 +import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
++import { noCompatibilityPolicy } from "@t3tools/provider-core/server/compatibility";
 +import { ProviderHost } from "@t3tools/provider-core/server/ProviderHost";
 +
 +const decodeJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
@@ -223,7 +224,7 @@ index a3a1110d87..7adbb29804 100644
  
  const NOW = Date.parse("2026-09-22T12:00:00.000Z");
  const grant = (overrides: Record<string, unknown>) => ({
-@@ -259,3 +279,517 @@ effectIt.layer(NodeServices.layer)("consumeClaudeResetCredit", (it) => {
+@@ -259,3 +280,518 @@ effectIt.layer(NodeServices.layer)("consumeClaudeResetCredit", (it) => {
      }),
    );
  });
@@ -334,6 +335,7 @@ index a3a1110d87..7adbb29804 100644
 +              shouldRunBackgroundWork: () => Effect.succeed(false),
 +              resolveAttachmentPath: () => null,
 +              credentials: () => Effect.die("usage polling must not access credential storage"),
++              compatibility: noCompatibilityPolicy,
 +            }),
 +          ),
 +        ),
@@ -1578,10 +1580,10 @@ index 446d4f1f31..03fe677e9b 100644
  });
  export type ServerProviderUsageWindow = typeof ServerProviderUsageWindow.Type;
 diff --git a/packages/provider-core/src/server/managedProvider.test.ts b/packages/provider-core/src/server/managedProvider.test.ts
-index f878b2f44e..44332804d8 100644
+index 0eccada27c..e8b026488e 100644
 --- a/packages/provider-core/src/server/managedProvider.test.ts
 +++ b/packages/provider-core/src/server/managedProvider.test.ts
-@@ -127,6 +127,7 @@ function layerProviderHost(input: {
+@@ -128,6 +128,7 @@ function layerProviderHost(input: {
  }
  
  const layerAlwaysRunTest = layerProviderHost({ runBackgroundWork: true });
@@ -1589,7 +1591,7 @@ index f878b2f44e..44332804d8 100644
  
  const enrichedSnapshotSecond: ServerProvider = {
    ...refreshedSnapshotSecond,
-@@ -776,12 +777,19 @@ describe("makeManagedServerProvider", () => {
+@@ -777,12 +778,19 @@ describe("makeManagedServerProvider", () => {
          assert.deepStrictEqual(update?.usageLimits, {
            checkedAt: "2026-04-10T00:05:00.000Z",
            windows: [
@@ -1610,7 +1612,7 @@ index f878b2f44e..44332804d8 100644
                resetsAt: "2026-04-17T00:00:00.000Z",
              },
            ],
-@@ -870,12 +878,16 @@ describe("makeManagedServerProvider", () => {
+@@ -871,12 +879,16 @@ describe("makeManagedServerProvider", () => {
            Effect.map((chunk) => Array.from(chunk)[0]!),
          );
          assert.deepStrictEqual(enriched.models, enrichedSnapshot.models);
@@ -1629,7 +1631,7 @@ index f878b2f44e..44332804d8 100644
          assert.strictEqual(refreshed.auth.workspaceId, "ws-a");
          assert.strictEqual(refreshed.auth.label, clearPlan ? undefined : "tier-2");
  
-@@ -966,7 +978,13 @@ describe("makeManagedServerProvider", () => {
+@@ -967,7 +979,13 @@ describe("makeManagedServerProvider", () => {
          assert.strictEqual((yield* provider.getSnapshot).auth.label, undefined);
          const refreshed = yield* provider.refresh;
          assert.strictEqual(refreshed.auth.label, undefined);
@@ -1644,7 +1646,7 @@ index f878b2f44e..44332804d8 100644
        }),
      ).pipe(Effect.provide(layerAlwaysRunTest)),
    );
-@@ -1007,15 +1025,21 @@ describe("makeManagedServerProvider", () => {
+@@ -1008,15 +1026,21 @@ describe("makeManagedServerProvider", () => {
          const partial = yield* provider.getSnapshot;
          assert.deepStrictEqual(partial.usageLimits, {
            checkedAt: "2026-04-10T00:00:02.000Z",
@@ -1669,7 +1671,7 @@ index f878b2f44e..44332804d8 100644
  
          const completeLimits = {
            checkedAt: "2026-04-10T00:00:04.000Z",
-@@ -1025,8 +1049,236 @@ describe("makeManagedServerProvider", () => {
+@@ -1026,8 +1050,236 @@ describe("makeManagedServerProvider", () => {
            ],
          } as const;
          yield* Ref.set(probeSnapshot, { ...refreshedSnapshot, usageLimits: completeLimits });
@@ -1908,20 +1910,21 @@ index f878b2f44e..44332804d8 100644
 +  ).pipe(Effect.provide(layerAlwaysRunTest)),
 +);
 diff --git a/packages/provider-core/src/server/managedProvider.ts b/packages/provider-core/src/server/managedProvider.ts
-index 33a8273359..b6318e17ca 100644
+index 2762930b5e..48b68dcc1e 100644
 --- a/packages/provider-core/src/server/managedProvider.ts
 +++ b/packages/provider-core/src/server/managedProvider.ts
-@@ -4,7 +4,9 @@ import {
+@@ -4,8 +4,10 @@ import {
    ServerSettingsError,
  } from "@t3tools/contracts";
  import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
 +import * as Cause from "effect/Cause";
+ import * as Context from "effect/Context";
  import * as Duration from "effect/Duration";
 +import * as Clock from "effect/Clock";
  import * as Effect from "effect/Effect";
  import * as Equal from "effect/Equal";
  import * as Fiber from "effect/Fiber";
-@@ -20,6 +22,7 @@ import {
+@@ -21,6 +23,7 @@ import {
    applyUsageLimitsUpdate,
    makeUsageLimits,
    resolveUsageLimitsAfterProbe,
@@ -1929,7 +1932,7 @@ index 33a8273359..b6318e17ca 100644
  } from "./usageLimits.ts";
  import type { ManagedServerProvider } from "./snapshot.ts";
  
-@@ -29,6 +32,7 @@ interface ProviderSnapshotState {
+@@ -30,6 +33,7 @@ interface ProviderSnapshotState {
    // null preserves an explicitly cleared plan across probes and enrichment.
    readonly usageAuthLabel: string | null | undefined;
    readonly checked: boolean;
@@ -1937,7 +1940,7 @@ index 33a8273359..b6318e17ca 100644
  }
  
  function withUsageLimits(
-@@ -55,6 +59,9 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
+@@ -64,6 +68,9 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
    readonly checkProvider: Effect.Effect<ServerProvider, ServerSettingsError>;
    readonly checkUsageLimits?: Effect.Effect<ServerProvider["usageLimits"]>;
    readonly invalidateUsageCache?: Effect.Effect<void>;
@@ -1947,7 +1950,7 @@ index 33a8273359..b6318e17ca 100644
    readonly enrichSnapshot?: (input: {
      readonly settings: Settings;
      readonly snapshot: ServerProvider;
-@@ -253,7 +260,13 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
+@@ -264,7 +271,13 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
        const snapshotToPublish = yield* Ref.modify(snapshotStateRef, (state) => {
          const complete = update.complete && update.windows.length > 0;
          const usageLimits = complete
@@ -1962,7 +1965,7 @@ index 33a8273359..b6318e17ca 100644
            : applyUsageLimitsUpdate({
                previous: state.snapshot.usageLimits,
                update,
-@@ -264,6 +277,7 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
+@@ -275,6 +288,7 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
          const relabel =
            (label !== undefined || (complete && state.usageAuthLabel !== undefined)) &&
            label !== auth.label;
@@ -1970,7 +1973,7 @@ index 33a8273359..b6318e17ca 100644
          if (usageLimits === state.snapshot.usageLimits && !relabel) {
            return [null, state] as const;
          }
-@@ -271,12 +285,36 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
+@@ -282,12 +296,36 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
            relabel ? { ...state.snapshot, auth: { ...auth, label } } : state.snapshot,
            usageLimits,
          );
@@ -2008,7 +2011,7 @@ index 33a8273359..b6318e17ca 100644
            },
          ] as const;
        });
-@@ -375,6 +413,43 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
+@@ -386,6 +424,43 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
      return genericDemand || instanceDemand;
    });
  
