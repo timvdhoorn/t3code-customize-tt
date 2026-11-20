@@ -12,14 +12,14 @@ server.getHostResources with optional fields; drop when pingdotgg/t3code#36693 m
  .../resourceTelemetry/HostResources.test.ts   | 145 +++++++++++++++++-
  .../src/resourceTelemetry/HostResources.ts    |  91 ++++++++++-
  .../chat/ThreadDetailsHost.browser.test.tsx   | 113 ++++++++++++++
- .../src/components/chat/ThreadDetailsHost.tsx | 125 +++++++++++++++
+ .../src/components/chat/ThreadDetailsHost.tsx | 141 +++++++++++++++++
  .../chat/ThreadDetailsItemsMenu.tsx           |   8 +
  .../components/chat/ThreadDetailsPanel.tsx    |   3 +
  .../components/chat/ThreadDetailsUsage.tsx    |   4 +-
  .../src/components/chat/threadDetailsItems.ts |   1 +
  packages/contracts/src/resourceTelemetry.ts   |   6 +
  packages/contracts/src/settings.ts            |   2 +
- 11 files changed, 491 insertions(+), 8 deletions(-)
+ 11 files changed, 507 insertions(+), 8 deletions(-)
  create mode 100644 apps/web/src/components/chat/ThreadDetailsHost.browser.test.tsx
  create mode 100644 apps/web/src/components/chat/ThreadDetailsHost.tsx
 
@@ -506,11 +506,12 @@ index 0000000000..fab3bb6795
 +});
 diff --git a/apps/web/src/components/chat/ThreadDetailsHost.tsx b/apps/web/src/components/chat/ThreadDetailsHost.tsx
 new file mode 100644
-index 0000000000..900b0fc3f0
+index 0000000000..c41eda3da5
 --- /dev/null
 +++ b/apps/web/src/components/chat/ThreadDetailsHost.tsx
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,141 @@
 +import type { EnvironmentId } from "@t3tools/contracts";
++import { T, useGT, Var } from "gt-react";
 +import { useEffect } from "react";
 +
 +import { useClientSettings } from "../../hooks/useSettings";
@@ -531,6 +532,7 @@ index 0000000000..900b0fc3f0
 +
 +/** CPU, memory and storage of the host this thread's environment runs on. */
 +export function ThreadDetailsHost({ environmentId }: { readonly environmentId: EnvironmentId }) {
++  const gt = useGT();
 +  const { data, refresh } = useEnvironmentQuery(
 +    serverEnvironment.hostResources({ environmentId, input: {} }),
 +  );
@@ -557,7 +559,7 @@ index 0000000000..900b0fc3f0
 +  return (
 +    <ThreadDetailsSection
 +      headingId="thread-details-host-heading"
-+      title="Host load"
++      title={gt("Host load")}
 +      showHeading={false}
 +    >
 +      <div className="grid grid-cols-[auto_minmax(3rem,1fr)_auto] gap-x-3 text-xs">
@@ -565,31 +567,31 @@ index 0000000000..900b0fc3f0
 +          label="CPU"
 +          fill={cpu}
 +          tone={cpu === null ? null : toneOf(cpu)}
-+          value={cpu === null ? "n/a" : `${cpu}%`}
++          value={cpu === null ? gt("n/a") : `${cpu}%`}
 +          tooltip={
 +            cores ? (
 +              <span className="block text-foreground">
 +                <span className="block">
-+                  {cores.length} cores · {threads} threads
++                  {gt("{cores} cores · {threads} threads", { cores: cores.length, threads })}
 +                </span>
 +                {cores.map((core, index) => (
 +                  // Index is the core's position in the server's order, which does not change.
 +                  // oxlint-disable-next-line react/no-array-index-key
 +                  <span key={index} className="flex justify-between gap-3 font-mono tabular-nums">
-+                    <span>Core {index + 1}</span>
++                    <span>{gt("Core {number}", { number: index + 1 })}</span>
 +                    <span>{coreLoad(core).text}</span>
 +                  </span>
 +                ))}
 +              </span>
 +            ) : (
-+              <span className="text-foreground">{threads} threads</span>
++              <span className="text-foreground">{gt("{threads} threads", { threads })}</span>
 +            )
 +          }
 +        />
 +        {breakdown
 +          ? cores?.map((core, index) => {
 +              const { busy, text } = coreLoad(core);
-+              const label = `Core ${index + 1}`;
++              const label = gt("Core {number}", { number: index + 1 });
 +              return (
 +                <UsageRow
 +                  // Index is the core's position in the server's order, which does not change.
@@ -601,7 +603,9 @@ index 0000000000..900b0fc3f0
 +                  value={text}
 +                  tooltip={
 +                    <span className="text-foreground">
-+                      {core.length > 1 ? `Threads: ${busy.join("%, ")}%` : `${busy[0]}% busy`}
++                      {core.length > 1
++                        ? gt("Threads: {loads}%", { loads: busy.join("%, ") })
++                        : gt("{load}% busy", { load: busy[0] })}
 +                    </span>
 +                  }
 +                />
@@ -610,25 +614,37 @@ index 0000000000..900b0fc3f0
 +          : null}
 +        {breakdown && !cores ? (
 +          <p className="col-span-3 text-muted-foreground">
-+            Per-core load not available on this host
++            <T>Per-core load not available on this host</T>
 +          </p>
 +        ) : null}
 +        <UsageRow
-+          label="Memory"
++          label={gt("Memory")}
 +          fill={memory}
 +          tone={toneOf(memory)}
 +          value={used(data.totalMemoryBytes, data.availableMemoryBytes)}
-+          ariaValue={`${memory}% used`}
-+          tooltip={<span className="text-foreground">Memory: {memory}% used</span>}
++          ariaValue={gt("{percent}% used", { percent: memory })}
++          tooltip={
++            <span className="text-foreground">
++              <T>
++                Memory: <Var>{memory}</Var>% used
++              </T>
++            </span>
++          }
 +        />
 +        {volume ? (
 +          <UsageRow
-+            label="Storage"
++            label={gt("Storage")}
 +            fill={storage}
 +            tone={toneOf(storage)}
 +            value={used(volume.totalBytes, volume.availableBytes)}
-+            ariaValue={`${storage}% used`}
-+            tooltip={<span className="text-foreground">Storage: {storage}% used</span>}
++            ariaValue={gt("{percent}% used", { percent: storage })}
++            tooltip={
++              <span className="text-foreground">
++                <T>
++                  Storage: <Var>{storage}</Var>% used
++                </T>
++              </span>
++            }
 +          />
 +        ) : null}
 +      </div>
@@ -636,18 +652,18 @@ index 0000000000..900b0fc3f0
 +  );
 +}
 diff --git a/apps/web/src/components/chat/ThreadDetailsItemsMenu.tsx b/apps/web/src/components/chat/ThreadDetailsItemsMenu.tsx
-index d84c13809e..e7a7125215 100644
+index 691e15fdc0..e956ff3d47 100644
 --- a/apps/web/src/components/chat/ThreadDetailsItemsMenu.tsx
 +++ b/apps/web/src/components/chat/ThreadDetailsItemsMenu.tsx
-@@ -15,6 +15,7 @@ import {
- /** Menu body that shows and hides thread details items. The card's context menu and Settings share it. */
+@@ -17,6 +17,7 @@ import {
  export function ThreadDetailsItemsMenuItems() {
    const visibility = useClientSettings(resolveThreadDetailsVisibility);
+   const m = useMessages();
 +  const hostCores = useClientSettings((settings) => settings.threadDetailsHostCores);
    return (
      <>
        <MenuGroup>
-@@ -34,6 +35,13 @@ export function ThreadDetailsItemsMenuItems() {
+@@ -38,6 +39,13 @@ export function ThreadDetailsItemsMenuItems() {
          ))}
        </MenuGroup>
        <MenuSeparator />
@@ -656,16 +672,16 @@ index d84c13809e..e7a7125215 100644
 +        disabled={!visibility.host}
 +        onCheckedChange={(checked) => updateClientSettings({ threadDetailsHostCores: checked })}
 +      >
-+        Show core breakdown
++        <T>Show core breakdown</T>
 +      </MenuCheckboxItem>
        <MenuItem
          disabled={isDefaultThreadDetailsVisibility(visibility)}
          onClick={() => updateClientSettings(RESET_THREAD_DETAILS_ITEMS)}
 diff --git a/apps/web/src/components/chat/ThreadDetailsPanel.tsx b/apps/web/src/components/chat/ThreadDetailsPanel.tsx
-index 4942080dbb..8d4e5af213 100644
+index d91c0156e8..68278a88fa 100644
 --- a/apps/web/src/components/chat/ThreadDetailsPanel.tsx
 +++ b/apps/web/src/components/chat/ThreadDetailsPanel.tsx
-@@ -31,6 +31,7 @@ import {
+@@ -32,6 +32,7 @@ import {
    ThreadDetailsUsage,
    type ThreadDetailsUsageInput,
  } from "./ThreadDetailsUsage";
@@ -683,19 +699,19 @@ index 4942080dbb..8d4e5af213 100644
  
                {visible.context && props.usage.contextWindow ? (
 diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.tsx b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
-index 0d6c012948..8717c2141a 100644
+index b2e09a35c5..78d154301a 100644
 --- a/apps/web/src/components/chat/ThreadDetailsUsage.tsx
 +++ b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
-@@ -175,7 +175,7 @@ function LimitRow({
+@@ -202,7 +202,7 @@ function LimitRow({
  }
  
- /** One label, hairline, and value row; the whole row opens the details tooltip. */
+ /** One label, hairline, and value row; the whole row opens the details tooltip. With `opensUsage` it links to the usage page. */
 -function UsageRow({
 +export function UsageRow({
    label,
    fill,
    tone,
-@@ -237,7 +237,7 @@ function UsageRow({
+@@ -274,7 +274,7 @@ function UsageRow({
          <span
            className={cn(
              // Text-only rows span the bar column so they never widen the shared value column.
@@ -705,19 +721,19 @@ index 0d6c012948..8717c2141a 100644
              tone === "error"
                ? "text-error-foreground"
 diff --git a/apps/web/src/components/chat/threadDetailsItems.ts b/apps/web/src/components/chat/threadDetailsItems.ts
-index e6f94cc4e1..05677dcf18 100644
+index 9f8f05449c..dd38c602d3 100644
 --- a/apps/web/src/components/chat/threadDetailsItems.ts
 +++ b/apps/web/src/components/chat/threadDetailsItems.ts
-@@ -14,6 +14,7 @@ export const THREAD_DETAILS_ITEMS = [
-   { id: "sideChats", label: "Side chats", defaultVisible: true },
-   { id: "usage", label: "Usage limits", defaultVisible: false },
-   { id: "context", label: "Context window", defaultVisible: false },
-+  { id: "host", label: "Host load", defaultVisible: false },
+@@ -27,6 +27,7 @@ export const THREAD_DETAILS_ITEMS = [
+   { id: "sideChats", label: msg("Side chats"), defaultVisible: true },
+   { id: "usage", label: msg("Usage limits"), defaultVisible: false },
+   { id: "context", label: msg("Context window"), defaultVisible: false },
++  { id: "host", label: msg("Host load"), defaultVisible: false },
  ] as const;
  
  export type ThreadDetailsItemId = (typeof THREAD_DETAILS_ITEMS)[number]["id"];
 diff --git a/packages/contracts/src/resourceTelemetry.ts b/packages/contracts/src/resourceTelemetry.ts
-index ff6fdc2599..ee24211a77 100644
+index f3800089f5..7a6336d183 100644
 --- a/packages/contracts/src/resourceTelemetry.ts
 +++ b/packages/contracts/src/resourceTelemetry.ts
 @@ -12,6 +12,12 @@ export const HostResourcesSnapshot = Schema.Struct({
@@ -734,7 +750,7 @@ index ff6fdc2599..ee24211a77 100644
  export type HostResourcesSnapshot = typeof HostResourcesSnapshot.Type;
  
 diff --git a/packages/contracts/src/settings.ts b/packages/contracts/src/settings.ts
-index 77679296e1..c80a0cd7e1 100644
+index 721e75d1b1..829cf2a1eb 100644
 --- a/packages/contracts/src/settings.ts
 +++ b/packages/contracts/src/settings.ts
 @@ -563,6 +563,7 @@ export const ClientSettingsSchema = Schema.Struct({
@@ -745,7 +761,7 @@ index 77679296e1..c80a0cd7e1 100644
    sidebarWorkingShelfEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
    sidebarProjectGroupingMode: SidebarProjectGroupingMode.pipe(
      Schema.withDecodingDefault(Effect.succeed(DEFAULT_SIDEBAR_PROJECT_GROUPING_MODE)),
-@@ -2128,6 +2129,7 @@ export const ClientSettingsPatch = Schema.Struct({
+@@ -2131,6 +2132,7 @@ export const ClientSettingsPatch = Schema.Struct({
    screenReaderWindowTitle: Schema.optionalKey(Schema.Boolean),
    threadDetailsUsageEnabled: Schema.optionalKey(Schema.Boolean),
    threadDetailsItems: Schema.optionalKey(Schema.Record(Schema.String, Schema.Boolean)),

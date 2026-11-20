@@ -9,8 +9,8 @@ Subject: [PATCH 07/16] feat(desktop): add macOS window glass with an inset
  apps/desktop/src/window/DesktopWindow.ts      |  24 +-
  apps/web/src/appInit.tsx                      |  29 ++
  .../src/components/ThreadTerminalDrawer.tsx   |   3 +-
- .../settings/AppearanceSettingsPanel.tsx      | 111 +++++++
- .../components/settings/SettingsPanels.tsx    |   8 +
+ .../settings/AppearanceSettingsPanel.tsx      | 115 +++++++
+ .../components/settings/SettingsPanels.tsx    |  10 +
  .../src/components/settings/settingsSearch.ts |  18 +
  apps/web/src/index.css                        | 313 ++++++++++++++++++
  apps/web/src/terminal/ghostty/core.ts         |   2 +
@@ -20,7 +20,7 @@ Subject: [PATCH 07/16] feat(desktop): add macOS window glass with an inset
  apps/web/src/windowGlass.test.ts              | 106 ++++++
  apps/web/src/windowGlass.ts                   |  76 +++++
  packages/contracts/src/settings.ts            |  21 ++
- 15 files changed, 839 insertions(+), 9 deletions(-)
+ 15 files changed, 845 insertions(+), 9 deletions(-)
  create mode 100644 apps/desktop/src/window/DesktopWindow.glass.test.ts
  create mode 100644 apps/web/src/terminal/ghostty/renderer.test.ts
  create mode 100644 apps/web/src/windowGlass.test.ts
@@ -51,10 +51,10 @@ index 0000000000..2e8fe8bc8f
 +  });
 +});
 diff --git a/apps/desktop/src/window/DesktopWindow.ts b/apps/desktop/src/window/DesktopWindow.ts
-index 4628be44d5..c53562ffd0 100644
+index 741e03b79b..d9d0486791 100644
 --- a/apps/desktop/src/window/DesktopWindow.ts
 +++ b/apps/desktop/src/window/DesktopWindow.ts
-@@ -165,6 +165,24 @@ function getInitialWindowBackgroundColor(shouldUseDarkColors: boolean): string {
+@@ -167,6 +167,24 @@ function getInitialWindowBackgroundColor(shouldUseDarkColors: boolean): string {
    return shouldUseDarkColors ? "#000000" : "#ffffff";
  }
  
@@ -79,7 +79,7 @@ index 4628be44d5..c53562ffd0 100644
  type DisplayBounds = Pick<Electron.Rectangle, "x" | "y" | "width" | "height">;
  
  // A window snapped to a display edge can be reported 1px past that edge.
-@@ -352,7 +370,9 @@ function syncWindowAppearance(
+@@ -354,7 +372,9 @@ function syncWindowAppearance(
        return;
      }
  
@@ -90,7 +90,7 @@ index 4628be44d5..c53562ffd0 100644
      const { titleBarOverlay } = getWindowTitleBarOptions(shouldUseDarkColors, platform);
      if (hasTitleBarOverlay && typeof titleBarOverlay === "object") {
        window.setTitleBarOverlay(titleBarOverlay);
-@@ -481,6 +501,7 @@ export const make = Effect.gen(function* () {
+@@ -483,6 +503,7 @@ export const make = Effect.gen(function* () {
        autoHideMenuBar: true,
        ...(environment.platform === "darwin" ? { disableAutoHideCursor: true } : {}),
        backgroundColor: getInitialWindowBackgroundColor(shouldUseDarkColors),
@@ -98,7 +98,7 @@ index 4628be44d5..c53562ffd0 100644
        ...iconOption,
        title: environment.displayName,
        ...getWindowTitleBarOptions(shouldUseDarkColors, environment.platform),
-@@ -506,6 +527,7 @@ export const make = Effect.gen(function* () {
+@@ -508,6 +529,7 @@ export const make = Effect.gen(function* () {
      yield* rendererHistory.register(window.webContents, { surface: "main" });
      if (environment.platform === "darwin") {
        window.setAutoHideCursor(false);
@@ -107,7 +107,7 @@ index 4628be44d5..c53562ffd0 100644
      let boundsPersistFiber: Fiber.Fiber<void, never> | undefined;
      let pendingBoundsPersistFiber: Fiber.Fiber<void, never> | undefined;
 diff --git a/apps/web/src/appInit.tsx b/apps/web/src/appInit.tsx
-index d1873481ee..1b04be7849 100644
+index ae8e685c5c..c5573fdc79 100644
 --- a/apps/web/src/appInit.tsx
 +++ b/apps/web/src/appInit.tsx
 @@ -13,6 +13,12 @@ import { applyAppearanceFontVariables, TYPOGRAPHY_ADVANCED_STORAGE_KEY } from ".
@@ -131,7 +131,7 @@ index d1873481ee..1b04be7849 100644
  import {
    subscribeComposerDraftModelReconciliation,
    subscribeDraftThreadPromotion,
-@@ -99,6 +106,28 @@ function startClientAppearance(): void {
+@@ -100,6 +107,28 @@ function startClientAppearance(): void {
          root.style.removeProperty("--glass-blur");
        }
      }
@@ -161,10 +161,10 @@ index d1873481ee..1b04be7849 100644
        previous?.fontFamilySans !== settings.fontFamilySans ||
        previous.fontFamilyCode !== settings.fontFamilyCode ||
 diff --git a/apps/web/src/components/ThreadTerminalDrawer.tsx b/apps/web/src/components/ThreadTerminalDrawer.tsx
-index 8d6e53360d..dbcea1208e 100644
+index 54ae776e18..a1eb7e6eb0 100644
 --- a/apps/web/src/components/ThreadTerminalDrawer.tsx
 +++ b/apps/web/src/components/ThreadTerminalDrawer.tsx
-@@ -386,6 +386,7 @@ export function terminalThemeFromApp(mountElement?: HTMLElement | null): Ghostty
+@@ -389,6 +389,7 @@ export function terminalThemeFromApp(mountElement?: HTMLElement | null): Ghostty
      ),
      palette: TERMINAL_PALETTES[isDark ? "dark" : "light"],
      selectionBackground: terminalSelection,
@@ -172,7 +172,7 @@ index 8d6e53360d..dbcea1208e 100644
    };
  }
  
-@@ -1104,7 +1105,7 @@ function TerminalSessionViewport({
+@@ -1129,7 +1130,7 @@ function TerminalSessionViewport({
        });
        themeObserver.observe(document.documentElement, {
          attributes: true,
@@ -182,10 +182,10 @@ index 8d6e53360d..dbcea1208e 100644
        setupCleanups.push(() => themeObserver.disconnect());
  
 diff --git a/apps/web/src/components/settings/AppearanceSettingsPanel.tsx b/apps/web/src/components/settings/AppearanceSettingsPanel.tsx
-index 00783b085d..225d2faa09 100644
+index 72fda9150a..2c34681b4c 100644
 --- a/apps/web/src/components/settings/AppearanceSettingsPanel.tsx
 +++ b/apps/web/src/components/settings/AppearanceSettingsPanel.tsx
-@@ -9,10 +9,14 @@ import {
+@@ -10,10 +10,14 @@ import {
    MAX_APPEARANCE_CONTRAST,
    MAX_GLASS_OPACITY,
    MAX_PANEL_ANIMATION_DURATION_MS,
@@ -200,7 +200,7 @@ index 00783b085d..225d2faa09 100644
  import {
    resolveSidebarStageBackdropVariant,
    type SidebarStageBackdropVariant,
-@@ -127,6 +131,15 @@ export function AppearanceSettingsPanel() {
+@@ -132,6 +136,15 @@ export function AppearanceSettingsPanel() {
      "--settings-slider-progress": `${glassOpacityRatio * 100}%`,
      "--settings-slider-fill-offset": `${0.5 - glassOpacityRatio}rem`,
    } as CSSProperties;
@@ -216,18 +216,18 @@ index 00783b085d..225d2faa09 100644
    const appearanceContrastRatio =
      (settings.appearanceContrast - MIN_APPEARANCE_CONTRAST) /
      (MAX_APPEARANCE_CONTRAST - MIN_APPEARANCE_CONTRAST);
-@@ -257,6 +270,104 @@ export function AppearanceSettingsPanel() {
+@@ -262,6 +275,108 @@ export function AppearanceSettingsPanel() {
            }
          />
  
 +        {showWindowGlass ? (
 +          <SettingsRow
 +            {...searchableSetting("window-glass")}
-+            description="Let the desktop show through the sidebar and the conversation."
++            description={gt("Let the desktop show through the sidebar and the conversation.")}
 +            resetAction={
 +              settings.windowGlass !== DEFAULT_UNIFIED_SETTINGS.windowGlass ? (
 +                <SettingResetButton
-+                  label="window glass"
++                  ariaLabel={gt("Reset window glass to default")}
 +                  onClick={() =>
 +                    updateSettings({ windowGlass: DEFAULT_UNIFIED_SETTINGS.windowGlass })
 +                  }
@@ -236,7 +236,7 @@ index 00783b085d..225d2faa09 100644
 +            }
 +            control={
 +              <Switch
-+                aria-label="Window glass"
++                aria-label={gt("Window glass")}
 +                checked={settings.windowGlass}
 +                onCheckedChange={(checked) => updateSettings({ windowGlass: Boolean(checked) })}
 +              />
@@ -247,11 +247,13 @@ index 00783b085d..225d2faa09 100644
 +        {showWindowGlass && settings.windowGlass ? (
 +          <SettingsRow
 +            {...searchableSetting("window-transparency")}
-+            description="Higher values let more of the desktop through the sidebar and the conversation."
++            description={gt(
++              "Higher values let more of the desktop through the sidebar and the conversation.",
++            )}
 +            resetAction={
 +              settings.windowTransparency !== DEFAULT_UNIFIED_SETTINGS.windowTransparency ? (
 +                <SettingResetButton
-+                  label="window transparency"
++                  ariaLabel={gt("Reset window transparency to default")}
 +                  onClick={() =>
 +                    updateSettings({
 +                      windowTransparency: DEFAULT_UNIFIED_SETTINGS.windowTransparency,
@@ -269,7 +271,7 @@ index 00783b085d..225d2faa09 100644
 +                  {settings.windowTransparency}%
 +                </output>
 +                <input
-+                  aria-label="Window transparency"
++                  aria-label={gt("Window transparency")}
 +                  className="settings-slider min-w-0 flex-1"
 +                  id="window-transparency"
 +                  max={MAX_WINDOW_TRANSPARENCY}
@@ -297,11 +299,13 @@ index 00783b085d..225d2faa09 100644
 +        {showWindowGlass ? (
 +          <SettingsRow
 +            {...searchableSetting("window-card")}
-+            description="Frame the conversation as a card with rounded corners beside the sidebar."
++            description={gt(
++              "Frame the conversation as a card with rounded corners beside the sidebar.",
++            )}
 +            resetAction={
 +              settings.windowCard !== DEFAULT_UNIFIED_SETTINGS.windowCard ? (
 +                <SettingResetButton
-+                  label="conversation card"
++                  ariaLabel={gt("Reset conversation card to default")}
 +                  onClick={() =>
 +                    updateSettings({ windowCard: DEFAULT_UNIFIED_SETTINGS.windowCard })
 +                  }
@@ -310,7 +314,7 @@ index 00783b085d..225d2faa09 100644
 +            }
 +            control={
 +              <Switch
-+                aria-label="Conversation card"
++                aria-label={gt("Conversation card")}
 +                checked={settings.windowCard}
 +                onCheckedChange={(checked) => updateSettings({ windowCard: Boolean(checked) })}
 +              />
@@ -320,24 +324,26 @@ index 00783b085d..225d2faa09 100644
 +
          <SettingsRow
            {...searchableSetting("chat-width")}
-           description="Set how wide messages and the composer can grow on large screens."
+           description={gt("Set how wide messages and the composer can grow on large screens.")}
 diff --git a/apps/web/src/components/settings/SettingsPanels.tsx b/apps/web/src/components/settings/SettingsPanels.tsx
-index ce31142b66..e24361564f 100644
+index 87a1ccef0a..10ed8965c2 100644
 --- a/apps/web/src/components/settings/SettingsPanels.tsx
 +++ b/apps/web/src/components/settings/SettingsPanels.tsx
-@@ -461,6 +461,11 @@ export function useSettingsRestore(onRestored?: () => void) {
-       ? ["Contrast"]
+@@ -497,6 +497,13 @@ export function useSettingsRestore(onRestored?: () => void) {
+     ...(settings.glassOpacity !== DEFAULT_UNIFIED_SETTINGS.glassOpacity
+       ? [gt("Glass opacity")]
        : []),
-     ...(settings.glassOpacity !== DEFAULT_UNIFIED_SETTINGS.glassOpacity ? ["Glass opacity"] : []),
-+    ...(settings.windowGlass !== DEFAULT_UNIFIED_SETTINGS.windowGlass ? ["Window glass"] : []),
-+    ...(settings.windowCard !== DEFAULT_UNIFIED_SETTINGS.windowCard ? ["Conversation card"] : []),
++    ...(settings.windowGlass !== DEFAULT_UNIFIED_SETTINGS.windowGlass ? [gt("Window glass")] : []),
++    ...(settings.windowCard !== DEFAULT_UNIFIED_SETTINGS.windowCard
++      ? [gt("Conversation card")]
++      : []),
 +    ...(settings.windowTransparency !== DEFAULT_UNIFIED_SETTINGS.windowTransparency
-+      ? ["Window transparency"]
++      ? [gt("Window transparency")]
 +      : []),
      ...(settings.diffColorScheme !== DEFAULT_UNIFIED_SETTINGS.diffColorScheme
-       ? ["Diff colors"]
+       ? [gt("Diff colors")]
        : []),
-@@ -677,6 +682,9 @@ export function useSettingsRestore(onRestored?: () => void) {
+@@ -716,6 +723,9 @@ export function useSettingsRestore(onRestored?: () => void) {
        screenReaderWindowTitle: DEFAULT_UNIFIED_SETTINGS.screenReaderWindowTitle,
        environmentIdentificationMode: DEFAULT_UNIFIED_SETTINGS.environmentIdentificationMode,
        glassOpacity: DEFAULT_UNIFIED_SETTINGS.glassOpacity,
@@ -348,34 +354,34 @@ index ce31142b66..e24361564f 100644
        sidebarProjectGroupingMode: DEFAULT_UNIFIED_SETTINGS.sidebarProjectGroupingMode,
        sidebarProjectSortOrder: DEFAULT_UNIFIED_SETTINGS.sidebarProjectSortOrder,
 diff --git a/apps/web/src/components/settings/settingsSearch.ts b/apps/web/src/components/settings/settingsSearch.ts
-index 154ad97bae..fa6a2645dc 100644
+index 51ac4d7e19..3a504f5e58 100644
 --- a/apps/web/src/components/settings/settingsSearch.ts
 +++ b/apps/web/src/components/settings/settingsSearch.ts
-@@ -335,6 +335,24 @@ export const SETTINGS_SEARCH_ITEMS = [
+@@ -353,6 +353,24 @@ export const SETTINGS_SEARCH_ITEMS = [
      to: "/settings/appearance",
-     searchTerms: ["transparent transparency solid menus dialogs composer"],
+     searchTerms: [msg("transparent transparency solid menus dialogs composer")],
    },
 +  {
 +    id: "window-glass",
-+    title: "Window glass",
++    title: msg("Window glass"),
 +    to: "/settings/appearance",
-+    searchTerms: ["vibrancy blur translucent macos sidebar card liquid"],
++    searchTerms: [msg("vibrancy blur translucent macos sidebar card liquid")],
 +  },
 +  {
 +    id: "window-transparency",
-+    title: "Window transparency",
++    title: msg("Window transparency"),
 +    to: "/settings/appearance",
-+    searchTerms: ["vibrancy glass blur translucent macos sidebar card opacity"],
++    searchTerms: [msg("vibrancy glass blur translucent macos sidebar card opacity")],
 +  },
 +  {
 +    id: "window-card",
-+    title: "Conversation card",
++    title: msg("Conversation card"),
 +    to: "/settings/appearance",
-+    searchTerms: ["inset card rounded corners frame gap macos rex"],
++    searchTerms: [msg("inset card rounded corners frame gap macos rex")],
 +  },
    {
      id: "diff-color-scheme",
-     title: "Diff colors",
+     title: msg("Diff colors"),
 diff --git a/apps/web/src/index.css b/apps/web/src/index.css
 index 05541d3970..23def256ba 100644
 --- a/apps/web/src/index.css
@@ -859,10 +865,10 @@ index b35070ed72..a91c0ee833 100644
      let backgroundStart = 0;
      while (backgroundStart < row.cells.length) {
 diff --git a/apps/web/src/terminal/ghostty/surface.ts b/apps/web/src/terminal/ghostty/surface.ts
-index e3d8cfbbe9..bd90045009 100644
+index 2e450cff91..b35b2b8d4b 100644
 --- a/apps/web/src/terminal/ghostty/surface.ts
 +++ b/apps/web/src/terminal/ghostty/surface.ts
-@@ -722,10 +722,12 @@ export class GhosttyTerminalSurface {
+@@ -724,10 +724,12 @@ export class GhosttyTerminalSurface {
      scrollbar.append(scrollbarThumb);
      mount.replaceChildren(canvas, input, scrollbar);
  
@@ -878,7 +884,7 @@ index e3d8cfbbe9..bd90045009 100644
      const fontSize = terminalFontSize(options.font?.size);
      try {
        // Load bundled fonts before measuring; fallback metrics would size the wrong grid.
-@@ -2090,6 +2092,7 @@ export class GhosttyTerminalSurface {
+@@ -2092,6 +2094,7 @@ export class GhosttyTerminalSurface {
        previousCursorY: this.renderedCursorY,
        focused: this.focused,
        hoveredLinkRange: this.hoveredLink?.range ?? null,
@@ -1081,7 +1087,7 @@ index 0000000000..e58808e548
 +  root.style.setProperty("--window-glass-card", `${Math.round(glass.cardAlpha * 1000) / 10}%`);
 +}
 diff --git a/packages/contracts/src/settings.ts b/packages/contracts/src/settings.ts
-index 678f58294c..77679296e1 100644
+index 378b8af0e4..721e75d1b1 100644
 --- a/packages/contracts/src/settings.ts
 +++ b/packages/contracts/src/settings.ts
 @@ -147,6 +147,19 @@ export const GlassOpacity = Schema.Int.check(
@@ -1116,7 +1122,7 @@ index 678f58294c..77679296e1 100644
    fontSizeInterface: InterfaceFontSize.pipe(
      Schema.withDecodingDefault(Effect.succeed(DEFAULT_INTERFACE_FONT_SIZE)),
    ),
-@@ -2078,6 +2096,9 @@ export const ClientSettingsPatch = Schema.Struct({
+@@ -2081,6 +2099,9 @@ export const ClientSettingsPatch = Schema.Struct({
    diffLayout: Schema.optionalKey(DiffLayout),
    environmentIdentificationMode: Schema.optionalKey(EnvironmentIdentificationMode),
    glassOpacity: Schema.optionalKey(GlassOpacity),

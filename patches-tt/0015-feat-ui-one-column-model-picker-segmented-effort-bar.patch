@@ -5,14 +5,14 @@ Subject: [PATCH 15/16] feat(ui): one-column model picker, segmented effort bar
  and a live timer on running sidebar rows
 
 ---
- .../chat/ComposerModelEffort.browser.test.tsx | 55 +++++++++++++-
- .../components/chat/ComposerModelEffort.tsx   | 73 +++++++++++--------
+ .../chat/ComposerModelEffort.browser.test.tsx | 55 +++++++++++-
+ .../components/chat/ComposerModelEffort.tsx   | 86 +++++++++++--------
  .../components/chat/ModelPickerContent.tsx    |  2 +-
- .../chat/ProviderModelPicker.browser.test.tsx | 48 ++++++++++++
+ .../chat/ProviderModelPicker.browser.test.tsx | 48 +++++++++++
  .../components/chat/ProviderModelPicker.tsx   |  8 +-
- .../SidebarThreadRow.branch.browser.test.tsx  | 50 ++++++++++++-
- .../components/sidebar/SidebarThreadRow.tsx   | 20 ++++-
- 7 files changed, 216 insertions(+), 40 deletions(-)
+ .../SidebarThreadRow.branch.browser.test.tsx  | 50 ++++++++++-
+ .../components/sidebar/SidebarThreadRow.tsx   | 29 +++++--
+ 7 files changed, 230 insertions(+), 48 deletions(-)
 
 diff --git a/apps/web/src/components/chat/ComposerModelEffort.browser.test.tsx b/apps/web/src/components/chat/ComposerModelEffort.browser.test.tsx
 index ab7d560d5c..b408bb4eb5 100644
@@ -95,19 +95,19 @@ index ab7d560d5c..b408bb4eb5 100644
 +  expect(bubbled.mock.calls[0]![0].defaultPrevented).toBe(false);
 +});
 diff --git a/apps/web/src/components/chat/ComposerModelEffort.tsx b/apps/web/src/components/chat/ComposerModelEffort.tsx
-index f56997ff2a..1ce6f1e800 100644
+index 1d0227c0f6..3b7ba00ef7 100644
 --- a/apps/web/src/components/chat/ComposerModelEffort.tsx
 +++ b/apps/web/src/components/chat/ComposerModelEffort.tsx
-@@ -7,7 +7,7 @@ import {
- import type { ProviderOptionDescriptor, RuntimeMode } from "@t3tools/contracts";
+@@ -8,7 +8,7 @@ import type { ProviderOptionDescriptor, RuntimeMode } from "@t3tools/contracts";
  import type { EffortDisplay } from "@t3tools/contracts/settings";
  import { getProviderOptionCurrentLabel } from "@t3tools/shared/model";
+ import { msg, T, useGT, useMessages } from "gt-react";
 -import { CheckIcon, ChevronRightIcon, ChevronUpIcon, WorkflowIcon } from "lucide-react";
 +import { ChevronRightIcon, ChevronUpIcon, WorkflowIcon } from "lucide-react";
  import { type KeyboardEvent, type ReactNode, use, useRef, useState } from "react";
  
- import { cn } from "~/lib/utils";
-@@ -178,11 +178,12 @@ export function describeComposerEffort(
+ import { m, type MessageResolver } from "~/i18n/messages";
+@@ -186,11 +186,12 @@ export function describeComposerEffort(
  
  const COLUMN_ROW =
    "flex h-8 w-full shrink-0 cursor-pointer items-center gap-2 rounded-sm px-2 text-left text-sm text-foreground outline-none hover:bg-foreground/[0.09] focus-visible:bg-foreground/[0.09] disabled:cursor-not-allowed disabled:opacity-64";
@@ -121,7 +121,7 @@ index f56997ff2a..1ce6f1e800 100644
    description?: string | undefined;
    selected: boolean;
    /** The column's one tab stop: the selected level, else the first when none shows as selected. */
-@@ -199,29 +200,27 @@ function ColumnRow(props: {
+@@ -208,35 +209,36 @@ function ColumnRow(props: {
      "data-effort-row": true,
      // Focus lands on a level after a model pick.
      "data-effort-level": true,
@@ -140,14 +140,21 @@ index f56997ff2a..1ce6f1e800 100644
 -      <span className="min-w-0 flex-1 truncate">{props.label}</span>
 -      {props.selected ? (
 -        <>
--          {props.isDefault ? <span className="sr-only">Default</span> : null}
+-          {props.isDefault ? (
+-            <span className="sr-only">
+-              {gt("Default", { $context: "marks the default option" })}
+-            </span>
+-          ) : null}
 -          <CheckIcon aria-hidden="true" className="size-3.5" />
 -        </>
 -      ) : props.isDefault ? (
--        <span className="text-muted-foreground/70 text-xs">Default</span>
--      ) : null}
+-        <span className="text-muted-foreground/70 text-xs">
+-          {gt("Default", { $context: "marks the default option" })}
+-        </span>
 +      <span className="truncate">{props.label}</span>
-+      {props.isDefault ? <span className="sr-only">Default</span> : null}
++      {props.isDefault ? (
++        <span className="sr-only">{gt("Default", { $context: "marks the default option" })}</span>
+       ) : null}
      </>
    );
 -  if (!props.description) return <button {...rowProps}>{content}</button>;
@@ -157,11 +164,18 @@ index f56997ff2a..1ce6f1e800 100644
        <TooltipTrigger render={<button {...rowProps} />}>{content}</TooltipTrigger>
 -      <TooltipPopup side="right" className="max-w-56">
 +      <TooltipPopup side="top" className="max-w-56">
-+        {props.isDefault ? <div>{props.label} · Default</div> : null}
++        {props.isDefault ? (
++          <div>
++            {gt("{option} · Default", {
++              $context: "marks the default option",
++              option: props.label,
++            })}
++          </div>
++        ) : null}
          {props.description}
        </TooltipPopup>
      </Tooltip>
-@@ -229,6 +228,20 @@ function ColumnRow(props: {
+@@ -244,6 +246,20 @@ function ColumnRow(props: {
  }
  
  function moveBetweenRows(event: KeyboardEvent<HTMLElement>) {
@@ -182,7 +196,7 @@ index f56997ff2a..1ce6f1e800 100644
    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
    // An option's side menu is a React child here, but it moves through its own items.
    if (!event.currentTarget.contains(event.target as Node)) return;
-@@ -304,7 +317,7 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
+@@ -321,7 +337,7 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
    const { descriptor } = control;
    if (control.kind === "boolean") {
      return (
@@ -191,7 +205,7 @@ index f56997ff2a..1ce6f1e800 100644
          {([true, false] as const).map((value) => (
            <ColumnRow
              key={String(value)}
-@@ -323,25 +336,27 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
+@@ -344,25 +360,27 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
    // An "Ultrathink:" prefix selects a level the column does not offer.
    const shown = choices.some((option) => option.id === value);
    return (
@@ -199,7 +213,7 @@ index f56997ff2a..1ce6f1e800 100644
 +    <>
        {locked ? (
          <div className="px-2 pb-1.5 text-muted-foreground/80 text-xs">
-           {ULTRATHINK_IN_BODY_NOTE}
+           {messages(ULTRATHINK_IN_BODY_NOTE)}
          </div>
        ) : null}
 -      {choices.map((option, index) => (
@@ -234,10 +248,10 @@ index f56997ff2a..1ce6f1e800 100644
  }
  
 diff --git a/apps/web/src/components/chat/ModelPickerContent.tsx b/apps/web/src/components/chat/ModelPickerContent.tsx
-index 87bacfd7ca..ebe6ee6b09 100644
+index f193d46034..cbc822fd83 100644
 --- a/apps/web/src/components/chat/ModelPickerContent.tsx
 +++ b/apps/web/src/components/chat/ModelPickerContent.tsx
-@@ -848,7 +848,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
+@@ -941,7 +941,7 @@ export const ModelPickerContent = memo(function ModelPickerContent(props: {
          ref={pickerContentRef}
          className={cn(
            "relative flex w-screen max-w-90 flex-row overflow-hidden",
@@ -311,10 +325,10 @@ index 06bb36a34c..948dc9cb3d 100644
 +  expect(list.offsetHeight + effort.offsetHeight).toBe(effort.parentElement!.offsetHeight);
 +});
 diff --git a/apps/web/src/components/chat/ProviderModelPicker.tsx b/apps/web/src/components/chat/ProviderModelPicker.tsx
-index 094f0c7098..9179829d3a 100644
+index 254b1ffeac..5cc29137ae 100644
 --- a/apps/web/src/components/chat/ProviderModelPicker.tsx
 +++ b/apps/web/src/components/chat/ProviderModelPicker.tsx
-@@ -462,13 +462,13 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
+@@ -472,13 +472,13 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
          {props.effortColumn ? (
            <DockedPickerContext value={{ modelLabel: triggerTitle }}>
              <div className="flex max-h-(--available-height) flex-col">
@@ -398,26 +412,35 @@ index a0410821ad..de2703d62b 100644
 +  });
 +});
 diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
-index f97147b95f..66eff160a1 100644
+index 0110b1dbfa..08e3ed7053 100644
 --- a/apps/web/src/components/sidebar/SidebarThreadRow.tsx
 +++ b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
-@@ -181,9 +181,14 @@ function WorkingDuration(props: { environmentId: EnvironmentId; startedAt: strin
- // the shared tick lands every working row's update in the same frame.
+@@ -188,12 +188,20 @@ function WorkingDuration(props: { environmentId: EnvironmentId; startedAt: strin
  function WorkingDurationLabel(props: { environmentId: EnvironmentId; startedMs: number }) {
    const nowMs = useNowSecond();
+   const messages = useMessages();
 +  const elapsedMs = toServerClock(props.environmentId, nowMs) - props.startedMs;
 +  const seconds = Math.floor(elapsedMs / 1000);
 +  // Under an hour the label keeps its seconds ("1m 12s"), so it still ticks after the first minute.
    return (
      <span className="tabular-nums">
--      {formatWorkingDurationLabel(toServerClock(props.environmentId, nowMs) - props.startedMs)}
+-      {formatWorkingDurationLabel(
+-        toServerClock(props.environmentId, nowMs) - props.startedMs,
+-        messages,
+-      )}
 +      {seconds >= 60 && seconds < 3600
-+        ? `${Math.floor(seconds / 60)}m ${seconds % 60}s`
-+        : formatWorkingDurationLabel(elapsedMs)}
++        ? messages(
++            msg("{minutes}m {seconds}s", {
++              $context: "elapsed time",
++              minutes: Math.floor(seconds / 60),
++              seconds: seconds % 60,
++            }),
++          )
++        : formatWorkingDurationLabel(elapsedMs, messages)}
      </span>
    );
  }
-@@ -816,6 +821,8 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -842,6 +850,8 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                          }
                        : null;
    const isWokeStatus = topStatus?.icon === "woke";
@@ -426,7 +449,7 @@ index f97147b95f..66eff160a1 100644
    // A child row leads with its status and the role its opener gave it.
    const childKind = props.nested
      ? sidebarChildThreadKindOf(
-@@ -1717,11 +1724,18 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1829,11 +1839,18 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                              topStatus.className,
                            )}
                          >

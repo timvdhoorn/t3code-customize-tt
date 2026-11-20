@@ -8,20 +8,20 @@ Subject: [PATCH 16/16] feat: show Claude's context window broken down by
  .../Adapters/ClaudeAdapterV2.test.ts          | 156 +++++++++++++++++-
  .../Adapters/ClaudeAdapterV2.ts               | 113 ++++++++++---
  .../ThreadDetailsContext.browser.test.tsx     |  93 +++++++++++
- .../components/chat/ThreadDetailsUsage.tsx    | 117 +++++++++++--
+ .../components/chat/ThreadDetailsUsage.tsx    | 125 ++++++++++++--
  .../src/state/contextCategories.test.ts       |  66 ++++++++
  .../client-runtime/src/state/contextWindow.ts |  88 ++++++++++
  packages/contracts/src/orchestrationV2.ts     |   3 +-
  packages/contracts/src/providerRuntime.ts     |  10 ++
- 8 files changed, 610 insertions(+), 36 deletions(-)
+ 8 files changed, 617 insertions(+), 37 deletions(-)
  create mode 100644 apps/web/src/components/chat/ThreadDetailsContext.browser.test.tsx
  create mode 100644 packages/client-runtime/src/state/contextCategories.test.ts
 
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-index c830387565..5276654009 100644
+index 2ac8c66a69..12e66f2b22 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-@@ -3570,6 +3570,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+@@ -3599,6 +3599,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
        "mcpServerStatus" | "readMcpResource" | "callMcpTool"
      > &
        Partial<Pick<ClaudeAdapterV2.ClaudeAgentSdkQuerySession, "listPermissionRules">>;
@@ -29,7 +29,7 @@ index c830387565..5276654009 100644
      readonly environment?: NodeJS.ProcessEnv;
      readonly onSessionInit?: (cwd: string) => Effect.Effect<void>;
      readonly subagentLaunchToolUseId?: string;
-@@ -3747,6 +3748,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+@@ -3776,6 +3777,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                    }).pipe(Effect.andThen(() => options?.renameSession?.(title) ?? Effect.void)),
                  backgroundTasks: options?.backgroundTasks ?? (() => Effect.succeed(false)),
                  mcpServerStatus: options?.mcp?.mcpServerStatus ?? Effect.succeed([]),
@@ -39,7 +39,7 @@ index c830387565..5276654009 100644
                  readMcpResource:
                    options?.mcp?.readMcpResource ??
                    (() => Effect.die("unexpected MCP resource read")),
-@@ -9750,6 +9754,152 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+@@ -10096,6 +10100,152 @@ describe("ClaudeAdapterV2 background wake turns", () => {
      ),
    );
  
@@ -192,7 +192,7 @@ index c830387565..5276654009 100644
    it.effect("measures a model outside the catalog against the window Claude reports", () =>
      Effect.gen(function* () {
        const harness = yield* makeWakeHarness;
-@@ -10285,7 +10435,11 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+@@ -10631,7 +10781,11 @@ describe("ClaudeAdapterV2 background wake turns", () => {
  
    it.effect.each([
      { autoCompactWindow: "", userSettings: '{"autoCompactWindow":300000}', maxTokens: 300_000 },
@@ -206,7 +206,7 @@ index c830387565..5276654009 100644
    ])(
      "reports the context window as $maxTokens, capped by the resolved autoCompactWindow",
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-index fac4413e15..2fd44688c8 100644
+index 526af40be2..4b8259fe0d 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 @@ -100,6 +100,7 @@ import {
@@ -217,7 +217,7 @@ index fac4413e15..2fd44688c8 100644
    type MessageId,
    type ModelSelection,
    type OrchestrationV2ConversationMessage,
-@@ -349,6 +350,22 @@ export function claudeProviderTurnTokenUsage(
+@@ -350,6 +351,22 @@ export function claudeProviderTurnTokenUsage(
  
  type ClaudeMessageUsage = Parameters<typeof claudeProviderTurnTokenUsage>[0];
  
@@ -240,7 +240,7 @@ index fac4413e15..2fd44688c8 100644
  // message_delta usage is per-message cumulative; null or absent fields retain message_start values and zeros replace them.
  function mergeClaudeStreamUsage(
    current: ClaudeMessageUsage,
-@@ -698,6 +715,11 @@ export interface ClaudeAgentSdkQuerySession {
+@@ -759,6 +776,11 @@ export interface ClaudeAgentSdkQuerySession {
      ReadonlyArray<ClaudeMcpServerStatus>,
      ClaudeAgentSdkQueryRunnerError
    >;
@@ -252,7 +252,7 @@ index fac4413e15..2fd44688c8 100644
    readonly readMcpResource: (input: {
      readonly server: string;
      readonly uri: string;
-@@ -1870,6 +1892,13 @@ export const layerQueryRunner: Layer.Layer<
+@@ -1953,6 +1975,13 @@ export const layerQueryRunner: Layer.Layer<
            try: () => queryRuntime.mcpServerStatus(),
            catch: (cause) => queryRunnerError(cause, "mcpServerStatus"),
          }),
@@ -266,7 +266,7 @@ index fac4413e15..2fd44688c8 100644
          readMcpResource: ({ server, uri }) =>
            Effect.tryPromise({
              try: () => queryRuntime.readMcpResource(server, uri),
-@@ -5938,6 +5967,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -6094,6 +6123,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
          const lastProviderThreadByNativeThread = yield* Ref.make(
            new Map<string, OrchestrationV2ProviderThread>(),
          );
@@ -279,7 +279,7 @@ index fac4413e15..2fd44688c8 100644
          const goalsByNativeThread = new Map<string, OrchestrationV2ProviderGoal | null>();
          // The title T3 last applied to each native session, so a turn renames it only when the
          // thread title changed. A native `/rename` T3 never applied survives later turns.
-@@ -6338,28 +6373,64 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -6494,28 +6529,64 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
              if (claudeMessageInputTokens(usage) <= 0) return;
              context.compactionTokens = undefined;
            }
@@ -465,13 +465,13 @@ index 0000000000..acd292df8f
 +  expect(screen.container.querySelector(".text-warning-foreground")).not.toBeNull();
 +});
 diff --git a/apps/web/src/components/chat/ThreadDetailsUsage.tsx b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
-index 8717c2141a..c79fe19d5c 100644
+index 78d154301a..565ec727e9 100644
 --- a/apps/web/src/components/chat/ThreadDetailsUsage.tsx
 +++ b/apps/web/src/components/chat/ThreadDetailsUsage.tsx
-@@ -12,11 +12,16 @@ import {
-   paceOf,
-   remainingPercent,
- } from "@t3tools/shared/usageLimits";
+@@ -14,11 +14,16 @@ import {
+ import { formatDuration, limitsNotice } from "@t3tools/shared/usageLimitsCopy";
+ import { Link } from "@tanstack/react-router";
+ import { msg, useGT, useLocale, useMessages } from "gt-react";
 -import type { ReactNode } from "react";
 +import { type ReactNode, useId, useState } from "react";
  
@@ -487,9 +487,9 @@ index 8717c2141a..c79fe19d5c 100644
  import { formatContextWindowTokens } from "../../lib/contextWindow";
  import { cn } from "../../lib/utils";
  import { formatUpcomingTimestamp } from "../../timestampFormat";
-@@ -95,6 +100,10 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
-       ? (threshold / maxTokens) * 100
-       : null;
+@@ -103,6 +108,10 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
+   const m = useMessages();
+   const locale = useLocale();
    const usedTokens = formatContextWindowTokens(usage.usedTokens);
 +  const [expanded, setExpanded] = useState(false);
 +  const listId = useId();
@@ -498,7 +498,7 @@ index 8717c2141a..c79fe19d5c 100644
    return (
      <ThreadDetailsSection
        headingId="thread-details-context-heading"
-@@ -108,6 +117,10 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
+@@ -116,6 +125,10 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
            tone={used === null ? null : used >= 90 ? "error" : used >= 80 ? "warning" : null}
            tick={tick}
            muted
@@ -509,8 +509,8 @@ index 8717c2141a..c79fe19d5c 100644
            value={
              maxTokens !== null
                ? `${usedTokens} / ${formatContextWindowTokens(maxTokens)}`
-@@ -130,14 +143,52 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
-                   {formatContextWindowCompactionMessage(threshold)}
+@@ -146,14 +159,52 @@ export function ThreadDetailsContext({ usage }: { readonly usage: ContextWindowS
+                   {formatContextWindowCompactionMessage(threshold, m)}
                  </span>
                ) : null}
 +              {hasCategories && !expanded ? <ContextCategoryList rows={categories} /> : null}
@@ -562,10 +562,10 @@ index 8717c2141a..c79fe19d5c 100644
  function LimitRow({
    window,
    now,
-@@ -184,6 +235,10 @@ export function UsageRow({
-   ariaValue = value,
+@@ -212,6 +263,10 @@ export function UsageRow({
    tooltip,
    muted = false,
+   opensUsage = false,
 +  segments,
 +  expanded,
 +  controls,
@@ -573,10 +573,10 @@ index 8717c2141a..c79fe19d5c 100644
  }: {
    readonly label: string;
    /** Bar fill from 0 to 100. Null hides the bar. */
-@@ -195,6 +250,13 @@ export function UsageRow({
-   readonly ariaValue?: string;
+@@ -224,6 +279,13 @@ export function UsageRow({
    readonly tooltip: ReactNode;
    readonly muted?: boolean;
+   readonly opensUsage?: boolean;
 +  /** Colored parts of the fill, sized by tokens; without any the fill keeps its single color. */
 +  readonly segments?: ReadonlyArray<ContextCategoryRow>;
 +  /** With `onToggle` the row is a button that expands more detail below it. */
@@ -585,34 +585,48 @@ index 8717c2141a..c79fe19d5c 100644
 +  readonly controls?: string | undefined;
 +  readonly onToggle?: (() => void) | undefined;
  }) {
+   const gt = useGT();
+   const rowProps = {
+@@ -232,14 +294,36 @@ export function UsageRow({
+       "col-span-3 grid h-6 grid-cols-subgrid items-center rounded-lg px-2.5 outline-none hover:bg-black/[0.035] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring data-popup-open:bg-black/[0.035] dark:hover:bg-white/[0.08] dark:data-popup-open:bg-white/[0.08]",
+       opensUsage
+         ? "group cursor-pointer active:bg-black/[0.06] dark:active:bg-white/[0.12]"
+-        : "cursor-default",
++        : onToggle
++          ? "cursor-pointer"
++          : "cursor-default",
+     ),
+   };
    return (
      <Tooltip>
-@@ -203,7 +265,23 @@ export function UsageRow({
-           <div
-             tabIndex={0}
-             aria-label={`${label}: ${ariaValue}`}
--            className="col-span-3 grid h-6 cursor-default grid-cols-subgrid items-center rounded-lg px-2.5 outline-none hover:bg-black/[0.035] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring data-popup-open:bg-black/[0.035] dark:hover:bg-white/[0.08] dark:data-popup-open:bg-white/[0.08]"
-+            {...(onToggle
-+              ? {
-+                  role: "button",
-+                  "aria-expanded": expanded ?? false,
-+                  "aria-controls": controls,
-+                  onClick: onToggle,
-+                  onKeyDown: (event: React.KeyboardEvent) => {
-+                    if (event.key !== "Enter" && event.key !== " ") return;
-+                    event.preventDefault();
-+                    if (!event.repeat) onToggle();
-+                  },
-+                }
-+              : {})}
-+            className={cn(
-+              "col-span-3 grid h-6 cursor-default grid-cols-subgrid items-center rounded-lg px-2.5 outline-none hover:bg-black/[0.035] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring data-popup-open:bg-black/[0.035] dark:hover:bg-white/[0.08] dark:data-popup-open:bg-white/[0.08]",
-+              onToggle && "cursor-pointer",
-+            )}
-           />
+       <TooltipTrigger
+         render={
+-          opensUsage ? <Link to="/usage" {...rowProps} /> : <div tabIndex={0} {...rowProps} />
++          opensUsage ? (
++            <Link to="/usage" {...rowProps} />
++          ) : (
++            <div
++              tabIndex={0}
++              {...rowProps}
++              {...(onToggle
++                ? {
++                    role: "button",
++                    "aria-expanded": expanded ?? false,
++                    "aria-controls": controls,
++                    onClick: onToggle,
++                    onKeyDown: (event: React.KeyboardEvent) => {
++                      if (event.key !== "Enter" && event.key !== " ") return;
++                      event.preventDefault();
++                      if (!event.repeat) onToggle();
++                    },
++                  }
++                : {})}
++            />
++          )
          }
        >
-@@ -213,22 +291,35 @@ export function UsageRow({
+         <span className="max-w-28 truncate text-muted-foreground group-hover:text-foreground">
+@@ -250,22 +334,35 @@ export function UsageRow({
              {fill > 0 ? (
                <span
                  className={cn(
@@ -650,12 +664,12 @@ index 8717c2141a..c79fe19d5c 100644
              {tick !== null ? (
                <span
                  aria-hidden
--                className="absolute -top-[3px] h-[9px] w-px -translate-x-1/2 bg-foreground/60"
+-                className="absolute -top-[3px] h-[9px] w-px -translate-x-1/2 bg-foreground/75"
 +                className={cn(
 +                  "absolute -top-[3px] h-[9px] w-px -translate-x-1/2",
 +                  tone === "error" ? "bg-error" : tone === "warning" ? "bg-warning" : "bg-foreground/60",
 +                )}
-                 style={{ left: `${tick}%` }}
+                 style={{ left: `clamp(0.5px, ${tick}%, calc(100% - 0.5px))` }}
                />
              ) : null}
 diff --git a/packages/client-runtime/src/state/contextCategories.test.ts b/packages/client-runtime/src/state/contextCategories.test.ts
@@ -731,7 +745,7 @@ index 0000000000..f2a6af363a
 +  });
 +});
 diff --git a/packages/client-runtime/src/state/contextWindow.ts b/packages/client-runtime/src/state/contextWindow.ts
-index a8f7e0f88c..9f36d9c9d0 100644
+index 37374b79b1..d21e85e756 100644
 --- a/packages/client-runtime/src/state/contextWindow.ts
 +++ b/packages/client-runtime/src/state/contextWindow.ts
 @@ -1,5 +1,6 @@
@@ -741,7 +755,15 @@ index a8f7e0f88c..9f36d9c9d0 100644
    type ModelSelection,
    type OrchestrationV2ProviderTurn,
    type OrchestrationV2ProviderTurnTokenUsage,
-@@ -111,6 +112,7 @@ export function deriveLatestContextWindowSnapshot(
+@@ -119,6 +120,7 @@ function compactionSnapshot(
+     durationMs: null,
+     compactsAutomatically: true,
+     autoCompactThreshold: null,
++    categories: null,
+     cost: null,
+     updatedAt,
+   };
+@@ -183,6 +185,7 @@ export function deriveLatestContextWindowSnapshot(
        durationMs: null,
        compactsAutomatically: true,
        autoCompactThreshold: liveUsage.autoCompactThreshold ?? null,
@@ -749,7 +771,7 @@ index a8f7e0f88c..9f36d9c9d0 100644
        cost: null,
        updatedAt: liveUsage.updatedAt,
      };
-@@ -147,6 +149,7 @@ export function deriveLatestContextWindowSnapshot(
+@@ -219,6 +222,7 @@ export function deriveLatestContextWindowSnapshot(
        compactsAutomatically: providerUsage.compactsAutomatically ?? null,
        cost: providerUsage.cost ?? null,
        autoCompactThreshold: providerUsage.autoCompactThreshold ?? null,
@@ -757,15 +779,7 @@ index a8f7e0f88c..9f36d9c9d0 100644
        updatedAt: DateTime.formatIso(providerUsageUpdatedAt),
      };
    }
-@@ -196,6 +199,7 @@ export function deriveLatestContextWindowSnapshot(
-       durationMs: null,
-       compactsAutomatically: true,
-       autoCompactThreshold: null,
-+      categories: null,
-       cost: null,
-       updatedAt: DateTime.formatIso(payload.startedAt ?? payload.updatedAt),
-     };
-@@ -330,3 +334,87 @@ export function compactBeforeSendTokens(input: {
+@@ -364,3 +368,87 @@ export function compactBeforeSendTokens(input: {
      ? contextWindow.usedTokens
      : null;
  }
@@ -854,10 +868,10 @@ index a8f7e0f88c..9f36d9c9d0 100644
 +    );
 +}
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
-index 169bbde951..1ef44a52a9 100644
+index 05cc7bd759..05349ff76a 100644
 --- a/packages/contracts/src/orchestrationV2.ts
 +++ b/packages/contracts/src/orchestrationV2.ts
-@@ -86,7 +86,7 @@ import {
+@@ -87,7 +87,7 @@ import {
    ToolActivityIcon,
    ToolActivitySource,
  } from "./providerRuntime.ts";
@@ -866,7 +880,7 @@ index 169bbde951..1ef44a52a9 100644
  
  export const OrchestrationV2Actor = Schema.Literals(["user", "agent", "system"]);
  export type OrchestrationV2Actor = typeof OrchestrationV2Actor.Type;
-@@ -237,6 +237,7 @@ export const OrchestrationV2ProviderTurnTokenUsage = Schema.Struct({
+@@ -238,6 +238,7 @@ export const OrchestrationV2ProviderTurnTokenUsage = Schema.Struct({
    reasoningOutputTokens: Schema.optional(NonNegativeInt),
    promptCacheTtlMs: Schema.optional(PositiveInt),
    autoCompactThreshold: Schema.optional(PositiveInt),
