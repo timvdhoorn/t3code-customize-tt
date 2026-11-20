@@ -130,4 +130,4 @@ The five default labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready
 
 ### Domain docs
 
-Single-context: `GLOSSARY.md` and `docs/adr/` at the repo root, created when needed. See `docs/agents/domain.md`.
+Single-context: `GLOSSARY.md` at the repo root, created when needed. See `docs/agents/domain.md`.
