@@ -10,8 +10,8 @@ What is live, what is in progress and what is open. Finished work leaves this pa
 - devbox1: server runs 5085 with the patches (before `patches-tt/0017`; the next `server` run picks it up). See [devbox1](machines/devbox1.md).
 
 ## In progress
-- MacBook Pro: 4851 with the patches; 5009 built ahead, installs when T3 Code quits; iOS build for 4851 (behind) rebuilds on that update.
+- MacBook Pro: 5009 with the patches; iOS build 202611221342 for 5009 on TestFlight (without `patches-tt/0017`); 5085 with the fix follows when T3 Code downloads it and quits.
 - MacBook Air: 5009 with the patches; picks up 5085 and `patches-tt/0017` through `fleet` and its update.
 
 ## Open
-- TestFlight: blocked on an App Store Connect agreement only the Account Holder can accept; see [TestFlight](machines/testflight.md).
+- Nothing open.
