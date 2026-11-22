@@ -14,4 +14,4 @@ What is live, what is in progress and what is open. Finished work leaves this pa
 - MacBook Air: 5009 with the patches; picks up 5085 through its update.
 
 ## Open
-- Nothing open.
+- Port to nightly 5098 with the APNs reconnect fix (`patches-tt/0003`: idle connection replaced after 4 min, one resend on a network error) and the `vite.config.ts` typecheck detection: PR open, not yet on any machine.
