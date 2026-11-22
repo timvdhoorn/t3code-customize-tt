@@ -58,6 +58,15 @@ class TypecheckerTest(unittest.TestCase):
         (self.bin / 'tsc-rs').write_text('')
         self.assertEqual(customize.typechecker(), ['tsc-rs'])
 
+    def test_follows_the_vite_typecheck_task(self):
+        server = self.source / 'apps' / 'server'
+        server.mkdir(parents=True)
+        (server / 'package.json').write_text(json.dumps({'scripts': {}}))
+        (server / 'vite.config.ts').write_text(
+            'typecheck: {\n  command: "effect-tsgo tsrs --noEmit",\n},\n')
+        (self.bin / 'effect-tsgo').write_text('')
+        self.assertEqual(customize.typechecker(), ['effect-tsgo', 'tsrs'])
+
 
 if __name__ == '__main__':
     unittest.main()
