@@ -14,4 +14,5 @@ What is live, what is in progress and what is open. Finished work leaves this pa
 - MacBook Air: 5009 with the patches; picks up 5085 through its update.
 
 ## Open
-- Nothing open.
+- Port to nightly 5098, PR open, not yet on any machine.
+- It carries `patches-tt/0003`: APNs reconnect after 4 idle min plus one resend; only main threads notify, Done without delay.

@@ -10,12 +10,12 @@ Subject: [PATCH 01/17] fix(server): measure Claude context against
  2 files changed, 103 insertions(+), 2 deletions(-)
 
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-index e1665b1baf..b101093863 100644
+index c0733af964..2af7c71b0c 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-@@ -993,6 +993,27 @@ describe("ClaudeAdapterV2 context usage", () => {
-     );
-     assert.strictEqual(usage.promptCacheExpiresAt, "2026-08-29T00:05:00.000Z");
+@@ -1018,6 +1018,27 @@ describe("ClaudeAdapterV2 context usage", () => {
+       updatedAt: "2026-08-29T00:03:00.000Z",
+     });
    });
 +
 +  it("measures context against autoCompactWindow, as Claude Code does", () => {
@@ -41,7 +41,7 @@ index e1665b1baf..b101093863 100644
  });
  
  describe("ClaudeAdapterV2 approval presentation", () => {
-@@ -10892,6 +10913,69 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+@@ -11001,6 +11022,69 @@ describe("ClaudeAdapterV2 background wake turns", () => {
      ),
    );
  
@@ -112,7 +112,7 @@ index e1665b1baf..b101093863 100644
      Effect.gen(function* () {
        const fileSystem = yield* FileSystem.FileSystem;
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-index b120f9feb5..ea939dd80a 100644
+index 5b8c5fabd5..0e9939acb2 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 @@ -259,6 +259,19 @@ export const CLAUDE_QUERY_ENDED_BEFORE_TURN_DETAIL =
@@ -135,22 +135,22 @@ index b120f9feb5..ea939dd80a 100644
  interface ClaudeCacheCreation {
    readonly ephemeral_1h_input_tokens: number;
    readonly ephemeral_5m_input_tokens: number;
-@@ -314,6 +327,7 @@ export function claudeProviderTurnTokenUsage(
+@@ -320,6 +333,7 @@ export function claudeProviderTurnTokenUsage(
    updatedAt: string,
    autoCompactWindow = "",
    requestedAt?: DateTime.Utc,
 +  contextWindow: number | null = maxTokens,
  ) {
    const inputTokens = claudeMessageInputTokens(usage);
-   const outputTokens = usage.output_tokens;
-@@ -325,12 +339,13 @@ export function claudeProviderTurnTokenUsage(
+   const outputTokens = optionalClaudeUsageTokenCount(usage.output_tokens) ?? 0;
+@@ -332,12 +346,13 @@ export function claudeProviderTurnTokenUsage(
        : DateTime.formatIso(DateTime.add(requestedAt, { milliseconds: promptCacheTtlMs }));
    return {
      usedTokens: inputTokens + outputTokens,
 -    maxTokens,
 +    maxTokens: contextWindow,
      inputTokens,
-     cachedInputTokens: usage.cache_read_input_tokens ?? 0,
+     cachedInputTokens,
      outputTokens,
      reasoningOutputTokens: 0,
      ...(promptCacheTtlMs === undefined ? {} : { promptCacheTtlMs }),
@@ -158,7 +158,7 @@ index b120f9feb5..ea939dd80a 100644
      ...claudeAutoCompactThreshold(autoCompactWindow, maxTokens),
      ...(promptCacheExpiresAt === undefined ? {} : { promptCacheExpiresAt }),
      updatedAt,
-@@ -6516,11 +6531,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -6533,11 +6548,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
            // arrives after generation, so it leaves the cache expiry unknown.
            if (requestStarted && context.streamUsage !== null) context.streamUsage.requestedAt = now;
            const maxTokens = claudeContextWindow(context.input.modelSelection);
@@ -172,7 +172,7 @@ index b120f9feb5..ea939dd80a 100644
                    ...claudeAutoCompactThreshold(context.autoCompactWindow, maxTokens),
                    updatedAt: DateTime.formatIso(now),
                  }
-@@ -6530,6 +6546,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -6547,6 +6563,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                    DateTime.formatIso(now),
                    context.autoCompactWindow,
                    context.streamUsage?.requestedAt,

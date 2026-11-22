@@ -6,10 +6,10 @@
 Which nightly the patches cover and what a port of them has to watch for. The port loop itself is in [docs/porting.md](../../docs/porting.md).
 
 ## Coverage
-- Shared patches: `patches-port/` targets nightly 0.1.12-nightly.20261122.5085 (`c9e9e7d36a91`).
+- Shared patches: `patches-port/` targets nightly 0.1.12-nightly.20261122.5098 (`620cf4770d99`).
 - `patches/` is upstream's and stays untouched.
 - Own patches: `patches-tt/` (17) and `patches-ios/` (11); a port applies 2 shared commits (`patches-port/`, minus the skips) + 17 + 11 = 30 commits.
-- `covered-nightly.txt`: 0.1.12-nightly.20261122.5085.
+- `covered-nightly.txt`: 0.1.12-nightly.20261122.5098.
 - Left out (`skip-shared.json`): desktop stats line and throughput, compaction settings, subscription switch.
 - Their bundle markers are replaced by `markers` in the same file.
 
@@ -30,4 +30,9 @@ Which nightly the patches cover and what a port of them has to watch for. The po
 - A web unit test rendering a `useGT` component needs `initializeGT` from `gt-react` plus `<GTProvider locale="en">`.
 - `initializeGTSPA` throws under Node; see `V2LifecycleRow.kind.test.tsx`.
 - 5009: patch strings are not in the GT catalogs, so other locales show English; upstream's `i18n:check` is not part of our checks.
+- 5098: the server's `typecheck` is a `vite.config.ts` task (#30879), not a `package.json` script; `typechecker()` reads both, else `checks` falls back to `tsc` and fails in `effect-tsgo patch`.
+- 5098: the sidebar meta line shows the environment, not the branch (#40736); row fixtures pass `environmentLabel`.
+- 5098: `patches-tt/0011` now only keeps its comment and test.
+- 5098: `departingThreadKey`/`shelfRouteThreadKey` (#26661) also keep a departing child thread's family on the settled shelf (`useSidebarChildThreads` takes `shelfRouteThreadKey`).
+- 5098: the effort bar's radios are named with their badge ("LowDefault"): tests match `/^Low/`; Left/Right runs before upstream's typeahead (#40798).
 - 5009: `ProviderHost` needs `compatibility` (`noCompatibilityPolicy` in test fixtures); Codex reads `config/read` before `thread/start`.
