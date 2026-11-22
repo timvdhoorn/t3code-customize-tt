@@ -1,0 +1,211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: timvdhoorn <timvdhoorn@gmail.com>
+Date: Sun, 22 Nov 2026 13:25:37 +0100
+Subject: [PATCH 17/17] perf: build the quiet thread list from the shell index
+
+A list over one point atom per thread rebuilt once per thread a snapshot
+changed. With idle subagents kept in the shell (nest agent-opened child
+threads) that is ~3800 rebuilds and blocked the mobile app for 30 s
+after a cold start.
+---
+ .../src/state/threadShell.quiet.test.ts       | 122 ++++++++++++++++++
+ .../client-runtime/src/state/threadShell.ts   |  49 +++++--
+ 2 files changed, 158 insertions(+), 13 deletions(-)
+ create mode 100644 packages/client-runtime/src/state/threadShell.quiet.test.ts
+
+diff --git a/packages/client-runtime/src/state/threadShell.quiet.test.ts b/packages/client-runtime/src/state/threadShell.quiet.test.ts
+new file mode 100644
+index 0000000000..8442516b3d
+--- /dev/null
++++ b/packages/client-runtime/src/state/threadShell.quiet.test.ts
+@@ -0,0 +1,122 @@
++import {
++  EnvironmentId,
++  RunId,
++  ThreadId,
++  type OrchestrationV2ShellSnapshot,
++  type OrchestrationV2ThreadShell,
++} from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++import * as Option from "effect/Option";
++import { Atom, AtomRegistry } from "effect/reactivity";
++import { describe, expect, it } from "vite-plus/test";
++
++import { PrimaryConnectionTarget } from "../connection/model.ts";
++import { v2Now, v2ShellSnapshot, v2ThreadShell } from "./orchestrationV2TestFixtures.ts";
++import { createEnvironmentThreadShellAtoms } from "./threadShell.ts";
++
++const environmentId = EnvironmentId.make("environment-v2");
++
++function makeHarness() {
++  const snapshotAtom = Atom.family((_environmentId: EnvironmentId) =>
++    Atom.make<OrchestrationV2ShellSnapshot | null>(v2ShellSnapshot),
++  );
++  const catalogValueAtom = Atom.make({
++    isReady: true,
++    entries: new Map([
++      [
++        environmentId,
++        {
++          target: new PrimaryConnectionTarget({
++            environmentId,
++            label: "Environment",
++            httpBaseUrl: "https://example.test",
++            wsBaseUrl: "wss://example.test",
++          }),
++          profile: Option.none(),
++          enabled: true,
++        },
++      ],
++    ]),
++  });
++  return {
++    registry: AtomRegistry.make(),
++    snapshotAtom,
++    threads: createEnvironmentThreadShellAtoms({
++      catalogValueAtom,
++      snapshotAtom,
++      hiddenThreadTagsAtom: () => Atom.make(null),
++    }),
++  };
++}
++
++describe("quiet thread shell list", () => {
++  // A shell kept with every idle subagent holds thousands of threads; rebuilding the list once
++  // per changed thread blocked the mobile app for half a minute after a cold start.
++  it("rebuilds once when a snapshot changes every thread", () => {
++    const { registry, threads, snapshotAtom } = makeHarness();
++    const shells = Array.from({ length: 300 }, (_, index) => ({
++      ...v2ThreadShell,
++      id: ThreadId.make(`thread-${index}`),
++    }));
++    registry.set(snapshotAtom(environmentId), { ...v2ShellSnapshot, threads: shells });
++    const dispose = registry.mount(threads.quietThreadShellsAtom);
++    let notifications = 0;
++    const unsubscribe = registry.subscribe(threads.quietThreadShellsAtom, () => {
++      notifications += 1;
++    });
++    try {
++      registry.set(snapshotAtom(environmentId), {
++        ...v2ShellSnapshot,
++        snapshotSequence: 2,
++        threads: shells.map((thread) => ({ ...thread, title: `${thread.id} renamed` })),
++      });
++      const list = registry.get(threads.quietThreadShellsAtom);
++      expect(list).toHaveLength(300);
++      expect(list.every((thread) => thread.title.endsWith("renamed"))).toBe(true);
++      expect(notifications).toBe(1);
++    } finally {
++      unsubscribe();
++      dispose();
++      registry.dispose();
++    }
++  });
++
++  it("gives the list and the point atom the same kept shell through streaming ticks", () => {
++    const { registry, threads, snapshotAtom } = makeHarness();
++    const runId = RunId.make("quiet-run");
++    const running: OrchestrationV2ThreadShell = {
++      ...v2ThreadShell,
++      latestRunId: runId,
++      activeRunId: runId,
++      status: "running",
++      itemCount: 1,
++      visibleItemCount: 1,
++    };
++    const setThread = (thread: OrchestrationV2ThreadShell, sequence: number) =>
++      registry.set(snapshotAtom(environmentId), {
++        ...v2ShellSnapshot,
++        snapshotSequence: sequence,
++        threads: [thread],
++      });
++    setThread(running, 1);
++    const pointAtom = threads.quietThreadShellAtom({ environmentId, threadId: running.id });
++    const disposePoint = registry.mount(pointAtom);
++    const disposeList = registry.mount(threads.quietThreadShellsAtom);
++    try {
++      const first = registry.get(pointAtom);
++      expect(registry.get(threads.quietThreadShellsAtom)[0]).toBe(first);
++      setThread({ ...running, updatedAt: DateTime.add(v2Now, { seconds: 1 }), itemCount: 4 }, 2);
++      expect(registry.get(pointAtom)).toBe(first);
++      expect(registry.get(threads.quietThreadShellsAtom)[0]).toBe(first);
++
++      setThread({ ...running, title: "Renamed" }, 3);
++      const renamed = registry.get(pointAtom);
++      expect(renamed?.title).toBe("Renamed");
++      expect(registry.get(threads.quietThreadShellsAtom)[0]).toBe(renamed);
++    } finally {
++      disposeList();
++      disposePoint();
++      registry.dispose();
++    }
++  });
++});
+diff --git a/packages/client-runtime/src/state/threadShell.ts b/packages/client-runtime/src/state/threadShell.ts
+index 44afac77b9..6375c3942b 100644
+--- a/packages/client-runtime/src/state/threadShell.ts
++++ b/packages/client-runtime/src/state/threadShell.ts
+@@ -508,17 +508,23 @@ export function createEnvironmentThreadShellAtoms(input: {
+   // Keeps the previous shell while only streaming ticks changed. During a run,
+   // its timestamps, item counts and latest message are as of the last kept
+   // change; anything that needs them current reads threadShellAtom.
+-  const quietThreadShellAtomFamily = Atom.family((key: string) => {
+-    let previous: EnvironmentThreadShell | null = null;
+-    return Atom.make((get) => {
+-      const next = get(threadShellAtomFamily(key));
+-      if (previous !== null && next !== null && sameApartFromStreaming(previous, next)) {
+-        return previous;
+-      }
+-      previous = next;
+-      return next;
+-    }).pipe(Atom.withLabel(`environment-quiet-thread-shell:${key}`));
+-  });
++  // One cache serves the point atoms and quietThreadShellsAtom, so both keep the same shell.
++  const keptQuietShells = new Map<string, EnvironmentThreadShell>();
++  const quietShell = (key: string, next: EnvironmentThreadShell | null) => {
++    if (next === null) {
++      keptQuietShells.delete(key);
++      return null;
++    }
++    const previous = keptQuietShells.get(key);
++    if (previous !== undefined && sameApartFromStreaming(previous, next)) return previous;
++    keptQuietShells.set(key, next);
++    return next;
++  };
++  const quietThreadShellAtomFamily = Atom.family((key: string) =>
++    Atom.make((get) => quietShell(key, get(threadShellAtomFamily(key)))).pipe(
++      Atom.withLabel(`environment-quiet-thread-shell:${key}`),
++    ),
++  );
+ 
+   // Child approvals and questions are hidden with their sidebar rows. Read their
+   // shell summaries, without subscribing to every child transcript. A task
+@@ -742,9 +748,26 @@ export function createEnvironmentThreadShellAtoms(input: {
+   const quietThreadShellsAtom = Atom.make((get) => {
+     const next: EnvironmentThreadShell[] = [];
+     const hidden = get(hiddenThreadKeysAtom);
++    // Reads each environment's index once rather than a point atom per thread: a list over point
++    // atoms rebuilds once per thread a snapshot changes, quadratic in the thread count.
++    const indexes = new Map<EnvironmentId, ReadonlyMap<ThreadId, OrchestrationV2ThreadShell>>();
++    const requests = new Map<EnvironmentId, ReadonlyMap<ThreadId, PendingSubagentRequest>>();
+     for (const ref of get(threadRefsAtom)) {
+-      if (hidden.has(threadKey(ref))) continue;
+-      const shell = get(quietThreadShellAtomFamily(threadKey(ref)));
++      const key = threadKey(ref);
++      if (hidden.has(key)) continue;
++      let index = indexes.get(ref.environmentId);
++      let subagentRequests = requests.get(ref.environmentId);
++      if (index === undefined || subagentRequests === undefined) {
++        index = get(environmentThreadIndexAtom(ref.environmentId));
++        subagentRequests = get(pendingSubagentRequestsAtom(ref.environmentId));
++        indexes.set(ref.environmentId, index);
++        requests.set(ref.environmentId, subagentRequests);
++      }
++      const source = index.get(ref.threadId);
++      const shell = quietShell(
++        key,
++        source === undefined ? null : scopedThread(ref.environmentId, source, subagentRequests),
++      );
+       if (shell !== null) next.push(shell);
+     }
+     if (arrayElementsEqual(previousQuietThreadShells, next)) return previousQuietThreadShells;

@@ -2,6 +2,7 @@
 
 One line per change, newest first. Format: [RULES.md](RULES.md#formats).
 
+- 2026-11-22 fix | Quiet thread list built from the shell index (`patches-tt/0017`): iOS cold start no longer blocks 30 s | status.md | docs/fork-changes.md
 - 2026-11-20 change | Patches ported to nightly 5009: all patch copy translated for upstream i18n (#37893) (PR open) | porting/current-port.md | patches-tt/, patches-ios/
 - 2026-11-16 change | Claude context categories in thread details and the iOS context sheet, `patches-tt/0016` + `patches-ios/0011` (PR open) | status.md | docs/fork-changes.md
 - 2026-11-15 change | Patches ported to nightly 4749 incl. patches-ios (swipe-actions conflict) | porting/current-port.md | patches-ios/
