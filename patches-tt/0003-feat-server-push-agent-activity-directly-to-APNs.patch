@@ -16,8 +16,8 @@ stay shared. Each server pushes only its own threads and only ends a Live
 Activity it filled itself. Without a key the server behaves as upstream.
 ---
  apps/server/src/auth/RpcAuthorization.ts      |   3 +
- apps/server/src/directPush/ApnsTransport.ts   | 196 ++++++
- apps/server/src/directPush/DirectPush.test.ts | 331 ++++++++++
+ apps/server/src/directPush/ApnsTransport.ts   | 246 ++++++++
+ apps/server/src/directPush/DirectPush.test.ts | 438 ++++++++++++++
  apps/server/src/directPush/DirectPush.ts      | 469 +++++++++++++++
  .../src/directPush/agentActivityDelivery.ts   | 567 ++++++++++++++++++
  .../src/environment/ServerEnvironment.ts      |   8 +-
@@ -28,7 +28,7 @@ Activity it filled itself. Without a key the server behaves as upstream.
  apps/server/src/server.ts                     |   4 +
  apps/server/src/ws.ts                         |  14 +
  packages/contracts/src/rpc.ts                 |  37 ++
- 13 files changed, 1756 insertions(+), 25 deletions(-)
+ 13 files changed, 1913 insertions(+), 25 deletions(-)
  create mode 100644 apps/server/src/directPush/ApnsTransport.ts
  create mode 100644 apps/server/src/directPush/DirectPush.test.ts
  create mode 100644 apps/server/src/directPush/DirectPush.ts
@@ -50,10 +50,10 @@ index ffe84c428a..678ef22cea 100644
    // Delivery logs hold request bodies, so they need the same scope as the URL.
 diff --git a/apps/server/src/directPush/ApnsTransport.ts b/apps/server/src/directPush/ApnsTransport.ts
 new file mode 100644
-index 0000000000..cc7ec0e04c
+index 0000000000..8c1855f8fd
 --- /dev/null
 +++ b/apps/server/src/directPush/ApnsTransport.ts
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,246 @@
 +// @effect-diagnostics nodeBuiltinImport:off -- APNs requires HTTP/2, which fetch does not speak here; ES256 signing uses node:crypto.
 +import * as NodeCrypto from "node:crypto";
 +import * as NodeHttp2 from "node:http2";
@@ -146,30 +146,58 @@ index 0000000000..cc7ec0e04c
 +  return body;
 +}
 +
-+export const make = Effect.gen(function* () {
-+  const sessions = new Map<string, NodeHttp2.ClientHttp2Session>();
++/** The part of an HTTP/2 client session the transport uses; tests pass a fake. */
++export type ApnsSession = Pick<
++  NodeHttp2.ClientHttp2Session,
++  "request" | "close" | "destroy" | "on" | "unref" | "closed" | "destroyed"
++>;
++
++/**
++ * A connection idle this long is replaced before the next push. On devbox1 every
++ * APNs request after 5+ idle minutes failed (251 of 812 on 2026-11-22, none after
++ * a shorter gap): the connection is gone without a GOAWAY, so the cached session
++ * looks open and the first request on it gets ECONNRESET. A reconnect costs <0.5 s.
++ */
++export const APNS_SESSION_IDLE_MS = 4 * 60_000;
++
++export const makeWith = Effect.fn("ApnsTransport.makeWith")(function* (
++  connect: (origin: string) => ApnsSession,
++) {
++  const sessions = new Map<string, { readonly session: ApnsSession; lastUsedAt: number }>();
 +  const tokens = new Map<string, { readonly jwt: string; readonly issuedAt: number }>();
 +
 +  yield* Effect.addFinalizer(() =>
 +    Effect.sync(() => {
-+      for (const session of sessions.values()) session.close();
++      for (const { session } of sessions.values()) session.close();
 +      sessions.clear();
 +    }),
 +  );
 +
-+  const sessionFor = (origin: string) => {
++  const dropSession = (origin: string, session: ApnsSession) => {
++    if (sessions.get(origin)?.session !== session) return;
++    sessions.delete(origin);
++    if (!session.destroyed) session.destroy();
++  };
++
++  const sessionFor = (origin: string, nowMs: number) => {
 +    const existing = sessions.get(origin);
-+    if (existing && !existing.closed && !existing.destroyed) return existing;
-+    const session = NodeHttp2.connect(origin);
++    if (existing && !existing.session.closed && !existing.session.destroyed) {
++      if (nowMs - existing.lastUsedAt < APNS_SESSION_IDLE_MS) {
++        existing.lastUsedAt = nowMs;
++        return existing.session;
++      }
++      dropSession(origin, existing.session);
++    }
++    const session = connect(origin);
 +    const forget = () => {
-+      if (sessions.get(origin) === session) sessions.delete(origin);
++      if (sessions.get(origin)?.session === session) sessions.delete(origin);
 +    };
 +    session.on("error", forget);
 +    session.on("close", forget);
 +    session.on("goaway", forget);
 +    // Idle connections do not keep the server process alive.
 +    session.unref();
-+    sessions.set(origin, session);
++    sessions.set(origin, { session, lastUsedAt: nowMs });
 +    return session;
 +  };
 +
@@ -186,12 +214,26 @@ index 0000000000..cc7ec0e04c
 +    return jwt;
 +  };
 +
++  // A request that fails on the network drops its connection and goes out once
++  // more on a fresh one; an APNs answer (any status) is never retried.
 +  const send: ApnsTransport["Service"]["send"] = (input) =>
-+    Effect.flatMap(Clock.currentTimeMillis, (nowMs) => sendAt(input, nowMs));
++    Effect.flatMap(Clock.currentTimeMillis, (nowMs) =>
++      sendAt(input, nowMs).pipe(
++        Effect.catch(() =>
++          Effect.flatMap(Clock.currentTimeMillis, (retryMs) => sendAt(input, retryMs)),
++        ),
++      ),
++    );
 +
-+  const sendAt = (input: Parameters<ApnsTransport["Service"]["send"]>[0], nowMs: number) =>
++  const sendAt = (input: ApnsSendInput, nowMs: number) =>
 +    Effect.callback<ApnsResponse, ApnsTransportError>((resume) => {
-+      const fail = (cause: unknown) =>
++      const origin = apnsOrigin(input.environment);
++      let session: ApnsSession | undefined;
++      let settled = false;
++      const fail = (cause: unknown) => {
++        if (settled) return;
++        settled = true;
++        if (session) dropSession(origin, session);
 +        resume(
 +          Effect.fail(
 +            new ApnsTransportError({
@@ -201,13 +243,15 @@ index 0000000000..cc7ec0e04c
 +            }),
 +          ),
 +        );
++      };
 +      let stream: NodeHttp2.ClientHttp2Stream;
 +      try {
 +        const topic =
 +          input.request.pushType === "liveactivity"
 +            ? `${input.bundleId}.push-type.liveactivity`
 +            : input.bundleId;
-+        stream = sessionFor(apnsOrigin(input.environment)).request({
++        session = sessionFor(origin, nowMs);
++        stream = session.request({
 +          ":method": "POST",
 +          ":path": `/3/device/${input.request.token}`,
 +          authorization: `bearer ${providerToken(input.credentials, nowMs)}`,
@@ -237,9 +281,13 @@ index 0000000000..cc7ec0e04c
 +        body += chunk;
 +      });
 +      stream.on("error", fail);
-+      stream.on("end", () =>
-+        resume(Effect.succeed({ status, reason: reasonFromBody(body), apnsId })),
-+      );
++      stream.on("end", () => {
++        // Ended without a response: the connection died under it.
++        if (status === 0) return fail(new Error("APNs stream ended without a response."));
++        if (settled) return;
++        settled = true;
++        resume(Effect.succeed({ status, reason: reasonFromBody(body), apnsId }));
++      });
 +      stream.end(encodePayload(input.request.payload));
 +      return Effect.sync(() => {
 +        if (!stream.closed) stream.close(NodeHttp2.constants.NGHTTP2_CANCEL);
@@ -249,15 +297,18 @@ index 0000000000..cc7ec0e04c
 +  return ApnsTransport.of({ send });
 +});
 +
++export const make = makeWith((origin) => NodeHttp2.connect(origin));
++
 +export const layer = Layer.effect(ApnsTransport, make);
 diff --git a/apps/server/src/directPush/DirectPush.test.ts b/apps/server/src/directPush/DirectPush.test.ts
 new file mode 100644
-index 0000000000..d729012f41
+index 0000000000..db751f7fd5
 --- /dev/null
 +++ b/apps/server/src/directPush/DirectPush.test.ts
-@@ -0,0 +1,331 @@
+@@ -0,0 +1,438 @@
 +// @effect-diagnostics nodeBuiltinImport:off -- the tests generate and verify a real P-256 key.
 +import * as NodeCrypto from "node:crypto";
++import * as NodeEvents from "node:events";
 +
 +import { assert, describe, it } from "@effect/vitest";
 +import { EnvironmentId, ThreadId } from "@t3tools/contracts";
@@ -586,6 +637,112 @@ index 0000000000..d729012f41
 +      ),
 +    );
 +  });
++});
++
++describe("ApnsTransport sessions", () => {
++  // A fake HTTP/2 session: `answer` decides each request's fate.
++  function fakeConnect(answer: (sessionIndex: number) => "ok" | "reset") {
++    const opened: Array<{ destroyed: boolean; requests: number }> = [];
++    const connect = (_origin: string) => {
++      const index = opened.length;
++      const record = { destroyed: false, requests: 0 };
++      opened.push(record);
++      const session = Object.assign(new NodeEvents.EventEmitter(), {
++        closed: false,
++        get destroyed() {
++          return record.destroyed;
++        },
++        close: () => {
++          record.destroyed = true;
++        },
++        destroy: () => {
++          record.destroyed = true;
++        },
++        unref: () => {},
++        request: () => {
++          record.requests += 1;
++          const stream = Object.assign(new NodeEvents.EventEmitter(), {
++            closed: false,
++            setEncoding: () => {},
++            setTimeout: () => {},
++            close: () => {},
++            end: () => {
++              queueMicrotask(() => {
++                if (answer(index) === "reset") {
++                  stream.emit("error", new Error("ECONNRESET"));
++                  return;
++                }
++                stream.emit("response", { ":status": 200, "apns-id": `id-${index}` });
++                stream.emit("end");
++              });
++            },
++          });
++          return stream;
++        },
++      });
++      return session as unknown as ApnsTransport.ApnsSession;
++    };
++    return { connect, opened };
++  }
++
++  const sendInput: ApnsTransport.ApnsSendInput = {
++    credentials: CONFIG,
++    environment: "production",
++    bundleId: CONFIG.bundleId,
++    request: {
++      token: "abcdef0123456789",
++      pushType: "alert",
++      priority: "10",
++      payload: { aps: { alert: "Done" } },
++    } as unknown as ApnsTransport.ApnsSendInput["request"],
++  };
++
++  it.effect("replaces a connection idle longer than APNS_SESSION_IDLE_MS", () =>
++    Effect.scoped(
++      Effect.gen(function* () {
++        const fake = fakeConnect(() => "ok");
++        const transport = yield* ApnsTransport.makeWith(fake.connect);
++        yield* transport.send(sendInput);
++        yield* TestClock.adjust(ApnsTransport.APNS_SESSION_IDLE_MS - 1_000);
++        yield* transport.send(sendInput);
++        assert.strictEqual(fake.opened.length, 1);
++        yield* TestClock.adjust(ApnsTransport.APNS_SESSION_IDLE_MS);
++        const response = yield* transport.send(sendInput);
++        assert.strictEqual(fake.opened.length, 2);
++        assert.isTrue(fake.opened[0]!.destroyed);
++        assert.strictEqual(response.apnsId, "id-1");
++      }),
++    ),
++  );
++
++  it.effect("resends once on a fresh connection when the network drops the request", () =>
++    Effect.scoped(
++      Effect.gen(function* () {
++        const fake = fakeConnect((index) => (index === 0 ? "reset" : "ok"));
++        const transport = yield* ApnsTransport.makeWith(fake.connect);
++        const response = yield* transport.send(sendInput);
++        assert.strictEqual(response.status, 200);
++        assert.strictEqual(response.apnsId, "id-1");
++        assert.deepStrictEqual(
++          fake.opened.map((session) => session.requests),
++          [1, 1],
++        );
++        assert.isTrue(fake.opened[0]!.destroyed);
++      }),
++    ),
++  );
++
++  it.effect("fails after the one resend fails too", () =>
++    Effect.scoped(
++      Effect.gen(function* () {
++        const fake = fakeConnect(() => "reset");
++        const transport = yield* ApnsTransport.makeWith(fake.connect);
++        const result = yield* Effect.flip(transport.send(sendInput));
++        assert.strictEqual(result._tag, "ApnsTransportError");
++        assert.strictEqual(fake.opened.length, 2);
++      }),
++    ),
++  );
 +});
 diff --git a/apps/server/src/directPush/DirectPush.ts b/apps/server/src/directPush/DirectPush.ts
 new file mode 100644
@@ -1676,10 +1833,10 @@ index f02f32d67e..749c4b62b9 100644
    [WS_METHODS.scheduledTasksUpsert]: "scheduledTasks",
    [WS_METHODS.scheduledTasksSetEnabled]: "scheduledTasks",
 diff --git a/apps/server/src/orchestration-v2/ProjectionStore.ts b/apps/server/src/orchestration-v2/ProjectionStore.ts
-index 1a20636117..61087322ad 100644
+index d5bd1cac22..76b2a86197 100644
 --- a/apps/server/src/orchestration-v2/ProjectionStore.ts
 +++ b/apps/server/src/orchestration-v2/ProjectionStore.ts
-@@ -1244,6 +1244,8 @@ export type AgentAwarenessThread = ProjectThreadAwarenessV2Input["thread"] &
+@@ -1245,6 +1245,8 @@ export type AgentAwarenessThread = ProjectThreadAwarenessV2Input["thread"] &
      OrchestrationV2ThreadShell,
      | "projectId"
      | "creationSource"
@@ -1688,7 +1845,7 @@ index 1a20636117..61087322ad 100644
      | "latestRunCompletedAt"
      | "archivedAt"
      | "snoozedUntil"
-@@ -9438,6 +9440,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -9454,6 +9456,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                id: state.thread.id,
                projectId: state.thread.projectId,
                creationSource: state.thread.creationSource,

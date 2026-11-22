@@ -5,17 +5,17 @@ Subject: [PATCH 15/17] feat(ui): one-column model picker, segmented effort bar
  and a live timer on running sidebar rows
 
 ---
- .../chat/ComposerModelEffort.browser.test.tsx | 55 +++++++++++-
+ .../chat/ComposerModelEffort.browser.test.tsx | 59 ++++++++++++-
  .../components/chat/ComposerModelEffort.tsx   | 86 +++++++++++--------
  .../components/chat/ModelPickerContent.tsx    |  2 +-
  .../chat/ProviderModelPicker.browser.test.tsx | 48 +++++++++++
  .../components/chat/ProviderModelPicker.tsx   |  8 +-
  .../SidebarThreadRow.branch.browser.test.tsx  | 50 ++++++++++-
  .../components/sidebar/SidebarThreadRow.tsx   | 29 +++++--
- 7 files changed, 230 insertions(+), 48 deletions(-)
+ 7 files changed, 232 insertions(+), 50 deletions(-)
 
 diff --git a/apps/web/src/components/chat/ComposerModelEffort.browser.test.tsx b/apps/web/src/components/chat/ComposerModelEffort.browser.test.tsx
-index ab7d560d5c..b408bb4eb5 100644
+index 1678552dd0..33bd82f561 100644
 --- a/apps/web/src/components/chat/ComposerModelEffort.browser.test.tsx
 +++ b/apps/web/src/components/chat/ComposerModelEffort.browser.test.tsx
 @@ -6,10 +6,11 @@ import {
@@ -40,9 +40,25 @@ index ab7d560d5c..b408bb4eb5 100644
              { id: "medium", label: "Medium" },
              { id: "high", label: "High" },
            ],
-@@ -122,3 +123,53 @@ it("draws an agent's reasoning as bars and keeps its mode out of the levels", as
-     .toBeInTheDocument();
-   await expect.element(page.getByRole("menuitemradio")).not.toBeInTheDocument();
+@@ -128,13 +129,13 @@ it("focuses a reasoning level by its first letter without selecting it", async (
+   await userEvent.tab();
+   await expect.element(screen.getByRole("radio", { name: "Medium" })).toHaveFocus();
+   await userEvent.keyboard("l");
+-  await expect.element(screen.getByRole("radio", { name: "Low" })).toHaveFocus();
++  await expect.element(screen.getByRole("radio", { name: /^Low/ })).toHaveFocus();
+   await expect
+     .element(screen.getByRole("radio", { name: "Medium" }))
+     .toHaveAttribute("aria-checked", "true");
+   for (const key of ["{Control>}h{/Control}", "{Meta>}h{/Meta}", "{Alt>}h{/Alt}", "{Delete}"]) {
+     await userEvent.keyboard(key);
+-    await expect.element(screen.getByRole("radio", { name: "Low" })).toHaveFocus();
++    await expect.element(screen.getByRole("radio", { name: /^Low/ })).toHaveFocus();
+   }
+   await userEvent.keyboard("H");
+   await expect.element(screen.getByRole("radio", { name: "High" })).toHaveFocus();
+@@ -146,3 +147,53 @@ it("focuses a reasoning level by its first letter without selecting it", async (
+     .element(screen.getByRole("radio", { name: "High" }))
+     .toHaveAttribute("aria-checked", "true");
  });
 +
 +it("lists the levels as one segmented bar with the current level highlighted", async () => {
@@ -95,7 +111,7 @@ index ab7d560d5c..b408bb4eb5 100644
 +  expect(bubbled.mock.calls[0]![0].defaultPrevented).toBe(false);
 +});
 diff --git a/apps/web/src/components/chat/ComposerModelEffort.tsx b/apps/web/src/components/chat/ComposerModelEffort.tsx
-index 1d0227c0f6..3b7ba00ef7 100644
+index b5d5a519a3..2a8a8c3f42 100644
 --- a/apps/web/src/components/chat/ComposerModelEffort.tsx
 +++ b/apps/web/src/components/chat/ComposerModelEffort.tsx
 @@ -8,7 +8,7 @@ import type { ProviderOptionDescriptor, RuntimeMode } from "@t3tools/contracts";
@@ -123,8 +139,8 @@ index 1d0227c0f6..3b7ba00ef7 100644
    /** The column's one tab stop: the selected level, else the first when none shows as selected. */
 @@ -208,35 +209,36 @@ function ColumnRow(props: {
      "data-effort-row": true,
-     // Focus lands on a level after a model pick.
-     "data-effort-level": true,
+     // Focus lands on a level after a model pick, and a typed letter finds one by its label.
+     "data-effort-level": props.label,
 +    "data-checked": props.selected || undefined,
      // Up and Down move between rows.
      tabIndex: props.tabStop ? 0 : -1,
@@ -193,10 +209,10 @@ index 1d0227c0f6..3b7ba00ef7 100644
 +    next?.focus();
 +    return;
 +  }
-   if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
-   // An option's side menu is a React child here, but it moves through its own items.
-   if (!event.currentTarget.contains(event.target as Node)) return;
-@@ -321,7 +337,7 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
+   const arrow = event.key === "ArrowDown" || event.key === "ArrowUp";
+   if (
+     !arrow &&
+@@ -334,7 +350,7 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
    const { descriptor } = control;
    if (control.kind === "boolean") {
      return (
@@ -205,7 +221,7 @@ index 1d0227c0f6..3b7ba00ef7 100644
          {([true, false] as const).map((value) => (
            <ColumnRow
              key={String(value)}
-@@ -344,25 +360,27 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
+@@ -357,25 +373,27 @@ function EffortRows(props: { control: ColumnControl; traits: TraitsSelection; lo
    // An "Ultrathink:" prefix selects a level the column does not offer.
    const shown = choices.some((option) => option.id === value);
    return (
@@ -347,7 +363,7 @@ index 254b1ffeac..5cc29137ae 100644
                      if (event.key !== "ArrowLeft" || event.altKey || event.ctrlKey || event.metaKey)
                        return;
 diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.branch.browser.test.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.branch.browser.test.tsx
-index a0410821ad..de2703d62b 100644
+index 6c16a21feb..ebd99a4a18 100644
 --- a/apps/web/src/components/sidebar/SidebarThreadRow.branch.browser.test.tsx
 +++ b/apps/web/src/components/sidebar/SidebarThreadRow.branch.browser.test.tsx
 @@ -4,7 +4,7 @@ import { page, userEvent } from "vite-plus/test/browser";
@@ -359,7 +375,7 @@ index a0410821ad..de2703d62b 100644
  import { useEnvironmentScope } from "../../state/session";
  import { buildSidebarDelegatedWorkers } from "../Sidebar.childThreads";
  import { TooltipProvider } from "../ui/tooltip";
-@@ -178,3 +178,51 @@ describe("the sidebar row's meta line leaves the branch out", () => {
+@@ -176,3 +176,51 @@ describe("the sidebar row's meta line leaves the branch out", () => {
      await expect.poll(() => document.body.textContent).toContain("2511");
    });
  });
@@ -412,10 +428,10 @@ index a0410821ad..de2703d62b 100644
 +  });
 +});
 diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
-index 3297af8987..cd0205c3a3 100644
+index a1685d0c7a..768779b91b 100644
 --- a/apps/web/src/components/sidebar/SidebarThreadRow.tsx
 +++ b/apps/web/src/components/sidebar/SidebarThreadRow.tsx
-@@ -188,12 +188,20 @@ function WorkingDuration(props: { environmentId: EnvironmentId; startedAt: strin
+@@ -190,12 +190,20 @@ function WorkingDuration(props: { environmentId: EnvironmentId; startedAt: strin
  function WorkingDurationLabel(props: { environmentId: EnvironmentId; startedMs: number }) {
    const nowMs = useNowSecond();
    const messages = useMessages();
@@ -440,7 +456,7 @@ index 3297af8987..cd0205c3a3 100644
      </span>
    );
  }
-@@ -842,6 +850,8 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -849,6 +857,8 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                          }
                        : null;
    const isWokeStatus = topStatus?.icon === "woke";
@@ -449,7 +465,7 @@ index 3297af8987..cd0205c3a3 100644
    // A child row leads with its status and the role its opener gave it.
    const childKind = props.nested
      ? sidebarChildThreadKindOf(
-@@ -1829,11 +1839,18 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
+@@ -1819,11 +1829,18 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThreadRowP
                              topStatus.className,
                            )}
                          >
