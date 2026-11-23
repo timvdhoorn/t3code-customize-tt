@@ -1,7 +1,7 @@
 # Status
 
 > Source: `./t3code-customize status` on each machine; GitHub PRs of `timvdhoorn/t3code-customize-tt`
-> Updated: 2026-11-22
+> Updated: 2026-11-23
 
 What is live, what is in progress and what is open. Finished work leaves this page; its facts live on the owning page.
 
@@ -11,6 +11,7 @@ What is live, what is in progress and what is open. Finished work leaves this pa
 - MacBook Pro: 5085 with the patches (incl. `patches-tt/0017`); iOS build 202611221444 for 5085 on TestFlight.
 
 ## In progress
+- `patches-tt/0018` (ignore the transcript Claude re-emits after an automatic compaction, upstream #38525) is in a PR, not yet merged or on any machine.
 - MacBook Air: 5009 with the patches; picks up 5085 through its update.
 
 ## Open
