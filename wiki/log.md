@@ -2,6 +2,7 @@
 
 One line per change, newest first. Format: [RULES.md](RULES.md#formats).
 
+- 2026-11-23 fix | Compaction replay ignored (`patches-tt/0018`): live-compact plugin no longer moves old tool items into the running turn (PR open) | status.md | docs/fork-changes.md
 - 2026-11-22 fix | Port to 5098; pushes after 5+ idle min were lost (31%): APNs reconnect + resend, Done instant, child threads silent (PR open) | porting/current-port.md | docs/fork-changes.md
 - 2026-11-22 dream | Pages replayed against status, units, patch counts, ios.json, TestFlight keys; no value differed, no duplicates; sessions since 11-15 held no new durable facts | index.md | lint
 - 2026-11-22 change | MBP on 5085; iOS build 202611221444 with the quiet-list fix on TestFlight | status.md | t3code-customize status

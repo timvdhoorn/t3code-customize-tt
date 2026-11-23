@@ -1,0 +1,241 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: timvdhoorn <timvdhoorn@gmail.com>
+Date: Mon, 23 Nov 2026 12:12:21 +0100
+Subject: [PATCH 18/18] fix: ignore the transcript Claude re-emits after an
+ automatic compaction
+
+After an automatic compact_boundary the CLI re-emits the kept transcript as root user and assistant frames (new uuids, original message and tool_use ids, zero usage) before the first stream_event. Ingesting them moved finished tool items into the running run and duplicated assistant text, pushing the user's message out of view (upstream pingdotgg/t3code#38525). Drop those frames until the first root stream_event or a requesting status.
+---
+ .../Adapters/ClaudeAdapterV2.test.ts          | 144 ++++++++++++++++++
+ .../Adapters/ClaudeAdapterV2.ts               |  35 +++++
+ 2 files changed, 179 insertions(+)
+
+diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
+index aedae4ac44..6d3923b493 100644
+--- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
++++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
+@@ -11568,6 +11568,150 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+       ),
+   );
+ 
++  // regression: upstream #38525. After an automatic compact_boundary the CLI re-emits the kept
++  // transcript as root frames with new uuids and the original message and tool_use ids.
++  it.effect("ignores the kept transcript Claude re-emits after an automatic compaction", () =>
++    Effect.gen(function* () {
++      const harness = yield* makeWakeHarness;
++      const firstAnswer = "Turn one answer text.";
++      const keptFrames = (suffix: string) => [
++        claudeSdkFrame({
++          type: "assistant",
++          uuid: `00000000-0000-4000-8000-0000000c1${suffix}1`,
++          session_id: WAKE_NATIVE_SESSION,
++          parent_tool_use_id: null,
++          message: {
++            id: "msg_kept_a",
++            type: "message",
++            role: "assistant",
++            model: "claude-sonnet-4-6",
++            content: [
++              { type: "text", text: firstAnswer },
++              {
++                type: "tool_use",
++                id: "toolu-kept-bash",
++                name: "Bash",
++                input: { command: "echo kept" },
++              },
++            ],
++          },
++        }),
++        claudeSdkFrame({
++          type: "user",
++          uuid: `00000000-0000-4000-8000-0000000c1${suffix}2`,
++          session_id: WAKE_NATIVE_SESSION,
++          parent_tool_use_id: null,
++          message: {
++            role: "user",
++            content: [
++              {
++                type: "tool_result",
++                tool_use_id: "toolu-kept-bash",
++                content: "kept",
++                is_error: false,
++              },
++            ],
++          },
++        }),
++      ];
++      yield* harness.runtime.startTurn(
++        makeClaudeTestTurnInput({
++          threadId: harness.threadId,
++          providerThread: harness.providerThread,
++          now: yield* DateTime.now,
++          attemptId: RunAttemptId.make("claude-replay-first-attempt"),
++          text: "First.",
++          attachments: [],
++        }),
++      );
++      for (const frame of keptFrames("0")) yield* harness.offerAndWait(frame);
++      yield* harness.offerAndWait(
++        makeResultFrame({ uuid: "00000000-0000-4000-8000-0000000c1f01", result: "" }),
++      );
++      yield* Queue.take(harness.terminalReceipts);
++
++      yield* harness.runtime.startTurn(
++        makeClaudeTestTurnInput({
++          threadId: harness.threadId,
++          providerThread: harness.providerThread,
++          now: yield* DateTime.now,
++          attemptId: RunAttemptId.make("claude-replay-second-attempt"),
++          text: "Second.",
++          attachments: [],
++        }),
++      );
++      const secondTurnStart = harness.events.length;
++      yield* harness.offerAndWait(
++        claudeSdkFrame({
++          type: "system",
++          subtype: "status",
++          status: "compacting",
++          uuid: "00000000-0000-4000-8000-0000000c1e01",
++          session_id: WAKE_NATIVE_SESSION,
++        }),
++      );
++      yield* harness.offerAndWait(
++        claudeSdkFrame({
++          type: "system",
++          subtype: "compact_boundary",
++          compact_metadata: { trigger: "auto", pre_tokens: 1500, post_tokens: 400 },
++          uuid: "00000000-0000-4000-8000-0000000c1e02",
++          session_id: WAKE_NATIVE_SESSION,
++        }),
++      );
++      for (const frame of keptFrames("9")) yield* harness.offerAndWait(frame);
++      yield* harness.offerAndWait(
++        claudeSdkFrame({
++          type: "stream_event",
++          event: { type: "message_start", message: { id: "msg_fresh" } },
++          parent_tool_use_id: null,
++          session_id: WAKE_NATIVE_SESSION,
++          uuid: "00000000-0000-4000-8000-0000000c1e03",
++        }),
++      );
++      yield* harness.offerAndWait(
++        makeAssistantTextFrame({
++          uuid: "00000000-0000-4000-8000-0000000c1e04",
++          text: "Fresh answer text.",
++        }),
++      );
++      yield* harness.offerAndWait(
++        makeResultFrame({ uuid: "00000000-0000-4000-8000-0000000c1f02", result: "" }),
++      );
++      yield* Queue.take(harness.terminalReceipts);
++
++      const secondTurnItems = harness.events
++        .slice(secondTurnStart)
++        .flatMap((event) => (event.type === "turn_item.updated" ? [event.turnItem] : []));
++      assert.isEmpty(
++        secondTurnItems.filter((item) => item.nativeItemRef?.nativeId === "toolu-kept-bash"),
++        "a finished tool item moved into the second turn",
++      );
++      assert.isEmpty(
++        secondTurnItems.filter(
++          (item) => item.type === "assistant_message" && item.text.includes(firstAnswer),
++        ),
++        "the first turn's answer was duplicated into the second turn",
++      );
++      assert.isTrue(
++        secondTurnItems.some(
++          (item) => item.type === "assistant_message" && item.text.includes("Fresh answer text."),
++        ),
++      );
++      const compactions = secondTurnItems.filter((item) => item.type === "compaction");
++      assert.equal(compactions.at(-1)?.status, "completed");
++    }).pipe(
++      Effect.provide(
++        Layer.mergeAll(
++          IdAllocator.layer,
++          McpProviderSessions.layer,
++          NodeServices.layer,
++          NodeCrypto.layer,
++        ),
++      ),
++    ),
++  );
++
+   it.effect("shows automatic compaction before its boundary and completes the same item", () =>
+     Effect.gen(function* () {
+       const harness = yield* makeWakeHarness;
+diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
+index d628050415..64f7533ac7 100644
+--- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
+@@ -3966,6 +3966,13 @@ function isClaudeBackgroundTasksChangedMessage(message: SDKMessage): boolean {
+   return message.type === "system" && (message.subtype as string) === "background_tasks_changed";
+ }
+ 
++function isClaudeZeroUsage(usage: ClaudeMessageUsage | null | undefined): boolean {
++  if (usage == null) return true;
++  return (
++    claudeMessageInputTokens(usage) <= 0 && (usage.output_tokens == null || usage.output_tokens <= 0)
++  );
++}
++
+ function isClaudeTurnStartMessage(message: SDKMessage): boolean {
+   return message.type === "system" && message.subtype === "init";
+ }
+@@ -5284,6 +5291,10 @@ interface ActiveClaudeTurnContext {
+   // Set while this turn's latest compaction status reports a failure, with
+   // Claude's error text when it sent one.
+   compactionFailure: { readonly message: string | undefined } | null;
++  // After an automatic compact_boundary the CLI re-emits the kept transcript as root user and
++  // assistant frames (new uuids, old message and tool_use ids) before the first stream_event.
++  // Ingesting them moves finished tool items into this run and duplicates text.
++  replayingCompactedTranscript: boolean;
+   // The title a `session_title_changed` frame reported; a `/rename` result applies it to the thread.
+   nativeSessionTitle: string | null;
+   // Steers end segments whose usage is excluded from the final result; bill them too, oldest first.
+@@ -11151,6 +11162,26 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+           }
+           yield* trackClaudeGoal({ nativeThreadId: liveQuery.nativeThreadId, context, message });
+ 
++          if (context.replayingCompactedTranscript) {
++            if (
++              (message.type === "stream_event" && !message.parent_tool_use_id) ||
++              (message.type === "system" &&
++                message.subtype === "status" &&
++                message.status === "requesting")
++            ) {
++              context.replayingCompactedTranscript = false;
++            } else if (
++              (message.type === "user" || message.type === "assistant") &&
++              message.parent_tool_use_id === null &&
++              (message.type === "user" ||
++                (message.message.model !== "<synthetic>" &&
++                  isClaudeZeroUsage(message.message.usage)))
++            ) {
++              // A replayed assistant frame reports zero usage; a real request reports its own.
++              return;
++            }
++          }
++
+           if (message.type === "stream_event" && !message.parent_tool_use_id) {
+             const event = message.event;
+             const reasoning = context.reasoning;
+@@ -11497,6 +11528,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+             deliveredAppContext.delete(context.nativeThreadId);
+             context.appContextOffered = undefined;
+             if (context.streamUsage !== null) context.streamUsage.usage = null;
++            if (message.compact_metadata.trigger === "auto") {
++              context.replayingCompactedTranscript = true;
++            }
+             const postTokens = message.compact_metadata.post_tokens;
+             const afterTokenCount =
+               typeof postTokens === "number" && Number.isFinite(postTokens) && postTokens > 0
+@@ -13811,6 +13845,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+               rateLimitResetTimes: new Map(),
+               latestAssistantRateLimit: null,
+               compactionFailure: null,
++              replayingCompactedTranscript: false,
+               nativeSessionTitle: null,
+               steeredSegmentUsage: [],
+               steersClosed: false,
