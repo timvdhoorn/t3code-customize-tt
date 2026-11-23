@@ -11,9 +11,9 @@ What is live, what is in progress and what is open. Finished work leaves this pa
 - MacBook Pro: 5085 with the patches (incl. `patches-tt/0017`); iOS build 202611221444 for 5085 on TestFlight.
 
 ## In progress
-- `patches-tt/0018` (ignore the transcript Claude re-emits after an automatic compaction, upstream #38525) is in a PR, not yet merged or on any machine.
+- `patches-tt/0018` (ignore the transcript Claude re-emits after an automatic compaction, upstream #38525) is merged; it reaches devbox1 with the port to 5138.
 - MacBook Air: 5009 with the patches; picks up 5085 through its update.
 
 ## Open
-- Port to nightly 5098, PR open, not yet on any machine.
+- Port to nightly 5138 (patch layers still based on 5098's shared port), PR open.
 - It carries `patches-tt/0003`: APNs reconnect after 4 idle min plus one resend; only main threads notify, Done without delay.

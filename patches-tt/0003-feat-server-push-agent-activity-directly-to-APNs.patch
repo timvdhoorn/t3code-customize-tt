@@ -35,7 +35,7 @@ Activity it filled itself. Without a key the server behaves as upstream.
  create mode 100644 apps/server/src/directPush/agentActivityDelivery.ts
 
 diff --git a/apps/server/src/auth/RpcAuthorization.ts b/apps/server/src/auth/RpcAuthorization.ts
-index ffe84c428a..678ef22cea 100644
+index b276fafb27..155e267ec4 100644
 --- a/apps/server/src/auth/RpcAuthorization.ts
 +++ b/apps/server/src/auth/RpcAuthorization.ts
 @@ -128,6 +128,9 @@ export const RPC_REQUIRED_SCOPES = {
@@ -46,8 +46,8 @@ index ffe84c428a..678ef22cea 100644
 +  [WS_METHODS.serverRegisterPushLiveActivity]: AuthOrchestrationReadScope,
 +  [WS_METHODS.serverGetPushActivitySnapshot]: AuthOrchestrationReadScope,
    [WS_METHODS.scheduledTasksSubscribe]: AuthOrchestrationReadScope,
-   [WS_METHODS.secretsAnswerRequest]: AuthOrchestrationOperateScope,
-   // Delivery logs hold request bodies, so they need the same scope as the URL.
+   [WS_METHODS.workflowsSubscribe]: AuthOrchestrationReadScope,
+   [WS_METHODS.workflowsCounts]: AuthOrchestrationReadScope,
 diff --git a/apps/server/src/directPush/ApnsTransport.ts b/apps/server/src/directPush/ApnsTransport.ts
 new file mode 100644
 index 0000000000..8c1855f8fd
@@ -1720,7 +1720,7 @@ index 0000000000..288496e494
 +  );
 +}
 diff --git a/apps/server/src/environment/ServerEnvironment.ts b/apps/server/src/environment/ServerEnvironment.ts
-index b29f9c874f..5ca5f6d34c 100644
+index a340037016..12ad12049a 100644
 --- a/apps/server/src/environment/ServerEnvironment.ts
 +++ b/apps/server/src/environment/ServerEnvironment.ts
 @@ -17,6 +17,7 @@ import packageJson from "../../package.json" with { type: "json" };
@@ -1731,7 +1731,7 @@ index b29f9c874f..5ca5f6d34c 100644
  import { resolveServerSelfUpdateCapability } from "../cloud/selfUpdate.ts";
  import { resolveServiceLauncherMode } from "../cloud/serviceLauncherClient.ts";
  import * as ServerConfig from "../config.ts";
-@@ -311,7 +312,12 @@ export const make = Effect.gen(function* () {
+@@ -313,7 +314,12 @@ export const make = Effect.gen(function* () {
    return ServerEnvironment.of({
      getEnvironmentId: Effect.succeed(environmentId),
      // Publishing opt-in and relay links change at runtime; read the capability per request.
@@ -1746,13 +1746,13 @@ index b29f9c874f..5ca5f6d34c 100644
          ...descriptor,
          capabilities: { ...descriptor.capabilities, agentActivityPublishing },
 diff --git a/apps/server/src/observability/RpcInstrumentation.ts b/apps/server/src/observability/RpcInstrumentation.ts
-index f02f32d67e..749c4b62b9 100644
+index a4a918fe1d..aad7788ca0 100644
 --- a/apps/server/src/observability/RpcInstrumentation.ts
 +++ b/apps/server/src/observability/RpcInstrumentation.ts
-@@ -105,6 +105,9 @@ const RPC_AGGREGATES = {
-   [WS_METHODS.serverRefreshUsageRates]: "server",
-   [WS_METHODS.serverSignalProcess]: "server",
-   [WS_METHODS.serverReportClientActivity]: "server",
+@@ -114,6 +114,9 @@ const RPC_AGGREGATES = {
+   [WS_METHODS.workflowsGetDefinition]: "workflows",
+   [WS_METHODS.workflowsSaveDefinition]: "workflows",
+   [WS_METHODS.workflowsDeleteDefinition]: "workflows",
 +  [WS_METHODS.serverRegisterPushDevice]: "server",
 +  [WS_METHODS.serverRegisterPushLiveActivity]: "server",
 +  [WS_METHODS.serverGetPushActivitySnapshot]: "server",
@@ -1760,7 +1760,7 @@ index f02f32d67e..749c4b62b9 100644
    [WS_METHODS.scheduledTasksUpsert]: "scheduledTasks",
    [WS_METHODS.scheduledTasksSetEnabled]: "scheduledTasks",
 diff --git a/apps/server/src/orchestration-v2/ProjectionStore.ts b/apps/server/src/orchestration-v2/ProjectionStore.ts
-index d5bd1cac22..76b2a86197 100644
+index 6451a41091..b88ca7ddb5 100644
 --- a/apps/server/src/orchestration-v2/ProjectionStore.ts
 +++ b/apps/server/src/orchestration-v2/ProjectionStore.ts
 @@ -1245,6 +1245,8 @@ export type AgentAwarenessThread = ProjectThreadAwarenessV2Input["thread"] &
@@ -1772,7 +1772,7 @@ index d5bd1cac22..76b2a86197 100644
      | "latestRunCompletedAt"
      | "archivedAt"
      | "snoozedUntil"
-@@ -9454,6 +9456,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
+@@ -9492,6 +9494,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                id: state.thread.id,
                projectId: state.thread.projectId,
                creationSource: state.thread.creationSource,
@@ -2028,10 +2028,10 @@ index 2eed87a803..33433bb8bb 100644
      const environmentId = yield* serverEnvironment.getEnvironmentId;
      const projectSnapshot = yield* projects.snapshot;
 diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
-index d06186beb1..e0d21ab460 100644
+index 499c1e2acc..dcccefc502 100644
 --- a/apps/server/src/server.ts
 +++ b/apps/server/src/server.ts
-@@ -118,6 +118,7 @@ import * as Keybindings from "./keybindings.ts";
+@@ -121,6 +121,7 @@ import * as Keybindings from "./keybindings.ts";
  import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
  import * as ServerOwnership from "./serverOwnership.ts";
  import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
@@ -2039,7 +2039,7 @@ index d06186beb1..e0d21ab460 100644
  import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
  import * as ServerSettings from "./serverSettings.ts";
  import * as ManagedLimits from "./policy/managedLimits.ts";
-@@ -828,6 +829,9 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
+@@ -846,6 +847,9 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
    Layer.provideMerge(
      Layer.mergeAll(AssetSigner.layer, EnvironmentKeys.layer, WorkspacePreviewRevisions.layer),
    ),
@@ -2050,10 +2050,10 @@ index d06186beb1..e0d21ab460 100644
    Layer.provideMerge(
      Layer.mergeAll(
 diff --git a/apps/server/src/ws.ts b/apps/server/src/ws.ts
-index ddd07fcfad..3b75626c06 100644
+index b6922b9e90..b952eecc45 100644
 --- a/apps/server/src/ws.ts
 +++ b/apps/server/src/ws.ts
-@@ -243,6 +243,7 @@ import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
+@@ -248,6 +248,7 @@ import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
  import * as DefectReporter from "./observability/DefectReporter.ts";
  import * as EventLoopMonitor from "./observability/EventLoopMonitor.ts";
  import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
@@ -2061,7 +2061,7 @@ index ddd07fcfad..3b75626c06 100644
  import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
  import { requiredScopeForDeviceList, rpcAuthorizationError } from "./auth/RpcAuthorization.ts";
  import * as RpcAuthorization from "./auth/RpcAuthorization.ts";
-@@ -1578,6 +1579,7 @@ export const layerWsRpc = (
+@@ -1589,6 +1590,7 @@ export const layerWsRpc = (
        const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
        const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
        const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
@@ -2069,7 +2069,7 @@ index ddd07fcfad..3b75626c06 100644
        const rpcClientIds = yield* Ref.make(new Set<RpcClientId>());
        yield* Effect.addFinalizer(() =>
          Ref.get(rpcClientIds).pipe(
-@@ -2804,6 +2806,18 @@ export const layerWsRpc = (
+@@ -2835,6 +2837,18 @@ export const layerWsRpc = (
                ),
              ),
            ),
@@ -2089,11 +2089,11 @@ index ddd07fcfad..3b75626c06 100644
          [WS_METHODS.cloudInstallRelayClient]: (_input) =>
            Stream.callback<RelayClientInstallProgressEvent, RelayClientInstallFailedError>((queue) =>
 diff --git a/packages/contracts/src/rpc.ts b/packages/contracts/src/rpc.ts
-index e30bf9af29..62a2aa970b 100644
+index c7fe990a4b..c703a57325 100644
 --- a/packages/contracts/src/rpc.ts
 +++ b/packages/contracts/src/rpc.ts
 @@ -48,6 +48,11 @@ import * as RpcMiddleware from "effect/rpc/RpcMiddleware";
- import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+ import { IsoDateTime, NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
  import { SecretSourceCheckResult } from "./settingsSecretValue.ts";
  import { SecretReference } from "./secretReference.ts";
 +import {
@@ -2104,7 +2104,7 @@ index e30bf9af29..62a2aa970b 100644
  import {
    ProviderAuthCancelInput,
    ProviderAuthCompleteInput,
-@@ -613,6 +618,11 @@ export const WS_METHODS = {
+@@ -630,6 +635,11 @@ export const WS_METHODS = {
    serverPrepareTriage: "server.prepareTriage",
    serverSignalProcess: "server.signalProcess",
    serverReportClientActivity: "server.reportClientActivity",
@@ -2116,7 +2116,7 @@ index e30bf9af29..62a2aa970b 100644
    serverGetUsageSummary: "server.getUsageSummary",
    serverRefreshUsageRates: "server.refreshUsageRates",
  
-@@ -1177,6 +1187,30 @@ const WsServerReportClientActivityRpc = Rpc.make(WS_METHODS.serverReportClientAc
+@@ -1207,6 +1217,30 @@ const WsServerReportClientActivityRpc = Rpc.make(WS_METHODS.serverReportClientAc
    error: EnvironmentAuthorizationError,
  });
  
@@ -2147,7 +2147,7 @@ index e30bf9af29..62a2aa970b 100644
  const PullRequestRpcError = Schema.Union([
    PullRequestUnavailableError,
    PullRequestOperationError,
-@@ -2462,6 +2496,9 @@ export const WsRpcGroup = RpcGroup.make(
+@@ -2560,6 +2594,9 @@ export const WsRpcGroup = RpcGroup.make(
    WsScheduledTasksListWebhookDeliveriesRpc,
    WsScheduledTasksGetWebhookDeliveryRpc,
    WsServerReportClientActivityRpc,
