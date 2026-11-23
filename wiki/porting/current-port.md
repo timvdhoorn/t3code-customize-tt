@@ -30,7 +30,8 @@ Which nightly the patches cover and what a port of them has to watch for. The po
 - A web unit test rendering a `useGT` component needs `initializeGT` from `gt-react` plus `<GTProvider locale="en">`.
 - `initializeGTSPA` throws under Node; see `V2LifecycleRow.kind.test.tsx`.
 - 5009: patch strings are not in the GT catalogs, so other locales show English; upstream's `i18n:check` is not part of our checks.
-- 5138: upstream wraps the subagent divider label in `relation?.label ?? (...)` (workflow runs); `patches-tt/0006` needs the extra `)`. `workflowRun` sits next to the opener fields in `models.ts` and `orchestrationV2.ts`, the workflow RPCs next to the APNs ones in `RpcInstrumentation.ts`.
+- 5138: upstream wraps the subagent divider label in `relation?.label ?? (...)`; `patches-tt/0006` needs the extra `)`.
+- 5138: `workflowRun` sits next to the opener fields (`models.ts`, `orchestrationV2.ts`), the workflow RPCs next to the APNs ones.
 - 5138: a browser test file that fails with `Failed to fetch dynamically imported module` right after a fresh install is a Vite flake; rerun `checks`.
 - 5098: the server's `typecheck` is a `vite.config.ts` task (#30879), not a `package.json` script; `typechecker()` reads both, else `checks` falls back to `tsc` and fails in `effect-tsgo patch`.
 - 5098: the sidebar meta line shows the environment, not the branch (#40736); row fixtures pass `environmentLabel`.
