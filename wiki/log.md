@@ -2,6 +2,7 @@
 
 One line per change, newest first. Format: [RULES.md](RULES.md#formats).
 
+- 2026-11-24 change | Patches ported to nightly 5204: 4 conflicts, 2 check fixes (settlement field rename, subagent-of label test) (PR open) | porting/current-port.md | checks
 - 2026-11-23 change | Patches ported to nightly 5138: 3 own-patch conflicts (workflowRun fields, workflow RPCs, divider paren in tt/0006) (PR open) | porting/current-port.md | checks
 - 2026-11-23 fix | Compaction replay ignored (`patches-tt/0018`): live-compact plugin no longer moves old tool items into the running turn (PR open) | status.md | docs/fork-changes.md
 - 2026-11-22 fix | Port to 5098; pushes after 5+ idle min were lost (31%): APNs reconnect + resend, Done instant, child threads silent (PR open) | porting/current-port.md | docs/fork-changes.md

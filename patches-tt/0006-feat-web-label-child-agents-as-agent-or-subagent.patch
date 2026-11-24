@@ -7,7 +7,7 @@ Subject: [PATCH 06/18] feat(web): label child agents as agent or subagent
  .../orchestration-v2/ProjectionStore.test.ts  |   8 +-
  apps/web/src/components/ChatView.tsx          |   8 +
  .../components/chat/BackgroundWorkDetails.tsx |   6 +-
- .../chat/MessagesTimeline.browser.test.tsx    |  22 ++
+ .../chat/MessagesTimeline.browser.test.tsx    |  24 +-
  .../src/components/chat/MessagesTimeline.tsx  |   7 +-
  .../chat/SubagentTooltipContent.tsx           |  29 ++-
  .../components/chat/ThreadActivityBanners.tsx |   8 +-
@@ -26,7 +26,7 @@ Subject: [PATCH 06/18] feat(web): label child agents as agent or subagent
  .../client-runtime/src/state/threadShell.ts   |  38 +++-
  packages/contracts/src/orchestrationV2.ts     |   1 +
  .../orchestrationV2PendingBackgroundWork.ts   |   2 +
- 22 files changed, 934 insertions(+), 124 deletions(-)
+ 22 files changed, 935 insertions(+), 125 deletions(-)
  create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.kind.browser.test.tsx
  create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.logic.ts
  create mode 100644 apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx
@@ -35,7 +35,7 @@ Subject: [PATCH 06/18] feat(web): label child agents as agent or subagent
  create mode 100644 packages/client-runtime/src/state/threadShell.kind.test.ts
 
 diff --git a/apps/server/src/orchestration-v2/ProjectionStore.test.ts b/apps/server/src/orchestration-v2/ProjectionStore.test.ts
-index 636e69e757..ffc9b01bd4 100644
+index 8de65435fd..5d63eb1dcf 100644
 --- a/apps/server/src/orchestration-v2/ProjectionStore.test.ts
 +++ b/apps/server/src/orchestration-v2/ProjectionStore.test.ts
 @@ -1979,7 +1979,13 @@ it.effect("SQL shells use the latest subagent owner for duplicate provider-threa
@@ -54,10 +54,10 @@ index 636e69e757..ffc9b01bd4 100644
      yield* assertOwners(threadId, owned);
      yield* assertOwners(otherThreadId, owned);
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index 10cbb215c9..f24cd9f723 100644
+index 357439cbdf..abdf260f3a 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -1014,6 +1014,14 @@ export default function ChatView(props: ChatViewProps) {
+@@ -1030,6 +1030,14 @@ export default function ChatView(props: ChatViewProps) {
        : {
            threadId: parentSubagentThreadRef.threadId,
            title: parentSubagentThread?.title ?? gt("Parent thread"),
@@ -73,10 +73,10 @@ index 10cbb215c9..f24cd9f723 100644
    const { threadError, sessionDismissal: threadErrorSessionDismissal } = resolveThreadErrorBanner({
      isServerThread,
 diff --git a/apps/web/src/components/chat/BackgroundWorkDetails.tsx b/apps/web/src/components/chat/BackgroundWorkDetails.tsx
-index 72ca70c2b1..b900b40d3a 100644
+index 4b1d0911d5..bc1cb16197 100644
 --- a/apps/web/src/components/chat/BackgroundWorkDetails.tsx
 +++ b/apps/web/src/components/chat/BackgroundWorkDetails.tsx
-@@ -106,7 +106,11 @@ export function BackgroundWorkDetails(props: {
+@@ -108,7 +108,11 @@ export function BackgroundWorkDetails(props: {
                          props.onOpenThread(childThreadId);
                        }}
                      >
@@ -86,14 +86,23 @@ index 72ca70c2b1..b900b40d3a 100644
 +                      ) : (
 +                        <T>Open subagent</T>
 +                      )}
-                     </InlineButton>
+                     </Button>
                    ) : null}
                  </section>
 diff --git a/apps/web/src/components/chat/MessagesTimeline.browser.test.tsx b/apps/web/src/components/chat/MessagesTimeline.browser.test.tsx
-index bce13bb454..d3d6f02aad 100644
+index 222f498e71..938251293b 100644
 --- a/apps/web/src/components/chat/MessagesTimeline.browser.test.tsx
 +++ b/apps/web/src/components/chat/MessagesTimeline.browser.test.tsx
-@@ -2497,3 +2497,25 @@ it("keeps concurrent approvals actionable outside collapsed work and restores se
+@@ -832,7 +832,7 @@ describe("MessagesTimeline messages", () => {
+         timelineEntries={[message("Short child reply.", { role: "assistant" }, "child-0")]}
+       />,
+     );
+-    expect(screen.text()).toContain("Subagent of");
++    expect(screen.text()).toContain("subagent of");
+     const viewport = props.listRef.current!.getScrollableNode()!;
+     const end = () => viewport.scrollHeight - viewport.clientHeight;
+     // Distance from the end as each scroll lands, against the content height at that moment.
+@@ -2546,3 +2546,25 @@ it("keeps concurrent approvals actionable outside collapsed work and restores se
      .element(screen.getByRole("button", { name: "Open the current tab", exact: true }))
      .toBeVisible();
  });
@@ -120,10 +129,10 @@ index bce13bb454..d3d6f02aad 100644
 +  });
 +});
 diff --git a/apps/web/src/components/chat/MessagesTimeline.tsx b/apps/web/src/components/chat/MessagesTimeline.tsx
-index aaaba1d4bc..91f407d5de 100644
+index 589f3d0981..d21a3d713e 100644
 --- a/apps/web/src/components/chat/MessagesTimeline.tsx
 +++ b/apps/web/src/components/chat/MessagesTimeline.tsx
-@@ -294,6 +294,8 @@ interface MessagesTimelineProps {
+@@ -302,6 +302,8 @@ interface MessagesTimelineProps {
      /** What this thread is to it, when not its subagent or side chat: `Step of`, say. */
      readonly relation?: { readonly label: string; readonly actionLabel: string };
      readonly open?: () => void;
@@ -132,7 +141,7 @@ index aaaba1d4bc..91f407d5de 100644
    } | null;
    workflowOpening?: WorkflowOpening | null;
    onForkFromRun?: (input: {
-@@ -1233,9 +1235,10 @@ const ConversationTimeline = memo(function ConversationTimeline({
+@@ -1241,9 +1243,10 @@ const ConversationTimeline = memo(function ConversationTimeline({
                  ? gt("Context from", {
                      $context: "divider label; the parent thread title follows as a link",
                    })
@@ -503,7 +512,7 @@ index 0000000000..6fc5719fe7
 +  return edge.sourceThreadId === currentThreadId ? resolve(msg("Fork")) : resolve(msg("Parent thread"));
 +}
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
-index 1faa7b3dbc..8836f58d7e 100644
+index 4a15ed1b0f..f8759a5e5a 100644
 --- a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
 +++ b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
 @@ -1,6 +1,7 @@
@@ -547,7 +556,7 @@ index 1faa7b3dbc..8836f58d7e 100644
    }
    return edge.sourceThreadId === currentThreadId
      ? resolve(msg("Open fork in this chat"))
-@@ -971,7 +978,7 @@ export function ThreadRelationshipsPanel(props: {
+@@ -984,7 +991,7 @@ export function ThreadRelationshipsPanel(props: {
  
    const stopSubagent = async (
      childThreadId: ThreadId,
@@ -556,7 +565,7 @@ index 1faa7b3dbc..8836f58d7e 100644
    ) => {
      if (stoppingId !== null) return;
      setStoppingId(childThreadId);
-@@ -981,7 +988,13 @@ export function ThreadRelationshipsPanel(props: {
+@@ -994,7 +1001,13 @@ export function ThreadRelationshipsPanel(props: {
      });
      setStoppingId(null);
      if (result._tag === "Failure") {
@@ -571,7 +580,7 @@ index 1faa7b3dbc..8836f58d7e 100644
      }
    };
  
-@@ -1041,6 +1054,7 @@ export function ThreadRelationshipsPanel(props: {
+@@ -1054,6 +1067,7 @@ export function ThreadRelationshipsPanel(props: {
      const workflowGroup =
        projectedAgent === undefined ? undefined : workflowGroupsById.get(projectedAgent.id);
      const agent = workflowGroup ? projectedAgent : currentSubagent(projectedAgent, node?.thread);
@@ -579,7 +588,7 @@ index 1faa7b3dbc..8836f58d7e 100644
      const failed = rowStatus === "failed" || rowStatus === "error";
      const canStop =
        agent &&
-@@ -1086,7 +1100,13 @@ export function ThreadRelationshipsPanel(props: {
+@@ -1099,7 +1113,13 @@ export function ThreadRelationshipsPanel(props: {
          : "";
      const project = projects.find((project) => project.id === node?.thread?.projectId);
      const isSideChat = node?.thread?.lineage.sideChat === true && !isParent;
@@ -594,7 +603,7 @@ index 1faa7b3dbc..8836f58d7e 100644
      const openProps =
        isSideChat || (isSubagent && !isParent)
          ? trigger((intent) => openSideThreadRow(threadId, intent))
-@@ -1123,10 +1143,15 @@ export function ThreadRelationshipsPanel(props: {
+@@ -1136,10 +1156,15 @@ export function ThreadRelationshipsPanel(props: {
            fallbackIcon={RelationshipIcon}
            status={rowStatus}
          />
@@ -612,7 +621,7 @@ index 1faa7b3dbc..8836f58d7e 100644
          </span>
          {agent ? null : (
            <ArrowRightIcon className="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
-@@ -1272,7 +1297,11 @@ export function ThreadRelationshipsPanel(props: {
+@@ -1285,7 +1310,11 @@ export function ThreadRelationshipsPanel(props: {
                        variant="ghost"
                        part="icon"
                        tone="destructive"
@@ -625,7 +634,7 @@ index 1faa7b3dbc..8836f58d7e 100644
                        disabled={stoppingId !== null}
                        onClick={() => void stopSubagent(threadId, agent)}
                      />
-@@ -1285,7 +1314,7 @@ export function ThreadRelationshipsPanel(props: {
+@@ -1298,7 +1327,7 @@ export function ThreadRelationshipsPanel(props: {
                    )}
                  </TooltipTrigger>
                  <TooltipPopup side="left">
@@ -1402,10 +1411,10 @@ index 0000000000..73698e6885
 +  });
 +});
 diff --git a/packages/client-runtime/src/state/threadExecution.ts b/packages/client-runtime/src/state/threadExecution.ts
-index 7a47960e7b..18f1e65815 100644
+index 3ce5f66047..e98e54da4c 100644
 --- a/packages/client-runtime/src/state/threadExecution.ts
 +++ b/packages/client-runtime/src/state/threadExecution.ts
-@@ -621,29 +621,49 @@ export function threadRuntimeHasInterruptibleRun(
+@@ -671,29 +671,49 @@ export function threadRuntimeHasInterruptibleRun(
  
  type BackgroundWorkKind = OrchestrationV2PendingBackgroundTask["kind"];
  
@@ -1463,7 +1472,7 @@ index 7a47960e7b..18f1e65815 100644
    },
  };
  
-@@ -696,10 +716,19 @@ export function presentRunStop(
+@@ -746,10 +766,19 @@ export function presentRunStop(
    };
  }
  
@@ -1483,7 +1492,7 @@ index 7a47960e7b..18f1e65815 100644
    readonly childThreadId: ThreadId | undefined;
  }
  
-@@ -742,8 +771,9 @@ export function presentPendingBackgroundWork(
+@@ -792,8 +821,9 @@ export function presentPendingBackgroundWork(
  ): PendingBackgroundWorkPresentation | null {
    if (tasks.length === 0) return null;
    const waiting = backgroundWorkHoldsCompletion(tasks);
@@ -1495,7 +1504,7 @@ index 7a47960e7b..18f1e65815 100644
        const description = task.description?.trim();
        const label =
          description === undefined
-@@ -753,36 +783,35 @@ export function presentPendingBackgroundWork(
+@@ -803,36 +833,35 @@ export function presentPendingBackgroundWork(
              : task.kind === "command" || task.kind === "monitor"
                ? commandDisplayText(description)
                : description;
@@ -1551,7 +1560,7 @@ index 7a47960e7b..18f1e65815 100644
      resolve,
    );
    return {
-@@ -794,25 +823,6 @@ export function presentPendingBackgroundWork(
+@@ -844,25 +873,6 @@ export function presentPendingBackgroundWork(
    };
  }
  
@@ -1689,10 +1698,10 @@ index 3325346d5d..e091033fe3 100644
    );
  }
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
-index 8b6cde0073..df84d9ba0b 100644
+index 48e909cb0a..19e2562831 100644
 --- a/packages/contracts/src/orchestrationV2.ts
 +++ b/packages/contracts/src/orchestrationV2.ts
-@@ -1218,6 +1218,7 @@ export const OrchestrationV2PendingBackgroundTask = kindUnionWithFallback(
+@@ -1224,6 +1224,7 @@ export const OrchestrationV2PendingBackgroundTask = kindUnionWithFallback(
        /** The owning provider thread's instance, populated in derived pending work. */
        providerInstanceId: Schema.optional(ProviderInstanceId),
        childThreadId: Schema.optional(ThreadId),
