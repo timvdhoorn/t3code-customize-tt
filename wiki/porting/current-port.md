@@ -1,15 +1,15 @@
 # Current port
 
 > Source: `patches-port/base.txt`, `covered-nightly.txt`, `skip-shared.json`; `./t3code-customize status`
-> Updated: 2026-11-23
+> Updated: 2026-11-24
 
 Which nightly the patches cover and what a port of them has to watch for. The port loop itself is in [docs/porting.md](../../docs/porting.md).
 
 ## Coverage
-- Shared patches: `patches-port/` targets nightly 0.1.12-nightly.20261122.5098 (`620cf4770d99`).
+- Shared patches: `patches-port/` targets nightly 0.1.12-nightly.20261124.5204 (`11c63a9f2cea`).
 - `patches/` is upstream's and stays untouched.
 - Own patches: `patches-tt/` (18) and `patches-ios/` (11); a port applies 2 shared commits (`patches-port/`, minus the skips) + 18 + 11 = 31 commits.
-- `covered-nightly.txt`: 0.1.12-nightly.20261123.5138.
+- `covered-nightly.txt`: 0.1.12-nightly.20261124.5204.
 - Left out (`skip-shared.json`): desktop stats line and throughput, compaction settings, subscription switch.
 - Their bundle markers are replaced by `markers` in the same file.
 
@@ -30,6 +30,9 @@ Which nightly the patches cover and what a port of them has to watch for. The po
 - A web unit test rendering a `useGT` component needs `initializeGT` from `gt-react` plus `<GTProvider locale="en">`.
 - `initializeGTSPA` throws under Node; see `V2LifecycleRow.kind.test.tsx`.
 - 5009: patch strings are not in the GT catalogs, so other locales show English; upstream's `i18n:check` is not part of our checks.
+- 5204: the server renamed `latestUserAuthoredMessageAt` to `latestResumingMessageAt` in `ProjectionSettlementCandidate`; `settlesWithOpener` (`patches-tt/0002`) omits the new name.
+- 5204: upstream's new parent-divider test expects "Subagent of"; `patches-tt/0006` lowercases it to "subagent of" and its test.
+- 5204: Background work's Open subagent is a `Button`, not an `InlineButton` (#38317); `patches-tt/0006` keeps the agent/subagent label inside it.
 - 5138: upstream wraps the subagent divider label in `relation?.label ?? (...)`; `patches-tt/0006` needs the extra `)`.
 - 5138: `workflowRun` sits next to the opener fields (`models.ts`, `orchestrationV2.ts`), the workflow RPCs next to the APNs ones.
 - 5138: a browser test file that fails with `Failed to fetch dynamically imported module` right after a fresh install is a Vite flake; rerun `checks`.

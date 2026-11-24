@@ -18,10 +18,10 @@ Subject: [PATCH 16/18] feat: show Claude's context window broken down by
  create mode 100644 packages/client-runtime/src/state/contextCategories.test.ts
 
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-index ebb2da925a..47216a8b8d 100644
+index d647d9fd24..bda1d96600 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-@@ -3864,6 +3864,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+@@ -3884,6 +3884,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
        "mcpServerStatus" | "readMcpResource" | "callMcpTool"
      > &
        Partial<Pick<ClaudeAdapterV2.ClaudeAgentSdkQuerySession, "listPermissionRules">>;
@@ -29,7 +29,7 @@ index ebb2da925a..47216a8b8d 100644
      readonly environment?: NodeJS.ProcessEnv;
      readonly onSessionInit?: (cwd: string) => Effect.Effect<void>;
      readonly subagentLaunchToolUseId?: string;
-@@ -4044,6 +4045,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+@@ -4064,6 +4065,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                    }).pipe(Effect.andThen(() => options?.renameSession?.(title) ?? Effect.void)),
                  backgroundTasks: options?.backgroundTasks ?? (() => Effect.succeed(false)),
                  mcpServerStatus: options?.mcp?.mcpServerStatus ?? Effect.succeed([]),
@@ -39,7 +39,7 @@ index ebb2da925a..47216a8b8d 100644
                  readMcpResource:
                    options?.mcp?.readMcpResource ??
                    (() => Effect.die("unexpected MCP resource read")),
-@@ -10769,6 +10773,152 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+@@ -11013,6 +11017,152 @@ describe("ClaudeAdapterV2 background wake turns", () => {
      ),
    );
  
@@ -192,7 +192,7 @@ index ebb2da925a..47216a8b8d 100644
    it.effect("measures a model outside the catalog against the window Claude reports", () =>
      Effect.gen(function* () {
        const harness = yield* makeWakeHarness;
-@@ -11304,7 +11454,11 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+@@ -11548,7 +11698,11 @@ describe("ClaudeAdapterV2 background wake turns", () => {
  
    it.effect.each([
      { autoCompactWindow: "", userSettings: '{"autoCompactWindow":300000}', maxTokens: 300_000 },
@@ -206,7 +206,7 @@ index ebb2da925a..47216a8b8d 100644
    ])(
      "reports the context window as $maxTokens, capped by the resolved autoCompactWindow",
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-index ed94fb8def..1a82bd688d 100644
+index 740de74181..89c14f588c 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 @@ -102,6 +102,7 @@ import {
@@ -217,7 +217,7 @@ index ed94fb8def..1a82bd688d 100644
    type MessageId,
    type ModelSelection,
    type OrchestrationV2ConversationMessage,
-@@ -366,6 +367,22 @@ export function claudeProviderTurnTokenUsage(
+@@ -369,6 +370,22 @@ export function claudeProviderTurnTokenUsage(
  
  type ClaudeMessageUsage = Parameters<typeof claudeProviderTurnTokenUsage>[0];
  
@@ -240,7 +240,7 @@ index ed94fb8def..1a82bd688d 100644
  // message_delta usage is per-message cumulative; null or absent fields retain message_start values and zeros replace them.
  function mergeClaudeStreamUsage(
    current: ClaudeMessageUsage,
-@@ -814,6 +831,11 @@ export interface ClaudeAgentSdkQuerySession {
+@@ -815,6 +832,11 @@ export interface ClaudeAgentSdkQuerySession {
      ReadonlyArray<ClaudeMcpServerStatus>,
      ClaudeAgentSdkQueryRunnerError
    >;
@@ -252,7 +252,7 @@ index ed94fb8def..1a82bd688d 100644
    readonly readMcpResource: (input: {
      readonly server: string;
      readonly uri: string;
-@@ -2080,6 +2102,13 @@ export const layerQueryRunner: Layer.Layer<
+@@ -2130,6 +2152,13 @@ export const layerQueryRunner: Layer.Layer<
            try: () => queryRuntime.mcpServerStatus(),
            catch: (cause) => queryRunnerError(cause, "mcpServerStatus"),
          }),
@@ -266,7 +266,7 @@ index ed94fb8def..1a82bd688d 100644
          readMcpResource: ({ server, uri }) =>
            Effect.tryPromise({
              try: () => queryRuntime.readMcpResource(server, uri),
-@@ -6286,6 +6315,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+@@ -6408,6 +6437,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
          const lastProviderThreadByNativeThread = yield* Ref.make(
            new Map<string, OrchestrationV2ProviderThread>(),
          );
@@ -279,8 +279,8 @@ index ed94fb8def..1a82bd688d 100644
          const goalsByNativeThread = new Map<string, OrchestrationV2ProviderGoal | null>();
          // The title T3 last applied to each native session, so a turn renames it only when the
          // thread title changed. A native `/rename` T3 never applied survives later turns.
-@@ -6686,28 +6721,64 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
-             if (claudeMessageInputTokens(usage) <= 0) return;
+@@ -6828,28 +6863,64 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
+             if (tokenUsage.inputTokens <= 0) return;
              context.compactionTokens = undefined;
            }
 -          yield* emitProviderEvent({
@@ -868,7 +868,7 @@ index 37374b79b1..d21e85e756 100644
 +    );
 +}
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
-index df84d9ba0b..330a1d2827 100644
+index 19e2562831..4e24d90cf8 100644
 --- a/packages/contracts/src/orchestrationV2.ts
 +++ b/packages/contracts/src/orchestrationV2.ts
 @@ -94,7 +94,7 @@ import {
