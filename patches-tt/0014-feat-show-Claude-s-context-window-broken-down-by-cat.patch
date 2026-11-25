@@ -11,13 +11,15 @@ Subject: [PATCH 14/16] feat: show Claude's context window broken down by
  .../ThreadDetailsContext.browser.test.tsx     |  93 ++++++++++++
  .../components/chat/ThreadDetailsUsage.tsx    | 129 +++++++++++++++--
  .../src/state/contextCategories.test.ts       |  66 +++++++++
- .../client-runtime/src/state/contextWindow.ts |  88 ++++++++++++
+ .../src/state/contextWindow.categories.ts     |  87 +++++++++++
+ .../client-runtime/src/state/contextWindow.ts |   5 +
  packages/contracts/src/orchestrationV2.ts     |   3 +-
  packages/contracts/src/providerRuntime.ts     |  10 ++
- 9 files changed, 620 insertions(+), 36 deletions(-)
+ 10 files changed, 624 insertions(+), 36 deletions(-)
  create mode 100644 apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.contextCategories.test.ts
  create mode 100644 apps/web/src/components/chat/ThreadDetailsContext.browser.test.tsx
  create mode 100644 packages/client-runtime/src/state/contextCategories.test.ts
+ create mode 100644 packages/client-runtime/src/state/contextWindow.categories.ts
 
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.contextCategories.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.contextCategories.test.ts
 new file mode 100644
@@ -747,45 +749,15 @@ index 0000000000..f2a6af363a
 +    expect(contextCategoryPercentText({ percent: null })).toBe("");
 +  });
 +});
-diff --git a/packages/client-runtime/src/state/contextWindow.ts b/packages/client-runtime/src/state/contextWindow.ts
-index 37374b79b1..d21e85e756 100644
---- a/packages/client-runtime/src/state/contextWindow.ts
-+++ b/packages/client-runtime/src/state/contextWindow.ts
-@@ -1,5 +1,6 @@
- import {
-   resolveIdleCompaction,
-+  type ContextUsageCategory,
-   type ModelSelection,
-   type OrchestrationV2ProviderTurn,
-   type OrchestrationV2ProviderTurnTokenUsage,
-@@ -119,6 +120,7 @@ function compactionSnapshot(
-     durationMs: null,
-     compactsAutomatically: true,
-     autoCompactThreshold: null,
-+    categories: null,
-     cost: null,
-     updatedAt,
-   };
-@@ -183,6 +185,7 @@ export function deriveLatestContextWindowSnapshot(
-       durationMs: null,
-       compactsAutomatically: true,
-       autoCompactThreshold: liveUsage.autoCompactThreshold ?? null,
-+      categories: liveUsage.categories ?? null,
-       cost: null,
-       updatedAt: liveUsage.updatedAt,
-     };
-@@ -219,6 +222,7 @@ export function deriveLatestContextWindowSnapshot(
-       compactsAutomatically: providerUsage.compactsAutomatically ?? null,
-       cost: providerUsage.cost ?? null,
-       autoCompactThreshold: providerUsage.autoCompactThreshold ?? null,
-+      categories: providerUsage.categories ?? null,
-       updatedAt: DateTime.formatIso(providerUsageUpdatedAt),
-     };
-   }
-@@ -364,3 +368,87 @@ export function compactBeforeSendTokens(input: {
-     ? contextWindow.usedTokens
-     : null;
- }
+diff --git a/packages/client-runtime/src/state/contextWindow.categories.ts b/packages/client-runtime/src/state/contextWindow.categories.ts
+new file mode 100644
+index 0000000000..a480f65a32
+--- /dev/null
++++ b/packages/client-runtime/src/state/contextWindow.categories.ts
+@@ -0,0 +1,87 @@
++import type { ContextUsageCategory } from "@t3tools/contracts";
++
++// Claude's `/context` rows for the thread details, which contextWindow.ts re-exports.
 +
 +// Claude Code's theme color names for the `/context` rows, as a fixed palette for light and dark.
 +const CONTEXT_CATEGORY_COLORS: Readonly<Record<string, string>> = {
@@ -870,6 +842,43 @@ index 37374b79b1..d21e85e756 100644
 +        (a.kind === "used" ? b.tokens - a.tokens : 0),
 +    );
 +}
+diff --git a/packages/client-runtime/src/state/contextWindow.ts b/packages/client-runtime/src/state/contextWindow.ts
+index 37374b79b1..dff3293a96 100644
+--- a/packages/client-runtime/src/state/contextWindow.ts
++++ b/packages/client-runtime/src/state/contextWindow.ts
+@@ -18,6 +18,8 @@ import * as DateTime from "effect/DateTime";
+ import { resolvePendingHandoff } from "../handoff.ts";
+ import type { ThreadStructure, ThreadStructureTurnItem } from "./models.ts";
+ 
++export * from "./contextWindow.categories.ts";
++
+ // Fallback TTL: Claude's 1h cache plus slack.
+ const CLAUDE_RESUME_COMPACTION_FALLBACK_MS = 70 * 60_000;
+ 
+@@ -119,6 +121,7 @@ function compactionSnapshot(
+     durationMs: null,
+     compactsAutomatically: true,
+     autoCompactThreshold: null,
++    categories: null,
+     cost: null,
+     updatedAt,
+   };
+@@ -183,6 +186,7 @@ export function deriveLatestContextWindowSnapshot(
+       durationMs: null,
+       compactsAutomatically: true,
+       autoCompactThreshold: liveUsage.autoCompactThreshold ?? null,
++      categories: liveUsage.categories ?? null,
+       cost: null,
+       updatedAt: liveUsage.updatedAt,
+     };
+@@ -219,6 +223,7 @@ export function deriveLatestContextWindowSnapshot(
+       compactsAutomatically: providerUsage.compactsAutomatically ?? null,
+       cost: providerUsage.cost ?? null,
+       autoCompactThreshold: providerUsage.autoCompactThreshold ?? null,
++      categories: providerUsage.categories ?? null,
+       updatedAt: DateTime.formatIso(providerUsageUpdatedAt),
+     };
+   }
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
 index 80dd7dd9e0..979ea2a6b7 100644
 --- a/packages/contracts/src/orchestrationV2.ts
