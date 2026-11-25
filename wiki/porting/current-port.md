@@ -8,7 +8,7 @@ Which nightly the patches cover and what a port of them has to watch for. The po
 ## Coverage
 - Shared patches: `patches-port/` targets nightly 0.1.12-nightly.20261125.5230 (`ca81b7b97a1c`).
 - `patches/` is upstream's and stays untouched.
-- Own patches: `patches-tt/` (18) and `patches-ios/` (11); a port applies 2 shared commits (`patches-port/`, minus the skips) + 18 + 11 = 31 commits.
+- Own patches: `patches-tt/` (16) and `patches-ios/` (11); a port applies 2 shared commits (`patches-port/`, minus the skips) + 16 + 11 = 29 commits.
 - `covered-nightly.txt`: 0.1.12-nightly.20261125.5230.
 - Left out (`skip-shared.json`): desktop stats line and throughput, compaction settings, subscription switch.
 - Their bundle markers are replaced by `markers` in the same file.
@@ -41,7 +41,5 @@ Which nightly the patches cover and what a port of them has to watch for. The po
 - 5138: a browser test file that fails with `Failed to fetch dynamically imported module` right after a fresh install is a Vite flake; rerun `checks`.
 - 5098: the server's `typecheck` is a `vite.config.ts` task (#30879), not a `package.json` script; `typechecker()` reads both, else `checks` falls back to `tsc` and fails in `effect-tsgo patch`.
 - 5098: the sidebar meta line shows the environment, not the branch (#40736); row fixtures pass `environmentLabel`.
-- 5098: `patches-tt/0011` now only keeps its comment and test.
 - 5098: `departingThreadKey`/`shelfRouteThreadKey` (#26661) also keep a departing child thread's family on the settled shelf (`useSidebarChildThreads` takes `shelfRouteThreadKey`).
-- 5098: the effort bar's radios are named with their badge ("LowDefault"): tests match `/^Low/`; Left/Right runs before upstream's typeahead (#40798).
 - 5009: `ProviderHost` needs `compatibility` (`noCompatibilityPolicy` in test fixtures); Codex reads `config/read` before `thread/start`.

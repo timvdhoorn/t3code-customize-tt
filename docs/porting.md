@@ -57,7 +57,7 @@ push or build.
 - One commit per patch, in the same order; the export maps commits to patches by count. A shared
   patch `skip-shared.json` leaves out has no commit and its `checks.json` entries do not run; never
   re-add it to get a later patch to apply. A shared patch that needs code from a skipped one gets
-  that code from a `patches-tt/` commit (as `patches-tt/0012` does for the usage-limits patch), or
+  that code from a `patches-tt/` commit (as `patches-tt/0011` does for the usage-limits patch), or
   needs Tim's decision when it builds on the skipped feature itself.
 - A port keeps every patch and every test. A failing check is fixed in the patch, so the checks
   stay as strong as before and no step is skipped. Only a test that also fails without any patch

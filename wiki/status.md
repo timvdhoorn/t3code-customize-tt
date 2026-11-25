@@ -1,19 +1,20 @@
 # Status
 
 > Source: `./t3code-customize status` on each machine; GitHub PRs of `timvdhoorn/t3code-customize-tt`
-> Updated: 2026-11-23
+> Updated: 2026-11-25
 
 What is live, what is in progress and what is open. Finished work leaves this page; its facts live on the owning page.
 
 ## Live
-- Patches ported to nightly 0.1.12-nightly.20261122.5085 on `main`, plus `patches-tt/0017` (quiet thread list: iOS cold-start thread open 33 s → 1.7 s); see [Current port](porting/current-port.md).
+- Patches ported to nightly 0.1.12-nightly.20261122.5085 on `main`, plus `patches-tt/0015` (quiet thread list: iOS cold-start thread open 33 s → 1.7 s); see [Current port](porting/current-port.md).
 - devbox1: server runs 5085 with the patches. See [devbox1](machines/devbox1.md).
-- MacBook Pro: 5085 with the patches (incl. `patches-tt/0017`); iOS build 202611221444 for 5085 on TestFlight.
+- MacBook Pro: 5085 with the patches (incl. `patches-tt/0015`); iOS build 202611221444 for 5085 on TestFlight.
 
 ## In progress
-- `patches-tt/0018` (ignore the transcript Claude re-emits after an automatic compaction, upstream #38525) is merged; it reaches devbox1 with the port to 5138.
+- `patches-tt/0016` (ignore the transcript Claude re-emits after an automatic compaction, upstream #38525) is merged; it reaches devbox1 with the port to 5138.
 - MacBook Air: 5009 with the patches; picks up 5085 through its update.
 
 ## Open
+- Patch reduction step 1: `patches-tt/` at 16 patches, without the branch-off-meta-line and picker/effort bar/row timer patches; PR open.
 - Port to nightly 5138 (patch layers still based on 5098's shared port), PR open.
 - It carries `patches-tt/0003`: APNs reconnect after 4 idle min plus one resend; only main threads notify, Done without delay.
