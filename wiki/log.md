@@ -2,6 +2,7 @@
 
 One line per change, newest first. Format: [RULES.md](RULES.md#formats).
 
+- 2026-11-25 change | Own patches no longer rewrap upstream lines: `patches-tt/0006` 522 → 418 changed upstream lines, 4 others touched; rule and check in porting.md (PR open) | porting/current-port.md | docs/porting.md
 - 2026-11-25 remove | `patches-tt/` 18 → 16: branch-off-meta-line and picker/effort bar/row timer patches dropped, rest renumbered (PR open) | porting/current-port.md | docs/fork-changes.md
 - 2026-11-25 change | Patches ported to nightly 5230: thread menu (readMenu), triage queue, iOS canSwipe; Air update race filed as #134 | porting/current-port.md | checks
 - 2026-11-24 change | Patches ported to nightly 5204: 4 conflicts, 2 check fixes (settlement field rename, subagent-of label test) (PR open) | porting/current-port.md | checks
