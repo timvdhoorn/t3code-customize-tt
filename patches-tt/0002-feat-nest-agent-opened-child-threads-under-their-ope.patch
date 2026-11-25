@@ -23,21 +23,21 @@ guide line, context-menu collapse and a summary stub.
  .../ThreadManagementService.test.ts           |    9 +-
  .../ThreadManagementService.ts                |    2 +
  .../ThreadSettlementService.test.ts           |  237 +++
- .../ThreadSettlementService.ts                |  177 ++-
+ .../ThreadSettlementService.ts                |  177 +-
  .../src/orchestration-v2/runtimeLayer.test.ts |   85 +
  .../Sidebar.childThreads.browser.test.tsx     |  181 +++
- .../components/Sidebar.childThreads.test.ts   |  617 ++++++++
- .../src/components/Sidebar.childThreads.tsx   | 1388 +++++++++++++++++
+ .../components/Sidebar.childThreads.test.ts   |  657 ++++++++
+ .../src/components/Sidebar.childThreads.tsx   | 1446 +++++++++++++++++
  .../src/components/Sidebar.families.test.ts   |  519 ++++++
  apps/web/src/components/Sidebar.families.ts   |  381 +++++
  apps/web/src/components/Sidebar.logic.test.ts |   45 +
  apps/web/src/components/Sidebar.logic.ts      |   58 +-
- apps/web/src/components/Sidebar.tsx           |  201 ++-
+ apps/web/src/components/Sidebar.tsx           |  205 ++-
  ...hreadRelationshipsControl.browser.test.tsx |    9 +
  ...lationshipsControl.opened.browser.test.tsx |  373 +++++
  .../chat/ThreadRelationshipsControl.tsx       |  344 +++-
  .../components/sidebar/SidebarThreadRow.tsx   |  192 ++-
- .../SidebarThreadRow.workers.browser.test.tsx |  984 ++++++++++++
+ .../SidebarThreadRow.workers.browser.test.tsx | 1178 ++++++++++++++
  .../web/src/components/sidebar/routeReveal.ts |   18 +-
  .../src/components/sidebar/threadModel.tsx    |  118 ++
  .../components/threadActionMenu.logic.test.ts |   33 +
@@ -55,8 +55,8 @@ guide line, context-menu collapse and a summary stub.
  packages/client-runtime/package.json          |    4 +
  .../src/operations/commands.test.ts           |   23 +
  .../client-runtime/src/operations/commands.ts |    6 +-
- .../src/state/childThreadSummary.test.ts      |  257 +++
- .../src/state/childThreadSummary.ts           |  432 +++++
+ .../src/state/childThreadSummary.test.ts      |  265 +++
+ .../src/state/childThreadSummary.ts           |  439 +++++
  packages/client-runtime/src/state/models.ts   |   23 +
  .../src/state/shell-sync.test.ts              |   24 +-
  packages/client-runtime/src/state/shell.ts    |    6 +-
@@ -66,7 +66,7 @@ guide line, context-menu collapse and a summary stub.
  packages/contracts/src/orchestrationV2.ts     |   32 +
  packages/contracts/src/orchestratorMcp.ts     |    6 +
  .../src/server/subagentProjection.ts          |    9 +-
- 57 files changed, 7395 insertions(+), 214 deletions(-)
+ 57 files changed, 7706 insertions(+), 214 deletions(-)
  create mode 100644 apps/web/src/components/Sidebar.childThreads.browser.test.tsx
  create mode 100644 apps/web/src/components/Sidebar.childThreads.test.ts
  create mode 100644 apps/web/src/components/Sidebar.childThreads.tsx
@@ -1485,10 +1485,10 @@ index 0000000000..3a924c41b5
 +);
 diff --git a/apps/web/src/components/Sidebar.childThreads.test.ts b/apps/web/src/components/Sidebar.childThreads.test.ts
 new file mode 100644
-index 0000000000..9a57a4f111
+index 0000000000..eecfde2386
 --- /dev/null
 +++ b/apps/web/src/components/Sidebar.childThreads.test.ts
-@@ -0,0 +1,617 @@
+@@ -0,0 +1,657 @@
 +import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 +import { describe, expect, it } from "vite-plus/test";
 +
@@ -1862,6 +1862,46 @@ index 0000000000..9a57a4f111
 +      ]),
 +    );
 +
++  it("lets a finished worker be settled, and only where its environment supports settling", () => {
++    const threads = [
++      thread("head"),
++      thread("asks", { delegatedBy: "head", input: true }),
++      thread("broke", { delegatedBy: "head", runtime: "failed" }),
++      thread("fresh", { delegatedBy: "head" }),
++      thread("busy", { delegatedBy: "head", runtime: "running" }),
++      thread("settled-busy", { delegatedBy: "head", runtime: "running", settled: true }),
++    ];
++    const settleable = (supportsSettlement?: (environmentId: string) => boolean) =>
++      buildSidebarDelegatedWorkers(threads, {
++        hasRow: listedAmong(threads),
++        isUnread: () => true,
++        ...(supportsSettlement ? { supportsSettlement } : {}),
++      })
++        .get("env:head")
++        ?.workers.map((worker) => `${worker.thread.id}:${worker.canSettle}`);
++    expect(settleable(() => true)).toEqual([
++      "asks:false",
++      "broke:true",
++      "fresh:true",
++      "busy:false",
++      "settled-busy:false",
++    ]);
++    expect(settleable((environmentId) => environmentId !== "env")).toEqual([
++      "asks:false",
++      "broke:false",
++      "fresh:false",
++      "busy:false",
++      "settled-busy:false",
++    ]);
++    expect(settleable()).toEqual([
++      "asks:false",
++      "broke:false",
++      "fresh:false",
++      "busy:false",
++      "settled-busy:false",
++    ]);
++  });
++
 +  it("counts live workers per kind under the thread that delegated them", () => {
 +    expect(
 +      counts([
@@ -2108,10 +2148,10 @@ index 0000000000..9a57a4f111
 +});
 diff --git a/apps/web/src/components/Sidebar.childThreads.tsx b/apps/web/src/components/Sidebar.childThreads.tsx
 new file mode 100644
-index 0000000000..2988c17425
+index 0000000000..0cb772c327
 --- /dev/null
 +++ b/apps/web/src/components/Sidebar.childThreads.tsx
-@@ -0,0 +1,1388 @@
+@@ -0,0 +1,1446 @@
 +// Child threads in the sidebar (patches-tt/0003). Family rules live in Sidebar.families.ts;
 +// this module holds the sidebar's state and rendering so Sidebar.tsx only calls into it.
 +import { msg, T, useGT, useMessages } from "gt-react";
@@ -2124,6 +2164,7 @@ index 0000000000..2988c17425
 +  childThreadKindOf,
 +  childThreadRolesOf,
 +  collectDelegatedWorkers,
++  delegatedWorkerCanSettle,
 +  resolveListedAncestorKey,
 +  canShowAsSubthread,
 +  delegatedWorkerParentKeyOf,
@@ -2141,6 +2182,7 @@ index 0000000000..2988c17425
 +import type { EnvironmentId } from "@t3tools/contracts";
 +import * as Schema from "effect/Schema";
 +import {
++  CheckIcon,
 +  ChevronRightIcon,
 +  CircleAlertIcon,
 +  CircleCheckIcon,
@@ -2355,6 +2397,12 @@ index 0000000000..2988c17425
 +  readonly model: ThreadModelDisplay | null;
 +  /** The worker's environment, when it runs elsewhere than the row's thread; else null. */
 +  readonly environmentLabel: string | null;
++  /**
++   * Whether the popover offers Settle: the thread menu's rule (its environment supports settling
++   * and the thread is not settled), for a worker that finished or failed
++   * (`delegatedWorkerCanSettle`).
++   */
++  readonly canSettle: boolean;
 +}
 +
 +export interface SidebarDelegatedWorkers {
@@ -2382,6 +2430,8 @@ index 0000000000..2988c17425
 +    ) => ReadonlyMap<string, SidebarProviderEntry> | undefined;
 +    /** Threads the user shows as a subthread: they nest as rows and count nowhere. */
 +    readonly subthreadKeys?: ReadonlySet<string>;
++    /** Whether an environment's server can settle threads; none can when left out. */
++    readonly supportsSettlement?: (environmentId: EnvironmentId) => boolean;
 +  },
 +): ReadonlyMap<string, SidebarDelegatedWorkers> {
 +  const subthreadKeys = options.subthreadKeys ?? NO_SUBTHREAD_KEYS;
@@ -2416,6 +2466,10 @@ index 0000000000..2988c17425
 +            ? null
 +            : (options.environmentLabelOf?.(worker.thread.environmentId) ??
 +              worker.thread.environmentId),
++        canSettle:
++          delegatedWorkerCanSettle(worker.kind) &&
++          worker.thread.settledOverride !== "settled" &&
++          options.supportsSettlement?.(worker.thread.environmentId) === true,
 +      })),
 +      chips,
 +      label: formatDelegatedWorkersLabel(chips),
@@ -2680,6 +2734,7 @@ index 0000000000..2988c17425
 +      environments.find((environment) => environment.environmentId === environmentId)?.label ??
 +      null,
 +    providerEntriesOf: (environmentId) => input.providerEntriesByEnvironment?.get(environmentId),
++    supportsSettlement: (environmentId) => serverConfigs.has(environmentId),
 +  });
 +  const familyByHeadKey = new Map(
 +    Object.values(sectionFamilies).flatMap((families) =>
@@ -3078,6 +3133,7 @@ index 0000000000..2988c17425
 +  | { readonly type: "open"; readonly thread: EnvironmentThreadShell }
 +  | { readonly type: "make-main-thread"; readonly thread: EnvironmentThreadShell }
 +  | { readonly type: "show-as-subthread"; readonly thread: EnvironmentThreadShell }
++  | { readonly type: "settle"; readonly thread: EnvironmentThreadShell }
 +  | {
 +      readonly type: "open-lineage";
 +      readonly rowThread: Pick<EnvironmentThreadShell, "environmentId" | "id">;
@@ -3153,7 +3209,6 @@ index 0000000000..2988c17425
 +  event.key === "Enter" || event.key === " ";
 +
 +// Stock menu item metrics (`MenuItem` in ui/menu.tsx), as the popover is a menu of workers.
-+// Stock menu item metrics (`MenuItem` in ui/menu.tsx), as the popover is a menu of workers.
 +const WORKER_MENU_ITEM_CLASS_NAME =
 +  "flex min-h-8 w-full min-w-0 cursor-pointer select-none items-center gap-2 rounded-sm px-2 py-1 text-left text-sm text-foreground outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring sm:min-h-7";
 +
@@ -3214,7 +3269,11 @@ index 0000000000..2988c17425
 +              type="button"
 +              data-testid="sidebar-delegated-worker"
 +              data-worker-nav=""
-+              className={cn(WORKER_MENU_ITEM_CLASS_NAME, "pe-9")}
++              // Room for the trailing controls at all times, so showing them moves nothing.
++              className={cn(
++                WORKER_MENU_ITEM_CLASS_NAME,
++                worker.canSettle ? "pe-16 sm:pe-14" : "pe-9",
++              )}
 +              onClick={() => onAction({ type: "open", thread: worker.thread })}
 +              onKeyDown={(event) => {
 +                // The menu takes focus a frame after it shows. Escape before that lands here, where
@@ -3296,10 +3355,31 @@ index 0000000000..2988c17425
 +        <Menu open={menuOpen} onOpenChange={setMenuOpen}>
 +          <span
 +            className={cn(
-+              "pointer-events-auto absolute right-0 opacity-0 group-hover/worker:opacity-100 group-focus-within/worker:opacity-100 pointer-coarse:opacity-100",
++              "pointer-events-auto absolute right-0 flex items-center opacity-0 group-hover/worker:opacity-100 group-focus-within/worker:opacity-100 pointer-coarse:opacity-100",
 +              menuOpen && "opacity-100",
 +            )}
 +          >
++            {/* A Tab stop of its own, as the sidebar row's Settle is. */}
++            {worker.canSettle ? (
++              <Tooltip>
++                <TooltipTrigger
++                  render={
++                    <Button
++                      aria-label={gt("Settle {title}", { title })}
++                      data-testid="sidebar-delegated-worker-settle"
++                      size="icon-xs"
++                      variant="ghost-muted"
++                      onClick={() => onAction({ type: "settle", thread: worker.thread })}
++                    />
++                  }
++                >
++                  <CheckIcon aria-hidden />
++                </TooltipTrigger>
++                <TooltipPopup side="top">
++                  <T>Settle thread</T>
++                </TooltipPopup>
++              </Tooltip>
++            ) : null}
 +            <MenuTrigger
 +              render={
 +                <Button
@@ -3343,7 +3423,11 @@ index 0000000000..2988c17425
 +  if (items.length === 0) return;
 +  event.preventDefault();
 +  event.stopPropagation();
-+  const index = items.findIndex((item) => item === document.activeElement);
++  // From an entry's Settle button the arrows move as from the entry itself.
++  const active =
++    document.activeElement?.closest("li")?.querySelector(WORKER_NAV_SELECTOR) ??
++    document.activeElement;
++  const index = items.findIndex((item) => item === active);
 +  const next =
 +    index === -1
 +      ? event.key === "ArrowDown"
@@ -3356,8 +3440,8 @@ index 0000000000..2988c17425
 +/**
 + * A row's live `delegate_task` workers: one chip per kind over the meta line's `anchor`, outside
 + * the row's button. The pointer resting on them opens the popover after the hover card's delay.
-+ * The popover lists them with their model: an entry opens its worker, its actions nest it or make
-+ * it a main thread, and "All in Lineage" opens the row's Lineage panel.
++ * The popover lists them with their model: an entry opens its worker, its actions settle it, nest
++ * it or make it a main thread, and "All in Lineage" opens the row's Lineage panel.
 + */
 +export function SidebarDelegatedWorkerChips(props: {
 +  readonly rowThread: Pick<EnvironmentThreadShell, "environmentId" | "id" | "title">;
@@ -3401,12 +3485,26 @@ index 0000000000..2988c17425
 +    if (isActivationKey(event)) event.stopPropagation();
 +  };
 +  const act = (action: SidebarDelegatedWorkerAction) => {
++    // Settling leaves the popover open on the workers that remain. The settled entry goes away,
++    // so focus moves on first: from the keyboard to the entry next to it, else to the popup.
++    if (action.type === "settle" && workers.workers.length > 1) {
++      const settle = document.activeElement;
++      const entry = settle?.closest("li") ?? null;
++      const neighbour = (
++        entry?.nextElementSibling ?? entry?.previousElementSibling
++      )?.querySelector<HTMLElement>(WORKER_NAV_SELECTOR);
++      onAction(action);
++      ((settle?.matches(":focus-visible") ? neighbour : null) ?? popupFocusRef.current)?.focus();
++      return;
++    }
 +    setOpen(false);
 +    onAction(action);
-+    // The last worker made a main thread or a subthread takes the chips with it: focus goes
-+    // back to the row.
++    // The last worker settled, made a main thread or a subthread takes the chips with it: focus
++    // goes back to the row.
 +    if (
-+      (action.type === "make-main-thread" || action.type === "show-as-subthread") &&
++      (action.type === "settle" ||
++        action.type === "make-main-thread" ||
++        action.type === "show-as-subthread") &&
 +      workers.workers.length === 1
 +    ) {
 +      requestAnimationFrame(() => rowElement.current?.focus());
@@ -4584,7 +4682,7 @@ index 0771ea2e33..7e5348b2e8 100644
    );
  }
 diff --git a/apps/web/src/components/Sidebar.tsx b/apps/web/src/components/Sidebar.tsx
-index 2ca4abf581..db8316fab9 100644
+index 2ca4abf581..329b2d2361 100644
 --- a/apps/web/src/components/Sidebar.tsx
 +++ b/apps/web/src/components/Sidebar.tsx
 @@ -63,10 +63,7 @@ import {
@@ -4876,7 +4974,7 @@ index 2ca4abf581..db8316fab9 100644
          const key = scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
          return { kind: "thread", key, section };
        });
-@@ -2665,6 +2703,45 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -2665,6 +2703,49 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
      },
    );
  
@@ -4912,6 +5010,10 @@ index 2ca4abf581..db8316fab9 100644
 +      setShownAsSubthread(action.thread, true);
 +      return;
 +    }
++    if (action.type === "settle") {
++      attemptSettle(scopeThreadRef(action.thread.environmentId, action.thread.id));
++      return;
++    }
 +    const ref = scopeThreadRef(action.rowThread.environmentId, action.rowThread.id);
 +    const panels = useRightPanelStore.getState();
 +    panels.setThreadPanelOpen(ref, "inline", true);
@@ -4922,7 +5024,7 @@ index 2ca4abf581..db8316fab9 100644
    const handleThreadContextMenu = useStableCallback(
      (
        threadRef: ScopedThreadRef,
-@@ -2754,6 +2831,9 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -2754,6 +2835,9 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                  titleRegeneration: configLoaded,
                },
                snoozePresets,
@@ -4932,7 +5034,7 @@ index 2ca4abf581..db8316fab9 100644
              }),
              position,
              source,
-@@ -2889,6 +2969,20 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -2889,6 +2973,20 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
            case "mark-unread":
              markThreadUnread(threadRef);
              return;
@@ -4953,7 +5055,7 @@ index 2ca4abf581..db8316fab9 100644
            case "copy-path":
              if (!threadWorkspacePath) {
                toastManager.add(
-@@ -3345,8 +3439,8 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -3345,8 +3443,8 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
            {isSearchingThreads ? (
              threadSearchResults.length > 0 ? (
                <TooltipProvider
@@ -4964,7 +5066,7 @@ index 2ca4abf581..db8316fab9 100644
                  closeDelay={0}
                  timeout={400}
                >
-@@ -3480,8 +3574,8 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -3480,8 +3578,8 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
            ) : null}
            {!isSearchingThreads ? (
              <TooltipProvider
@@ -4975,7 +5077,7 @@ index 2ca4abf581..db8316fab9 100644
                closeDelay={0}
                timeout={400}
              >
-@@ -3627,6 +3721,8 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -3627,6 +3725,8 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                              onUnpin={attemptUnpin}
                              onAcknowledgeWoke={acknowledgeWoke}
                              onFileDropThreads={handleThreadFileDrop}
@@ -4984,7 +5086,7 @@ index 2ca4abf581..db8316fab9 100644
                            />
                          );
                        };
-@@ -3650,6 +3746,13 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -3650,6 +3750,13 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                            // Folders draw active rows in their own place below.
                            if (projectFolders !== null && item.section === "active") continue;
                            items.push(renderThreadRow(threadByKey.get(item.key)!, item.section));
@@ -4998,7 +5100,7 @@ index 2ca4abf581..db8316fab9 100644
                            continue;
                          }
                          if (projectFolders !== null && item.marker === "active-placeholder") {
-@@ -3665,7 +3768,8 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -3665,7 +3772,8 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                                  onContextMenu={handleProjectFolderContextMenu}
                                />,
                              );
@@ -5008,7 +5110,7 @@ index 2ca4abf581..db8316fab9 100644
                                items.push(
                                  renderThreadRow(
                                    thread,
-@@ -3673,6 +3777,13 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -3673,6 +3781,13 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                                    sidebarFolderRowId(folder.group.projectKey),
                                  ),
                                );
@@ -5022,7 +5124,7 @@ index 2ca4abf581..db8316fab9 100644
                              }
                            }
                            continue;
-@@ -3812,7 +3923,9 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
+@@ -3812,7 +3927,9 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                                : gt(
                                    "{count, plural, one {Show {count} more} other {Show {count} more}}",
                                    {
@@ -6327,10 +6429,10 @@ index dcc7f69830..1e46dac57e 100644
            terminalProcessCount={runningTerminalIds.length}
 diff --git a/apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx b/apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx
 new file mode 100644
-index 0000000000..ec2b40e6b3
+index 0000000000..d801127da4
 --- /dev/null
 +++ b/apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx
-@@ -0,0 +1,984 @@
+@@ -0,0 +1,1178 @@
 +import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 +import { describe, expect, it, vi } from "vite-plus/test";
 +import { cdp, page, userEvent } from "vite-plus/test/browser";
@@ -6457,9 +6559,11 @@ index 0000000000..ec2b40e6b3
 +) {
 +  const workers = buildSidebarDelegatedWorkers(threads, {
 +    hasRow: (thread) => thread.id === "head" || thread.detachedFromOpener === true,
-+    isUnread: () => false,
++    // A worker with `unseen` finished and was not opened yet: the popover's "new" kind.
++    isUnread: (thread) => (thread as { unseen?: boolean }).unseen === true,
 +    environmentLabelOf: (environmentId) => (environmentId === "air" ? "MacBook Air" : null),
 +    providerEntriesOf: () => currentEntries,
++    supportsSettlement: () => true,
 +  });
 +  return {
 +    thread: HEAD,
@@ -6505,7 +6609,10 @@ index 0000000000..ec2b40e6b3
 +  } as unknown as Parameters<typeof NestedThreadRow>[0];
 +}
 +
-+/** The row with its workers kept in state: making one a main thread detaches it, as the app does. */
++/**
++ * The row with its workers kept in state: making one a main thread detaches it and settling one
++ * settles it, as the app does.
++ */
 +function RowHarness(props: {
 +  readonly threads: readonly EnvironmentThreadShell[];
 +  readonly onAction: (action: SidebarDelegatedWorkerAction) => void;
@@ -6514,11 +6621,13 @@ index 0000000000..ec2b40e6b3
 +  const [threads, setThreads] = useState(props.threads);
 +  const onAction = (action: SidebarDelegatedWorkerAction) => {
 +    props.onAction(action);
-+    if (action.type !== "make-main-thread") return;
++    if (action.type !== "make-main-thread" && action.type !== "settle") return;
++    const change =
++      action.type === "settle"
++        ? { settledOverride: "settled" as const }
++        : { detachedFromOpener: true as const };
 +    setThreads((current) =>
-+      current.map((thread) =>
-+        thread.id === action.thread.id ? { ...thread, detachedFromOpener: true } : thread,
-+      ),
++      current.map((thread) => (thread.id === action.thread.id ? { ...thread, ...change } : thread)),
 +    );
 +  };
 +  return <NestedThreadRow {...rowProps(onAction, props.onThreadClick, threads)} />;
@@ -7313,6 +7422,193 @@ index 0000000000..ec2b40e6b3
 +      .element();
 +    expect(age.classList).toContain("pointer-coarse:opacity-0");
 +    expect(more.parentElement!.classList).toContain("pointer-coarse:opacity-100");
++  });
++
++  describe("settling a finished worker", () => {
++    // One worker of each live kind: only the finished ones (new, failed) can be settled here.
++    const SETTLE_THREADS = [
++      HEAD,
++      worker("asks", "S2: migration", { hasPendingUserInput: true }),
++      worker("broke", "Fix: flaky login", { runtime: { status: "failed" } }),
++      worker("fresh", "Rev #12 sidebar", { unseen: true }),
++      worker("tests", "W: e2e suite", { runtime: { status: "running" } }),
++    ];
++    const settleOf = (title: string) => page.getByRole("button", { name: `Settle ${title}` });
++    const opacityOf = (element: Element) => getComputedStyle(element.parentElement!).opacity;
++
++    it.each([
++      [390, 844],
++      [1280, 800],
++    ] as const)(
++      "offers Settle on a finished worker and none on one that works or waits at %ipx",
++      async (width, height) => {
++        await using _screen = await renderRow(width, height, vi.fn(), noop, SETTLE_THREADS);
++        await userEvent.click(page.getByTestId("sidebar-delegated-workers"));
++        await popupOpened();
++        await expect.element(settleOf("Rev #12 sidebar")).toBeInTheDocument();
++        await expect.element(settleOf("Fix: flaky login")).toBeInTheDocument();
++        await expect.element(settleOf("W: e2e suite")).not.toBeInTheDocument();
++        await expect.element(settleOf("S2: migration")).not.toBeInTheDocument();
++        const settle = settleOf("Rev #12 sidebar").element();
++        expect(settle.tagName).toBe("BUTTON");
++        // On a touch screen, where nothing hovers, the control always shows.
++        expect(settle.parentElement!.classList).toContain("pointer-coarse:opacity-100");
++        // The control stays inside its entry, left of "More actions".
++        const entry = settle.closest("li")!.getBoundingClientRect();
++        const box = settle.getBoundingClientRect();
++        const more = page
++          .getByRole("button", { name: "More actions for Rev #12 sidebar" })
++          .element()
++          .getBoundingClientRect();
++        expect(box.left).toBeGreaterThanOrEqual(entry.left);
++        expect(box.right).toBeLessThanOrEqual(more.left);
++        expect(more.right).toBeLessThanOrEqual(entry.right);
++      },
++    );
++
++    it("shows Settle on hover without moving the entry, in place of its age", async () => {
++      await using _screen = await renderRow(1280, 800, vi.fn(), noop, SETTLE_THREADS);
++      await userEvent.click(page.getByTestId("sidebar-delegated-workers"));
++      await popupOpened();
++      const settle = settleOf("Rev #12 sidebar").element();
++      const entry = settle.closest("li")!;
++      const title = entry.querySelector('[data-testid="sidebar-delegated-worker-title"]')!;
++      const age = entry.querySelector('[data-testid="sidebar-delegated-worker-age"]')!;
++      const boxes = () =>
++        [entry, title].map((element) => {
++          const { left, top, width, height } = element.getBoundingClientRect();
++          return { left, top, width, height };
++        });
++      // Park the pointer on another entry: this one shows its age and no actions.
++      await userEvent.hover(page.getByText("W: e2e suite"));
++      await expect.poll(() => opacityOf(settle)).toBe("0");
++      expect(getComputedStyle(age).opacity).toBe("1");
++      const before = boxes();
++      await userEvent.hover(title);
++      await expect.poll(() => opacityOf(settle)).toBe("1");
++      expect(getComputedStyle(age).opacity).toBe("0");
++      expect(boxes()).toEqual(before);
++      // The title never runs under the controls.
++      expect(title.getBoundingClientRect().right).toBeLessThanOrEqual(
++        settle.getBoundingClientRect().left,
++      );
++      await userEvent.hover(settle);
++      await expect
++        .poll(() => document.querySelector('[data-slot="tooltip-popup"]')?.textContent)
++        .toBe("Settle thread");
++    });
++
++    it("settles the worker without opening it, and keeps the popover open on the others", async () => {
++      const onAction = vi.fn();
++      const onThreadClick = vi.fn();
++      await using _screen = await renderRow(1280, 800, onAction, onThreadClick, SETTLE_THREADS);
++      const trigger = page.getByTestId("sidebar-delegated-workers");
++      await userEvent.click(trigger);
++      await popupOpened();
++      await expect
++        .element(trigger)
++        .toHaveAccessibleName(
++          "1 agent needs you, 1 failed, 1 new, 1 working for Release 0.9 voorbereiden",
++        );
++      await userEvent.click(settleOf("Rev #12 sidebar"));
++      expect(onAction).toHaveBeenCalledTimes(1);
++      expect(onAction).toHaveBeenLastCalledWith({
++        type: "settle",
++        thread: expect.objectContaining({ id: "fresh" }),
++      });
++      expect(onThreadClick).not.toHaveBeenCalled();
++      // The settled worker leaves the list, the chips recount and the popover stays.
++      await expect.element(page.getByText("Rev #12 sidebar")).not.toBeInTheDocument();
++      await expect
++        .element(trigger)
++        .toHaveAccessibleName(
++          "1 agent needs you, 1 failed, 1 working for Release 0.9 voorbereiden",
++        );
++      const popover = page.getByTestId("sidebar-delegated-workers-popover");
++      await expect.element(popover).toBeVisible();
++      expect(popover.element().querySelectorAll("li")).toHaveLength(3);
++      // Focus stays in the popover, on no entry: a pointer settled it.
++      expect(popover.element().contains(document.activeElement)).toBe(true);
++      expect(popover.element().querySelector(":focus-visible")).toBeNull();
++    });
++
++    it("reaches Settle with Tab, shows it for keyboard focus and moves focus on after settling", async () => {
++      const onAction = vi.fn();
++      await using _screen = await renderRow(1280, 800, onAction, noop, SETTLE_THREADS);
++      const trigger = page.getByTestId("sidebar-delegated-workers");
++      (trigger.element() as HTMLElement).focus();
++      await userEvent.keyboard("{Enter}");
++      await popupOpened();
++      const entryOf = (title: string) =>
++        page.getByText(title).element().closest<HTMLElement>("[data-worker-nav]")!;
++      await expect.poll(() => document.activeElement).toBe(entryOf("S2: migration"));
++      // A waiting worker has no Settle: Tab goes on to the next entry.
++      await userEvent.keyboard("{Tab}");
++      expect(document.activeElement).toBe(entryOf("Fix: flaky login"));
++      const settle = settleOf("Fix: flaky login").element();
++      await userEvent.keyboard("{Tab}");
++      expect(document.activeElement).toBe(settle);
++      expect(settle.matches(":focus-visible")).toBe(true);
++      await expect.poll(() => opacityOf(settle)).toBe("1");
++      // Arrow keys still walk the entries from the control.
++      await userEvent.keyboard("{ArrowDown}");
++      expect(document.activeElement).toBe(entryOf("Rev #12 sidebar"));
++      await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
++      expect(document.activeElement).toBe(settle);
++      await userEvent.keyboard("{Enter}");
++      expect(onAction).toHaveBeenCalledTimes(1);
++      expect(onAction).toHaveBeenLastCalledWith({
++        type: "settle",
++        thread: expect.objectContaining({ id: "broke" }),
++      });
++      await expect.element(page.getByText("Fix: flaky login")).not.toBeInTheDocument();
++      await expect.element(page.getByTestId("sidebar-delegated-workers-popover")).toBeVisible();
++      // The keyboard lands on the entry that took the settled one's place.
++      await expect.poll(() => document.activeElement).toBe(entryOf("Rev #12 sidebar"));
++    });
++
++    it("closes the popover and puts focus back on the row when the last worker is settled", async () => {
++      const onAction = vi.fn();
++      await using _screen = await renderRow(1280, 800, onAction, noop, [
++        HEAD,
++        worker("fresh", "Rev #12 sidebar", { unseen: true }),
++      ]);
++      await userEvent.click(page.getByTestId("sidebar-delegated-workers"));
++      await popupOpened();
++      await userEvent.click(settleOf("Rev #12 sidebar"));
++      await expect
++        .element(page.getByTestId("sidebar-delegated-workers-popover"))
++        .not.toBeInTheDocument();
++      await expect.element(page.getByTestId("sidebar-delegated-workers")).not.toBeInTheDocument();
++      await expect
++        .poll(() => document.activeElement)
++        .toBe(page.getByTestId("sidebar-row-card").element());
++    });
++
++    it.each([390, 1280])(
++      "keeps a long title clear of Settle and inside the popover at %ipx",
++      async (width) => {
++        await using _screen = await renderRow(width, 800, vi.fn(), noop, [
++          HEAD,
++          worker("long", LONG_TITLE, { unseen: true }),
++        ]);
++        await userEvent.click(page.getByTestId("sidebar-delegated-workers"));
++        await popupOpened();
++        const settle = settleOf(LONG_TITLE).element().getBoundingClientRect();
++        const title = document.querySelector<HTMLElement>(
++          '[data-testid="sidebar-delegated-worker-title"]',
++        )!;
++        expect(title.scrollWidth).toBeGreaterThan(title.clientWidth);
++        expect(title.getBoundingClientRect().right).toBeLessThanOrEqual(settle.left);
++        const box = page
++          .getByTestId("sidebar-delegated-workers-popover")
++          .element()
++          .getBoundingClientRect();
++        expect(box.left).toBeGreaterThanOrEqual(0);
++        expect(box.right).toBeLessThanOrEqual(window.innerWidth);
++        expect(settle.right).toBeLessThanOrEqual(box.right);
++      },
++    );
 +  });
 +});
 diff --git a/apps/web/src/components/sidebar/routeReveal.ts b/apps/web/src/components/sidebar/routeReveal.ts
@@ -8229,10 +8525,10 @@ index 17d6264c40..01f3709325 100644
      if (input.modelSelection !== undefined) {
 diff --git a/packages/client-runtime/src/state/childThreadSummary.test.ts b/packages/client-runtime/src/state/childThreadSummary.test.ts
 new file mode 100644
-index 0000000000..97d286d5c4
+index 0000000000..1fc10808e0
 --- /dev/null
 +++ b/packages/client-runtime/src/state/childThreadSummary.test.ts
-@@ -0,0 +1,257 @@
+@@ -0,0 +1,265 @@
 +import { describe, expect, it } from "vite-plus/test";
 +
 +import {
@@ -8241,6 +8537,7 @@ index 0000000000..97d286d5c4
 +  childThreadRoleOf,
 +  childThreadRolesOf,
 +  collectDelegatedWorkers,
++  delegatedWorkerCanSettle,
 +  foldChildThreadFamily,
 +  formatChildThreadKindsLabel,
 +  canShowAsSubthread,
@@ -8434,6 +8731,13 @@ index 0000000000..97d286d5c4
 +  });
 +});
 +
++describe("delegatedWorkerCanSettle", () => {
++  it("offers Settle on a worker that finished or failed, not on one that works or waits", () => {
++    const kinds: readonly ChildThreadKind[] = ["needs-you", "failed", "new", "working"];
++    expect(kinds.filter(delegatedWorkerCanSettle)).toEqual(["failed", "new"]);
++  });
++});
++
 +describe("launched threads as workers", () => {
 +  const head = { environmentId: "env", id: "head", archivedAt: null };
 +  const launched = { environmentId: "env", id: "kid", openedByThreadId: "head", archivedAt: null };
@@ -8492,10 +8796,10 @@ index 0000000000..97d286d5c4
 +});
 diff --git a/packages/client-runtime/src/state/childThreadSummary.ts b/packages/client-runtime/src/state/childThreadSummary.ts
 new file mode 100644
-index 0000000000..e3ea91ae66
+index 0000000000..635dc810b7
 --- /dev/null
 +++ b/packages/client-runtime/src/state/childThreadSummary.ts
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,439 @@
 +// What a family's children are doing (patches-tt/0003), shared by the web sidebar and the
 +// mobile thread list: one kind per child, the chips a family's disclosure row shows, the order
 +// its live children list in, the fold that keeps settled children behind one "+N settled" row,
@@ -8704,6 +9008,13 @@ index 0000000000..e3ea91ae66
 +  "new",
 +  "working",
 +];
++
++/**
++ * Whether a row's list of workers offers Settle on one: it finished (new) or failed. A worker
++ * that works or waits on the user stays in the list after a settle, so it gets none.
++ */
++export const delegatedWorkerCanSettle = (kind: ChildThreadKind): boolean =>
++  kind === "new" || kind === "failed";
 +
 +/** Upper bound on delegation chains, so corrupt data can never spin. */
 +const MAX_DELEGATION_DEPTH = 32;
