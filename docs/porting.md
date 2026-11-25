@@ -63,6 +63,20 @@ push or build.
   stay as strong as before and no step is skipped. Only a test that also fails without any patch
   goes in `known-upstream-failures.json` (file, full name `describe > test`, upstream PR or issue,
   date added), after you ran it on the plain nightly; never to hide a failure a patch causes.
+- A patch never reformats an upstream line it does not change: no rewrapping, quote, comma or
+  parenthesis changes. Upstream formats with `vp fmt` (about 100 columns, config in `vite.config.ts`);
+  a statement the patch does edit follows that formatter, not 80 columns. Every rewrapped upstream
+  line is a conflict waiting for the next port. Check it in the source checkout with all patches
+  applied and a clean tree; both numbers must be equal (a lower second one means a patch removed
+  upstream lines only to reformat them, and `git diff` then shows what the formatter put back):
+
+  ```sh
+  git diff --name-only --diff-filter=M <nightly commit> HEAD > /tmp/modified
+  git diff --numstat <nightly commit> -- $(cat /tmp/modified) | awk '{d += $2} END {print d}'
+  xargs node_modules/.bin/vp fmt --no-error-on-unmatched-pattern < /tmp/modified
+  git diff --numstat <nightly commit> -- $(cat /tmp/modified) | awk '{d += $2} END {print d}'
+  git checkout -- .
+  ```
 - A feature that cannot be ported sensibly: stop and explain why, with the patch and the upstream
   change that blocks it.
 - `node_modules` comes from `pnpm install --frozen-lockfile --ignore-scripts`; `checks` runs it.
