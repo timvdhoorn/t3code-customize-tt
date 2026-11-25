@@ -71,12 +71,17 @@ push or build.
   upstream lines only to reformat them, and `git diff` then shows what the formatter put back):
 
   ```sh
-  git diff --name-only --diff-filter=M <nightly commit> HEAD > /tmp/modified
-  git diff --numstat <nightly commit> -- $(cat /tmp/modified) | awk '{d += $2} END {print d}'
-  xargs node_modules/.bin/vp fmt --no-error-on-unmatched-pattern < /tmp/modified
-  git diff --numstat <nightly commit> -- $(cat /tmp/modified) | awk '{d += $2} END {print d}'
+  modified=$(mktemp) &&
+    git diff --name-only --diff-filter=M <nightly commit> HEAD > "$modified" &&
+    test -s "$modified" &&
+    git diff --numstat <nightly commit> -- $(cat "$modified") | awk '{d += $2} END {print d}' &&
+    xargs node_modules/.bin/vp fmt --no-error-on-unmatched-pattern < "$modified" &&
+    git diff --numstat <nightly commit> -- $(cat "$modified") | awk '{d += $2} END {print d}'
   git checkout -- .
+  rm "$modified"
   ```
+
+  A step that fails ends the chain, so fewer than two numbers is a failed check, never a pass.
 - A feature that cannot be ported sensibly: stop and explain why, with the patch and the upstream
   change that blocks it.
 - `node_modules` comes from `pnpm install --frozen-lockfile --ignore-scripts`; `checks` runs it.
