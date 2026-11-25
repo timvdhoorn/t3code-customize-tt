@@ -12,16 +12,17 @@ Subject: [PATCH 04/11] feat(mobile): nest child threads under their opener in
  .../src/features/home/useThreadListActions.ts |  18 +
  .../threads/ThreadNavigationSidebar.tsx       | 103 +-
  .../features/threads/thread-list-v2-items.tsx | 670 ++++++++++++-
- .../src/features/threads/threadListV2.test.ts | 612 ++++++++++++
+ .../threads/threadListV2.childThreads.test.ts | 637 ++++++++++++
  .../src/features/threads/threadListV2.ts      | 906 ++++++++++++++----
  .../use-thread-list-v2-shelf-preferences.ts   | 123 +++
  .../src/features/threads/useThreadListV2.ts   |  13 +-
  apps/mobile/src/lib/storage.test.ts           |  20 +
  .../src/persistence/mobile-preferences.ts     |  26 +
  apps/mobile/src/state/threads.ts              |  10 +-
- .../src/state/threadShell.test.ts             |  37 +
+ .../state/threadShell.childThreads.test.ts    |  39 +-
  .../client-runtime/src/state/threadShell.ts   |  24 +
- 16 files changed, 2473 insertions(+), 210 deletions(-)
+ 16 files changed, 2499 insertions(+), 211 deletions(-)
+ create mode 100644 apps/mobile/src/features/threads/threadListV2.childThreads.test.ts
 
 diff --git a/apps/mobile/src/components/ui/AppSymbol.android.tsx b/apps/mobile/src/components/ui/AppSymbol.android.tsx
 index 5333af3ea5..550598da9b 100644
@@ -1517,37 +1518,41 @@ index c6b0f0d535..5d102cf274 100644
      </View>
    );
  });
-diff --git a/apps/mobile/src/features/threads/threadListV2.test.ts b/apps/mobile/src/features/threads/threadListV2.test.ts
-index 36f1005791..308ffc2374 100644
---- a/apps/mobile/src/features/threads/threadListV2.test.ts
-+++ b/apps/mobile/src/features/threads/threadListV2.test.ts
-@@ -35,6 +35,7 @@ import { threadJumpTarget } from "../keyboard/threadKeyboardShortcuts";
- import {
-   buildThreadListV2Items,
-   buildThreadListV2ListItems,
+diff --git a/apps/mobile/src/features/threads/threadListV2.childThreads.test.ts b/apps/mobile/src/features/threads/threadListV2.childThreads.test.ts
+new file mode 100644
+index 0000000000..53371ddf7e
+--- /dev/null
++++ b/apps/mobile/src/features/threads/threadListV2.childThreads.test.ts
+@@ -0,0 +1,637 @@
++import { presentThreadShell } from "@t3tools/client-runtime/state/models";
++import * as DateTime from "effect/DateTime";
++import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
++import { EnvironmentId, ProviderInstanceId, RunId, ThreadId } from "@t3tools/contracts";
++import { describe, expect, it } from "vite-plus/test";
++import { makeRawThreadShell, makeThreadShellFixture } from "../../test-fixtures";
++import {
++  buildThreadListV2Items,
++  buildThreadListV2ListItems,
 +  buildThreadListV2WorkerSettleMenu,
-   getThreadListV2OrderedSection,
-   layoutThreadListV2RowMenuActions,
-   resolveThreadListV2SnoozeMenuSelection,
-@@ -42,11 +43,14 @@ import {
-   resolveThreadListV2SnoozePresets,
-   resolveThreadListV2RowStatus,
-   resolveThreadListV2Status,
++  getThreadListV2OrderedSection,
 +  resolveThreadListV2RowKey,
 +  isThreadListV2ListItem,
-   resolveThreadListV2WokeAt,
-   threadListV2ListItemsAreEqual,
-   threadListV2RowAccessibilityLabel,
-   threadHasUnseenCompletion,
-   type ThreadListV2ListItem,
++  threadListV2ListItemsAreEqual,
 +  threadListV2ChildThreadFoldHeadStateOf,
- } from "./threadListV2";
- 
- const environmentId = EnvironmentId.make("environment-1");
-@@ -1893,3 +1897,611 @@ describe("queued messages keep a settled thread active", () => {
-     expect(layout.settledCount).toBe(1);
-   });
- });
++} from "./threadListV2";
++
++const environmentId = EnvironmentId.make("environment-1");
++
++function makeThread(
++  input: Partial<EnvironmentThreadShell> & Pick<EnvironmentThreadShell, "id" | "title">,
++): EnvironmentThreadShell {
++  return makeThreadShellFixture({
++    environmentId,
++    ...input,
++  });
++}
++
++const NOW = "2026-06-02T00:00:00.000Z";
 +
 +describe("child threads", () => {
 +  const SNOOZED = {
@@ -3579,14 +3584,23 @@ index a0acea9187..3ecd358700 100644
  export const childThreadApprovalsAtom = createChildThreadApprovalsAtom({
    childThreadInputsAtom: environmentThreadShells.childThreadInputsAtom,
    pendingRequestsAtom: environmentThreadDetails.pendingRequestsAtom,
-diff --git a/packages/client-runtime/src/state/threadShell.test.ts b/packages/client-runtime/src/state/threadShell.test.ts
-index 224f425787..522ed823c6 100644
---- a/packages/client-runtime/src/state/threadShell.test.ts
-+++ b/packages/client-runtime/src/state/threadShell.test.ts
-@@ -145,6 +145,43 @@ describe("v2 thread shell lists", () => {
-     registry.dispose();
-   });
+diff --git a/packages/client-runtime/src/state/threadShell.childThreads.test.ts b/packages/client-runtime/src/state/threadShell.childThreads.test.ts
+index cae8e7f100..575f223748 100644
+--- a/packages/client-runtime/src/state/threadShell.childThreads.test.ts
++++ b/packages/client-runtime/src/state/threadShell.childThreads.test.ts
+@@ -3,7 +3,7 @@ import * as Option from "effect/Option";
+ import { Atom, AtomRegistry } from "effect/reactivity";
+ import { describe, expect, it } from "vite-plus/test";
+ import { PrimaryConnectionTarget } from "../connection/model.ts";
+-import { v2ShellSnapshot, v2ThreadShell } from "./orchestrationV2TestFixtures.ts";
++import { v2Now, v2ShellSnapshot, v2ThreadShell } from "./orchestrationV2TestFixtures.ts";
+ import { createEnvironmentThreadShellAtoms } from "./threadShell.ts";
  
+ const environmentId = EnvironmentId.make("environment-v2");
+@@ -43,6 +43,43 @@ function makeHarness(environmentIds: ReadonlyArray<EnvironmentId> = [environment
+ }
+ 
+ describe("v2 thread shell lists", () => {
 +  it("keeps delegated workers in the roster but not provider-native subagents", () => {
 +    const { registry, threads, snapshotAtom } = makeHarness();
 +    const root = v2ThreadShell;

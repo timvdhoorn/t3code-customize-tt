@@ -6,25 +6,28 @@ Subject: [PATCH 08/16] fix(server): drop a usage window the account no longer
 
 A Claude rate-limit event with unifiedWindows lists every rolling window the account has. When the 5h window disappears from it (a plan without a 5h limit), the merged snapshot kept the last 5h reading forever, so the composer stats showed a 5h meter that no longer exists. Such an update now names the ids it covers in full (replaces), and a covered id it omits drops out unless a newer reading still has it.
 ---
- .../src/provider/claudeUsageLimits.test.ts    | 30 +++++++++
- apps/server/src/provider/claudeUsageLimits.ts |  4 ++
+ .../claudeUsageLimits.replacedWindows.test.ts | 35 ++++++++
+ .../src/provider/claudeUsageLimits.test.ts    |  1 +
+ apps/server/src/provider/claudeUsageLimits.ts |  4 +
  packages/contracts/src/providerUsageLimits.ts |  6 +-
- .../src/server/usageLimits.test.ts            | 61 +++++++++++++++++++
- .../provider-core/src/server/usageLimits.ts   | 21 ++++++-
- 5 files changed, 120 insertions(+), 2 deletions(-)
+ .../usageLimits.replacedWindows.test.ts       | 83 +++++++++++++++++++
+ .../provider-core/src/server/usageLimits.ts   | 21 ++++-
+ 6 files changed, 148 insertions(+), 2 deletions(-)
+ create mode 100644 apps/server/src/provider/claudeUsageLimits.replacedWindows.test.ts
+ create mode 100644 packages/provider-core/src/server/usageLimits.replacedWindows.test.ts
 
-diff --git a/apps/server/src/provider/claudeUsageLimits.test.ts b/apps/server/src/provider/claudeUsageLimits.test.ts
-index 8c84abfae4..b774c07561 100644
---- a/apps/server/src/provider/claudeUsageLimits.test.ts
-+++ b/apps/server/src/provider/claudeUsageLimits.test.ts
-@@ -341,8 +341,38 @@ describe("claudeRateLimitEventToUpdate", () => {
-           resetsAt: "2026-07-19T22:26:40.000Z",
-         },
-       ],
-+      replaces: ["five_hour", "seven_day"],
-     });
-   });
+diff --git a/apps/server/src/provider/claudeUsageLimits.replacedWindows.test.ts b/apps/server/src/provider/claudeUsageLimits.replacedWindows.test.ts
+new file mode 100644
+index 0000000000..e9b4b5580b
+--- /dev/null
++++ b/apps/server/src/provider/claudeUsageLimits.replacedWindows.test.ts
+@@ -0,0 +1,35 @@
++import { describe, expect, it } from "vite-plus/test";
++import { claudeRateLimitEventToUpdate } from "./claudeUsageLimits.ts";
 +
++const noNames = { overageIncluded: undefined } as const;
++
++describe("claudeRateLimitEventToUpdate", () => {
 +  it("replaces the rolling windows when unifiedWindows no longer lists the 5h window", () => {
 +    const update = claudeRateLimitEventToUpdate(
 +      {
@@ -53,9 +56,19 @@ index 8c84abfae4..b774c07561 100644
 +
 +    expect(update?.replaces).toBeUndefined();
 +  });
++});
+diff --git a/apps/server/src/provider/claudeUsageLimits.test.ts b/apps/server/src/provider/claudeUsageLimits.test.ts
+index 8c84abfae4..f7ba554efd 100644
+--- a/apps/server/src/provider/claudeUsageLimits.test.ts
++++ b/apps/server/src/provider/claudeUsageLimits.test.ts
+@@ -341,6 +341,7 @@ describe("claudeRateLimitEventToUpdate", () => {
+           resetsAt: "2026-07-19T22:26:40.000Z",
+         },
+       ],
++      replaces: ["five_hour", "seven_day"],
+     });
+   });
  });
- 
- describe("claudeOAuthUsageToLimits", () => {
 diff --git a/apps/server/src/provider/claudeUsageLimits.ts b/apps/server/src/provider/claudeUsageLimits.ts
 index 98e4c9b55b..693b355981 100644
 --- a/apps/server/src/provider/claudeUsageLimits.ts
@@ -90,14 +103,35 @@ index e252269966..71e1436b9a 100644
  });
  export type ProviderUsageLimitsUpdate = typeof ProviderUsageLimitsUpdate.Type;
  
-diff --git a/packages/provider-core/src/server/usageLimits.test.ts b/packages/provider-core/src/server/usageLimits.test.ts
-index c259ae78d0..8d21f4d369 100644
---- a/packages/provider-core/src/server/usageLimits.test.ts
-+++ b/packages/provider-core/src/server/usageLimits.test.ts
-@@ -108,6 +108,67 @@ describe("applyUsageLimitsUpdate", () => {
-   });
- });
- 
+diff --git a/packages/provider-core/src/server/usageLimits.replacedWindows.test.ts b/packages/provider-core/src/server/usageLimits.replacedWindows.test.ts
+new file mode 100644
+index 0000000000..f5b575c16c
+--- /dev/null
++++ b/packages/provider-core/src/server/usageLimits.replacedWindows.test.ts
+@@ -0,0 +1,83 @@
++import { describe, expect, it } from "vite-plus/test";
++import { applyUsageLimitsUpdate } from "./usageLimits.ts";
++
++const checkedAt = "2026-09-03T12:00:00.000Z";
++const session = {
++  id: "five_hour",
++  kind: "session",
++  label: "Session",
++  checkedAt,
++  usedPercent: 40,
++  windowDurationMins: 300,
++  resetsAt: "2026-09-03T14:00:00.000Z",
++} as const;
++const weekly = {
++  id: "seven_day",
++  kind: "weekly",
++  label: "Weekly",
++  checkedAt,
++  usedPercent: 20,
++  windowDurationMins: 10_080,
++} as const;
++const published = { checkedAt, windows: [session, weekly] };
++
 +describe("replaced windows", () => {
 +  const later = "2026-09-03T12:05:00.000Z";
 +
@@ -158,10 +192,6 @@ index c259ae78d0..8d21f4d369 100644
 +    ).toBe(only);
 +  });
 +});
-+
- describe("resolveUsageLimitsAfterProbe", () => {
-   it("uses read order for windows while taking metadata from the successful probe", () => {
-     const live = {
 diff --git a/packages/provider-core/src/server/usageLimits.ts b/packages/provider-core/src/server/usageLimits.ts
 index a35c029af6..af81481010 100644
 --- a/packages/provider-core/src/server/usageLimits.ts

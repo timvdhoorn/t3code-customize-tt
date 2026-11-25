@@ -9,28 +9,29 @@ t3_thread_launch and create_threads) and renders families like Claude.app:
 a child nests under its opener only within the same inbox section, with a
 guide line, context-menu collapse and a summary stub.
 ---
- .../src/mcp/OrchestratorMcpService.test.ts    |   97 ++
+ ...rchestratorMcpService.childThreads.test.ts |  184 +++
  apps/server/src/mcp/OrchestratorMcpService.ts |    2 +
  .../src/mcp/toolkits/orchestrator/tools.ts    |    2 +-
- .../src/mcp/toolkits/project/handlers.test.ts |   93 +-
+ .../project/handlers.childThreads.test.ts     |  117 ++
+ .../src/mcp/toolkits/project/handlers.test.ts |    1 +
  .../src/mcp/toolkits/project/handlers.ts      |    6 +
  apps/server/src/mcp/toolkits/project/tools.ts |    8 +-
  .../src/orchestration-v2/Orchestrator.ts      |   14 +-
  .../src/orchestration-v2/ProjectionStore.ts   |   21 +
- .../SubagentProjection.test.ts                |   25 +
+ .../SubagentProjection.childThreads.test.ts   |   87 +
  .../ThreadLaunchService.test.ts               |   42 +
  .../orchestration-v2/ThreadLaunchService.ts   |    8 +
  .../ThreadManagementService.test.ts           |    9 +-
  .../ThreadManagementService.ts                |    2 +
- .../ThreadSettlementService.test.ts           |  237 +++
+ ...readSettlementService.childThreads.test.ts |  139 ++
+ .../ThreadSettlementService.test.ts           |  168 ++
  .../ThreadSettlementService.ts                |  177 +-
  .../src/orchestration-v2/runtimeLayer.test.ts |   85 +
  .../Sidebar.childThreads.browser.test.tsx     |  181 +++
- .../components/Sidebar.childThreads.test.ts   |  657 ++++++++
+ .../components/Sidebar.childThreads.test.ts   |  703 ++++++++
  .../src/components/Sidebar.childThreads.tsx   | 1422 +++++++++++++++++
  .../src/components/Sidebar.families.test.ts   |  519 ++++++
  apps/web/src/components/Sidebar.families.ts   |    3 +
- apps/web/src/components/Sidebar.logic.test.ts |   45 +
  apps/web/src/components/Sidebar.logic.ts      |   58 +-
  apps/web/src/components/Sidebar.tsx           |  205 ++-
  ...hreadRelationshipsControl.browser.test.tsx |    9 +
@@ -40,7 +41,7 @@ guide line, context-menu collapse and a summary stub.
  .../SidebarThreadRow.workers.browser.test.tsx | 1178 ++++++++++++++
  .../web/src/components/sidebar/routeReveal.ts |   18 +-
  .../src/components/sidebar/threadModel.tsx    |  118 ++
- .../components/threadActionMenu.logic.test.ts |   33 +
+ ...hreadActionMenu.logic.childThreads.test.ts |   61 +
  .../src/components/threadActionMenu.logic.ts  |   39 +
  apps/web/src/components/ui/tooltip.tsx        |   10 +-
  apps/web/src/contextMenuFallback.ts           |   23 +
@@ -64,11 +65,15 @@ guide line, context-menu collapse and a summary stub.
  packages/client-runtime/src/state/shell.ts    |    6 +-
  .../src/state/threadCommands.test.ts          |    6 +-
  .../src/state/threadCommands.ts               |   14 +-
- .../src/state/threadShell.test.ts             |   37 +
+ .../state/threadShell.childThreads.test.ts    |   82 +
  packages/contracts/src/orchestrationV2.ts     |   32 +
  packages/contracts/src/orchestratorMcp.ts     |    6 +
  .../src/server/subagentProjection.ts          |    9 +-
- 59 files changed, 8258 insertions(+), 214 deletions(-)
+ 60 files changed, 8577 insertions(+), 213 deletions(-)
+ create mode 100644 apps/server/src/mcp/OrchestratorMcpService.childThreads.test.ts
+ create mode 100644 apps/server/src/mcp/toolkits/project/handlers.childThreads.test.ts
+ create mode 100644 apps/server/src/orchestration-v2/SubagentProjection.childThreads.test.ts
+ create mode 100644 apps/server/src/orchestration-v2/ThreadSettlementService.childThreads.test.ts
  create mode 100644 apps/web/src/components/Sidebar.childThreads.browser.test.tsx
  create mode 100644 apps/web/src/components/Sidebar.childThreads.test.ts
  create mode 100644 apps/web/src/components/Sidebar.childThreads.tsx
@@ -77,6 +82,7 @@ guide line, context-menu collapse and a summary stub.
  create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.opened.browser.test.tsx
  create mode 100644 apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx
  create mode 100644 apps/web/src/components/sidebar/threadModel.tsx
+ create mode 100644 apps/web/src/components/threadActionMenu.logic.childThreads.test.ts
  create mode 100644 apps/web/src/state/openedThreads.test.ts
  create mode 100644 apps/web/src/state/openedThreads.ts
  create mode 100644 apps/web/src/state/sidebarListing.ts
@@ -85,15 +91,101 @@ guide line, context-menu collapse and a summary stub.
  create mode 100644 packages/client-runtime/src/state/childThreadFamilies.ts
  create mode 100644 packages/client-runtime/src/state/childThreadSummary.test.ts
  create mode 100644 packages/client-runtime/src/state/childThreadSummary.ts
+ create mode 100644 packages/client-runtime/src/state/threadShell.childThreads.test.ts
 
-diff --git a/apps/server/src/mcp/OrchestratorMcpService.test.ts b/apps/server/src/mcp/OrchestratorMcpService.test.ts
-index cae358e2be..c7775e86b4 100644
---- a/apps/server/src/mcp/OrchestratorMcpService.test.ts
-+++ b/apps/server/src/mcp/OrchestratorMcpService.test.ts
-@@ -3856,6 +3856,103 @@ describe("OrchestratorMcpService provider resolution", () => {
-       }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
-   );
- 
+diff --git a/apps/server/src/mcp/OrchestratorMcpService.childThreads.test.ts b/apps/server/src/mcp/OrchestratorMcpService.childThreads.test.ts
+new file mode 100644
+index 0000000000..48b110fc35
+--- /dev/null
++++ b/apps/server/src/mcp/OrchestratorMcpService.childThreads.test.ts
+@@ -0,0 +1,184 @@
++import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
++import * as NodeServices from "@effect/platform-node/NodeServices";
++import { assert, describe, it } from "@effect/vitest";
++import {
++  CommandId,
++  EnvironmentId,
++  MessageId,
++  ProjectId,
++  ProviderDriverKind,
++  ProviderInstanceId,
++  ThreadId,
++  type ServerProvider,
++} from "@t3tools/contracts";
++import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
++import * as Effect from "effect/Effect";
++import * as Layer from "effect/Layer";
++import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
++import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
++import * as LegacyV1ThreadImporter from "../orchestration-v2/legacy/LegacyV1ThreadImporter.ts";
++import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
++import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
++import * as SqlitePersistence from "../persistence/Sqlite.ts";
++import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
++import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
++import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
++import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
++import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
++import * as ProjectService from "../project/ProjectService.ts";
++import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts";
++import * as ServerSettings from "../serverSettings.ts";
++import * as SecretRequests from "../secrets/SecretRequests.ts";
++import * as RemoteDelegation from "../peer/RemoteDelegation.ts";
++import type { McpInvocationScope } from "./McpInvocationContext.ts";
++import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
++
++const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
++  Layer.provide(Layer.mock(ThreadLaunchService.ThreadLaunchService)({})),
++  Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
++);
++
++describe("OrchestratorMcpService provider resolution", () => {
++  const parentThreadId = ThreadId.make("thread:mcp-providers-parent");
++  const projectId = ProjectId.make("project:mcp-providers");
++  const codexInstanceId = ProviderInstanceId.make("codex");
++
++  const scope: McpInvocationScope = {
++    environmentId: EnvironmentId.make("environment:mcp-providers"),
++    requestNamespace: "provider-session:mcp-providers",
++    thread: {
++      threadId: parentThreadId,
++      providerSessionId: "provider-session:mcp-providers",
++      providerInstanceId: codexInstanceId,
++    },
++    client: undefined,
++    capabilities: new Set(["orchestration"]),
++    issuedAt: 1,
++  };
++
++  const providerSnapshot = (input: {
++    readonly instanceId: ProviderInstanceId;
++    readonly driver: ProviderDriverKind;
++    readonly model?: string;
++    readonly enabled?: boolean;
++  }): ServerProvider => ({
++    instanceId: input.instanceId,
++    driver: input.driver,
++    enabled: input.enabled ?? true,
++    installed: input.enabled !== false,
++    version: input.enabled === false ? null : "test",
++    status: input.enabled === false ? "disabled" : "ready",
++    auth: { status: input.enabled === false ? "unknown" : "authenticated" },
++    ...(input.enabled === false ? { message: "Provider is disabled in T3 Code settings." } : {}),
++    checkedAt: "2026-09-13T00:00:00.000Z",
++    models:
++      input.model === undefined
++        ? []
++        : [{ slug: input.model, name: input.model, isCustom: false, capabilities: null }],
++    slashCommands: [],
++    skills: [],
++  });
++
++  const providerRegistryLayer = (providers: ReadonlyArray<ServerProvider>) =>
++    Layer.mock(ProviderRegistry.ProviderRegistry)({
++      getProviders: Effect.succeed(providers),
++      refreshInstance: () => Effect.succeed(providers),
++    });
++
 +  it.live("create_threads nests a thread under its opener unless it asks for a main thread", () =>
 +    Effect.scoped(
 +      Effect.gen(function* () {
@@ -190,10 +282,7 @@ index cae358e2be..c7775e86b4 100644
 +      }).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
 +    ),
 +  );
-+
-   it.effect(
-     "inherits an available parent instance for driver-only targets and otherwise selects a healthy peer",
-     () =>
++});
 diff --git a/apps/server/src/mcp/OrchestratorMcpService.ts b/apps/server/src/mcp/OrchestratorMcpService.ts
 index a604173ddc..27a69f0dcd 100644
 --- a/apps/server/src/mcp/OrchestratorMcpService.ts
@@ -220,28 +309,40 @@ index f617b61fab..b93e08efa5 100644
    parameters: OrchestratorMcpCreateThreadsInput,
    success: OrchestratorMcpCreateThreadsResult,
    failure: OrchestratorMcpFailure,
-diff --git a/apps/server/src/mcp/toolkits/project/handlers.test.ts b/apps/server/src/mcp/toolkits/project/handlers.test.ts
-index 17fa4dd496..4086b86d51 100644
---- a/apps/server/src/mcp/toolkits/project/handlers.test.ts
-+++ b/apps/server/src/mcp/toolkits/project/handlers.test.ts
-@@ -9,12 +9,12 @@ import {
-   ProviderInstanceId,
-   ProviderDriverKind,
-   type ServerProvider,
+diff --git a/apps/server/src/mcp/toolkits/project/handlers.childThreads.test.ts b/apps/server/src/mcp/toolkits/project/handlers.childThreads.test.ts
+new file mode 100644
+index 0000000000..d53575645e
+--- /dev/null
++++ b/apps/server/src/mcp/toolkits/project/handlers.childThreads.test.ts
+@@ -0,0 +1,117 @@
++import * as ProviderRegistry from "../../../provider/ProviderRegistry.ts";
++import { expect, it } from "@effect/vitest";
++import {
++  EnvironmentId,
++  ProjectId,
++  ProviderInstanceId,
 +  ThreadId,
-   type Project as ProjectRecord,
-   type ModelSelection,
-   type ProjectScript,
-   type RuntimeMode,
-   type OrchestrationV2ThreadShell,
--  ThreadId,
- } from "@t3tools/contracts";
- import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
- import * as NodeServices from "@effect/platform-node/NodeServices";
-@@ -50,6 +50,96 @@ import * as McpToolAccess from "../../McpToolAccess.ts";
- import * as ProjectHandlers from "./handlers.ts";
- import { ProjectToolkit } from "./tools.ts";
- 
++  type Project as ProjectRecord,
++  type OrchestrationV2ThreadShell,
++} from "@t3tools/contracts";
++import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
++import * as NodeServices from "@effect/platform-node/NodeServices";
++import * as Effect from "effect/Effect";
++import * as Layer from "effect/Layer";
++import * as Stream from "effect/Stream";
++import * as DocumentText from "../../../provider/DocumentText.ts";
++import * as ThreadLaunch from "../../../orchestration-v2/ThreadLaunchService.ts";
++import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
++import * as ServerConfig from "../../../config.ts";
++import * as ServerSettings from "../../../serverSettings.ts";
++import * as Project from "../../../project/ProjectService.ts";
++import * as ManagedProjectFolders from "../../../project/ManagedProjectFolders.ts";
++import * as GitVcsDriver from "../../../vcs/GitVcsDriver.ts";
++import * as McpInvocationContext from "../../McpInvocationContext.ts";
++import * as McpToolAccess from "../../McpToolAccess.ts";
++import * as ProjectHandlers from "./handlers.ts";
++import { ProjectToolkit } from "./tools.ts";
++
 +it.effect("attributes a launched thread and its first message to the calling thread", () =>
 +  Effect.gen(function* () {
 +    const sourceThreadId = ThreadId.make("source-thread");
@@ -331,11 +432,11 @@ index 17fa4dd496..4086b86d51 100644
 +    expect(launchedDetached).toBe(true);
 +  }),
 +);
-+
- const clientLaunchHarness = (input: {
-   readonly runtimeModeCeiling: RuntimeMode;
-   readonly defaultRuntimeMode?: RuntimeMode;
-@@ -255,6 +345,7 @@ it.effect(
+diff --git a/apps/server/src/mcp/toolkits/project/handlers.test.ts b/apps/server/src/mcp/toolkits/project/handlers.test.ts
+index 17fa4dd496..e9badf3d0d 100644
+--- a/apps/server/src/mcp/toolkits/project/handlers.test.ts
++++ b/apps/server/src/mcp/toolkits/project/handlers.test.ts
+@@ -255,6 +255,7 @@ it.effect(
        });
        expect(belowCeiling.launched[0]?.runtimeMode).toBe("approval-required");
        expect(belowCeiling.launched[0]?.initialMessage?.senderThreadId).toBeUndefined();
@@ -493,14 +594,75 @@ index 5d7944394f..4efadba260 100644
                    status,
                    latestRunId,
                    latestRunRequestedAt:
-diff --git a/apps/server/src/orchestration-v2/SubagentProjection.test.ts b/apps/server/src/orchestration-v2/SubagentProjection.test.ts
-index 0f083c49c5..5cb717d2fa 100644
---- a/apps/server/src/orchestration-v2/SubagentProjection.test.ts
-+++ b/apps/server/src/orchestration-v2/SubagentProjection.test.ts
-@@ -135,6 +135,31 @@ it("resets a subagent child's snooze, title job and remote delegation but keeps
-   });
- });
- 
+diff --git a/apps/server/src/orchestration-v2/SubagentProjection.childThreads.test.ts b/apps/server/src/orchestration-v2/SubagentProjection.childThreads.test.ts
+new file mode 100644
+index 0000000000..61911d058f
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/SubagentProjection.childThreads.test.ts
+@@ -0,0 +1,87 @@
++import { assert, it } from "@effect/vitest";
++import {
++  type ModelSelection,
++  NodeId,
++  type OrchestrationV2AppThread,
++  ProjectId,
++  ProviderInstanceId,
++  ProviderThreadId,
++  ThreadId,
++} from "@t3tools/contracts";
++import * as DateTime from "effect/DateTime";
++import { makeSubagentChildThread } from "@t3tools/provider-core/server/subagentProjection";
++
++const parentThreadId = ThreadId.make("thread:subagent-snoozed-parent");
++const childThreadId = ThreadId.make("thread:subagent-awake-child");
++const parentProviderInstanceId = ProviderInstanceId.make("codex");
++const childProviderInstanceId = ProviderInstanceId.make("claude");
++const parentModelSelection = {
++  instanceId: parentProviderInstanceId,
++  model: "gpt-5.4",
++} satisfies ModelSelection;
++const childModelSelection = {
++  instanceId: childProviderInstanceId,
++  model: "claude-opus-4-1",
++} satisfies ModelSelection;
++const parentCreatedAt = DateTime.makeUnsafe("2026-07-24T09:00:00.000Z");
++const snoozedAt = DateTime.makeUnsafe("2026-07-24T09:05:00.000Z");
++const snoozedUntil = DateTime.makeUnsafe("2026-07-25T09:00:00.000Z");
++const childCreatedAt = DateTime.makeUnsafe("2026-07-24T09:10:00.000Z");
++
++function makeParentThread(): OrchestrationV2AppThread {
++  return {
++    createdBy: "user",
++    creationSource: "web",
++    id: parentThreadId,
++    projectId: ProjectId.make("project:subagent-snooze"),
++    title: "Snoozed parent",
++    providerInstanceId: parentProviderInstanceId,
++    modelSelection: parentModelSelection,
++    runtimeMode: "full-access",
++    interactionMode: "plan",
++    branch: "feature/source",
++    worktreePath: "/tmp/source-worktree",
++    activeProviderThreadId: ProviderThreadId.make("provider-thread:subagent-snoozed-parent"),
++    lineage: {
++      parentThreadId: null,
++      relationshipToParent: null,
++      rootThreadId: parentThreadId,
++    },
++    forkedFrom: null,
++    createdAt: parentCreatedAt,
++    updatedAt: snoozedAt,
++    archivedAt: null,
++    settledOverride: null,
++    settledAt: null,
++    lastVisitedAt: null,
++    snoozedUntil,
++    snoozedAt,
++    deletedAt: null,
++    historyOrigin: "v1_import",
++  };
++}
++
 +it("a subagent child does not inherit its parent's opener or main-thread state", () => {
 +  // Fork: an agent-opened main thread delegates; its worker nests under it, not as a main thread.
 +  const parentThread: OrchestrationV2AppThread = {
@@ -525,10 +687,6 @@ index 0f083c49c5..5cb717d2fa 100644
 +  assert.notProperty(childThread, "detachedFromOpener");
 +  assert.equal(childThread.lineage.parentThreadId, parentThreadId);
 +});
-+
- it.effect.each(["provider", "mcp"] as const)(
-   "a %s child does not inherit parent settlement protections and settles once its parent settles",
-   (creationSource) =>
 diff --git a/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts b/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
 index 98434fa496..a642868f17 100644
 --- a/apps/server/src/orchestration-v2/ThreadLaunchService.test.ts
@@ -655,8 +813,153 @@ index a928d46a17..1737fd65c5 100644
      });
      return { sequence: result.sequence };
    });
+diff --git a/apps/server/src/orchestration-v2/ThreadSettlementService.childThreads.test.ts b/apps/server/src/orchestration-v2/ThreadSettlementService.childThreads.test.ts
+new file mode 100644
+index 0000000000..0ac9156420
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/ThreadSettlementService.childThreads.test.ts
+@@ -0,0 +1,139 @@
++import { describe, expect, it } from "@effect/vitest";
++import * as DateTime from "effect/DateTime";
++import {
++  ProjectId,
++  ProviderInstanceId,
++  ThreadId,
++  type OrchestrationV2ThreadShell,
++} from "@t3tools/contracts";
++import * as ProjectionStore from "./ProjectionStore.ts";
++import * as ThreadSettlementService from "./ThreadSettlementService.ts";
++
++const NOW_MS = Date.parse("2026-06-10T12:00:00.000Z");
++const DAY_MS = 24 * 60 * 60 * 1_000;
++
++function at(offsetMs: number): DateTime.Utc {
++  return DateTime.makeUnsafe(NOW_MS + offsetMs);
++}
++
++type SettlementShell = OrchestrationV2ThreadShell &
++  Pick<ProjectionStore.ProjectionSettlementCandidate, "latestResumingMessageAt">;
++
++function shell(overrides: Partial<SettlementShell> = {}): SettlementShell {
++  return {
++    id: ThreadId.make("thread-1"),
++    projectId: ProjectId.make("project-1"),
++    title: "Thread",
++    providerInstanceId: ProviderInstanceId.make("codex"),
++    modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
++    runtimeMode: "full-access",
++    interactionMode: "default",
++    worktreePath: null,
++    activeProviderThreadId: null,
++    lineage: {
++      rootThreadId: ThreadId.make("thread-1"),
++      parentThreadId: null,
++      relationshipToParent: null,
++    },
++    forkedFrom: null,
++    createdBy: "user",
++    creationSource: "web",
++    activeRunId: null,
++    latestVisibleMessage: null,
++    hasActionableProposedPlan: false,
++    itemCount: 0,
++    visibleItemCount: 0,
++    lastVisitedAt: null,
++    deletedAt: null,
++    branch: null,
++    linkedPullRequest: null,
++    status: "idle",
++    activityRunStatus: null,
++    pendingRuntimeRequest: null,
++    pendingBackgroundTasks: [],
++    latestRunId: null,
++    latestRunRequestedAt: null,
++    latestRunStartedAt: null,
++    latestRunCompletedAt: null,
++    latestUserMessageAt: null,
++    latestResumingMessageAt: overrides.latestUserMessageAt ?? null,
++    createdAt: at(-30 * DAY_MS),
++    updatedAt: at(-10 * DAY_MS),
++    archivedAt: null,
++    settledOverride: null,
++    settledAt: null,
++    snoozedUntil: null,
++    snoozedAt: null,
++    pinnedAt: null,
++    ...overrides,
++  };
++}
++
++describe("settlesWithOpener", () => {
++  const openerId = ThreadId.make("opener");
++  const opened = { openedByThreadId: openerId };
++  const settles = (overrides: Partial<SettlementShell>) =>
++    ThreadSettlementService.settlesWithOpener(shell(overrides), openerId, NOW_MS);
++
++  it("settles idle threads the opener launched or delegated", () => {
++    expect(settles(opened)).toBe(true);
++    expect(settles({ ...opened, status: "completed", settledOverride: "active" })).toBe(true);
++    expect(
++      settles({
++        lineage: {
++          rootThreadId: openerId,
++          parentThreadId: openerId,
++          relationshipToParent: "subagent",
++        },
++        createdBy: "agent",
++        creationSource: "server",
++      }),
++    ).toBe(true);
++  });
++
++  it("leaves other threads and provider-native subagents alone", () => {
++    expect(settles({})).toBe(false);
++    expect(settles({ openedByThreadId: ThreadId.make("someone-else") })).toBe(false);
++    expect(
++      settles({
++        lineage: {
++          rootThreadId: openerId,
++          parentThreadId: openerId,
++          relationshipToParent: "subagent",
++        },
++        creationSource: "provider",
++      }),
++    ).toBe(false);
++  });
++
++  it("keeps children that still work, wait on the user, or were kept on purpose", () => {
++    expect(settles({ ...opened, settledOverride: "settled" })).toBe(false);
++    expect(settles({ ...opened, archivedAt: at(-1) })).toBe(false);
++    expect(settles({ ...opened, pinnedAt: at(-1) })).toBe(false);
++    expect(settles({ ...opened, autoSettleDisabledAt: at(-1) })).toBe(false);
++    expect(settles({ ...opened, activityRunStatus: "running" })).toBe(false);
++    expect(settles({ ...opened, pendingRuntimeRequest: { kind: "user_input" } as never })).toBe(
++      false,
++    );
++    expect(
++      settles({ ...opened, pendingBackgroundTasks: [{ taskId: "review", kind: "subagent" }] }),
++    ).toBe(false);
++    expect(settles({ ...opened, snoozedAt: at(-DAY_MS), snoozedUntil: at(DAY_MS) })).toBe(false);
++  });
++
++  it("leaves a child the user made a main thread", () => {
++    expect(settles({ ...opened, detachedFromOpener: true })).toBe(false);
++    expect(
++      settles({
++        lineage: {
++          rootThreadId: openerId,
++          parentThreadId: openerId,
++          relationshipToParent: "subagent",
++        },
++        createdBy: "agent",
++        creationSource: "server",
++        detachedFromOpener: true,
++      }),
++    ).toBe(false);
++  });
++});
 diff --git a/apps/server/src/orchestration-v2/ThreadSettlementService.test.ts b/apps/server/src/orchestration-v2/ThreadSettlementService.test.ts
-index b17cb0070e..4d77984ffb 100644
+index b17cb0070e..25d63a77c7 100644
 --- a/apps/server/src/orchestration-v2/ThreadSettlementService.test.ts
 +++ b/apps/server/src/orchestration-v2/ThreadSettlementService.test.ts
 @@ -7,6 +7,8 @@ import {
@@ -890,79 +1193,6 @@ index b17cb0070e..4d77984ffb 100644
    it.effect("runs the settle script in the thread's own worktree", () =>
      Effect.gen(function* () {
        const warnings: string[] = [];
-@@ -2588,3 +2756,72 @@ describe("isSnoozed", () => {
-     ).toBeNull();
-   });
- });
-+
-+describe("settlesWithOpener", () => {
-+  const openerId = ThreadId.make("opener");
-+  const opened = { openedByThreadId: openerId };
-+  const settles = (overrides: Partial<SettlementShell>) =>
-+    ThreadSettlementService.settlesWithOpener(shell(overrides), openerId, NOW_MS);
-+
-+  it("settles idle threads the opener launched or delegated", () => {
-+    expect(settles(opened)).toBe(true);
-+    expect(settles({ ...opened, status: "completed", settledOverride: "active" })).toBe(true);
-+    expect(
-+      settles({
-+        lineage: {
-+          rootThreadId: openerId,
-+          parentThreadId: openerId,
-+          relationshipToParent: "subagent",
-+        },
-+        createdBy: "agent",
-+        creationSource: "server",
-+      }),
-+    ).toBe(true);
-+  });
-+
-+  it("leaves other threads and provider-native subagents alone", () => {
-+    expect(settles({})).toBe(false);
-+    expect(settles({ openedByThreadId: ThreadId.make("someone-else") })).toBe(false);
-+    expect(
-+      settles({
-+        lineage: {
-+          rootThreadId: openerId,
-+          parentThreadId: openerId,
-+          relationshipToParent: "subagent",
-+        },
-+        creationSource: "provider",
-+      }),
-+    ).toBe(false);
-+  });
-+
-+  it("keeps children that still work, wait on the user, or were kept on purpose", () => {
-+    expect(settles({ ...opened, settledOverride: "settled" })).toBe(false);
-+    expect(settles({ ...opened, archivedAt: at(-1) })).toBe(false);
-+    expect(settles({ ...opened, pinnedAt: at(-1) })).toBe(false);
-+    expect(settles({ ...opened, autoSettleDisabledAt: at(-1) })).toBe(false);
-+    expect(settles({ ...opened, activityRunStatus: "running" })).toBe(false);
-+    expect(settles({ ...opened, pendingRuntimeRequest: { kind: "user_input" } as never })).toBe(
-+      false,
-+    );
-+    expect(
-+      settles({ ...opened, pendingBackgroundTasks: [{ taskId: "review", kind: "subagent" }] }),
-+    ).toBe(false);
-+    expect(settles({ ...opened, snoozedAt: at(-DAY_MS), snoozedUntil: at(DAY_MS) })).toBe(false);
-+  });
-+
-+  it("leaves a child the user made a main thread", () => {
-+    expect(settles({ ...opened, detachedFromOpener: true })).toBe(false);
-+    expect(
-+      settles({
-+        lineage: {
-+          rootThreadId: openerId,
-+          parentThreadId: openerId,
-+          relationshipToParent: "subagent",
-+        },
-+        createdBy: "agent",
-+        creationSource: "server",
-+        detachedFromOpener: true,
-+      }),
-+    ).toBe(false);
-+  });
-+});
 diff --git a/apps/server/src/orchestration-v2/ThreadSettlementService.ts b/apps/server/src/orchestration-v2/ThreadSettlementService.ts
 index 2884600cee..e9add8422b 100644
 --- a/apps/server/src/orchestration-v2/ThreadSettlementService.ts
@@ -1489,10 +1719,10 @@ index 0000000000..3a924c41b5
 +);
 diff --git a/apps/web/src/components/Sidebar.childThreads.test.ts b/apps/web/src/components/Sidebar.childThreads.test.ts
 new file mode 100644
-index 0000000000..eecfde2386
+index 0000000000..a4243ba85c
 --- /dev/null
 +++ b/apps/web/src/components/Sidebar.childThreads.test.ts
-@@ -0,0 +1,657 @@
+@@ -0,0 +1,703 @@
 +import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 +import { describe, expect, it } from "vite-plus/test";
 +
@@ -1511,6 +1741,8 @@ index 0000000000..eecfde2386
 +import { sidebarUnderParentKeys } from "../state/sidebarListing";
 +import { nextSubthreadKeys, pruneSubthreadKeys } from "../state/subthreads";
 +import { resolveThreadStatusPill } from "./Sidebar.logic";
++import { EnvironmentId, ThreadId } from "@t3tools/contracts";
++import { makeThreadFixture } from "../test-fixtures";
 +
 +const thread = (
 +  id: string,
@@ -2148,6 +2380,50 @@ index 0000000000..eecfde2386
 +    expect(subthreadMenuStateOf(launched, new Set(), () => false)).toBeNull();
 +    expect(subthreadMenuStateOf(launched, new Set(), () => true)).toBe("hidden");
 +    expect(subthreadMenuStateOf(worker, new Set(["env:worker"]), () => false)).toBe("shown");
++  });
++});
++
++describe("sidebar worker listing", () => {
++  it("lists a delegated worker the user made a main thread with the other threads", () => {
++    const environmentId = EnvironmentId.make("environment-row");
++    const root = makeThreadFixture({ id: ThreadId.make("thread-root"), environmentId });
++    const worker = (id: string, detached: boolean) => ({
++      ...makeThreadFixture({
++        id: ThreadId.make(id),
++        environmentId,
++        lineage: {
++          rootThreadId: root.id,
++          parentThreadId: root.id,
++          relationshipToParent: "subagent",
++        },
++      }),
++      delegatedByThreadId: root.id,
++      ...(detached ? { detachedFromOpener: true as const } : {}),
++    });
++    const nested = worker("thread-nested", false);
++    const detached = worker("thread-detached", true);
++    const visible = filterSidebarV2VisibleThreads([root, nested, detached], null, new Set());
++    expect(visible.map((thread) => thread.id)).toEqual([root.id, detached.id]);
++  });
++
++  it("never lists a provider-native subagent, even one marked as a main thread", () => {
++    const environmentId = EnvironmentId.make("environment-row");
++    const root = makeThreadFixture({ id: ThreadId.make("thread-root"), environmentId });
++    const subagent = {
++      ...makeThreadFixture({
++        id: ThreadId.make("thread-native-subagent"),
++        environmentId,
++        creationSource: "provider",
++        lineage: {
++          rootThreadId: root.id,
++          parentThreadId: root.id,
++          relationshipToParent: "subagent",
++        },
++      }),
++      detachedFromOpener: true as const,
++    };
++    const visible = filterSidebarV2VisibleThreads([root, subagent], null, new Set());
++    expect(visible.map((thread) => thread.id)).toEqual([root.id]);
 +  });
 +});
 diff --git a/apps/web/src/components/Sidebar.childThreads.tsx b/apps/web/src/components/Sidebar.childThreads.tsx
@@ -4112,69 +4388,6 @@ index 0000000000..c36543a6f6
 +// Child-thread family rules now live in client-runtime so the web sidebar and
 +// the mobile thread list nest threads the same way.
 +export * from "@t3tools/client-runtime/state/thread-families";
-diff --git a/apps/web/src/components/Sidebar.logic.test.ts b/apps/web/src/components/Sidebar.logic.test.ts
-index 685d865c4e..52ee457e11 100644
---- a/apps/web/src/components/Sidebar.logic.test.ts
-+++ b/apps/web/src/components/Sidebar.logic.test.ts
-@@ -14,6 +14,7 @@ import {
-   deleteSelectedThreadEntries,
-   getFallbackThreadIdAfterDelete,
-   hasUnseenCompletion,
-+  filterSidebarV2VisibleThreads,
-   orderItemsByPreferredIds,
-   pinOrderKeyBetween,
-   resolveSidebarSweepKeys,
-@@ -142,6 +143,50 @@ describe("deleteSelectedThreadEntries", () => {
-   });
- });
- 
-+describe("sidebar worker listing", () => {
-+  it("lists a delegated worker the user made a main thread with the other threads", () => {
-+    const environmentId = EnvironmentId.make("environment-row");
-+    const root = makeThreadFixture({ id: ThreadId.make("thread-root"), environmentId });
-+    const worker = (id: string, detached: boolean) => ({
-+      ...makeThreadFixture({
-+        id: ThreadId.make(id),
-+        environmentId,
-+        lineage: {
-+          rootThreadId: root.id,
-+          parentThreadId: root.id,
-+          relationshipToParent: "subagent",
-+        },
-+      }),
-+      delegatedByThreadId: root.id,
-+      ...(detached ? { detachedFromOpener: true as const } : {}),
-+    });
-+    const nested = worker("thread-nested", false);
-+    const detached = worker("thread-detached", true);
-+    const visible = filterSidebarV2VisibleThreads([root, nested, detached], null, new Set());
-+    expect(visible.map((thread) => thread.id)).toEqual([root.id, detached.id]);
-+  });
-+
-+  it("never lists a provider-native subagent, even one marked as a main thread", () => {
-+    const environmentId = EnvironmentId.make("environment-row");
-+    const root = makeThreadFixture({ id: ThreadId.make("thread-root"), environmentId });
-+    const subagent = {
-+      ...makeThreadFixture({
-+        id: ThreadId.make("thread-native-subagent"),
-+        environmentId,
-+        creationSource: "provider",
-+        lineage: {
-+          rootThreadId: root.id,
-+          parentThreadId: root.id,
-+          relationshipToParent: "subagent",
-+        },
-+      }),
-+      detachedFromOpener: true as const,
-+    };
-+    const visible = filterSidebarV2VisibleThreads([root, subagent], null, new Set());
-+    expect(visible.map((thread) => thread.id)).toEqual([root.id]);
-+  });
-+});
-+
- function makeLatestRun(overrides?: {
-   completedAt?: string | null;
-   startedAt?: string | null;
 diff --git a/apps/web/src/components/Sidebar.logic.ts b/apps/web/src/components/Sidebar.logic.ts
 index 0771ea2e33..7e5348b2e8 100644
 --- a/apps/web/src/components/Sidebar.logic.ts
@@ -7373,19 +7586,44 @@ index 0000000000..8e1c9be5ef
 +    />
 +  );
 +}
-diff --git a/apps/web/src/components/threadActionMenu.logic.test.ts b/apps/web/src/components/threadActionMenu.logic.test.ts
-index d73a50f7a1..bcb93f373b 100644
---- a/apps/web/src/components/threadActionMenu.logic.test.ts
-+++ b/apps/web/src/components/threadActionMenu.logic.test.ts
-@@ -26,7 +26,40 @@ const baseState: ThreadActionMenuState = {
-   ],
- };
- 
+diff --git a/apps/web/src/components/threadActionMenu.logic.childThreads.test.ts b/apps/web/src/components/threadActionMenu.logic.childThreads.test.ts
+new file mode 100644
+index 0000000000..4f08f72749
+--- /dev/null
++++ b/apps/web/src/components/threadActionMenu.logic.childThreads.test.ts
+@@ -0,0 +1,61 @@
++import { describe, expect, it } from "vite-plus/test";
++import { buildThreadActionMenuItems, type ThreadActionMenuState } from "./threadActionMenu.logic";
++
++const baseState: ThreadActionMenuState = {
++  canOperate: true,
++  branch: null,
++  projectFilter: null,
++  isPinned: false,
++  isSettled: false,
++  autoSettleEnabled: true,
++  isSnoozed: false,
++  canSnoozeNow: true,
++  isRegeneratingTitle: false,
++  isRunning: false,
++  hasCompletedRun: true,
++  supports: {
++    settlement: true,
++    autoSettleOptOut: true,
++    snooze: true,
++    pinning: true,
++    titleRegeneration: true,
++  },
++  snoozePresets: [
++    { id: "hour", label: "In 1 hour", whenLabel: "3:00 PM", snoozedUntil: "2026-08-07T15:00:00Z" },
++  ],
++};
++
 +function ids(state: ThreadActionMenuState): string[] {
 +  return buildThreadActionMenuItems(state).map((item) => item.id);
 +}
 +
- describe("buildThreadActionMenuItems", () => {
++describe("buildThreadActionMenuItems", () => {
 +  it("offers making a nested child a main thread", () => {
 +    expect(ids(baseState)).not.toContain("make-main-thread");
 +    expect(ids({ ...baseState, canMakeMainThread: false })).not.toContain("make-main-thread");
@@ -7414,10 +7652,7 @@ index d73a50f7a1..bcb93f373b 100644
 +      "show-child-threads",
 +    );
 +  });
-+
-   it.each([false, true])(
-     "disables both lifecycle directions without permission (reversed: %s)",
-     (reversed) => {
++});
 diff --git a/apps/web/src/components/threadActionMenu.logic.ts b/apps/web/src/components/threadActionMenu.logic.ts
 index 211e812c67..fac9f79085 100644
 --- a/apps/web/src/components/threadActionMenu.logic.ts
@@ -10013,14 +10248,57 @@ index d60c433f5b..60ce17518d 100644
        })),
        "snooze",
      ),
-diff --git a/packages/client-runtime/src/state/threadShell.test.ts b/packages/client-runtime/src/state/threadShell.test.ts
-index 9210949afb..e8391b8d51 100644
---- a/packages/client-runtime/src/state/threadShell.test.ts
-+++ b/packages/client-runtime/src/state/threadShell.test.ts
-@@ -145,6 +145,43 @@ describe("v2 thread shell lists", () => {
-     registry.dispose();
-   });
- 
+diff --git a/packages/client-runtime/src/state/threadShell.childThreads.test.ts b/packages/client-runtime/src/state/threadShell.childThreads.test.ts
+new file mode 100644
+index 0000000000..cae8e7f100
+--- /dev/null
++++ b/packages/client-runtime/src/state/threadShell.childThreads.test.ts
+@@ -0,0 +1,82 @@
++import { EnvironmentId, ThreadId, type OrchestrationV2ShellSnapshot } from "@t3tools/contracts";
++import * as Option from "effect/Option";
++import { Atom, AtomRegistry } from "effect/reactivity";
++import { describe, expect, it } from "vite-plus/test";
++import { PrimaryConnectionTarget } from "../connection/model.ts";
++import { v2ShellSnapshot, v2ThreadShell } from "./orchestrationV2TestFixtures.ts";
++import { createEnvironmentThreadShellAtoms } from "./threadShell.ts";
++
++const environmentId = EnvironmentId.make("environment-v2");
++
++function makeHarness(environmentIds: ReadonlyArray<EnvironmentId> = [environmentId]) {
++  const snapshotAtom = Atom.family((_environmentId: EnvironmentId) =>
++    Atom.make<OrchestrationV2ShellSnapshot | null>(v2ShellSnapshot),
++  );
++  const catalogValueAtom = Atom.make({
++    isReady: true,
++    entries: new Map(
++      environmentIds.map((id) => [
++        id,
++        {
++          target: new PrimaryConnectionTarget({
++            environmentId: id,
++            label: "Environment",
++            httpBaseUrl: "https://example.test",
++            wsBaseUrl: "wss://example.test",
++          }),
++          profile: Option.none(),
++          enabled: true,
++        },
++      ]),
++    ),
++  });
++  return {
++    registry: AtomRegistry.make(),
++    snapshotAtom,
++    catalogValueAtom,
++    threads: createEnvironmentThreadShellAtoms({
++      catalogValueAtom,
++      snapshotAtom,
++      hiddenThreadTagsAtom: () => Atom.make(null),
++    }),
++  };
++}
++
++describe("v2 thread shell lists", () => {
 +  it("names the delegator of a delegate_task child, not of a provider-native subagent", () => {
 +    const { registry, threads, snapshotAtom } = makeHarness();
 +    const root = v2ThreadShell;
@@ -10057,10 +10335,7 @@ index 9210949afb..e8391b8d51 100644
 +    dispose();
 +    registry.dispose();
 +  });
-+
-   it("keeps a live subagent question inside the parent without flagging its thread", () => {
-     const { registry, threads, snapshotAtom } = makeHarness();
-     const root = v2ThreadShell;
++});
 diff --git a/packages/contracts/src/orchestrationV2.ts b/packages/contracts/src/orchestrationV2.ts
 index 563479d00b..580e9a67b6 100644
 --- a/packages/contracts/src/orchestrationV2.ts

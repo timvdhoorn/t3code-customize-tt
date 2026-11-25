@@ -5,23 +5,50 @@ Subject: [PATCH 14/16] feat: show Claude's context window broken down by
  category in thread details
 
 ---
- .../Adapters/ClaudeAdapterV2.test.ts          | 150 ++++++++++++++++++
- .../Adapters/ClaudeAdapterV2.ts               | 113 ++++++++++---
- .../ThreadDetailsContext.browser.test.tsx     |  93 +++++++++++
- .../components/chat/ThreadDetailsUsage.tsx    | 129 +++++++++++++--
- .../src/state/contextCategories.test.ts       |  66 ++++++++
- .../client-runtime/src/state/contextWindow.ts |  88 ++++++++++
+ .../ClaudeAdapterV2.contextCategories.test.ts |  19 +++
+ .../Adapters/ClaudeAdapterV2.test.ts          | 135 ++++++++++++++++++
+ .../Adapters/ClaudeAdapterV2.ts               | 113 ++++++++++++---
+ .../ThreadDetailsContext.browser.test.tsx     |  93 ++++++++++++
+ .../components/chat/ThreadDetailsUsage.tsx    | 129 +++++++++++++++--
+ .../src/state/contextCategories.test.ts       |  66 +++++++++
+ .../client-runtime/src/state/contextWindow.ts |  88 ++++++++++++
  packages/contracts/src/orchestrationV2.ts     |   3 +-
  packages/contracts/src/providerRuntime.ts     |  10 ++
- 8 files changed, 616 insertions(+), 36 deletions(-)
+ 9 files changed, 620 insertions(+), 36 deletions(-)
+ create mode 100644 apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.contextCategories.test.ts
  create mode 100644 apps/web/src/components/chat/ThreadDetailsContext.browser.test.tsx
  create mode 100644 packages/client-runtime/src/state/contextCategories.test.ts
 
+diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.contextCategories.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.contextCategories.test.ts
+new file mode 100644
+index 0000000000..3d6609a8e6
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.contextCategories.test.ts
+@@ -0,0 +1,19 @@
++import { assert, describe, it } from "@effect/vitest";
++import * as ClaudeAdapterV2 from "./ClaudeAdapterV2.ts";
++
++describe("ClaudeAdapterV2 background wake turns", () => {
++  it("keeps only the CLI rows that fit the contract", () => {
++    assert.deepEqual(
++      ClaudeAdapterV2.claudeContextCategories([
++        { name: "Messages", tokens: 10.4, color: "purple", kind: "used" },
++        { name: "Future", tokens: 5, color: "red", kind: "somethingNew" },
++        { name: "No kind", tokens: 5, color: "red" },
++        { name: "", tokens: 5, color: "red", kind: "used" },
++        { name: "Long color", tokens: 5, color: "x".repeat(41), kind: "used" },
++        null,
++      ]),
++      [{ name: "Messages", tokens: 10, color: "purple", kind: "used" }],
++    );
++    assert.deepEqual(ClaudeAdapterV2.claudeContextCategories(undefined), []);
++  });
++});
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-index aebd4acfba..67aaf66d13 100644
+index ebd98d8e9a..031c5ed8f4 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.test.ts
-@@ -3884,6 +3884,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+@@ -3863,6 +3863,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
        "mcpServerStatus" | "readMcpResource" | "callMcpTool"
      > &
        Partial<Pick<ClaudeAdapterV2.ClaudeAgentSdkQuerySession, "listPermissionRules">>;
@@ -29,7 +56,7 @@ index aebd4acfba..67aaf66d13 100644
      readonly environment?: NodeJS.ProcessEnv;
      readonly onSessionInit?: (cwd: string) => Effect.Effect<void>;
      readonly subagentLaunchToolUseId?: string;
-@@ -4064,6 +4065,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+@@ -4043,6 +4044,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                    }).pipe(Effect.andThen(() => options?.renameSession?.(title) ?? Effect.void)),
                  backgroundTasks: options?.backgroundTasks ?? (() => Effect.succeed(false)),
                  mcpServerStatus: options?.mcp?.mcpServerStatus ?? Effect.succeed([]),
@@ -39,7 +66,7 @@ index aebd4acfba..67aaf66d13 100644
                  readMcpResource:
                    options?.mcp?.readMcpResource ??
                    (() => Effect.die("unexpected MCP resource read")),
-@@ -11055,6 +11059,152 @@ describe("ClaudeAdapterV2 background wake turns", () => {
+@@ -11034,6 +11038,137 @@ describe("ClaudeAdapterV2 background wake turns", () => {
      ),
    );
  
@@ -173,21 +200,6 @@ index aebd4acfba..67aaf66d13 100644
 +      assert.deepEqual(categoriesOf(harness.events.slice(before)).slice(0, 1), [contextRows]);
 +    }).pipe(withContextLayers),
 +  );
-+
-+  it("keeps only the CLI rows that fit the contract", () => {
-+    assert.deepEqual(
-+      ClaudeAdapterV2.claudeContextCategories([
-+        { name: "Messages", tokens: 10.4, color: "purple", kind: "used" },
-+        { name: "Future", tokens: 5, color: "red", kind: "somethingNew" },
-+        { name: "No kind", tokens: 5, color: "red" },
-+        { name: "", tokens: 5, color: "red", kind: "used" },
-+        { name: "Long color", tokens: 5, color: "x".repeat(41), kind: "used" },
-+        null,
-+      ]),
-+      [{ name: "Messages", tokens: 10, color: "purple", kind: "used" }],
-+    );
-+    assert.deepEqual(ClaudeAdapterV2.claudeContextCategories(undefined), []);
-+  });
 +
    it.effect("measures a model outside the catalog against the window Claude reports", () =>
      Effect.gen(function* () {

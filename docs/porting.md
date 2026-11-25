@@ -81,7 +81,16 @@ push or build.
   rm "$modified"
   ```
 
-  A step that fails ends the chain, so fewer than two numbers is a failed check, never a pass.
+  Fewer than two numbers, or a blank line where a number belongs, is a failed check, never a pass:
+  a failing `mktemp`, `test -s`, `xargs … vp fmt` or first `git diff` ends the chain, but a `git diff`
+  that fails inside a `… | awk` step does not (the pipeline's status is awk's), it prints a blank
+  line. The closing `git checkout -- .` discards every uncommitted change to a tracked file in the
+  checkout, which is why the tree must be clean before you start.
+- A patch's own tests go in a test file the patch owns, beside the upstream one and named for the
+  feature (`threadShell.childThreads.test.ts`), listed in `checks-tt.json` or `checks-ios.json`. An
+  upstream test file changes only where upstream's own test must change (an assertion the patch
+  makes fail, a fixture or mock every test shares). A test that needs a large private harness of an
+  upstream test file stays in that file rather than copying the harness.
 - A feature that cannot be ported sensibly: stop and explain why, with the patch and the upstream
   change that blocks it.
 - `node_modules` comes from `pnpm install --frozen-lockfile --ignore-scripts`; `checks` runs it.

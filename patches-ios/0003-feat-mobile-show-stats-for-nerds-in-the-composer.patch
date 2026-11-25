@@ -23,21 +23,24 @@ thread compacts automatically comes from the provider thread.
  apps/mobile/src/state/composer-cache-usage.ts |  55 ++
  apps/mobile/src/state/use-composer-stats.ts   |  66 ++
  .../src/state/use-thread-composer-state.ts    |  34 +
- apps/web/src/lib/contextWindow.test.ts        |  60 +-
+ .../lib/contextWindow.composerStats.test.ts   |  41 ++
+ apps/web/src/lib/contextWindow.test.ts        |  23 +-
  apps/web/src/lib/contextWindow.ts             |  16 +-
  packages/client-runtime/package.json          |   4 +
  .../src/state/composerStats.test.ts           | 598 ++++++++++++++++
  .../client-runtime/src/state/composerStats.ts | 422 ++++++++++++
- .../src/state/contextWindow.test.ts           |  18 +-
+ .../state/contextWindow.composerStats.test.ts |  18 +
  .../client-runtime/src/state/contextWindow.ts |  46 +-
- 21 files changed, 2366 insertions(+), 35 deletions(-)
+ 22 files changed, 2371 insertions(+), 34 deletions(-)
  create mode 100644 apps/mobile/src/features/threads/ComposerStats.tsx
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.test.ts
  create mode 100644 apps/mobile/src/features/threads/composerStatsRow.ts
  create mode 100644 apps/mobile/src/state/composer-cache-usage.ts
  create mode 100644 apps/mobile/src/state/use-composer-stats.ts
+ create mode 100644 apps/web/src/lib/contextWindow.composerStats.test.ts
  create mode 100644 packages/client-runtime/src/state/composerStats.test.ts
  create mode 100644 packages/client-runtime/src/state/composerStats.ts
+ create mode 100644 packages/client-runtime/src/state/contextWindow.composerStats.test.ts
 
 diff --git a/apps/mobile/src/features/settings/SettingsFollowUpRouteScreen.tsx b/apps/mobile/src/features/settings/SettingsFollowUpRouteScreen.tsx
 index cfc5783e24..31436a7a32 100644
@@ -1479,45 +1482,16 @@ index 5033ef4e8e..f0ca2ddb2f 100644
      sideChatUnavailableReason,
    };
  }
-diff --git a/apps/web/src/lib/contextWindow.test.ts b/apps/web/src/lib/contextWindow.test.ts
-index a9bef5448f..d5d7128789 100644
---- a/apps/web/src/lib/contextWindow.test.ts
-+++ b/apps/web/src/lib/contextWindow.test.ts
-@@ -47,9 +47,28 @@ const compactionEntry = (providerThreadId: string | null) =>
- 
- describe("V2 context window presentation", () => {
-   it("uses retained compaction token data when available", () => {
--    const snapshot = deriveLatestContextWindowSnapshot([compactionEntry(null)]);
-+    const base = compactionEntry(null).item;
-+    const entries = [
-+      {
-+        item: {
-+          ...base,
-+          startedAt: DateTime.makeUnsafe("2026-06-19T23:59:00.000Z"),
-+          completedAt: DateTime.makeUnsafe("2026-06-20T00:00:00.000Z"),
-+        },
-+      },
-+    ] as const;
-+    const snapshot = deriveLatestContextWindowSnapshot(entries);
-+    expect(snapshot?.updatedAt).toBe("2026-06-20T00:00:00.000Z");
-+    for (const status of ["running", "failed"] as const) {
-+      expect(
-+        deriveLatestContextWindowSnapshot(
-+          entries.map((entry) => ({ item: { ...entry.item, status } })),
-+        ),
-+      ).toBeNull();
-+    }
-     expect(snapshot?.usedTokens).toBe(2_000);
--    expect(snapshot?.totalProcessedTokens).toBe(10_000);
-+    expect(snapshot?.totalProcessedTokens).toBeNull();
-+    expect(snapshot?.compactsAutomatically).toBeNull();
-   });
- 
-   it("ignores a retired provider thread's compaction after a provider switch", () => {
-@@ -308,3 +327,40 @@ describe("latestProviderTurnTokenUsage", () => {
-     }
-   });
- });
+diff --git a/apps/web/src/lib/contextWindow.composerStats.test.ts b/apps/web/src/lib/contextWindow.composerStats.test.ts
+new file mode 100644
+index 0000000000..257559e2e7
+--- /dev/null
++++ b/apps/web/src/lib/contextWindow.composerStats.test.ts
+@@ -0,0 +1,41 @@
++import { describe, expect, it } from "vite-plus/test";
++import * as DateTime from "effect/DateTime";
++import { ProviderThreadId } from "@t3tools/contracts";
++import { deriveLatestContextWindowSnapshot } from "@t3tools/client-runtime/state/context-window";
 +
 +describe("compaction policy metadata", () => {
 +  it("preserves reported policy alongside newer turn occupancy", () => {
@@ -1555,6 +1529,41 @@ index a9bef5448f..d5d7128789 100644
 +    ).toMatchObject({ compactsAutomatically: null, autoCompactThreshold: null });
 +  });
 +});
+diff --git a/apps/web/src/lib/contextWindow.test.ts b/apps/web/src/lib/contextWindow.test.ts
+index a9bef5448f..b21b61ac1d 100644
+--- a/apps/web/src/lib/contextWindow.test.ts
++++ b/apps/web/src/lib/contextWindow.test.ts
+@@ -47,9 +47,28 @@ const compactionEntry = (providerThreadId: string | null) =>
+ 
+ describe("V2 context window presentation", () => {
+   it("uses retained compaction token data when available", () => {
+-    const snapshot = deriveLatestContextWindowSnapshot([compactionEntry(null)]);
++    const base = compactionEntry(null).item;
++    const entries = [
++      {
++        item: {
++          ...base,
++          startedAt: DateTime.makeUnsafe("2026-06-19T23:59:00.000Z"),
++          completedAt: DateTime.makeUnsafe("2026-06-20T00:00:00.000Z"),
++        },
++      },
++    ] as const;
++    const snapshot = deriveLatestContextWindowSnapshot(entries);
++    expect(snapshot?.updatedAt).toBe("2026-06-20T00:00:00.000Z");
++    for (const status of ["running", "failed"] as const) {
++      expect(
++        deriveLatestContextWindowSnapshot(
++          entries.map((entry) => ({ item: { ...entry.item, status } })),
++        ),
++      ).toBeNull();
++    }
+     expect(snapshot?.usedTokens).toBe(2_000);
+-    expect(snapshot?.totalProcessedTokens).toBe(10_000);
++    expect(snapshot?.totalProcessedTokens).toBeNull();
++    expect(snapshot?.compactsAutomatically).toBeNull();
+   });
+ 
+   it("ignores a retired provider thread's compaction after a provider switch", () => {
 diff --git a/apps/web/src/lib/contextWindow.ts b/apps/web/src/lib/contextWindow.ts
 index 1cf3eee799..b4e8bb5647 100644
 --- a/apps/web/src/lib/contextWindow.ts
@@ -2623,23 +2632,14 @@ index 0000000000..2b8784c2c4
 +    ),
 +  };
 +}
-diff --git a/packages/client-runtime/src/state/contextWindow.test.ts b/packages/client-runtime/src/state/contextWindow.test.ts
-index 994d3d62a2..daa9c29c1c 100644
---- a/packages/client-runtime/src/state/contextWindow.test.ts
-+++ b/packages/client-runtime/src/state/contextWindow.test.ts
-@@ -14,7 +14,7 @@ import {
- import * as DateTime from "effect/DateTime";
- import { describe, expect, it } from "vite-plus/test";
- 
--import { compactBeforeSendTokens } from "./contextWindow.ts";
-+import { compactBeforeSendTokens, formatContextWindowTokens } from "./contextWindow.ts";
- import type { ThreadStructure } from "./models.ts";
- import { v2Projection } from "./orchestrationV2TestFixtures.ts";
- 
-@@ -262,3 +262,19 @@ describe("compactBeforeSendTokens", () => {
-     );
-   });
- });
+diff --git a/packages/client-runtime/src/state/contextWindow.composerStats.test.ts b/packages/client-runtime/src/state/contextWindow.composerStats.test.ts
+new file mode 100644
+index 0000000000..e4fa6a8771
+--- /dev/null
++++ b/packages/client-runtime/src/state/contextWindow.composerStats.test.ts
+@@ -0,0 +1,18 @@
++import { describe, expect, it } from "vite-plus/test";
++import { formatContextWindowTokens } from "./contextWindow.ts";
 +
 +describe("formatContextWindowTokens", () => {
 +  it("formats compact token values", () => {
