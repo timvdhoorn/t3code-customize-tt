@@ -2,6 +2,7 @@
 
 One line per change, newest first. Format: [RULES.md](RULES.md#formats).
 
+- 2026-11-25 change | Own tests moved from upstream test files to 17 patch-owned ones (in `checks-tt.json`/`checks-ios.json`): upstream test lines 2581 → 1310 (PR open) | - | docs/porting.md
 - 2026-11-25 change | `patches-tt/0002` creates the family rules (`childThreadFamilies.ts`, test in `checks-tt.json`) in client-runtime; `patches-ios/0004` no longer moves them (PR open) | - | docs/fork-changes.md
 - 2026-11-25 add | Settle a finished or failed agent from the sidebar chips popover and the iOS chips menu (`patches-tt/0002`, `patches-ios/0004`, PR open) | porting/current-port.md | docs/fork-changes.md
 - 2026-11-25 fix | Sidebar hover-delay test no longer flakes on the Macs: vitest-browser ran the fake clock during a slow hover; the test holds it (`patches-tt/0002`, PR open) | porting/current-port.md | checks
