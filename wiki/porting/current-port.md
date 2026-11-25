@@ -1,15 +1,15 @@
 # Current port
 
 > Source: `patches-port/base.txt`, `covered-nightly.txt`, `skip-shared.json`; `./t3code-customize status`
-> Updated: 2026-11-24
+> Updated: 2026-11-25
 
 Which nightly the patches cover and what a port of them has to watch for. The port loop itself is in [docs/porting.md](../../docs/porting.md).
 
 ## Coverage
-- Shared patches: `patches-port/` targets nightly 0.1.12-nightly.20261124.5204 (`11c63a9f2cea`).
+- Shared patches: `patches-port/` targets nightly 0.1.12-nightly.20261125.5230 (`ca81b7b97a1c`).
 - `patches/` is upstream's and stays untouched.
 - Own patches: `patches-tt/` (18) and `patches-ios/` (11); a port applies 2 shared commits (`patches-port/`, minus the skips) + 18 + 11 = 31 commits.
-- `covered-nightly.txt`: 0.1.12-nightly.20261124.5204.
+- `covered-nightly.txt`: 0.1.12-nightly.20261125.5230.
 - Left out (`skip-shared.json`): desktop stats line and throughput, compaction settings, subscription switch.
 - Their bundle markers are replaced by `markers` in the same file.
 
@@ -30,6 +30,9 @@ Which nightly the patches cover and what a port of them has to watch for. The po
 - A web unit test rendering a `useGT` component needs `initializeGT` from `gt-react` plus `<GTProvider locale="en">`.
 - `initializeGTSPA` throws under Node; see `V2LifecycleRow.kind.test.tsx`.
 - 5009: patch strings are not in the GT catalogs, so other locales show English; upstream's `i18n:check` is not part of our checks.
+- 5230: the thread menu is `readMenu()` returning `{ items, run }` (`useThreadActionMenu.ts`); `patches-tt/0002` adds the subthread hooks above it and its two menu fields.
+- 5230: settle and snooze go through `applySettle`/`applySnooze` and the offline triage queue (`threadCommands.ts`); `patches-tt/0002` keeps `withoutSettledBy` in `applySettle` and `lastSnoozeWakeAt` in unsnooze.
+- 5230: the iOS row guard is `canSwipe`, not `canOperateThread`; `patches-ios/0004` keeps its family guide there.
 - 5204: the server renamed `latestUserAuthoredMessageAt` to `latestResumingMessageAt` in `ProjectionSettlementCandidate`; `settlesWithOpener` (`patches-tt/0002`) omits the new name.
 - 5204: upstream's new parent-divider test expects "Subagent of"; `patches-tt/0006` lowercases it to "subagent of" and its test.
 - 5204: Background work's Open subagent is a `Button`, not an `InlineButton` (#38317); `patches-tt/0006` keeps the agent/subagent label inside it.

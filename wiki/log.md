@@ -2,6 +2,7 @@
 
 One line per change, newest first. Format: [RULES.md](RULES.md#formats).
 
+- 2026-11-25 change | Patches ported to nightly 5230: thread menu (readMenu), triage queue, iOS canSwipe; Air update race filed as #134 | porting/current-port.md | checks
 - 2026-11-24 change | Patches ported to nightly 5204: 4 conflicts, 2 check fixes (settlement field rename, subagent-of label test) (PR open) | porting/current-port.md | checks
 - 2026-11-23 change | Patches ported to nightly 5138: 3 own-patch conflicts (workflowRun fields, workflow RPCs, divider paren in tt/0006) (PR open) | porting/current-port.md | checks
 - 2026-11-23 fix | Compaction replay ignored (`patches-tt/0018`): live-compact plugin no longer moves old tool items into the running turn (PR open) | status.md | docs/fork-changes.md
