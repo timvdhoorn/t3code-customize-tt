@@ -36,7 +36,8 @@ guide line, context-menu collapse and a summary stub.
  apps/web/src/components/Sidebar.tsx           |  205 ++-
  ...hreadRelationshipsControl.browser.test.tsx |    9 +
  ...lationshipsControl.opened.browser.test.tsx |  373 +++++
- .../chat/ThreadRelationshipsControl.tsx       |  344 +++-
+ ...readRelationshipsControl.openedThreads.tsx |  197 +++
+ .../chat/ThreadRelationshipsControl.tsx       |  184 ++-
  .../components/sidebar/SidebarThreadRow.tsx   |  192 ++-
  .../SidebarThreadRow.workers.browser.test.tsx | 1178 ++++++++++++++
  .../web/src/components/sidebar/routeReveal.ts |   18 +-
@@ -69,7 +70,7 @@ guide line, context-menu collapse and a summary stub.
  packages/contracts/src/orchestrationV2.ts     |   32 +
  packages/contracts/src/orchestratorMcp.ts     |    6 +
  .../src/server/subagentProjection.ts          |    9 +-
- 60 files changed, 8577 insertions(+), 213 deletions(-)
+ 61 files changed, 8614 insertions(+), 213 deletions(-)
  create mode 100644 apps/server/src/mcp/OrchestratorMcpService.childThreads.test.ts
  create mode 100644 apps/server/src/mcp/toolkits/project/handlers.childThreads.test.ts
  create mode 100644 apps/server/src/orchestration-v2/SubagentProjection.childThreads.test.ts
@@ -80,6 +81,7 @@ guide line, context-menu collapse and a summary stub.
  create mode 100644 apps/web/src/components/Sidebar.families.test.ts
  create mode 100644 apps/web/src/components/Sidebar.families.ts
  create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.opened.browser.test.tsx
+ create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.openedThreads.tsx
  create mode 100644 apps/web/src/components/sidebar/SidebarThreadRow.workers.browser.test.tsx
  create mode 100644 apps/web/src/components/sidebar/threadModel.tsx
  create mode 100644 apps/web/src/components/threadActionMenu.logic.childThreads.test.ts
@@ -5349,121 +5351,60 @@ index 0000000000..e32e9adaa2
 +    row.getBoundingClientRect().right,
 +  );
 +});
-diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
-index 0aefaa8cea..4a15ed1b0f 100644
---- a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
-+++ b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
-@@ -49,16 +49,19 @@ import {
-   ArrowRightIcon,
-   BotIcon,
-   ChevronDownIcon,
+diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.openedThreads.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.openedThreads.tsx
+new file mode 100644
+index 0000000000..a9e4d56ef9
+--- /dev/null
++++ b/apps/web/src/components/chat/ThreadRelationshipsControl.openedThreads.tsx
+@@ -0,0 +1,197 @@
++import { scopedThreadKey, scopeThreadRef } from "@t3tools/client-runtime/environment";
++import { canShowAsSubthread } from "@t3tools/client-runtime/state/thread-family-summary";
++import type { EnvironmentId, OrchestrationV2ThreadShell } from "@t3tools/contracts";
++import { useGT } from "gt-react";
++import {
++  ArrowRightIcon,
 +  CornerDownRightIcon,
-   CornerLeftUpIcon,
-   GitForkIcon,
-   MessagesSquareIcon,
++  CornerLeftUpIcon,
 +  ListIndentDecreaseIcon,
 +  ListIndentIncreaseIcon,
-   MoreHorizontalIcon,
-   PlusIcon,
-   SquareIcon,
-   UnplugIcon,
- } from "lucide-react";
- import { msg, T, useGT, useMessages, Var } from "gt-react";
--import { useRef, useState, type ReactNode } from "react";
-+import { useRef, useState, type ComponentType, type ReactNode } from "react";
- import type { MessageResolver } from "~/i18n/messages";
- 
- import { useArchivedThreadSnapshots } from "../../lib/archivedThreadsState";
-@@ -74,6 +77,14 @@ import {
-   useAnyEnvironmentHiding,
- } from "../../state/entities";
- import { useEnvironment, useEnvironmentProviders } from "../../state/environments";
-+import {
-+  openedThreadActivityAt,
-+  useOpenedThreadShells,
-+  useOpenerThreadShell,
-+} from "../../state/openedThreads";
-+import { useSetShownAsSubthread, useSubthreadKeys } from "../../state/subthreads";
-+import { canShowAsSubthread } from "@t3tools/client-runtime/state/thread-family-summary";
-+import { RelativeTimeLabel } from "../sidebar/SidebarThreadRow";
- import { serverEnvironment } from "../../state/server";
- import {
-   applyProviderInstanceSettings,
-@@ -159,17 +170,32 @@ type RemoteSubagent = OrchestrationV2Subagent & {
-   readonly remoteChild: OrchestrationV2RemoteTaskChild;
- };
- 
--/** A task delegated to a linked environment has no thread here, so it gets its own row kind. */
--type LineageRow = ThreadRelationshipWalkRow | { readonly remote: RemoteSubagent };
-+/**
-+ * A task delegated to a linked environment has no thread here, so it gets its own row kind,
-+ * as does a thread an agent here opened with T3 tools (`openedByThreadId`), which the
-+ * relationship graph does not know.
-+ */
-+type LineageRow =
-+  | ThreadRelationshipWalkRow
-+  | { readonly remote: RemoteSubagent }
-+  | { readonly opened: OrchestrationV2ThreadShell };
++} from "lucide-react";
++import type { ComponentType } from "react";
 +
-+const openedThreadStatus = (thread: OrchestrationV2ThreadShell) =>
++import { cn } from "~/lib/utils";
++
++import { useSetShownAsSubthread, useSubthreadKeys } from "../../state/subthreads";
++import { RelativeTimeLabel } from "../sidebar/SidebarThreadRow";
++import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
++import { ThreadDetailsControl } from "./ThreadDetailsControl";
++import { ThreadRelationshipIcon, threadRelationshipStatusLabel } from "./ThreadRelationshipIcon";
++
++// The opened-threads rows and subthread toggle of the Lineage panel
++// (ThreadRelationshipsControl.tsx), which only renders them.
++
++export const openedThreadStatus = (thread: OrchestrationV2ThreadShell) =>
 +  thread.activityRunStatus ?? thread.status;
- 
- const lineageRowStatus = (row: LineageRow) =>
--  "remote" in row ? row.remote.status : row.edge.status;
-+  "remote" in row
-+    ? row.remote.status
-+    : "opened" in row
-+      ? openedThreadStatus(row.opened)
-+      : row.edge.status;
- 
- const isFinishedAgentStatus = (status: string | null | undefined) =>
-   ["completed", "failed", "error", "cancelled", "interrupted", "idle"].includes(status ?? "");
- 
- function ThreadLineageGroup<Row extends LineageRow>(props: {
-   readonly label: string | null;
-+  readonly icon?: ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
-   readonly rows: ReadonlyArray<Row>;
-   readonly expanded: boolean;
-   readonly children: (rows: ReadonlyArray<Row>) => ReactNode;
-@@ -182,11 +208,12 @@ function ThreadLineageGroup<Row extends LineageRow>(props: {
-     return status === "failed" || status === "error";
-   }).length;
-   if (props.rows.length === 0) return null;
-+  const GroupIcon = props.icon ?? BotIcon;
-   return (
-     <div>
-       {props.label ? (
-         <ThreadDetailsControl aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>
--          <BotIcon aria-hidden className={THREAD_DETAILS_PANEL_ICON_CLASS} />
-+          <GroupIcon aria-hidden className={THREAD_DETAILS_PANEL_ICON_CLASS} />
-           <span className={cn(THREAD_DETAILS_PANEL_LABEL_CLASS, "min-w-0 flex-1 truncate")}>
-             {props.label}
-           </span>
-@@ -379,6 +406,155 @@ function RemoteSubagentRow(props: {
-   );
- }
- 
++
 +/** Row actions that show on hover or focus, and always on touch screens. */
-+const LINEAGE_ROW_ACTIONS_CLASS =
++export const LINEAGE_ROW_ACTIONS_CLASS =
 +  "pointer-events-none absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100";
 +/** Trailing text the row actions cover. */
-+const LINEAGE_ROW_TRAILING_HIDDEN_CLASS =
++export const LINEAGE_ROW_TRAILING_HIDDEN_CLASS =
 +  "group-hover:opacity-0 group-focus-within:opacity-0 pointer-coarse:opacity-0 [@media(hover:none)]:opacity-0";
 +/**
 + * The subthread toggle alone: over the trailing label on hover with a mouse, but in the row's
 + * flow on touch screens, so the label stays readable there.
 + */
-+const LINEAGE_SUBTHREAD_ACTIONS_CLASS =
++export const LINEAGE_SUBTHREAD_ACTIONS_CLASS =
 +  "pointer-events-none absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:static pointer-coarse:shrink-0 pointer-coarse:translate-y-0 pointer-coarse:pe-1 pointer-coarse:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:static [@media(hover:none)]:shrink-0 [@media(hover:none)]:translate-y-0 [@media(hover:none)]:pe-1 [@media(hover:none)]:opacity-100";
 +/** The subthread toggle next to a "Failed" label, which nothing may cover: always in the flow. */
-+const LINEAGE_SUBTHREAD_ACTIONS_INLINE_CLASS =
++export const LINEAGE_SUBTHREAD_ACTIONS_INLINE_CLASS =
 +  "flex shrink-0 items-center pe-1 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 pointer-coarse:opacity-100 [@media(hover:none)]:opacity-100";
 +/** Trailing text the subthread toggle covers, only with a mouse. */
-+const LINEAGE_SUBTHREAD_TRAILING_HIDDEN_CLASS =
++export const LINEAGE_SUBTHREAD_TRAILING_HIDDEN_CLASS =
 +  "pointer-fine:group-hover:opacity-0 pointer-fine:group-focus-within:opacity-0";
 +
 +/** Whether a worker or launched thread shows as a subthread in the sidebar, and its toggle. */
-+interface LineageSubthreadState {
++export interface LineageSubthreadState {
 +  readonly shown: boolean;
 +  readonly onToggle: () => void;
 +}
@@ -5472,7 +5413,7 @@ index 0aefaa8cea..4a15ed1b0f 100644
 + * Fork (patches-tt/0003): a worker or launched thread counts on its opener's sidebar row; this
 + * shows it as a nested subthread row there ("Show as subthread"), or back ("Hide subthread").
 + */
-+function LineageSubthreadAction(props: {
++export function LineageSubthreadAction(props: {
 +  readonly title: string;
 +  readonly subthread: LineageSubthreadState;
 +}) {
@@ -5509,7 +5450,7 @@ index 0aefaa8cea..4a15ed1b0f 100644
 + * thread's side, its opener. Same row as the other Lineage rows: status icon, title, and the
 + * age the sidebar shows (or the status, in red, when the thread failed).
 + */
-+function OpenedThreadRow(props: {
++export function OpenedThreadRow(props: {
 +  readonly thread: OrchestrationV2ThreadShell;
 +  readonly relation: "opened" | "opener";
 +  /** The opened thread's last activity; for the opener, when this thread was opened. */
@@ -5517,9 +5458,11 @@ index 0aefaa8cea..4a15ed1b0f 100644
 +  readonly onOpen: () => void;
 +  /** For an opened thread that is no main thread: its sidebar subthread toggle. */
 +  readonly subthread?: LineageSubthreadState | null;
++  /** The Lineage tooltip of the upstream file, which keeps it private. */
++  readonly LineageTooltipContent: ComponentType<{ readonly title: string; readonly hint: string }>;
 +}) {
 +  const gt = useGT();
-+  const { thread } = props;
++  const { thread, LineageTooltipContent } = props;
 +  const subthread = props.subthread ?? null;
 +  const status = openedThreadStatus(thread);
 +  const statusLabel = threadRelationshipStatusLabel(status);
@@ -5592,16 +5535,122 @@ index 0aefaa8cea..4a15ed1b0f 100644
 +  );
 +}
 +
- /**
-  * The thread on a linked environment whose agent delegated this one. It opens
-  * there when this client is connected to that environment.
-@@ -521,6 +697,13 @@ export function ThreadRelationshipsPanel(props: {
++// Fork (patches-tt/0003): a worker or launched thread of this one, not a main thread, can show
++// as a subthread in the sidebar.
++export function useLineageSubthreadStateOf(props: { readonly environmentId: EnvironmentId }) {
++  const subthreadKeys = useSubthreadKeys();
++  const setShownAsSubthread = useSetShownAsSubthread();
++  const subthreadStateOf = (
++    thread: OrchestrationV2ThreadShell | null | undefined,
++  ): LineageSubthreadState | null => {
++    if (!thread) return null;
++    const links = { ...thread, environmentId: props.environmentId };
++    // This thread is the opener (or delegator), so it is loaded.
++    if (!canShowAsSubthread(links, () => true)) return null;
++    const shown = subthreadKeys.has(
++      scopedThreadKey(scopeThreadRef(props.environmentId, thread.id)),
++    );
++    return { shown, onToggle: () => setShownAsSubthread(links, !shown) };
++  };
++  return subthreadStateOf;
++}
+diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
+index 0aefaa8cea..16ec07cbe5 100644
+--- a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
++++ b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
+@@ -49,6 +49,7 @@ import {
+   ArrowRightIcon,
+   BotIcon,
+   ChevronDownIcon,
++  CornerDownRightIcon,
+   CornerLeftUpIcon,
+   GitForkIcon,
+   MessagesSquareIcon,
+@@ -58,7 +59,7 @@ import {
+   UnplugIcon,
+ } from "lucide-react";
+ import { msg, T, useGT, useMessages, Var } from "gt-react";
+-import { useRef, useState, type ReactNode } from "react";
++import { useRef, useState, type ComponentType, type ReactNode } from "react";
+ import type { MessageResolver } from "~/i18n/messages";
+ 
+ import { useArchivedThreadSnapshots } from "../../lib/archivedThreadsState";
+@@ -74,6 +75,22 @@ import {
+   useAnyEnvironmentHiding,
+ } from "../../state/entities";
+ import { useEnvironment, useEnvironmentProviders } from "../../state/environments";
++import {
++  openedThreadActivityAt,
++  useOpenedThreadShells,
++  useOpenerThreadShell,
++} from "../../state/openedThreads";
++import {
++  LINEAGE_ROW_ACTIONS_CLASS,
++  LINEAGE_ROW_TRAILING_HIDDEN_CLASS,
++  LINEAGE_SUBTHREAD_ACTIONS_CLASS,
++  LINEAGE_SUBTHREAD_ACTIONS_INLINE_CLASS,
++  LINEAGE_SUBTHREAD_TRAILING_HIDDEN_CLASS,
++  LineageSubthreadAction,
++  OpenedThreadRow,
++  openedThreadStatus,
++  useLineageSubthreadStateOf,
++} from "./ThreadRelationshipsControl.openedThreads";
+ import { serverEnvironment } from "../../state/server";
+ import {
+   applyProviderInstanceSettings,
+@@ -159,17 +176,29 @@ type RemoteSubagent = OrchestrationV2Subagent & {
+   readonly remoteChild: OrchestrationV2RemoteTaskChild;
+ };
+ 
+-/** A task delegated to a linked environment has no thread here, so it gets its own row kind. */
+-type LineageRow = ThreadRelationshipWalkRow | { readonly remote: RemoteSubagent };
++/**
++ * A task delegated to a linked environment has no thread here, so it gets its own row kind,
++ * as does a thread an agent here opened with T3 tools (`openedByThreadId`), which the
++ * relationship graph does not know.
++ */
++type LineageRow =
++  | ThreadRelationshipWalkRow
++  | { readonly remote: RemoteSubagent }
++  | { readonly opened: OrchestrationV2ThreadShell };
+ 
+ const lineageRowStatus = (row: LineageRow) =>
+-  "remote" in row ? row.remote.status : row.edge.status;
++  "remote" in row
++    ? row.remote.status
++    : "opened" in row
++      ? openedThreadStatus(row.opened)
++      : row.edge.status;
+ 
+ const isFinishedAgentStatus = (status: string | null | undefined) =>
+   ["completed", "failed", "error", "cancelled", "interrupted", "idle"].includes(status ?? "");
+ 
+ function ThreadLineageGroup<Row extends LineageRow>(props: {
+   readonly label: string | null;
++  readonly icon?: ComponentType<{ className?: string; "aria-hidden"?: boolean }>;
+   readonly rows: ReadonlyArray<Row>;
+   readonly expanded: boolean;
+   readonly children: (rows: ReadonlyArray<Row>) => ReactNode;
+@@ -182,11 +211,12 @@ function ThreadLineageGroup<Row extends LineageRow>(props: {
+     return status === "failed" || status === "error";
+   }).length;
+   if (props.rows.length === 0) return null;
++  const GroupIcon = props.icon ?? BotIcon;
+   return (
+     <div>
+       {props.label ? (
+         <ThreadDetailsControl aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>
+-          <BotIcon aria-hidden className={THREAD_DETAILS_PANEL_ICON_CLASS} />
++          <GroupIcon aria-hidden className={THREAD_DETAILS_PANEL_ICON_CLASS} />
+           <span className={cn(THREAD_DETAILS_PANEL_LABEL_CLASS, "min-w-0 flex-1 truncate")}>
+             {props.label}
+           </span>
+@@ -521,6 +551,12 @@ export function ThreadRelationshipsPanel(props: {
        ? scopeThreadRef(props.environmentId, parentShell.id)
        : null;
    const parentProjection = useQuietThreadProjection(parentRef)?.projection;
 +  const openedShells = useOpenedThreadShells(ref);
-+  const subthreadKeys = useSubthreadKeys();
-+  const setShownAsSubthread = useSetShownAsSubthread();
++  const subthreadStateOf = useLineageSubthreadStateOf(props);
 +  const openerThreadId = currentThread?.openedByThreadId ?? null;
 +  const loadedOpener = useOpenerThreadShell(
 +    openerThreadId === null ? null : scopeThreadRef(props.environmentId, openerThreadId),
@@ -5609,7 +5658,7 @@ index 0aefaa8cea..4a15ed1b0f 100644
    const navigate = useNavigate();
    const trigger = useSideThreadTrigger();
    const mergeBack = useAtomCommand(threadEnvironment.mergeBack);
-@@ -634,6 +817,26 @@ export function ThreadRelationshipsPanel(props: {
+@@ -634,6 +670,26 @@ export function ThreadRelationshipsPanel(props: {
        Object.hasOwn(resolvedThreadTitles, threadId),
    );
    const canDetach = projection ? canDetachThreadProviderSession(projection) : false;
@@ -5636,7 +5685,7 @@ index 0aefaa8cea..4a15ed1b0f 100644
  
    const {
      related = [],
-@@ -656,11 +859,19 @@ export function ThreadRelationshipsPanel(props: {
+@@ -656,11 +712,19 @@ export function ThreadRelationshipsPanel(props: {
    const groups: ReadonlyArray<{
      id: string;
      label: string | null;
@@ -5656,7 +5705,7 @@ index 0aefaa8cea..4a15ed1b0f 100644
      {
        id: "previous",
        label: gt("Previous agents"),
-@@ -671,7 +882,9 @@ export function ThreadRelationshipsPanel(props: {
+@@ -671,7 +735,9 @@ export function ThreadRelationshipsPanel(props: {
    const runningCount =
      (projection?.subagents.filter(
        (agent) => agent.childThreadId === null && agent.status === "running",
@@ -5667,7 +5716,7 @@ index 0aefaa8cea..4a15ed1b0f 100644
  
    // A linked environment's agent may have delegated this thread from there.
    const delegatedFrom = currentThread?.delegatedFrom;
-@@ -684,6 +897,8 @@ export function ThreadRelationshipsPanel(props: {
+@@ -684,6 +750,8 @@ export function ThreadRelationshipsPanel(props: {
        runningCount > 0 ||
        remoteActive.length > 0 ||
        remotePrevious.length > 0 ||
@@ -5676,29 +5725,7 @@ index 0aefaa8cea..4a15ed1b0f 100644
        delegatedFrom !== undefined ||
        // Disconnect lives in this heading, so a thread with only side chats still shows it.
        (canDetach && sideChats.length > 0));
-@@ -796,6 +1011,21 @@ export function ThreadRelationshipsPanel(props: {
-     }
-   };
- 
-+  // Fork (patches-tt/0003): a worker or launched thread of this one, not a main thread, can show
-+  // as a subthread in the sidebar.
-+  const subthreadStateOf = (
-+    thread: OrchestrationV2ThreadShell | null | undefined,
-+  ): LineageSubthreadState | null => {
-+    if (!thread) return null;
-+    const links = { ...thread, environmentId: props.environmentId };
-+    // This thread is the opener (or delegator), so it is loaded.
-+    if (!canShowAsSubthread(links, () => true)) return null;
-+    const shown = subthreadKeys.has(
-+      scopedThreadKey(scopeThreadRef(props.environmentId, thread.id)),
-+    );
-+    return { shown, onToggle: () => setShownAsSubthread(links, !shown) };
-+  };
-+
-   const parentTitle =
-     mergeTargetThreadId === null
-       ? null
-@@ -858,9 +1088,15 @@ export function ThreadRelationshipsPanel(props: {
+@@ -858,9 +926,15 @@ export function ThreadRelationshipsPanel(props: {
        workflowGroup?.workflow.status === "running" &&
        agent?.origin === "provider_native" &&
        providerDriver === "claudeAgent";
@@ -5717,7 +5744,7 @@ index 0aefaa8cea..4a15ed1b0f 100644
      const project = projects.find((project) => project.id === node?.thread?.projectId);
      const isSideChat = node?.thread?.lineage.sideChat === true && !isParent;
      const hint = relationshipHint(edge, props.threadId, isSideChat, m);
-@@ -937,6 +1173,8 @@ export function ThreadRelationshipsPanel(props: {
+@@ -937,6 +1011,8 @@ export function ThreadRelationshipsPanel(props: {
                variant="ghost"
                part={workflowGroup ? "primary" : "row"}
                {...openProps}
@@ -5726,7 +5753,7 @@ index 0aefaa8cea..4a15ed1b0f 100644
              />
            }
          >
-@@ -1025,32 +1263,45 @@ export function ThreadRelationshipsPanel(props: {
+@@ -1025,32 +1101,45 @@ export function ThreadRelationshipsPanel(props: {
          ) : (
            relationshipLink
          )}
@@ -5798,7 +5825,7 @@ index 0aefaa8cea..4a15ed1b0f 100644
            </div>
          ) : null}
        </li>
-@@ -1074,6 +1325,8 @@ export function ThreadRelationshipsPanel(props: {
+@@ -1074,6 +1163,8 @@ export function ThreadRelationshipsPanel(props: {
              related.length > 0 ||
              active.length > 0 ||
              remoteActive.length > 0 ||
@@ -5807,7 +5834,7 @@ index 0aefaa8cea..4a15ed1b0f 100644
              delegatedFrom !== undefined
            }
            data-thread-relationships-panel
-@@ -1112,11 +1365,30 @@ export function ThreadRelationshipsPanel(props: {
+@@ -1112,11 +1203,32 @@ export function ThreadRelationshipsPanel(props: {
                />
              </ThreadLineageRowList>
            )}
@@ -5816,6 +5843,7 @@ index 0aefaa8cea..4a15ed1b0f 100644
 +              <OpenedThreadRow
 +                thread={openerShell}
 +                relation="opener"
++                LineageTooltipContent={LineageTooltipContent}
 +                ageTimestamp={openedAt}
 +                onOpen={() => openThread(openerShell.id)}
 +              />
@@ -5831,6 +5859,7 @@ index 0aefaa8cea..4a15ed1b0f 100644
 +                      key={row.opened.id}
 +                      thread={row.opened}
 +                      relation="opened"
++                      LineageTooltipContent={LineageTooltipContent}
 +                      ageTimestamp={openedThreadActivityAt(ref.environmentId, row.opened)}
 +                      onOpen={() => openThread(row.opened.id)}
 +                      subthread={subthreadStateOf(row.opened)}

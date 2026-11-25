@@ -18,7 +18,8 @@ Subject: [PATCH 06/16] feat(web): label child agents as agent or subagent
  .../chat/V2LifecycleRow.kind.test.tsx         | 100 ++++++++
  .../src/components/chat/V2LifecycleRow.tsx    |  37 ++-
  .../src/state/subagentDisplay.kind.test.ts    |  57 +++++
- .../src/state/subagentDisplay.ts              |  79 ++++++-
+ .../src/state/subagentDisplay.kind.ts         |  59 +++++
+ .../src/state/subagentDisplay.ts              |  27 ++-
  .../src/state/threadExecution.kind.test.ts    |  95 ++++++++
  .../src/state/threadExecution.ts              | 108 +++++----
  .../src/state/threadShell.kind.test.ts        |  23 ++
@@ -26,11 +27,12 @@ Subject: [PATCH 06/16] feat(web): label child agents as agent or subagent
  .../client-runtime/src/state/threadShell.ts   |  38 +++-
  packages/contracts/src/orchestrationV2.ts     |   1 +
  .../orchestrationV2PendingBackgroundWork.ts   |   2 +
- 22 files changed, 854 insertions(+), 102 deletions(-)
+ 23 files changed, 861 insertions(+), 102 deletions(-)
  create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.kind.browser.test.tsx
  create mode 100644 apps/web/src/components/chat/ThreadRelationshipsControl.logic.ts
  create mode 100644 apps/web/src/components/chat/V2LifecycleRow.kind.test.tsx
  create mode 100644 packages/client-runtime/src/state/subagentDisplay.kind.test.ts
+ create mode 100644 packages/client-runtime/src/state/subagentDisplay.kind.ts
  create mode 100644 packages/client-runtime/src/state/threadExecution.kind.test.ts
  create mode 100644 packages/client-runtime/src/state/threadShell.kind.test.ts
 
@@ -512,7 +514,7 @@ index 0000000000..6fc5719fe7
 +  return edge.sourceThreadId === currentThreadId ? resolve(msg("Fork")) : resolve(msg("Parent thread"));
 +}
 diff --git a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
-index 4a15ed1b0f..a6d2ddb61b 100644
+index 16ec07cbe5..38ea7e8a49 100644
 --- a/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
 +++ b/apps/web/src/components/chat/ThreadRelationshipsControl.tsx
 @@ -1,6 +1,7 @@
@@ -536,7 +538,7 @@ index 4a15ed1b0f..a6d2ddb61b 100644
  import { deriveProviderSubagentStatus } from "@t3tools/client-runtime/state/thread-execution";
  import {
    deriveThreadRelationshipGraph,
-@@ -255,14 +260,16 @@ function relationshipHint(
+@@ -258,14 +263,16 @@ function relationshipHint(
    edge: ThreadRelationshipEdge,
    currentThreadId: ThreadId,
    sideChat: boolean,
@@ -556,7 +558,7 @@ index 4a15ed1b0f..a6d2ddb61b 100644
    }
    return edge.sourceThreadId === currentThreadId
      ? resolve(msg("Open fork in this chat"))
-@@ -984,7 +991,7 @@ export function ThreadRelationshipsPanel(props: {
+@@ -837,7 +844,7 @@ export function ThreadRelationshipsPanel(props: {
  
    const stopSubagent = async (
      childThreadId: ThreadId,
@@ -565,7 +567,7 @@ index 4a15ed1b0f..a6d2ddb61b 100644
    ) => {
      if (stoppingId !== null) return;
      setStoppingId(childThreadId);
-@@ -994,7 +1001,11 @@ export function ThreadRelationshipsPanel(props: {
+@@ -847,7 +854,11 @@ export function ThreadRelationshipsPanel(props: {
      });
      setStoppingId(null);
      if (result._tag === "Failure") {
@@ -578,7 +580,7 @@ index 4a15ed1b0f..a6d2ddb61b 100644
      }
    };
  
-@@ -1054,6 +1065,7 @@ export function ThreadRelationshipsPanel(props: {
+@@ -892,6 +903,7 @@ export function ThreadRelationshipsPanel(props: {
      const workflowGroup =
        projectedAgent === undefined ? undefined : workflowGroupsById.get(projectedAgent.id);
      const agent = workflowGroup ? projectedAgent : currentSubagent(projectedAgent, node?.thread);
@@ -586,7 +588,7 @@ index 4a15ed1b0f..a6d2ddb61b 100644
      const failed = rowStatus === "failed" || rowStatus === "error";
      const canStop =
        agent &&
-@@ -1099,7 +1111,13 @@ export function ThreadRelationshipsPanel(props: {
+@@ -937,7 +949,13 @@ export function ThreadRelationshipsPanel(props: {
          : "";
      const project = projects.find((project) => project.id === node?.thread?.projectId);
      const isSideChat = node?.thread?.lineage.sideChat === true && !isParent;
@@ -601,7 +603,7 @@ index 4a15ed1b0f..a6d2ddb61b 100644
      const openProps =
        isSideChat || (isSubagent && !isParent)
          ? trigger((intent) => openSideThreadRow(threadId, intent))
-@@ -1136,10 +1154,15 @@ export function ThreadRelationshipsPanel(props: {
+@@ -974,10 +992,15 @@ export function ThreadRelationshipsPanel(props: {
            fallbackIcon={RelationshipIcon}
            status={rowStatus}
          />
@@ -619,7 +621,7 @@ index 4a15ed1b0f..a6d2ddb61b 100644
          </span>
          {agent ? null : (
            <ArrowRightIcon className="size-3 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
-@@ -1285,7 +1308,11 @@ export function ThreadRelationshipsPanel(props: {
+@@ -1123,7 +1146,11 @@ export function ThreadRelationshipsPanel(props: {
                        variant="ghost"
                        part="icon"
                        tone="destructive"
@@ -632,7 +634,7 @@ index 4a15ed1b0f..a6d2ddb61b 100644
                        disabled={stoppingId !== null}
                        onClick={() => void stopSubagent(threadId, agent)}
                      />
-@@ -1298,7 +1325,7 @@ export function ThreadRelationshipsPanel(props: {
+@@ -1136,7 +1163,7 @@ export function ThreadRelationshipsPanel(props: {
                    )}
                  </TooltipTrigger>
                  <TooltipPopup side="left">
@@ -967,64 +969,20 @@ index 0000000000..ddc152c586
 +    expect(subagentGroupSummary([{ status: "completed" }]).label).toBe("Ran 1 subagent");
 +  });
 +});
-diff --git a/packages/client-runtime/src/state/subagentDisplay.ts b/packages/client-runtime/src/state/subagentDisplay.ts
-index 85f1c508f9..7d084035b4 100644
---- a/packages/client-runtime/src/state/subagentDisplay.ts
-+++ b/packages/client-runtime/src/state/subagentDisplay.ts
-@@ -1,5 +1,6 @@
- import type {
-   ModelSelection,
-+  OrchestrationV2Subagent,
-   OrchestrationV2TurnItemStatus,
-   OrchestrationV2ThreadShell,
-   OrchestrationProjectShell,
-@@ -12,8 +13,13 @@ import { isTerminalSubagentStatus } from "./subagentRuntime.ts";
- import { mFallback, msg } from "gt-i18n";
- import type { MFunctionType } from "gt-i18n/types";
- 
-+type SubagentOrigin = OrchestrationV2Subagent["origin"] | undefined;
+diff --git a/packages/client-runtime/src/state/subagentDisplay.kind.ts b/packages/client-runtime/src/state/subagentDisplay.kind.ts
+new file mode 100644
+index 0000000000..01a9148114
+--- /dev/null
++++ b/packages/client-runtime/src/state/subagentDisplay.kind.ts
+@@ -0,0 +1,59 @@
++import type { OrchestrationV2Subagent } from "@t3tools/contracts";
++import { mFallback, msg } from "gt-i18n";
++import type { MFunctionType } from "gt-i18n/types";
 +
- export function subagentGroupSummary(
--  members: ReadonlyArray<{ readonly status: OrchestrationV2TurnItemStatus }>,
-+  members: ReadonlyArray<{
-+    readonly status: OrchestrationV2TurnItemStatus;
-+    readonly origin?: SubagentOrigin;
-+  }>,
-   resolve: MFunctionType = mFallback,
- ) {
-   const active = members.some(
-@@ -22,16 +28,19 @@ export function subagentGroupSummary(
-   return {
-     label: active
-       ? resolve(
--          msg(
--            "{count, plural, one {Kicked off {count} subagent} other {Kicked off {count} subagents}}",
--            {
--              count: members.length,
--            },
--          ),
-+          msg("Kicked off {children}", {
-+            children: childAgentCountLabel(
-+              members.map(({ origin }) => origin),
-+              resolve,
-+            ),
-+          }),
-         )
-       : resolve(
--          msg("{count, plural, one {Ran {count} subagent} other {Ran {count} subagents}}", {
--            count: members.length,
-+          msg("Ran {children}", {
-+            children: childAgentCountLabel(
-+              members.map(({ origin }) => origin),
-+              resolve,
-+            ),
-           }),
-         ),
-     active,
-@@ -47,6 +56,58 @@ const SUBAGENT_STATUS_COUNTS = {
-   idle: msg("{count} idle"),
- };
- 
++// The "agent" or "subagent" wording of a child agent, which subagentDisplay.ts re-exports.
++
++export type SubagentOrigin = OrchestrationV2Subagent["origin"] | undefined;
++
 +/**
 + * A T3 `delegate_task` worker (`app_owned`) runs its own provider session in its own thread;
 + * a provider-native subagent runs inside the parent's provider process.
@@ -1076,10 +1034,55 @@ index 85f1c508f9..7d084035b4 100644
 +    ),
 +  );
 +}
+diff --git a/packages/client-runtime/src/state/subagentDisplay.ts b/packages/client-runtime/src/state/subagentDisplay.ts
+index 85f1c508f9..434da1ce38 100644
+--- a/packages/client-runtime/src/state/subagentDisplay.ts
++++ b/packages/client-runtime/src/state/subagentDisplay.ts
+@@ -11,9 +11,15 @@ import { resolveModelShortName } from "../providerClients.ts";
+ import { isTerminalSubagentStatus } from "./subagentRuntime.ts";
+ import { mFallback, msg } from "gt-i18n";
+ import type { MFunctionType } from "gt-i18n/types";
++import { childAgentCountLabel, type SubagentOrigin } from "./subagentDisplay.kind.ts";
 +
- export function summarizeSubagentStatuses(
-   statuses: ReadonlyArray<OrchestrationV2TurnItemStatus>,
++export * from "./subagentDisplay.kind.ts";
+ 
+ export function subagentGroupSummary(
+-  members: ReadonlyArray<{ readonly status: OrchestrationV2TurnItemStatus }>,
++  members: ReadonlyArray<{
++    readonly status: OrchestrationV2TurnItemStatus;
++    readonly origin?: SubagentOrigin;
++  }>,
    resolve: MFunctionType = mFallback,
+ ) {
+   const active = members.some(
+@@ -22,16 +28,19 @@ export function subagentGroupSummary(
+   return {
+     label: active
+       ? resolve(
+-          msg(
+-            "{count, plural, one {Kicked off {count} subagent} other {Kicked off {count} subagents}}",
+-            {
+-              count: members.length,
+-            },
+-          ),
++          msg("Kicked off {children}", {
++            children: childAgentCountLabel(
++              members.map(({ origin }) => origin),
++              resolve,
++            ),
++          }),
+         )
+       : resolve(
+-          msg("{count, plural, one {Ran {count} subagent} other {Ran {count} subagents}}", {
+-            count: members.length,
++          msg("Ran {children}", {
++            children: childAgentCountLabel(
++              members.map(({ origin }) => origin),
++              resolve,
++            ),
+           }),
+         ),
+     active,
 diff --git a/packages/client-runtime/src/state/threadExecution.kind.test.ts b/packages/client-runtime/src/state/threadExecution.kind.test.ts
 new file mode 100644
 index 0000000000..73698e6885

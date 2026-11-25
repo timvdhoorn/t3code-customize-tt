@@ -91,6 +91,10 @@ push or build.
   upstream test file changes only where upstream's own test must change (an assertion the patch
   makes fail, a fixture or mock every test shares). A test that needs a large private harness of an
   upstream test file stays in that file rather than copying the harness.
+- A patch's own code goes in a file the patch owns, beside the upstream one and named for the
+  feature (`contextWindow.categories.ts`); the upstream file gets only the import and the call. Code
+  that needs a private value of the upstream file stays there: an own file never imports the
+  upstream file that imports it.
 - A feature that cannot be ported sensibly: stop and explain why, with the patch and the upstream
   change that blocks it.
 - `node_modules` comes from `pnpm install --frozen-lockfile --ignore-scripts`; `checks` runs it.
