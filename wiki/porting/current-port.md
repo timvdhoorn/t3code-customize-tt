@@ -38,6 +38,8 @@ Which nightly the patches cover and what a port of them has to watch for. The po
 - 5204: Background work's Open subagent is a `Button`, not an `InlineButton` (#38317); `patches-tt/0006` keeps the agent/subagent label inside it.
 - 5138: upstream wraps the subagent divider label in `relation?.label ?? (...)`; `patches-tt/0006` needs the extra `)`.
 - 5138: `workflowRun` sits next to the opener fields (`models.ts`, `orchestrationV2.ts`), the workflow RPCs next to the APNs ones.
+- Browser tests on a fake clock: vitest-browser advances it 50 ms per 50 ms of real time a command (`userEvent.hover`, `click`) is pending.
+- So a check that something has not happened yet after such a command holds the clock during it (`hoverWithClockHeld` in `SidebarThreadRow.workers.browser.test.tsx`); the Macs' hovers take 50 to 160 ms, devbox1's less.
 - 5138: a browser test file that fails with `Failed to fetch dynamically imported module` right after a fresh install is a Vite flake; rerun `checks`.
 - 5098: the server's `typecheck` is a `vite.config.ts` task (#30879), not a `package.json` script; `typechecker()` reads both, else `checks` falls back to `tsc` and fails in `effect-tsgo patch`.
 - 5098: the sidebar meta line shows the environment, not the branch (#40736); row fixtures pass `environmentLabel`.
