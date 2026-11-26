@@ -2,6 +2,7 @@
 
 One line per change, newest first. Format: [RULES.md](RULES.md#formats).
 
+- 2026-11-26 change | Patches ported to nightly 0.1.13-nightly.20261125.5258; one conflict, the terminal canvas fill in `patches-tt/0007` (PR open) | porting/current-port.md | patches-tt/
 - 2026-11-25 remove | Unused web re-export `Sidebar.families.ts` out of `patches-tt/0002`; nothing imported it: patch lines 9962 → 9951 (PR open) | - | docs/fork-changes.md
 - 2026-11-25 remove | Duplicate web test `Sidebar.families.test.ts` out of `patches-tt/0002`; its 36 tests run in `childThreadFamilies.test.ts`: patch lines 10489 → 9962 (PR open) | - | docs/fork-changes.md
 - 2026-11-25 change | Own code moved from 5 upstream files to patch-owned ones (list in `docs/fork-changes.md`): upstream production lines 7031 → 6559 (PR open) | - | docs/porting.md

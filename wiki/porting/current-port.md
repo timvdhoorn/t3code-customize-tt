@@ -1,15 +1,15 @@
 # Current port
 
 > Source: `patches-port/base.txt`, `covered-nightly.txt`, `skip-shared.json`; `./t3code-customize status`
-> Updated: 2026-11-25
+> Updated: 2026-11-26
 
 Which nightly the patches cover and what a port of them has to watch for. The port loop itself is in [docs/porting.md](../../docs/porting.md).
 
 ## Coverage
-- Shared patches: `patches-port/` targets nightly 0.1.12-nightly.20261125.5230 (`ca81b7b97a1c`).
+- Shared patches: `patches-port/` targets nightly 0.1.13-nightly.20261125.5258 (`bf961f8121c6`).
 - `patches/` is upstream's and stays untouched.
 - Own patches: `patches-tt/` (16) and `patches-ios/` (11); a port applies 2 shared commits (`patches-port/`, minus the skips) + 16 + 11 = 29 commits.
-- `covered-nightly.txt`: 0.1.12-nightly.20261125.5230.
+- `covered-nightly.txt`: 0.1.13-nightly.20261125.5258.
 - Left out (`skip-shared.json`): desktop stats line and throughput, compaction settings, subscription switch.
 - Their bundle markers are replaced by `markers` in the same file.
 
@@ -30,6 +30,7 @@ Which nightly the patches cover and what a port of them has to watch for. The po
 - A web unit test rendering a `useGT` component needs `initializeGT` from `gt-react` plus `<GTProvider locale="en">`.
 - `initializeGTSPA` throws under Node; see `V2LifecycleRow.kind.test.tsx`.
 - 5009: patch strings are not in the GT catalogs, so other locales show English; upstream's `i18n:check` is not part of our checks.
+- 5258: `GhosttyTerminalSurface.create` subscribes to i18n and wraps the rest in `try` (#42872); `patches-tt/0007` keeps its `transparentBackground` guard around the canvas fill above `subscribeI18n`.
 - 5230: the thread menu is `readMenu()` returning `{ items, run }` (`useThreadActionMenu.ts`); `patches-tt/0002` adds the subthread hooks above it and its two menu fields.
 - 5230: settle and snooze go through `applySettle`/`applySnooze` and the offline triage queue (`threadCommands.ts`); `patches-tt/0002` keeps `withoutSettledBy` in `applySettle` and `lastSnoozeWakeAt` in unsnooze.
 - 5230: the iOS row guard is `canSwipe`, not `canOperateThread`; `patches-ios/0004` keeps its family guide there.
