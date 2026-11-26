@@ -1137,20 +1137,14 @@ FAILED_SUITES = re.compile(r'Failed Suites\s+\d+')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
 
 
-def stale_known_failures():
-    """Keys (file :: full name) of the entries some earlier `checks` run saw pass."""
-    return {key for key, seen in load(KNOWN_SEEN, {}).items() if seen.get('passedOn')}
-
-
 def tolerated_failures(report, root, target, output=''):
     """{file relative to SOURCE: [full names]} of the files whose every failure is a known upstream
     failure in an unpatched upstream test; files with a load error or any other failure are left out,
-    and nothing is tolerated when a suite or hook failed or an entry went stale."""
+    and nothing is tolerated when a suite or hook failed. An entry is tolerated for as long as it is
+    listed: a flaky test passes on one run and fails on the next, so an earlier pass voids nothing."""
     if FAILED_SUITES.search(ANSI.sub('', output or '')):
         return {}
-    stale = stale_known_failures()
-    known = {(e['file'], e['test']) for e in known_failures()
-             if e['file'] + ' :: ' + e['test'] not in stale}
+    known = {(e['file'], e['test']) for e in known_failures()}
     tolerated = {}
     for result in report.get('testResults', []):
         if result.get('status') != 'failed' or result.get('message'):
@@ -1167,8 +1161,19 @@ def tolerated_failures(report, root, target, output=''):
     return tolerated
 
 
+def known_outcomes(seen):
+    """(last pass, last failure) of a seen record, each {'target', 'at'} or None. A record written
+    before the two were kept apart holds only its last outcome and the commit of its first pass."""
+    seen = seen or {}
+    last = {'target': seen.get('target'), 'at': seen.get('at')}
+    passed = seen.get('passed') or (last if seen.get('status') == 'passed' else
+                                    {'target': seen['passedOn'], 'at': None} if seen.get('passedOn') else None)
+    failed = seen.get('failed') or (last if seen.get('status') == 'failed' else None)
+    return passed, failed
+
+
 def record_known_outcomes(report, root, target):
-    """Remember whether each listed test failed or passed in this run, for `status` (stale entries)."""
+    """Remember per listed test the last run it passed in and the last it failed in, for `status`."""
     listed = {(e['file'], e['test']) for e in known_failures()}
     if not listed:
         return
@@ -1180,14 +1185,16 @@ def record_known_outcomes(report, root, target):
             full = test_full_name(assertion)
             if (name, full) in listed and assertion.get('status') in ('passed', 'failed'):
                 key = name + ' :: ' + full
-                # Once seen passing it stays stale (no longer tolerated) until the entry is removed.
-                passed_on = (seen.get(key) or {}).get('passedOn') or (
-                    target if assertion['status'] == 'passed' else None)
-                seen[key] = dict({'status': assertion['status'], 'target': target,
-                                  'at': time.strftime('%Y-%m-%dT%H:%M:%S')},
-                                 **({'passedOn': passed_on} if passed_on else {}))
+                passed, failed = known_outcomes(seen.get(key))
+                now = {'target': target, 'at': time.strftime('%Y-%m-%dT%H:%M:%S')}
                 if assertion['status'] == 'passed':
-                    say(f'          known upstream failure now passes, remove it from {KNOWN_FAILURES.name}: {full}')
+                    passed = now
+                    say(f'          known upstream failure passed in this run: {full}')
+                else:
+                    failed = now
+                seen[key] = dict({'status': assertion['status']}, **now,
+                                 **({'passed': passed} if passed else {}),
+                                 **({'failed': failed} if failed else {}))
     try:
         save(KNOWN_SEEN, seen)
     except OSError:
@@ -1195,17 +1202,25 @@ def record_known_outcomes(report, root, target):
 
 
 def report_known_failures():
+    """What this machine saw of each listed test. Advice only: a pass here does not end the tolerance,
+    because the same test may still fail on the next run or on another machine."""
     entries = known_failures()
     if not entries:
         return
     seen = load(KNOWN_SEEN, {})
+
+    def when(outcome):
+        return outcome['target'][:12] + (f" ({outcome['at']})" if outcome.get('at') else '')
+
     say()
     say(f'Known upstream failures ({KNOWN_FAILURES.name}):')
     for entry in entries:
-        last = seen.get(entry['file'] + ' :: ' + entry['test'])
-        state = ('not run yet' if not last else
-                 f"stale, passed on {last['passedOn'][:12]}, no longer tolerated: remove it" if last.get('passedOn')
-                 else f"still fails on {last['target'][:12]} ({last['at']})")
+        passed, failed = known_outcomes(seen.get(entry['file'] + ' :: ' + entry['test']))
+        state = ('not run yet' if not passed and not failed else
+                 f'still fails on {when(failed)}' if not passed else
+                 f'passed on {when(passed)}, '
+                 + (f'last failed on {when(failed)}' if failed else 'not seen failing here')
+                 + ': remove it once it no longer fails anywhere')
         say(f"    {entry['test']} ({entry['file']}; {entry.get('upstream', 'no reference')}): {state}")
 
 
