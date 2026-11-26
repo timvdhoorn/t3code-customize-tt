@@ -200,7 +200,12 @@ prints `pass (known upstream failure: <name>)`.
 The proof that a listed test fails without patches is the run on the plain nightly made before
 adding it (rerunning it there in every check would cost a second install); the source check keeps a
 patch from rewriting the test itself. A patch that changes the code under test is not caught by it,
-so add an entry only after that plain-nightly run, with the upstream reference. `checks` records
-per entry whether it failed or passed (`~/.cache/t3code-customize/known-upstream-failures-seen.json`);
-`status` lists the entries and calls one stale once it passed on any nightly; from then on it is no
-longer tolerated, so remove it.
+so add an entry only after that plain-nightly run, with the upstream reference.
+
+An entry is tolerated for as long as it is listed. A pass does not end that: a flaky test passes on
+one run or machine and fails on the next, so a tolerance that a pass switched off would break the
+first build after it. `checks` records per entry the last run it passed in and the last it failed in
+(`~/.cache/t3code-customize/known-upstream-failures-seen.json`, per machine), and `status` reports
+them as advice: `still fails on <commit> (<time>)`, or `passed on <commit> (<time>), last failed on
+<commit> (<time>): remove it once it no longer fails anywhere`. Remove an entry by hand once upstream
+fixed the test, or once it no longer fails on any machine.

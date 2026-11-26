@@ -137,22 +137,25 @@ class KnownFailuresTest(unittest.TestCase):
         passed, _, _ = self.run_step(report([(renamed, 'failed')]))
         self.assertFalse(passed)
 
-    def test_a_passing_entry_is_reported_stale(self):
-        passed, _, printed = self.run_step(report([(KNOWN, 'passed'), (OTHER, 'passed')]), code=0)
-        self.assertTrue(passed)
-        self.assertIn('known upstream failure now passes', printed)
+    def status(self):
         out = io.StringIO()
         with patch('sys.stdout', out):
             customize.report_known_failures()
-        self.assertIn('stale', out.getvalue())
-        self.assertIn('remove it', out.getvalue())
+        return out.getvalue()
+
+    def test_a_passing_entry_is_reported_with_removal_advice(self):
+        passed, _, printed = self.run_step(report([(KNOWN, 'passed'), (OTHER, 'passed')]), code=0)
+        self.assertTrue(passed)
+        self.assertIn('known upstream failure passed in this run', printed)
+        status = self.status()
+        self.assertIn(f'passed on {self.target[:12]}', status)
+        self.assertIn('not seen failing here', status)
+        self.assertIn('remove it once it no longer fails anywhere', status)
+        self.assertNotIn('no longer tolerated', status)
 
     def test_a_failing_entry_is_reported_as_still_failing(self):
         self.run_step(report([(KNOWN, 'failed')]))
-        out = io.StringIO()
-        with patch('sys.stdout', out):
-            customize.report_known_failures()
-        self.assertIn('still fails', out.getvalue())
+        self.assertIn(f'still fails on {self.target[:12]}', self.status())
 
     def test_a_failing_hook_in_the_file_voids_the_entry(self):
         # Real vitest 5.0.5 with a throwing beforeAll: message '', the known test failed, the tests
@@ -173,15 +176,41 @@ class KnownFailuresTest(unittest.TestCase):
         passed, _, _ = self.run_step(report([(KNOWN, 'failed'), (OTHER, 'errored')]))
         self.assertFalse(passed)
 
-    def test_a_stale_entry_is_no_longer_tolerated(self):
+    def test_a_listed_failure_is_tolerated_after_an_earlier_pass(self):
+        # A flaky upstream test: the MacBook Pro passed it all afternoon on 2026-11-25, then failed it.
         self.run_step(report([(KNOWN, 'passed'), (OTHER, 'passed')]), code=0)
+        passed, failing, printed = self.run_step(report([(KNOWN, 'failed'), (OTHER, 'passed')]))
+        self.assertTrue(passed, failing)
+        self.assertIn(f'pass (known upstream failure: {KNOWN})', printed)
+        status = self.status()
+        self.assertIn(f'passed on {self.target[:12]}', status)
+        self.assertIn(f'last failed on {self.target[:12]}', status)
+        self.assertIn('remove it once it no longer fails anywhere', status)
+
+    def test_a_pass_recorded_by_an_older_tool_keeps_the_entry_tolerated(self):
+        self.seen.write_text(json.dumps({FILE + ' :: ' + KNOWN: {
+            'status': 'passed', 'target': self.target, 'at': '2026-11-25T18:30:00', 'passedOn': self.target}}))
+        passed, failing, _ = self.run_step(report([(KNOWN, 'failed'), (OTHER, 'passed')]))
+        self.assertTrue(passed, failing)
+        status = self.status()
+        self.assertIn(f'passed on {self.target[:12]} (2026-11-25T18:30:00)', status)
+        self.assertIn('last failed on', status)
+
+    def test_an_unlisted_failure_still_fails_after_an_earlier_pass(self):
+        self.run_step(report([(KNOWN, 'passed'), (OTHER, 'passed')]), code=0)
+        passed, failing, _ = self.run_step(report([(KNOWN, 'failed'), (OTHER, 'failed')]))
+        self.assertFalse(passed)
+        self.assertEqual(failing, [FILE])
+        passed, failing, _ = self.run_step(report([(KNOWN, 'passed'), (OTHER, 'failed')]))
+        self.assertFalse(passed)
+        self.assertEqual(failing, [FILE])
+
+    def test_a_changed_test_source_still_fails_after_an_earlier_pass(self):
+        self.run_step(report([(KNOWN, 'passed'), (OTHER, 'passed')]), code=0)
+        (self.source / FILE).write_text(UPSTREAM.replace('toBeCloseTo(473)', 'toBeCloseTo(470)'))
         passed, failing, _ = self.run_step(report([(KNOWN, 'failed'), (OTHER, 'passed')]))
         self.assertFalse(passed)
         self.assertEqual(failing, [FILE])
-        out = io.StringIO()
-        with patch('sys.stdout', out):
-            customize.report_known_failures()
-        self.assertIn('stale', out.getvalue())
 
     def test_a_top_level_case_ends_at_its_own_closer(self):
         text = ('it("top", () => {\n  const block = `\nfirst\n}`;\n  expect(block).toBe(1);\n});\n'
