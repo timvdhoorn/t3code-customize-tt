@@ -8,13 +8,13 @@ What is live, what is in progress and what is open. Finished work leaves this pa
 ## Live
 - Patches ported to nightly 0.1.14-nightly.20261127.5332 on `main` (PR #150); see [Current port](porting/current-port.md).
 - devbox1: server runs 5332 with the patches. See [devbox1](machines/devbox1.md).
-
-- MacBook Pro: own signed T3 Code 5332 (issue #152 branch `t3/macos-customized-signed-updates`, PR open), installed 2026-11-27; T3's 5258 app in `~/.local/share/t3code-customize/rollback/`.
+- MacBook Pro: own signed T3 Code 5345 (PR #158), installed 2026-11-27; T3's 5258 app in
+  `~/.local/share/t3code-customize/rollback/`. TestFlight: T3 Code TT 2.4.0 (202611272015) for 5345.
 
 ## In progress
-- Own signed macOS app (issue #152): PR from `t3/macos-customized-signed-updates`, not merged. Until
-  it merges, the MacBook Pro's `com.github.t3code-customize.update` LaunchAgent is booted out (main's
-  code cannot update the signed app); `fleet` after the merge turns it on again.
+- MacBook Pro: a newly signed app blocks on the keychain prompt for "t3code Safe Storage" until Tim
+  answers it with Always Allow; until then the UI hangs. `fleet` after PR #158 turns the update
+  LaunchAgent on again.
 - MacBook Air: offline (with Tim); stays on 5258 until it has a "Developer ID Application" identity
   in its login keychain (export it from the MacBook Pro as .p12, 1Password).
 
