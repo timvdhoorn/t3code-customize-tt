@@ -1,0 +1,365 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <a@b.c>
+Date: Fri, 27 Nov 2026 17:22:21 +0100
+Subject: [PATCH 17/17] feat(web): cite the assistant selection with Cmd+L
+
+---
+ apps/web/src/components/ChatView.tsx          |   2 +
+ ...ctionToolbar.citeShortcut.browser.test.tsx | 129 ++++++++++++++++++
+ .../chat/AssistantSelectionToolbar.tsx        |  45 +++++-
+ .../settings/KeybindingsSettings.logic.ts     |   1 +
+ apps/web/src/keybindings.test.ts              |   8 ++
+ apps/web/src/lib/assistantSelectionCite.ts    |  32 +++++
+ packages/contracts/src/keybindings.ts         |   1 +
+ packages/shared/src/keybindings.ts            |   1 +
+ 8 files changed, 212 insertions(+), 7 deletions(-)
+ create mode 100644 apps/web/src/components/chat/AssistantSelectionToolbar.citeShortcut.browser.test.tsx
+ create mode 100644 apps/web/src/lib/assistantSelectionCite.ts
+
+diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
+index 12f9956e30..83e3018146 100644
+--- a/apps/web/src/components/ChatView.tsx
++++ b/apps/web/src/components/ChatView.tsx
+@@ -221,6 +221,7 @@ import { makeWorkspaceFileDropHandlers } from "./chat/workspaceFileDrop";
+ import { isEditableFocused } from "../lib/editableFocus";
+ import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
+ import { shortcutLabelForCommand } from "../keybindings";
++import { citeSelectionFromShortcut } from "../lib/assistantSelectionCite";
+ import { cn } from "~/lib/utils";
+ import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
+ import { toastManager } from "./ui/toast";
+@@ -2980,6 +2981,7 @@ export default function ChatView(props: ChatViewProps) {
+           return false;
+         openThreadFind(activeThreadKey);
+       },
++      "chat.citeSelection": () => citeSelectionFromShortcut(),
+       "composer.cycleHost": ({ event }) => {
+         if (!canChangeEnvironment) return false;
+         if (event.repeat) return;
+diff --git a/apps/web/src/components/chat/AssistantSelectionToolbar.citeShortcut.browser.test.tsx b/apps/web/src/components/chat/AssistantSelectionToolbar.citeShortcut.browser.test.tsx
+new file mode 100644
+index 0000000000..ec4db7379a
+--- /dev/null
++++ b/apps/web/src/components/chat/AssistantSelectionToolbar.citeShortcut.browser.test.tsx
+@@ -0,0 +1,129 @@
++import {
++  ASSISTANT_CITATION_MAX_TEXT_LENGTH,
++  EnvironmentId,
++  ThreadId,
++  type ResolvedKeybindingsConfig,
++} from "@t3tools/contracts";
++import { compileResolvedKeybindingsConfig } from "@t3tools/shared/keybindings";
++import { useState } from "react";
++import { describe, expect, it, vi } from "vite-plus/test";
++import { page } from "vite-plus/test/browser";
++
++import { citeSelectionFromShortcut } from "~/lib/assistantSelectionCite";
++import { render } from "../../../test/render";
++import { AssistantSelectionToolbar } from "./AssistantSelectionToolbar";
++
++const threadRef = { environmentId: EnvironmentId.make("env"), threadId: ThreadId.make("thread") };
++
++const bindings = (key: string): ResolvedKeybindingsConfig =>
++  compileResolvedKeybindingsConfig([{ key, command: "chat.citeSelection" }]);
++
++// Mirrors the timeline: the viewport marks the citable region and the source is one message.
++function Harness(props: {
++  text: string;
++  onCite: () => boolean;
++  keybindings?: ResolvedKeybindingsConfig;
++}) {
++  const [viewport, setViewport] = useState<HTMLElement | null>(null);
++  return (
++    <div ref={setViewport} data-assistant-citation-viewport="true">
++      <div data-assistant-citation-source="message-1" data-testid="source">
++        <p>{props.text}</p>
++      </div>
++      <AssistantSelectionToolbar
++        viewport={viewport}
++        threadRef={threadRef}
++        onCite={props.onCite}
++        {...(props.keybindings ? { keybindings: props.keybindings } : {})}
++      />
++    </div>
++  );
++}
++
++async function mountWithSelection(
++  text: string,
++  options: {
++    selectText?: boolean;
++    onCite?: () => boolean;
++    keybindings?: ResolvedKeybindingsConfig;
++  },
++) {
++  const onCite = options.onCite ?? vi.fn(() => true);
++  const screen = await render(
++    <Harness
++      text={text}
++      onCite={onCite}
++      {...(options.keybindings ? { keybindings: options.keybindings } : {})}
++    />,
++  );
++  if (options.selectText !== false) {
++    const paragraph = document.querySelector("[data-testid=source] p");
++    if (!paragraph?.firstChild) throw new Error("source text missing");
++    const range = document.createRange();
++    range.selectNodeContents(paragraph);
++    const selection = window.getSelection();
++    selection?.removeAllRanges();
++    selection?.addRange(range);
++    document.dispatchEvent(new Event("selectionchange"));
++  }
++  return { screen, onCite, [Symbol.asyncDispose]: () => screen[Symbol.asyncDispose]() };
++}
++
++const citeButton = () => page.getByRole("button", { name: /selection (in composer|is too long)/ });
++
++describe("AssistantSelectionToolbar chat.citeSelection", () => {
++  it("cites the shown selection like the button and clears it", async () => {
++    const onCite = vi.fn(() => true);
++    await using _mounted = await mountWithSelection("Cite me with the keyboard", { onCite });
++    await expect.element(citeButton()).toBeVisible();
++    expect(citeSelectionFromShortcut()).toBe(true);
++    expect(onCite).toHaveBeenCalledTimes(1);
++    expect(onCite.mock.calls[0]).toEqual([
++      expect.objectContaining({ messageId: "message-1", text: "Cite me with the keyboard" }),
++      expect.anything(),
++    ]);
++    expect(window.getSelection()?.toString()).toBe("");
++    await expect.element(citeButton()).not.toBeInTheDocument();
++    expect(citeSelectionFromShortcut()).toBe(false);
++  });
++
++  it("does nothing for a selection that is too long to cite", async () => {
++    const onCite = vi.fn(() => true);
++    await using _mounted = await mountWithSelection(
++      "x".repeat(ASSISTANT_CITATION_MAX_TEXT_LENGTH + 1),
++      {
++        onCite,
++      },
++    );
++    await expect
++      .element(page.getByRole("button", { name: "Selection is too long to cite" }))
++      .toBeDisabled();
++    expect(citeSelectionFromShortcut()).toBe(false);
++    expect(onCite).not.toHaveBeenCalled();
++  });
++
++  it("lets the key pass without a selection", async () => {
++    const onCite = vi.fn(() => true);
++    await using _mounted = await mountWithSelection("Nothing selected", {
++      selectText: false,
++      onCite,
++    });
++    expect(citeSelectionFromShortcut()).toBe(false);
++    expect(onCite).not.toHaveBeenCalled();
++  });
++
++  it("shows the bound shortcut on the button and follows a rebinding", async () => {
++    await using _mounted = await mountWithSelection("Hint me", {
++      keybindings: bindings("ctrl+shift+y"),
++    });
++    await expect.element(citeButton()).toBeVisible();
++    const title = citeButton().element().getAttribute("title");
++    expect(title).toMatch(/^Cite selection in composer \(.*Y.*\)$/i);
++  });
++
++  it("has no hint when the command is unbound", async () => {
++    await using _mounted = await mountWithSelection("No hint", { keybindings: [] });
++    await expect.element(citeButton()).toBeVisible();
++    expect(citeButton().element().getAttribute("title")).toBe("Cite selection in composer");
++  });
++});
+diff --git a/apps/web/src/components/chat/AssistantSelectionToolbar.tsx b/apps/web/src/components/chat/AssistantSelectionToolbar.tsx
+index afb51240b6..cd92d2a217 100644
+--- a/apps/web/src/components/chat/AssistantSelectionToolbar.tsx
++++ b/apps/web/src/components/chat/AssistantSelectionToolbar.tsx
+@@ -2,11 +2,13 @@ import {
+   ASSISTANT_CITATION_MAX_TEXT_LENGTH,
+   MessageId,
+   type AssistantCitation,
++  type ResolvedKeybindingsConfig,
+   type ScopedThreadRef,
+ } from "@t3tools/contracts";
++import { useAtomValue } from "@effect/atom-react";
+ import { useGT } from "gt-react";
+ import { QuoteIcon } from "lucide-react";
+-import { use, useEffect, useLayoutEffect, useRef, useState } from "react";
++import { use, useEffect, useEffectEvent, useLayoutEffect, useRef, useState } from "react";
+ import { createPortal } from "react-dom";
+ import {
+   captureAssistantTextSelection,
+@@ -18,6 +20,8 @@ import {
+   resolveSelectionActionPosition,
+   type SelectionActionPoint,
+ } from "~/lib/selectionActions";
++import { citeSelectionTitle, registerCiteSelection } from "~/lib/assistantSelectionCite";
++import { primaryServerKeybindingsAtom } from "~/state/server";
+ import { Button } from "../ui/button";
+ import { BackgroundThreadContext } from "./backgroundThread";
+ 
+@@ -25,10 +29,12 @@ export function AssistantSelectionToolbar({
+   viewport,
+   threadRef,
+   onCite,
++  keybindings,
+ }: {
+   viewport: HTMLElement | null;
+   threadRef: ScopedThreadRef;
+   onCite: (citation: AssistantCitation, sourceAnchor: AssistantCitationSourceAnchor) => boolean;
++  keybindings?: ResolvedKeybindingsConfig;
+ }) {
+   const [selection, setSelection] = useState<{
+     citation: AssistantCitation;
+@@ -39,6 +45,27 @@ export function AssistantSelectionToolbar({
+   const actionsRef = useRef<ReturnType<typeof observeSelectionActions> | null>(null);
+   const backgroundThread = use(BackgroundThreadContext);
+   const gt = useGT();
++  const primaryKeybindings = useAtomValue(primaryServerKeybindingsAtom);
++  const citeSelected = useEffectEvent(() => {
++    if (
++      !selection ||
++      selection.citation.text.length > ASSISTANT_CITATION_MAX_TEXT_LENGTH ||
++      !onCite(selection.citation, selection.sourceAnchor)
++    ) {
++      return false;
++    }
++    window.getSelection()?.removeAllRanges();
++    actionsRef.current?.cancel();
++    setSelection(null);
++    return true;
++  });
++  const showing = selection !== null;
++
++  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- registers the chat.citeSelection shortcut target while the Cite toolbar shows
++  useEffect(() => {
++    if (!showing || backgroundThread) return;
++    return registerCiteSelection(citeSelected);
++  }, [showing, backgroundThread]);
+ 
+   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- measures the toolbar DOM node and clamps its position inside the window before paint
+   useLayoutEffect(() => {
+@@ -185,12 +212,7 @@ export function AssistantSelectionToolbar({
+     actionsRef.current?.cancel();
+     setSelection(null);
+   };
+-  const cite = () => {
+-    if (tooLong || !onCite(selection.citation, selection.sourceAnchor)) return false;
+-    window.getSelection()?.removeAllRanges();
+-    dismiss();
+-    return true;
+-  };
++  const cite = () => citeSelected();
+   return createPortal(
+     <Button
+       ref={toolbarRef}
+@@ -199,6 +221,15 @@ export function AssistantSelectionToolbar({
+       variant="glass"
+       disabled={tooLong}
+       aria-label={tooLong ? gt("Selection is too long to cite") : gt("Cite selection in composer")}
++      title={
++        tooLong
++          ? undefined
++          : citeSelectionTitle(
++              gt("Cite selection in composer"),
++              keybindings ?? primaryKeybindings,
++              (action, shortcut) => gt("{action} ({shortcut})", { action, shortcut }),
++            )
++      }
+       className="fixed z-50 max-w-[calc(100vw-1rem)]"
+       style={{ left: selection.position.x, top: selection.position.y }}
+       onPointerDown={(event) => event.preventDefault()}
+diff --git a/apps/web/src/components/settings/KeybindingsSettings.logic.ts b/apps/web/src/components/settings/KeybindingsSettings.logic.ts
+index 4b44c66ad3..ab886e8bbc 100644
+--- a/apps/web/src/components/settings/KeybindingsSettings.logic.ts
++++ b/apps/web/src/components/settings/KeybindingsSettings.logic.ts
+@@ -548,6 +548,7 @@ const LATE_COMMAND_LABELS: Partial<Record<KeybindingCommand, string>> = {
+   "view.reopenClosed": msg("Reopen Closed Tab"),
+   "preview.focusUrl": msg("Preview: Focus URL"),
+   "preview.find": msg("Preview: Find on Page"),
++  "chat.citeSelection": msg("Chat: Cite Selection"),
+ };
+ 
+ export function commandLabel(command: KeybindingCommand, resolve: MessageResolver = m): string {
+diff --git a/apps/web/src/keybindings.test.ts b/apps/web/src/keybindings.test.ts
+index 728797735e..3aba940382 100644
+--- a/apps/web/src/keybindings.test.ts
++++ b/apps/web/src/keybindings.test.ts
+@@ -164,6 +164,14 @@ const DEFAULT_BINDINGS = compile([
+       whenNot(whenIdentifier("previewFocus")),
+     ),
+   },
++  {
++    shortcut: modShortcut("l"),
++    command: "chat.citeSelection",
++    whenAst: whenAnd(
++      whenNot(whenIdentifier("terminalFocus")),
++      whenNot(whenIdentifier("previewFocus")),
++    ),
++  },
+   {
+     shortcut: modShortcut("m", { shiftKey: true }),
+     command: "modelPicker.toggle",
+diff --git a/apps/web/src/lib/assistantSelectionCite.ts b/apps/web/src/lib/assistantSelectionCite.ts
+new file mode 100644
+index 0000000000..a7e5b9faf3
+--- /dev/null
++++ b/apps/web/src/lib/assistantSelectionCite.ts
+@@ -0,0 +1,32 @@
++import type { KeybindingCommand, ResolvedKeybindingsConfig } from "@t3tools/contracts";
++import { shortcutLabelForCommand } from "../keybindings";
++
++export const CITE_SELECTION_COMMAND = "chat.citeSelection" satisfies KeybindingCommand;
++
++type CiteSelection = () => boolean;
++
++// One native selection exists at a time, so the foreground toolbar showing Cite is the only target.
++let activeCite: CiteSelection | null = null;
++
++/** The Cite toolbar registers while it shows; the returned function unregisters it. */
++export function registerCiteSelection(cite: CiteSelection): () => void {
++  activeCite = cite;
++  return () => {
++    if (activeCite === cite) activeCite = null;
++  };
++}
++
++/** Cites the shown selection like the button does. False when nothing was cited, so the key passes through. */
++export function citeSelectionFromShortcut(): boolean {
++  return activeCite?.() ?? false;
++}
++
++/** Tooltip for the Cite button, with the user's binding when there is one. */
++export function citeSelectionTitle(
++  action: string,
++  keybindings: ResolvedKeybindingsConfig,
++  format: (action: string, shortcut: string) => string,
++): string {
++  const shortcut = shortcutLabelForCommand(keybindings, CITE_SELECTION_COMMAND);
++  return shortcut ? format(action, shortcut) : action;
++}
+diff --git a/packages/contracts/src/keybindings.ts b/packages/contracts/src/keybindings.ts
+index 855afb7401..70212ee8dc 100644
+--- a/packages/contracts/src/keybindings.ts
++++ b/packages/contracts/src/keybindings.ts
+@@ -108,6 +108,7 @@ export const STATIC_KEYBINDING_COMMANDS = [
+   "chat.newLocal",
+   "chat.newWithoutProject",
+   "chat.find",
++  "chat.citeSelection",
+   "editor.openFavorite",
+   "usage.cost",
+   "usage.tokens",
+diff --git a/packages/shared/src/keybindings.ts b/packages/shared/src/keybindings.ts
+index acca591ec6..38dc7e1ed5 100644
+--- a/packages/shared/src/keybindings.ts
++++ b/packages/shared/src/keybindings.ts
+@@ -117,6 +117,7 @@ export const DEFAULT_KEYBINDINGS: ReadonlyArray<KeybindingRule> = [
+   { key: "mod+shift+n", command: "chat.newLocal", when: "!terminalFocus" },
+   { key: "mod+alt+n", command: "chat.newWithoutProject", when: "!terminalFocus" },
+   { key: "mod+f", command: "chat.find", when: "!terminalFocus && !previewFocus" },
++  { key: "mod+l", command: "chat.citeSelection", when: "!terminalFocus && !previewFocus" },
+   { key: "mod+shift+m", command: "modelPicker.toggle", when: "!terminalFocus" },
+   { key: "mod+shift+h", command: "composer.host", when: "!terminalFocus" },
+   { key: "mod+shift+e", command: "composer.effort", when: "!terminalFocus" },
