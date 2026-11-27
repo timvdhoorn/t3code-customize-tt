@@ -3969,10 +3969,10 @@ def wait_for_exit(app_path, seconds):
     return True
 
 
-def quit_app(app_path):
+def quit_app(app_path, busy=desktop_busy_threads):
     """Quit T3 Code as Cmd+Q does and wait until it and its helpers exit. Asks the app through Apple
     Events first; SIGTERM (Electron quits on it too) only when that did not end it in time. Returns
-    the method that worked: 'osascript' or 'SIGTERM'."""
+    the method that worked: 'osascript', 'SIGTERM' or 'SIGKILL'."""
     method = 'osascript'
     with contextlib.suppress(subprocess.TimeoutExpired, OSError):
         # A first Apple Event to the app may wait on an Automation prompt nobody answers; the timeout ends it.
@@ -3980,17 +3980,44 @@ def quit_app(app_path):
                        stdin=subprocess.DEVNULL, capture_output=True, timeout=QUIT_ASK_TIMEOUT)
     if not wait_for_exit(app_path, QUIT_TIMEOUT):
         method = 'SIGTERM'
-        for pid in main_app_pids(app_path):
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(pid, signal.SIGTERM)
+        signal_pids(main_app_pids(app_path), signal.SIGTERM)
         if not wait_for_exit(app_path, QUIT_TIMEOUT):
-            raise Stop(f'T3 Code did not quit within {2 * QUIT_TIMEOUT} s; the customized app waits for the next run.')
+            method = 'SIGKILL'
+            kill_hung_app(app_path, busy)
     # Its helpers and backend end with it; give them a moment.
     for _ in range(15):
         if not app_processes(app_path):
             break
         time.sleep(1)
     return method
+
+
+def signal_pids(pids, sig):
+    for pid in pids:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, sig)
+
+
+def kill_hung_app(app_path, busy):
+    """End a T3 Code whose main thread answers neither the Apple Event nor SIGTERM. Seen on the
+    MacBook Pro: a newly signed copy blocks its main thread on the keychain prompt for "t3code Safe
+    Storage" until someone answers it, and both quit routes need that thread. Only while no thread
+    works, asked again here. The main process holds no state database (only the backend has
+    statev2.sqlite open), so the backend first gets SIGTERM and closes it itself; SQLite's WAL
+    survives a killed process anyway (a commit is in the WAL, an unfinished one rolls back)."""
+    if busy():
+        raise Stop(f'T3 Code did not quit within {2 * QUIT_TIMEOUT} s and threads work now; '
+                   'the customized app waits for the next run.')
+    main = main_app_pids(app_path)
+    signal_pids([pid for pid, _, _ in app_processes(app_path) if pid not in main], signal.SIGTERM)
+    deadline = time.time() + QUIT_TIMEOUT
+    while any(pid not in main for pid, _, _ in app_processes(app_path)) and time.time() < deadline:
+        time.sleep(1)
+    signal_pids(main, signal.SIGKILL)
+    if not wait_for_exit(app_path, QUIT_TIMEOUT):
+        raise Stop('T3 Code did not end even after SIGKILL; the customized app waits for the next run.')
+    time.sleep(5)  # helpers notice their parent is gone
+    signal_pids([pid for pid, _, _ in app_processes(app_path)], signal.SIGKILL)
 
 
 def install_signed_pending(background=False, busy=None):
@@ -4027,7 +4054,7 @@ def install_signed_pending(background=False, busy=None):
             return False
         if decision == 'quit':
             step('No thread works: quitting T3 Code to install its customized version...')
-            quit_method = quit_app(app.path)
+            quit_method = quit_app(app.path, busy)
             say(f'    T3 Code quit ({quit_method}).')
         swap_mac_app(staged, app.path)
     finally:
@@ -4050,7 +4077,9 @@ def install_signed_pending(background=False, busy=None):
         shutil.rmtree(launcher, ignore_errors=True)
     prune_stock_archives()
     message = f"T3 Code {pending['version']} with the customization is installed" + (
-        f' and reopened (quit via {quit_method}).' if quit_method else '; open it as usual.')
+        f' and reopened (quit via {quit_method}).' if quit_method else '; open it as usual.') + (
+        # A new signature: macOS asks before the app reads its key, and the app hangs until answered.
+        ' If macOS asks for the login keychain password for "t3code Safe Storage", enter it and choose Always Allow.')
     if background:
         notify(LAUNCHER_NAME, message)
     else:

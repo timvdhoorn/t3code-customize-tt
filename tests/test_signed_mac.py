@@ -239,7 +239,7 @@ class SignedFlowTest(unittest.TestCase):
 
     real_install = staticmethod(customize.install_signed_pending)
 
-    def quit(self, app_path):
+    def quit(self, app_path, busy=None):
         self.quits.append(app_path)
         self.running = False
         return 'osascript'
@@ -394,6 +394,36 @@ class SignedFlowTest(unittest.TestCase):
                     patch.object(customize.os, 'kill', side_effect=lambda pid, sig: killed.append((pid, sig))):
                 self.assertEqual(customize.quit_app(self.installed.path), 'SIGTERM')
         self.assertEqual(killed, [(42, customize.signal.SIGTERM)])
+
+    def hung_app(self, busy):
+        """quit_app against an app whose main process (42) ignores the Apple Event and SIGTERM, as one
+        blocked on a keychain prompt does; its backend (43) exits on SIGTERM."""
+        alive, killed = {42, 43}, []
+
+        def kill(pid, sig):
+            killed.append((pid, sig))
+            if pid == 43 or sig == customize.signal.SIGKILL:
+                alive.discard(pid)
+        executable = str(self.installed.path / 'Contents/MacOS' / self.installed.path.stem)
+        processes = lambda app: [(pid, 1 if pid == 42 else 42, executable) for pid in sorted(alive)]
+        with patch.object(customize.subprocess, 'run'), patch.object(customize.os, 'kill', side_effect=kill), \
+                patch.object(customize, 'app_processes', side_effect=processes), \
+                patch.object(customize.time, 'sleep'), patch.object(customize, 'QUIT_TIMEOUT', 0):
+            try:
+                return customize.quit_app(self.installed.path, busy=lambda: busy), killed
+            except customize.Stop:
+                return None, killed
+
+    def test_a_hung_app_is_killed_only_while_no_thread_works(self):
+        method, killed = self.hung_app(busy=[])
+        self.assertEqual(method, 'SIGKILL')
+        # The backend is asked to close the state database before the main process is killed.
+        self.assertEqual(killed, [(42, customize.signal.SIGTERM), (43, customize.signal.SIGTERM),
+                                  (42, customize.signal.SIGKILL)])
+        method, killed = self.hung_app(busy=['thread'])
+        self.assertIsNone(method)
+        self.assertNotIn(customize.signal.SIGKILL, [sig for _, sig in killed])
+        self.assertNotIn(43, [pid for pid, _ in killed])
 
     def test_without_a_signing_identity_no_zip_of_t3s_app_is_kept(self):
         download(self.caches, self.release())
