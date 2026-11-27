@@ -9,9 +9,13 @@ What is live, what is in progress and what is open. Finished work leaves this pa
 - Patches ported to nightly 0.1.14-nightly.20261127.5332 on `main` (PR #150); see [Current port](porting/current-port.md).
 - devbox1: server runs 5332 with the patches. See [devbox1](machines/devbox1.md).
 
+- MacBook Pro: T3 Code 5258 customized; TestFlight has iOS build 202611271237 (5258).
+
 ## In progress
-- MacBook Pro: unreachable over SSH since 2026-11-27 morning; still on 5258 or older, so the app update to 5332 and the iOS build wait until it is reachable and T3 Code restarts.
-- MacBook Air: offline (with Tim); picks up 5332 through its updater when T3 Code quits.
+- Macs stay on 5258: nightly 5332 turns the inspector fuse off, so the macOS launcher cannot inject
+  and the prebuild fails; the downloaded update waits (issue #152).
+- MacBook Air: offline (with Tim); same block once it downloads 5332.
 
 ## Open
+- Issue #152: choose a new macOS hook (own signed build, re-signed app, or wait for upstream).
 - Upstream closed pingdotgg/t3code#16699 unmerged; keeping the child-threads patch waits for Tim's confirmation.
