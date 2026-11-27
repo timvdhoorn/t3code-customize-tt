@@ -1,0 +1,459 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <a@b.c>
+Date: Fri, 27 Nov 2026 17:22:21 +0100
+Subject: [PATCH 17/17] feat(web): cite the assistant selection with Cmd+L
+
+---
+ apps/web/src/components/ChatView.tsx          |   2 +
+ ...ctionToolbar.citeShortcut.browser.test.tsx | 200 ++++++++++++++++++
+ .../chat/AssistantSelectionToolbar.tsx        |  71 +++++--
+ .../components/chat/CiteSelectionShortcut.tsx |   9 +
+ .../src/components/chat/useChatShortcuts.ts   |   2 +-
+ .../settings/KeybindingsSettings.logic.ts     |   1 +
+ apps/web/src/keybindings.test.ts              |   8 +
+ apps/web/src/lib/assistantSelectionCite.ts    |  17 ++
+ packages/contracts/src/keybindings.ts         |   1 +
+ packages/shared/src/keybindings.ts            |   1 +
+ 10 files changed, 288 insertions(+), 24 deletions(-)
+ create mode 100644 apps/web/src/components/chat/AssistantSelectionToolbar.citeShortcut.browser.test.tsx
+ create mode 100644 apps/web/src/components/chat/CiteSelectionShortcut.tsx
+ create mode 100644 apps/web/src/lib/assistantSelectionCite.ts
+
+diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
+index 12f9956e30..83e3018146 100644
+--- a/apps/web/src/components/ChatView.tsx
++++ b/apps/web/src/components/ChatView.tsx
+@@ -221,6 +221,7 @@ import { makeWorkspaceFileDropHandlers } from "./chat/workspaceFileDrop";
+ import { isEditableFocused } from "../lib/editableFocus";
+ import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
+ import { shortcutLabelForCommand } from "../keybindings";
++import { citeSelectionFromShortcut } from "../lib/assistantSelectionCite";
+ import { cn } from "~/lib/utils";
+ import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
+ import { toastManager } from "./ui/toast";
+@@ -2980,6 +2981,7 @@ export default function ChatView(props: ChatViewProps) {
+           return false;
+         openThreadFind(activeThreadKey);
+       },
++      "chat.citeSelection": () => citeSelectionFromShortcut(),
+       "composer.cycleHost": ({ event }) => {
+         if (!canChangeEnvironment) return false;
+         if (event.repeat) return;
+diff --git a/apps/web/src/components/chat/AssistantSelectionToolbar.citeShortcut.browser.test.tsx b/apps/web/src/components/chat/AssistantSelectionToolbar.citeShortcut.browser.test.tsx
+new file mode 100644
+index 0000000000..f01870a821
+--- /dev/null
++++ b/apps/web/src/components/chat/AssistantSelectionToolbar.citeShortcut.browser.test.tsx
+@@ -0,0 +1,200 @@
++import { ASSISTANT_CITATION_MAX_TEXT_LENGTH, EnvironmentId, ThreadId } from "@t3tools/contracts";
++import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
++import { useState } from "react";
++import { describe, expect, it, vi } from "vite-plus/test";
++import { page, userEvent } from "vite-plus/test/browser";
++
++vi.mock(import("~/state/server"), async (original) => {
++  const actual = await original();
++  const { Atom } = await import("effect/reactivity");
++  const { DEFAULT_RESOLVED_KEYBINDINGS: defaults } = await import("@t3tools/shared/keybindings");
++  return { ...actual, primaryServerKeybindingsAtom: Atom.make(defaults) };
++});
++
++import { citeSelectionFromShortcut } from "~/lib/assistantSelectionCite";
++import { render } from "../../../test/render";
++import type { ChatComposerHandle } from "./ChatComposer";
++import { AssistantSelectionToolbar } from "./AssistantSelectionToolbar";
++import { useChatShortcuts } from "./useChatShortcuts";
++
++const threadRef = { environmentId: EnvironmentId.make("env"), threadId: ThreadId.make("thread") };
++
++const shortcutContext = {
++  terminalFocus: false,
++  terminalOpen: false,
++  previewFocus: false,
++  previewOpen: false,
++  isWeb: true,
++  isDesktop: false,
++  modelPickerOpen: false,
++};
++
++// The chat's real window (or side chat pane) shortcut listener runs `chat.citeSelection`, as ChatView wires it.
++function Harness(props: {
++  text: string;
++  onCite: () => boolean;
++  embedded?: boolean;
++  previewFocus?: boolean;
++}) {
++  const [viewport, setViewport] = useState<HTMLElement | null>(null);
++  const [composerElement, setComposerElement] = useState<HTMLElement | null>(null);
++  useChatShortcuts({
++    enabled: props.embedded !== true,
++    embedded: props.embedded === true,
++    composerElement,
++    keybindings: DEFAULT_RESOLVED_KEYBINDINGS,
++    scriptKeybindings: [],
++    getShortcutContext: () => ({ ...shortcutContext, previewFocus: props.previewFocus === true }),
++    threadFindActive: false,
++    composerRef: { current: null } as unknown as { current: ChatComposerHandle | null },
++    branchToolbarRef: { current: null },
++    closeThreadFind: () => {},
++    commands: { "chat.citeSelection": () => citeSelectionFromShortcut() },
++    fallback: () => undefined,
++  });
++  const chat = (
++    <div ref={setViewport} data-assistant-citation-viewport="true">
++      <div data-assistant-citation-source="message-1" data-testid="source">
++        <p>{props.text}</p>
++      </div>
++      <AssistantSelectionToolbar viewport={viewport} threadRef={threadRef} onCite={props.onCite} />
++      <div ref={setComposerElement} />
++    </div>
++  );
++  return props.embedded ? <div data-side-chat-pane>{chat}</div> : chat;
++}
++
++async function mountWithSelection(
++  text: string,
++  options: {
++    selectText?: boolean;
++    onCite?: () => boolean;
++    embedded?: boolean;
++    previewFocus?: boolean;
++  },
++) {
++  const onCite = options.onCite ?? vi.fn(() => true);
++  const screen = await render(
++    <Harness
++      text={text}
++      onCite={onCite}
++      {...(options.embedded ? { embedded: true } : {})}
++      {...(options.previewFocus ? { previewFocus: true } : {})}
++    />,
++    { router: false },
++  );
++  if (options.selectText !== false) {
++    const paragraph = document.querySelector("[data-testid=source] p");
++    if (!paragraph?.firstChild) throw new Error("source text missing");
++    const range = document.createRange();
++    range.selectNodeContents(paragraph);
++    const selection = window.getSelection();
++    selection?.removeAllRanges();
++    selection?.addRange(range);
++    document.dispatchEvent(new Event("selectionchange"));
++  }
++  return { screen, onCite, [Symbol.asyncDispose]: () => screen[Symbol.asyncDispose]() };
++}
++
++const citeButton = () => page.getByRole("button", { name: /selection (in composer|is too long)/ });
++
++/** A real Ctrl+L keydown at the document, as the browser would deliver it. */
++function pressCiteKey(target: Element = document.body) {
++  const event = new KeyboardEvent("keydown", {
++    key: "l",
++    ctrlKey: true,
++    bubbles: true,
++    cancelable: true,
++  });
++  target.dispatchEvent(event);
++  return event;
++}
++
++describe("chat.citeSelection key path", () => {
++  it("cites the shown selection on Ctrl+L, clears it and takes the key", async () => {
++    using _platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux x86_64");
++    const onCite = vi.fn(() => true);
++    await using _mounted = await mountWithSelection("Cite me with the keyboard", { onCite });
++    await expect.element(citeButton()).toBeVisible();
++
++    const event = pressCiteKey();
++
++    expect(event.defaultPrevented).toBe(true);
++    expect(onCite).toHaveBeenCalledTimes(1);
++    expect(onCite.mock.calls[0]).toEqual([
++      expect.objectContaining({ messageId: "message-1", text: "Cite me with the keyboard" }),
++      expect.anything(),
++    ]);
++    expect(window.getSelection()?.toString()).toBe("");
++    await expect.element(citeButton()).not.toBeInTheDocument();
++  });
++
++  it("cites a selection inside an embedded side chat", async () => {
++    using _platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux x86_64");
++    const onCite = vi.fn(() => true);
++    await using _mounted = await mountWithSelection("Side chat words", { onCite, embedded: true });
++    await expect.element(citeButton()).toBeVisible();
++
++    const event = pressCiteKey(document.querySelector("[data-testid=source] p")!);
++
++    expect(event.defaultPrevented).toBe(true);
++    expect(onCite).toHaveBeenCalledTimes(1);
++  });
++
++  it("passes the key through without a selection", async () => {
++    using _platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux x86_64");
++    const onCite = vi.fn(() => true);
++    await using _mounted = await mountWithSelection("Nothing selected", {
++      selectText: false,
++      onCite,
++    });
++
++    const event = pressCiteKey();
++
++    expect(event.defaultPrevented).toBe(false);
++    expect(onCite).not.toHaveBeenCalled();
++  });
++
++  it("passes the key through for a selection that is too long to cite", async () => {
++    using _platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux x86_64");
++    const onCite = vi.fn(() => true);
++    await using _mounted = await mountWithSelection(
++      "x".repeat(ASSISTANT_CITATION_MAX_TEXT_LENGTH + 1),
++      { onCite },
++    );
++    await expect
++      .element(page.getByRole("button", { name: "Selection is too long to cite" }))
++      .toBeDisabled();
++
++    const event = pressCiteKey();
++
++    expect(event.defaultPrevented).toBe(false);
++    expect(onCite).not.toHaveBeenCalled();
++  });
++
++  it("leaves the key to a focused preview", async () => {
++    using _platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux x86_64");
++    const onCite = vi.fn(() => true);
++    await using _mounted = await mountWithSelection("Selected in the chat", {
++      onCite,
++      previewFocus: true,
++    });
++    await expect.element(citeButton()).toBeVisible();
++
++    const event = pressCiteKey();
++
++    expect(event.defaultPrevented).toBe(false);
++    expect(onCite).not.toHaveBeenCalled();
++  });
++
++  it("shows the bound shortcut in the button's tooltip and keyshortcuts", async () => {
++    using _platform = vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux x86_64");
++    await using _mounted = await mountWithSelection("Hint me", {});
++    await expect.element(citeButton()).toBeVisible();
++    expect(citeButton().element().getAttribute("aria-keyshortcuts")).toMatch(/L/);
++
++    await userEvent.hover(citeButton());
++
++    await expect.element(page.getByText("Cite selection in composer (Ctrl+L)")).toBeVisible();
++  });
++});
+diff --git a/apps/web/src/components/chat/AssistantSelectionToolbar.tsx b/apps/web/src/components/chat/AssistantSelectionToolbar.tsx
+index afb51240b6..6708ad92c5 100644
+--- a/apps/web/src/components/chat/AssistantSelectionToolbar.tsx
++++ b/apps/web/src/components/chat/AssistantSelectionToolbar.tsx
+@@ -4,6 +4,7 @@ import {
+   type AssistantCitation,
+   type ScopedThreadRef,
+ } from "@t3tools/contracts";
++import { useAtomValue } from "@effect/atom-react";
+ import { useGT } from "gt-react";
+ import { QuoteIcon } from "lucide-react";
+ import { use, useEffect, useLayoutEffect, useRef, useState } from "react";
+@@ -18,8 +19,12 @@ import {
+   resolveSelectionActionPosition,
+   type SelectionActionPoint,
+ } from "~/lib/selectionActions";
++import { shortcutLabelForCommand } from "~/keybindings";
++import { primaryServerKeybindingsAtom } from "~/state/server";
+ import { Button } from "../ui/button";
++import { SharedTooltipTrigger } from "../ui/shared-tooltip";
+ import { BackgroundThreadContext } from "./backgroundThread";
++import { CiteSelectionShortcut } from "./CiteSelectionShortcut";
+ 
+ export function AssistantSelectionToolbar({
+   viewport,
+@@ -39,6 +44,10 @@ export function AssistantSelectionToolbar({
+   const actionsRef = useRef<ReturnType<typeof observeSelectionActions> | null>(null);
+   const backgroundThread = use(BackgroundThreadContext);
+   const gt = useGT();
++  const citeShortcut = shortcutLabelForCommand(
++    useAtomValue(primaryServerKeybindingsAtom),
++    "chat.citeSelection",
++  );
+ 
+   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- measures the toolbar DOM node and clamps its position inside the window before paint
+   useLayoutEffect(() => {
+@@ -192,30 +201,46 @@ export function AssistantSelectionToolbar({
+     return true;
+   };
+   return createPortal(
+-    <Button
+-      ref={toolbarRef}
+-      type="button"
+-      size="xs"
+-      variant="glass"
+-      disabled={tooLong}
+-      aria-label={tooLong ? gt("Selection is too long to cite") : gt("Cite selection in composer")}
+-      className="fixed z-50 max-w-[calc(100vw-1rem)]"
+-      style={{ left: selection.position.x, top: selection.position.y }}
+-      onPointerDown={(event) => event.preventDefault()}
+-      onClick={cite}
+-      onKeyDown={(event) => {
+-        event.stopPropagation();
+-        if (event.key === "Escape" && !event.nativeEvent.isComposing) {
+-          event.preventDefault();
+-          dismiss();
++    <>
++      {backgroundThread ? null : <CiteSelectionShortcut cite={cite} />}
++      <SharedTooltipTrigger
++        side="bottom"
++        label={
++          citeShortcut
++            ? gt("Cite selection in composer ({shortcut})", { shortcut: citeShortcut })
++            : gt("Cite selection in composer")
++        }
++        render={
++          <Button
++            ref={toolbarRef}
++            type="button"
++            size="xs"
++            variant="glass"
++            disabled={tooLong}
++            aria-label={
++              tooLong ? gt("Selection is too long to cite") : gt("Cite selection in composer")
++            }
++            aria-keyshortcuts={tooLong ? undefined : (citeShortcut ?? undefined)}
++            className="fixed z-50 max-w-[calc(100vw-1rem)]"
++            style={{ left: selection.position.x, top: selection.position.y }}
++            onPointerDown={(event) => event.preventDefault()}
++            onClick={cite}
++            onKeyDown={(event) => {
++              event.stopPropagation();
++              if (event.key === "Escape" && !event.nativeEvent.isComposing) {
++                event.preventDefault();
++                dismiss();
++              }
++            }}
++          />
+         }
+-      }}
+-    >
+-      <QuoteIcon aria-hidden="true" className="size-3.5" />
+-      {tooLong
+-        ? gt("Shorten selection")
+-        : gt("Cite", { $context: "verb, button that quotes the selected text" })}
+-    </Button>,
++      >
++        <QuoteIcon aria-hidden="true" className="size-3.5" />
++        {tooLong
++          ? gt("Shorten selection")
++          : gt("Cite", { $context: "verb, button that quotes the selected text" })}
++      </SharedTooltipTrigger>
++    </>,
+     document.body,
+   );
+ }
+diff --git a/apps/web/src/components/chat/CiteSelectionShortcut.tsx b/apps/web/src/components/chat/CiteSelectionShortcut.tsx
+new file mode 100644
+index 0000000000..8102b11ea3
+--- /dev/null
++++ b/apps/web/src/components/chat/CiteSelectionShortcut.tsx
+@@ -0,0 +1,9 @@
++import { useEffect } from "react";
++import { registerCiteSelection } from "~/lib/assistantSelectionCite";
++
++/** Mounted while the foreground Cite toolbar shows: makes `chat.citeSelection` run its `cite`. */
++export function CiteSelectionShortcut({ cite }: { cite: () => boolean }) {
++  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- registers the chat.citeSelection shortcut target while the Cite toolbar shows
++  useEffect(() => registerCiteSelection(cite), [cite]);
++  return null;
++}
+diff --git a/apps/web/src/components/chat/useChatShortcuts.ts b/apps/web/src/components/chat/useChatShortcuts.ts
+index d3b0ccff51..ced0ae409c 100644
+--- a/apps/web/src/components/chat/useChatShortcuts.ts
++++ b/apps/web/src/components/chat/useChatShortcuts.ts
+@@ -136,7 +136,7 @@ export function useChatShortcuts(input: ChatShortcutsInput) {
+       context: input.getShortcutContext(event.target),
+     });
+     let run: ChatShortcutHandler | undefined;
+-    if (command === "chat.find") run = input.commands[command];
++    if (command === "chat.find" || command === "chat.citeSelection") run = input.commands[command];
+     else if (command && event.target instanceof Node && composerElement?.contains(event.target)) {
+       run = composerShortcutCommands(input.composerRef, input.branchToolbarRef)[command];
+     }
+diff --git a/apps/web/src/components/settings/KeybindingsSettings.logic.ts b/apps/web/src/components/settings/KeybindingsSettings.logic.ts
+index 4b44c66ad3..ab886e8bbc 100644
+--- a/apps/web/src/components/settings/KeybindingsSettings.logic.ts
++++ b/apps/web/src/components/settings/KeybindingsSettings.logic.ts
+@@ -548,6 +548,7 @@ const LATE_COMMAND_LABELS: Partial<Record<KeybindingCommand, string>> = {
+   "view.reopenClosed": msg("Reopen Closed Tab"),
+   "preview.focusUrl": msg("Preview: Focus URL"),
+   "preview.find": msg("Preview: Find on Page"),
++  "chat.citeSelection": msg("Chat: Cite Selection"),
+ };
+ 
+ export function commandLabel(command: KeybindingCommand, resolve: MessageResolver = m): string {
+diff --git a/apps/web/src/keybindings.test.ts b/apps/web/src/keybindings.test.ts
+index 728797735e..3aba940382 100644
+--- a/apps/web/src/keybindings.test.ts
++++ b/apps/web/src/keybindings.test.ts
+@@ -164,6 +164,14 @@ const DEFAULT_BINDINGS = compile([
+       whenNot(whenIdentifier("previewFocus")),
+     ),
+   },
++  {
++    shortcut: modShortcut("l"),
++    command: "chat.citeSelection",
++    whenAst: whenAnd(
++      whenNot(whenIdentifier("terminalFocus")),
++      whenNot(whenIdentifier("previewFocus")),
++    ),
++  },
+   {
+     shortcut: modShortcut("m", { shiftKey: true }),
+     command: "modelPicker.toggle",
+diff --git a/apps/web/src/lib/assistantSelectionCite.ts b/apps/web/src/lib/assistantSelectionCite.ts
+new file mode 100644
+index 0000000000..3440698417
+--- /dev/null
++++ b/apps/web/src/lib/assistantSelectionCite.ts
+@@ -0,0 +1,17 @@
++type CiteSelection = () => boolean;
++
++// One native selection exists at a time, so the foreground toolbar showing Cite is the only target.
++let activeCite: CiteSelection | null = null;
++
++/** The Cite toolbar registers while it shows; the returned function unregisters it. */
++export function registerCiteSelection(cite: CiteSelection): () => void {
++  activeCite = cite;
++  return () => {
++    if (activeCite === cite) activeCite = null;
++  };
++}
++
++/** Cites the shown selection like the button does. False when nothing was cited, so the key passes through. */
++export function citeSelectionFromShortcut(): boolean {
++  return activeCite?.() ?? false;
++}
+diff --git a/packages/contracts/src/keybindings.ts b/packages/contracts/src/keybindings.ts
+index 855afb7401..70212ee8dc 100644
+--- a/packages/contracts/src/keybindings.ts
++++ b/packages/contracts/src/keybindings.ts
+@@ -108,6 +108,7 @@ export const STATIC_KEYBINDING_COMMANDS = [
+   "chat.newLocal",
+   "chat.newWithoutProject",
+   "chat.find",
++  "chat.citeSelection",
+   "editor.openFavorite",
+   "usage.cost",
+   "usage.tokens",
+diff --git a/packages/shared/src/keybindings.ts b/packages/shared/src/keybindings.ts
+index acca591ec6..38dc7e1ed5 100644
+--- a/packages/shared/src/keybindings.ts
++++ b/packages/shared/src/keybindings.ts
+@@ -117,6 +117,7 @@ export const DEFAULT_KEYBINDINGS: ReadonlyArray<KeybindingRule> = [
+   { key: "mod+shift+n", command: "chat.newLocal", when: "!terminalFocus" },
+   { key: "mod+alt+n", command: "chat.newWithoutProject", when: "!terminalFocus" },
+   { key: "mod+f", command: "chat.find", when: "!terminalFocus && !previewFocus" },
++  { key: "mod+l", command: "chat.citeSelection", when: "!terminalFocus && !previewFocus" },
+   { key: "mod+shift+m", command: "modelPicker.toggle", when: "!terminalFocus" },
+   { key: "mod+shift+h", command: "composer.host", when: "!terminalFocus" },
+   { key: "mod+shift+e", command: "composer.effort", when: "!terminalFocus" },

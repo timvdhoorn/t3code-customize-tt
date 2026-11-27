@@ -2,6 +2,7 @@
 
 One line per change, newest first. Format: [RULES.md](RULES.md#formats).
 
+- 2026-11-27 change | Cmd+L cites the assistant selection: new own patch `patches-tt/0017`, command `chat.citeSelection` (PR open) | - | docs/fork-changes.md, checks-tt.json
 - 2026-11-27 change | Patches ported to nightly 0.1.14-nightly.20261127.5332 (shared tooltip #42671, configurable mobile fonts #43840) | porting/current-port.md | docs/fork-changes.md
 - 2026-11-26 change | Patches ported to nightly 0.1.13-nightly.20261125.5258; one conflict, the terminal canvas fill in `patches-tt/0007` (PR open) | porting/current-port.md | patches-tt/
 - 2026-11-26 fix | A listed known upstream failure stays tolerated after a pass (flaky test broke the MacBook Pro iOS build of 2026-11-25); `status` advises on removal (PR open) | - | docs/machines.md
