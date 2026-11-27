@@ -34,7 +34,9 @@ run the same patches.
   `--fix` first rebuild directly over SSH; that path never builds iOS. The agent runs at `ProcessType`
   Interactive with `Nice` 10: as Standard its browser checks ran at priority 20 and failed under load
   ("Unattended updates" in [fork-changes.md](fork-changes.md)).
-- **Never interrupt a running thread.** Nothing in this tool quits or relaunches the Mac app. A
+- **Never interrupt a running thread.** The Mac app is quit and reopened only to install the own
+  signed app ("Own signed macOS app" in [fork-changes.md](fork-changes.md)), and only while
+  `busy_threads` finds no work; otherwise the build waits in `signed-pending.json` for a later run. A
   T3 server restarts only in `server` and `server-off`, once per run, and only while it is idle:
   `busy_threads` finds no live work in `~/.t3/userdata/statev2.sqlite`, by the rules the server
   itself uses to recover work after a restart: a run in `orchestration_v2_projection_runs` that is
@@ -87,6 +89,12 @@ run the same patches.
     notifies Tim and stays on its current build (see "Ports" below). A re-signed copy at `~/Applications/T3 Code (Customized).app`
     from older versions of this tool ran with `T3CODE_DISABLE_AUTO_UPDATE=true`, so it never
     updated; `install_mac_launcher` removes it, and none may remain.
+  - Mac on the own signed app (nightly 5332 and later, whose inspector fuse is off): the updater
+    still downloads to `pending/`, and the same run builds from the zip, signs the result and installs
+    it itself while no thread works (quit, replace, reopen), then builds iOS on the MacBook Pro. No
+    `prebuilt.json` is written, so Squirrel never installs T3's stock app over it. A Mac without a
+    "Developer ID Application" identity in its login keychain stops with a message and stays on
+    its current app.
   - devbox1: the `autoupdate` timer at 04:30 runs `server --t3-update`: `t3 update`
     stages the newest `t3@nightly` (a no-op when it already runs it), the customized server is built
     for it, and the one restart waits for idle as above. When the patches break there, it notifies
@@ -109,7 +117,7 @@ run the same patches.
   with `~/Devops/agent-tooling/playbook-new-box`; this repo only adds the patches.
 - Never edit a machine's T3 install by hand; `server`, `server-off` and `update` own it. On a Mac,
   T3's own updater installs new releases (up to the covered nightly, `covered-nightly.txt`) into the
-  untouched app; `update` (and `autoupdate`) only rebuild the overlay for it, and until then the launcher opens stock.
+  untouched app; `update` (and `autoupdate`) only rebuild the overlay for it, and until then the launcher opens stock. On the own signed app `update` builds and installs the app itself.
 - Python must stay compatible with macOS's system Python 3.9.
 
 ## Unattended ports
