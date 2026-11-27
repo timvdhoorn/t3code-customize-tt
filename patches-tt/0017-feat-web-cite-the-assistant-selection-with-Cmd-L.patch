@@ -5,7 +5,7 @@ Subject: [PATCH 17/17] feat(web): cite the assistant selection with Cmd+L
 
 ---
  apps/web/src/components/ChatView.tsx          |   2 +
- ...ctionToolbar.citeShortcut.browser.test.tsx | 200 ++++++++++++++++++
+ ...ctionToolbar.citeShortcut.browser.test.tsx | 211 ++++++++++++++++++
  .../chat/AssistantSelectionToolbar.tsx        |  71 +++++--
  .../components/chat/CiteSelectionShortcut.tsx |   9 +
  .../src/components/chat/useChatShortcuts.ts   |   2 +-
@@ -14,7 +14,7 @@ Subject: [PATCH 17/17] feat(web): cite the assistant selection with Cmd+L
  apps/web/src/lib/assistantSelectionCite.ts    |  17 ++
  packages/contracts/src/keybindings.ts         |   1 +
  packages/shared/src/keybindings.ts            |   1 +
- 10 files changed, 288 insertions(+), 24 deletions(-)
+ 10 files changed, 299 insertions(+), 24 deletions(-)
  create mode 100644 apps/web/src/components/chat/AssistantSelectionToolbar.citeShortcut.browser.test.tsx
  create mode 100644 apps/web/src/components/chat/CiteSelectionShortcut.tsx
  create mode 100644 apps/web/src/lib/assistantSelectionCite.ts
@@ -41,10 +41,10 @@ index 12f9956e30..83e3018146 100644
          if (event.repeat) return;
 diff --git a/apps/web/src/components/chat/AssistantSelectionToolbar.citeShortcut.browser.test.tsx b/apps/web/src/components/chat/AssistantSelectionToolbar.citeShortcut.browser.test.tsx
 new file mode 100644
-index 0000000000..f01870a821
+index 0000000000..f09f1f4099
 --- /dev/null
 +++ b/apps/web/src/components/chat/AssistantSelectionToolbar.citeShortcut.browser.test.tsx
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,211 @@
 +import { ASSISTANT_CITATION_MAX_TEXT_LENGTH, EnvironmentId, ThreadId } from "@t3tools/contracts";
 +import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
 +import { useState } from "react";
@@ -59,7 +59,7 @@ index 0000000000..f01870a821
 +});
 +
 +import { citeSelectionFromShortcut } from "~/lib/assistantSelectionCite";
-+import { render } from "../../../test/render";
++import { act, render } from "../../../test/render";
 +import type { ChatComposerHandle } from "./ChatComposer";
 +import { AssistantSelectionToolbar } from "./AssistantSelectionToolbar";
 +import { useChatShortcuts } from "./useChatShortcuts";
@@ -145,6 +145,13 @@ index 0000000000..f01870a821
 +
 +const citeButton = () => page.getByRole("button", { name: /selection (in composer|is too long)/ });
 +
++/**
++ * The toolbar registers its shortcut target in a passive effect, which can still be pending when
++ * its button is already visible (a busy machine, parallel test files). A real key comes later than
++ * that commit, so flush the effect before the key; otherwise it passes through and the test flakes.
++ */
++const settleEffects = () => act(async () => {});
++
 +/** A real Ctrl+L keydown at the document, as the browser would deliver it. */
 +function pressCiteKey(target: Element = document.body) {
 +  const event = new KeyboardEvent("keydown", {
@@ -163,6 +170,7 @@ index 0000000000..f01870a821
 +    const onCite = vi.fn(() => true);
 +    await using _mounted = await mountWithSelection("Cite me with the keyboard", { onCite });
 +    await expect.element(citeButton()).toBeVisible();
++    await settleEffects();
 +
 +    const event = pressCiteKey();
 +
@@ -181,6 +189,7 @@ index 0000000000..f01870a821
 +    const onCite = vi.fn(() => true);
 +    await using _mounted = await mountWithSelection("Side chat words", { onCite, embedded: true });
 +    await expect.element(citeButton()).toBeVisible();
++    await settleEffects();
 +
 +    const event = pressCiteKey(document.querySelector("[data-testid=source] p")!);
 +
@@ -212,6 +221,7 @@ index 0000000000..f01870a821
 +    await expect
 +      .element(page.getByRole("button", { name: "Selection is too long to cite" }))
 +      .toBeDisabled();
++    await settleEffects();
 +
 +    const event = pressCiteKey();
 +
@@ -227,6 +237,7 @@ index 0000000000..f01870a821
 +      previewFocus: true,
 +    });
 +    await expect.element(citeButton()).toBeVisible();
++    await settleEffects();
 +
 +    const event = pressCiteKey();
 +
