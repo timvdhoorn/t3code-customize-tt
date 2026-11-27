@@ -12,9 +12,10 @@ What is live, what is in progress and what is open. Finished work leaves this pa
 - MacBook Pro: T3 Code 5258 customized; TestFlight has iOS build 202611271237 (5258).
 
 ## In progress
-- Macs stay on 5258: nightly 5332 turns the inspector fuse off, so the macOS launcher cannot inject
-  and the prebuild fails; the downloaded update waits (issue #152).
+- Macs stay on 5258 by Tim's choice (2026-11-27): nightly 5332 turns the inspector fuse off, so the
+  launcher cannot inject; a downloaded newer nightly waits because its prebuild fails (issue #152).
 - MacBook Air: offline (with Tim); same block once it downloads 5332.
 
 ## Open
-- Issue #152: choose a new macOS hook (own signed build, re-signed app, or wait for upstream).
+- Macs: watch upstream t3code-customize for a new macOS hook; an own signed build is rejected
+  (it breaks passkey sign-in to T3 Connect).
