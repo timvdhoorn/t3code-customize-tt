@@ -28,7 +28,7 @@ Which nightly the patches cover and what a port of them has to watch for. The po
 - `port --resume` writes the patch folders and `covered-nightly.txt` here but opens no PR.
 - Commit them as `chore: port patches to nightly <version>` on a branch and open the PR yourself.
 - 4749 conflict: upstream sized the swipe actions from the measured row (`compactActions`, `rowHeight`, label constants) in `thread-swipe-actions.tsx`; `patches-ios/0004` keeps both and adds `iconOnlyActions`.
-- Upstream PRs named in `docs/fork-changes.md`: #16699 closed unmerged 2026-11-27 and upstream has no opener provenance; the child-threads patch stays.
+- Upstream PRs named in `docs/fork-changes.md`: #16699 closed unmerged 2026-11-27 and upstream has no opener provenance; the child-threads patch stays (Tim, 2026-11-27).
 - 4838: upstream dropped `resolveSidebarRowThreadId`; `patches-tt/0002` keeps `resolveSidebarRowThreadKey`, iOS keeps `resolveThreadListV2RowKey` over upstream's `useSidebarRowThreadKey`.
 - 4838: upstream refreshes the update check before a download (#37476, `downloadAvailableUpdate(refresh)`); the automatic covered download in `patches-tt/0005` passes `false` so it never fetches an uncovered nightly.
 - 5009: upstream translated the app with gt-react (#37893); the `no-untranslated-copy` lint in `checks` fails on bare copy.
