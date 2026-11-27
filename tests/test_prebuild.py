@@ -68,6 +68,10 @@ class PrebuildTest(unittest.TestCase):
                    patch.object(customize, 'DATA', self.data), patch.object(customize, 'CACHE', self.tmp / 'cache'),
                    patch.object(customize, 'STATE', self.data / 'state.json'),
                    patch.object(customize, 'PREBUILT', self.data / 'prebuilt.json'),
+                   patch.object(customize, 'SIGNED_PENDING', self.data / 'signed-pending.json'),
+                   patch.object(customize, 'STOCK_ARCHIVES', self.data / 'stock'),
+                   # The launcher route: these fake apps have the inspector fuse on (test_signed_mac).
+                   patch.object(customize, 'signed_route', return_value=False),
                    patch.object(customize, 'UPDATER_CACHES', self.caches),
                    patch.object(customize, 'say'), patch.object(customize, 'notify')]
         for item in patches:

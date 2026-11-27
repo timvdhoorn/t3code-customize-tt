@@ -108,7 +108,15 @@ Your current T3 Code keeps working the whole time.
 
 ## macOS
 
-Your `T3 Code (Nightly).app` stays exactly as T3 ships it, so it keeps its signature, passkeys,
+From nightly 0.1.14-nightly.20261127.5332 on, T3 Code no longer allows the launcher's startup
+hook. For such a nightly the tool builds its own copy of the app, signs it with the
+"Developer ID Application" identity in your login keychain and installs it as
+`T3 Code (Nightly).app` when no thread is working (it quits and reopens T3 Code for that). That app
+has no passkeys and T3's own updater only downloads; this tool installs
+each new nightly. Without such an identity the build stops and T3 Code stays as it is. The first
+install keeps T3's app in `~/.local/share/t3code-customize/rollback/`.
+
+For an older nightly: your `T3 Code (Nightly).app` stays exactly as T3 ships it, so it keeps its signature, passkeys,
 keychain access and T3's own updater. Open **T3 Code (Customized)** from Spotlight, Launchpad or
 `/Applications`: it starts your app and loads the rebuilt bundles into it. Started any other way
 (Dock, Finder, a `t3code://` link) T3 Code runs stock. See the [macOS guide](docs/macos.md).

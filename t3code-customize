@@ -329,6 +329,9 @@ OPERATIONAL_CODE = frozenset({
     '_publish_port', 'publish_cover', '_publish_cover', 'can_publish', 'port_branch', 'port_changes', 'committed_folder', 'working_folder',
     'is_port_file', 'newest_nightly', 'cmd_port', 'cmd_continue',
     'find_agent', 'available_agents', 'choose_agent', 'agent_prompt',
+    'install_signed_pending', 'install_decision', 'quit_app', 'main_app_pids', 'app_processes', 'wait_for_exit',
+    'desktop_busy_threads', 'stage_mac_app', 'swap_mac_app', 'recover_mac_app', 'recover_mac_apps',
+    'signed_status', 'prune_stock_archives', 'refuse_on_signed_route',
 })
 
 
@@ -2437,6 +2440,9 @@ def cmd_build(args, stock=None):
     if not stock:
         promote_prebuilt(app)
     say('T3 Code: ' + str(app.path))
+    # Fork: a nightly without the inspector fuse builds as an own signed copy (build_signed).
+    if signed_route(app):
+        return build_signed(args, app, stock)
     if MAC and electron_fuses(app.path).get('EnableNodeCliInspectArguments') != '1':
         raise Stop('This T3 Code no longer lets a launcher hook into its startup, so the customization cannot load\n'
                    'into the signed app. Your current T3 Code is untouched.')
@@ -2589,8 +2595,8 @@ def prune(keep=3):
     state = load(STATE, {})
     current = Path(state['build']).parent if state.get('build') else CURRENT.resolve()
     # The build made ahead of a nightly's install (prebuild) stays until that install uses it.
-    kept = {current.resolve()} | {Path(record['build']).parent.resolve() for record in [load(PREBUILT, {})]
-                                  if record.get('build')}
+    kept = {current.resolve()} | {Path(record['build']).parent.resolve()
+                                  for record in [load(PREBUILT, {}), load(SIGNED_PENDING, {})] if record.get('build')}
     builds = sorted((DATA / 'builds').iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
     for old in builds[keep:]:
         if old.resolve() not in kept:
@@ -2837,6 +2843,10 @@ def launch_mac(app, target, rest):
 
 def cmd_launch(args):
     app = installed_app()
+    if on_signed_route():
+        # Fork: the installed app is the customized copy; open it as Finder would.
+        rest = args.rest[1:] if args.rest[:1] == ['--'] else args.rest
+        return subprocess.run(['open', '-a', str(app.path), *(['--args', *rest] if rest else [])], check=False)
     target, notice = launch_target()
     if notice and MAC and not DISABLED.exists():
         notice = start_background_update() or notice
@@ -3509,6 +3519,651 @@ def promote_prebuilt(app):
     return True
 
 
+# --- Own signed macOS app (fork) -------------------------------------------------------
+# From 0.1.14-nightly.20261127.5332 T3 ships with Electron's EnableNodeCliInspectArguments fuse off,
+# so the launcher can no longer load the overlay into T3's signed app. For such a nightly (and from
+# then on: a Mac that runs this tool's copy stays on it) the build overlays the patched archives
+# on a copy of T3's own app, as on Linux, drops the entitlements only T3's team may sign (passkeys
+# for T3 Connect, its keychain group; this Mac uses no passkeys) and signs the copy with this Mac's
+# Developer ID. The copy replaces /Applications/T3 Code (Nightly).app while no thread works; user
+# data lives outside the bundle, so threads and settings carry over.
+# T3's updater keeps downloading the covered nightly, but never hands it to Squirrel: that happens
+# only once prebuilt.json names the download (patches-tt/0005), and this route never writes it.
+# Squirrel would refuse anyway: it installs only an update that satisfies the running app's
+# designated requirement, which names this Mac's team, not T3's.
+
+from platform_support import app_candidates  # noqa: E402 (fork: recover_mac_apps)
+
+SIGNED_PENDING = DATA / 'signed-pending.json'
+# T3's own app per nightly, zipped: what a rebuild for the installed copy starts from, and the
+# way back to T3's app (ditto -x -k <zip> /Applications).
+STOCK_ARCHIVES = DATA / 'stock'
+# T3's own app as it was before the first signed copy replaced it (launcher route), zipped once.
+ROLLBACK = DATA / 'rollback'
+SIGNED_MARKER = 'T3CodeCustomize'
+INSPECT_FUSE = 'EnableNodeCliInspectArguments'
+SIGNING_ENV = 'T3CODE_CUSTOMIZE_SIGNING_IDENTITY'
+TEAM_ENTITLEMENTS = ('com.apple.application-identifier', 'keychain-access-groups')
+IDENTITY_LINE = re.compile(r'^\s*\d+\)\s+([0-9A-Fa-f]{40})\s+"([^"]+)"', re.M)
+SHIPIT_STATE = UPDATER_CACHES / (MAC_BUNDLE_ID + '.ShipIt') / 'ShipItState.plist'
+QUIT_TIMEOUT = 90
+QUIT_ASK_TIMEOUT = 30
+# Free space a signed build needs, in multiples of T3's app: the unpacked app, the copy that becomes
+# the build and the zip of T3's app kept to rebuild from. An install needs the copy staged next to
+# the installed app and, the first time, the rollback zip of T3's app.
+SPACE_FACTOR_BUILD = 3
+SPACE_FACTOR_INSTALL = 2
+
+
+def signed_marker(app_path):
+    """What this tool wrote into the Info.plist of a copy it signed ({'version', 'builtAt'}), or
+    None for T3's own app."""
+    try:
+        info = plistlib.loads((Path(app_path) / 'Contents/Info.plist').read_bytes())
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    marker = info.get(SIGNED_MARKER)
+    return marker if isinstance(marker, dict) else None
+
+
+def mac_route(fuses, installed_signed):
+    """'signed' when a build must become this tool's own signed copy, else 'launcher'. Once a Mac
+    runs the signed copy it stays on that route: the launcher needs T3's own app back."""
+    return 'signed' if installed_signed or fuses.get(INSPECT_FUSE) != '1' else 'launcher'
+
+
+def installed_signed():
+    try:
+        return signed_marker(installed_app().path) is not None
+    except PlatformError:
+        return False
+
+
+def signed_route(app):
+    """True on macOS when app (installed, or unpacked from a download) builds as the signed copy."""
+    return MAC and mac_route(electron_fuses(app.path), installed_signed()) == 'signed'
+
+
+def choose_identity(listing, wanted=None):
+    """(SHA-1, name) to sign with from `security find-identity -v -p codesigning`: the wanted one (a
+    name or SHA-1), else the first Developer ID Application identity; None when there is none."""
+    found = [(sha.upper(), name) for sha, name in IDENTITY_LINE.findall(listing)]
+    if wanted:
+        return next(((sha, name) for sha, name in found if wanted.strip().upper() == sha or wanted.strip() == name), None)
+    return next(((sha, name) for sha, name in found if name.startswith('Developer ID Application:')), None)
+
+
+def signing_identity():
+    """The identity this Mac signs its copy with, or a Stop that says what is missing."""
+    wanted = os.environ.get(SIGNING_ENV) or load(CONFIG / 'config.json', {}).get('signingIdentity')
+    listing = subprocess.run(['security', 'find-identity', '-v', '-p', 'codesigning'],
+                             capture_output=True, text=True).stdout
+    chosen = choose_identity(listing, wanted)
+    if not chosen:
+        missing = (f'the signing identity "{wanted}" ({SIGNING_ENV} or signingIdentity in {CONFIG / "config.json"})'
+                   if wanted else 'a "Developer ID Application" signing identity')
+        raise Stop(f'This T3 Code can only be customized as a copy you sign, and this Mac has no {missing} in its'
+                   ' login keychain.\nT3 Code stays as it is. Import the identity (a .p12 exported from a Mac that'
+                   ' has it) or name another one, then run again.')
+    return chosen
+
+
+def strip_team_entitlements(entitlements):
+    """Entitlements minus those only T3's team can sign: its application and team identifiers, its
+    keychain group and every com.apple.developer.* key (associated domains for passkeys need T3's
+    provisioning profile). Hardened-runtime exceptions and device access stay."""
+    return {key: value for key, value in entitlements.items()
+            if key not in TEAM_ENTITLEMENTS and not key.startswith('com.apple.developer.')}
+
+
+def signed_info(info, asar_hashes, marker, validates):
+    """Info.plist for the signed copy: each rebuilt archive's header hash under ElectronAsarIntegrity
+    (Electron checks it when its integrity fuse is on, validates) and this tool's marker."""
+    info = copy.deepcopy(info)
+    if validates or isinstance(info.get('ElectronAsarIntegrity'), dict):
+        integrity = info.setdefault('ElectronAsarIntegrity', {})
+        for name, digest in sorted(asar_hashes.items()):
+            integrity['Resources/' + name] = {'algorithm': 'SHA256', 'hash': digest}
+    info[SIGNED_MARKER] = marker
+    return info
+
+
+def is_macho(path):
+    try:
+        with Path(path).open('rb') as data:
+            head = data.read(8)
+    except OSError:
+        return False
+    if head[:4] in (b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe'):
+        return True
+    # Universal binaries; a Java class shares the magic but has a version above 30 where they count archs.
+    return head[:4] in (b'\xca\xfe\xba\xbe', b'\xca\xfe\xba\xbf') and len(head) == 8 and 0 < struct.unpack('>I', head[4:])[0] < 30
+
+
+def bundle_executable(path):
+    """True for the main executable of a nested .app or .framework, which signing the bundle covers."""
+    parent = path.parent
+    if parent.name == 'MacOS' and parent.parent.name == 'Contents' and parent.parent.parent.suffix == '.app':
+        return True
+    return (parent.parent.name == 'Versions' and parent.parent.parent.suffix == '.framework'
+            and path.name == parent.parent.parent.stem)
+
+
+def nested_code(app):
+    """Code inside the app to sign before the app itself, innermost first: every nested .app and
+    .framework and every other Mach-O file. Symlinks (a framework's Versions/Current) are skipped."""
+    items = []
+    for root, folders, files in os.walk(app / 'Contents'):
+        here = Path(root)
+        for name in list(folders):
+            if (here / name).is_symlink():
+                folders.remove(name)
+            elif Path(name).suffix in ('.app', '.framework'):
+                items.append(here / name)
+        for name in files:
+            path = here / name
+            if here == app / 'Contents/MacOS' or path.is_symlink() or bundle_executable(path):
+                continue
+            if is_macho(path):
+                items.append(path)
+    return sorted(items, key=lambda path: (-len(path.relative_to(app).parts), str(path)))
+
+
+def code_entitlements(path):
+    shown = subprocess.run(['codesign', '-d', '--entitlements', '-', '--xml', str(path)], capture_output=True)
+    return plistlib.loads(shown.stdout) if shown.returncode == 0 and shown.stdout.strip() else {}
+
+
+def codesign(args, log, timeout=900):
+    # A keychain that asks for access would wait for a click nobody makes; a timeout ends it.
+    try:
+        result = subprocess.run(['codesign', *args], stdin=subprocess.DEVNULL, stdout=log, stderr=log, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise Stop('codesign waited more than 15 minutes, probably for keychain access. Allow codesign to use'
+                   f' the signing key once (Keychain Access), then run again. Log: {log.name}')
+    if result.returncode:
+        raise Stop(f'codesign failed on {Path(args[-1]).name}. Over SSH it cannot use the login keychain'
+                   f' (errSecInternalComponent): run it through the LaunchAgent (launchctl kickstart'
+                   f' gui/<uid>/{AUTOUPDATE_LABEL}). Log: {log.name}')
+
+
+def sign_mac_app(app, signer, log):
+    """Sign the copy inside out with signer (SHA-1, name), without T3's team entitlements, and verify it."""
+    sha, name = signer
+    entitlements = strip_team_entitlements(code_entitlements(app))
+    run(['xattr', '-cr', str(app)], log=log)
+    # T3's provisioning profile grants its team's entitlements; this copy claims none of them.
+    (app / 'Contents/embedded.provisionprofile').unlink(missing_ok=True)
+    base = ['--force', '--sign', sha, '--options', 'runtime', '--timestamp=none']
+    work = Path(tempfile.mkdtemp(prefix='entitlements-'))
+    try:
+        for index, item in enumerate(nested_code(app)):
+            if item.suffix == '.app':
+                plist = work / f'{index}.plist'
+                plist.write_bytes(plistlib.dumps(strip_team_entitlements(code_entitlements(item))))
+                codesign([*base, '--entitlements', str(plist), str(item)], log)
+            else:
+                codesign([*base, '--preserve-metadata=entitlements', str(item)], log)
+        plist = work / 'app.plist'
+        plist.write_bytes(plistlib.dumps(entitlements))
+        codesign([*base, '--entitlements', str(plist), str(app)], log)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    verify_signed(app, log)
+    say(f'    Signed with {name.split(" (")[0]}')
+
+
+def verify_signed(app, log):
+    checked = subprocess.run(['codesign', '--verify', '--deep', '--strict', '--verbose=2', str(app)],
+                             stdout=log, stderr=log)
+    if checked.returncode:
+        raise Stop(f'The signed T3 Code failed codesign --verify --deep --strict. Log: {log.name}')
+
+
+def mac_copy(app, job):
+    """A copy of the app bundle to customize (ditto keeps its symlinks, as Squirrel's unpacking does)."""
+    target = job / 'signed' / app.path.name
+    target.parent.mkdir(parents=True)
+    run(['ditto', str(app.path), str(target)])
+    return InstalledApp.inspect(target, 'darwin')
+
+
+def finish_signed_app(app, signer, version, log):
+    """Record the rebuilt archives and this tool's marker in Info.plist, then sign the copy."""
+    info_path = app.path / 'Contents/Info.plist'
+    hashes = {path.name: asar_header_hash(path) for path in app.resources.glob('*.asar')}
+    validates = electron_fuses(app.path).get('EnableEmbeddedAsarIntegrityValidation') == '1'
+    marker = {'version': version, 'builtAt': time.strftime('%Y-%m-%dT%H:%M:%S')}
+    info_path.write_bytes(plistlib.dumps(signed_info(plistlib.loads(info_path.read_bytes()), hashes, marker, validates)))
+    step('Signing your customized T3 Code...')
+    sign_mac_app(app.path, signer, log)
+
+
+def tree_size(path):
+    """Bytes in a folder tree (an app bundle), symlinks counted as links."""
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            with contextlib.suppress(OSError):
+                total += os.lstat(os.path.join(root, name)).st_size
+    return total
+
+
+def zip_size(path):
+    """Unpacked bytes of a zip."""
+    with zipfile.ZipFile(path) as bundle:
+        return sum(item.file_size for item in bundle.infolist())
+
+
+def ensure_free_space(folder, needed, what):
+    """Stop before a copy that would fill the disk: needed bytes must be free where folder lives."""
+    folder = Path(folder)
+    while not folder.exists() and folder != folder.parent:
+        folder = folder.parent
+    free = shutil.disk_usage(folder).free
+    if free < needed:
+        raise Stop(f'Not enough free disk space to {what}: it needs {needed >> 20} MB on the volume of {folder},'
+                   f' {free >> 20} MB is free. T3 Code stays as it is; free some space and run again.')
+
+
+def build_signed_copy(args, app):
+    """cmd_build for the signed route: build the patched bundles for app (T3's own app, unpacked from
+    a zip), overlay them on a copy of it and sign the copy. Returns the build record; installing it
+    is install_signed_pending's."""
+    signer = signing_identity()
+    ensure_free_space(CACHE, SPACE_FACTOR_BUILD * tree_size(app.path), 'build the customized T3 Code')
+    stock_fingerprint = app.fingerprint()
+    recipe = recipe_hash()
+    DATA.mkdir(parents=True, exist_ok=True)
+    logs = CACHE / 'logs'
+    logs.mkdir(parents=True, exist_ok=True)
+    job = CACHE / 'work' / time.strftime('%Y%m%d-%H%M%S')
+    job.mkdir(parents=True)
+    with (logs / (job.name + '.log')).open('w', encoding='utf-8') as log:
+        say('Log: ' + log.name)
+        step('Reading your T3 Code...')
+        stock_root = mac_copy(app, job)
+        archive = Archive(stock_root.resources / 'app.asar')
+        try:
+            metadata = json.loads(archive.read('package.json'))
+        finally:
+            archive.close()
+        server = stock_root.resources / 'server.asar'
+        archive = Archive(server if server.is_file() else stock_root.resources / 'app.asar')
+        try:
+            config = read_public_config(archive)
+        finally:
+            archive.close()
+        version, commit = metadata['version'], metadata.get('t3codeCommitHash', '')
+        if 'nightly' not in version:
+            raise Stop(f'This is T3 Code {version}. The patches target T3 Code Nightly; install Nightly and run again.')
+        if not re.fullmatch(r'[0-9a-f]{7,40}', commit):
+            raise Stop('This application does not record its source commit, so it cannot be rebuilt exactly.')
+        say(f'    Nightly {version}, upstream commit {commit[:12]}')
+        if len(config) != len(PUBLIC_CONFIG):
+            say('    Note: could not read T3 Connect config from your app; sign-in may not work in this build.')
+        node_bin = ensure_node(log)
+        env = build_env(node_bin)
+        target = ensure_commit(commit, version, log)
+        ported = apply_patches(args, target, version, env, log)
+        head = git('rev-parse', 'HEAD').strip()
+        with build_rewrites_discarded():
+            build_bundles(env, version, stock_root.resources, config, log)
+        if git('rev-parse', 'HEAD').strip() != head:
+            raise Stop('The source checkout changed during the build.')
+        step('Assembling and verifying your customized app...')
+        overlay_app(stock_root, job, config)
+        finish_signed_app(stock_root, signer, version, log)
+        if app.fingerprint() != stock_fingerprint:
+            raise Stop("T3's own app changed during the build. Run again.")
+        if ported:
+            export_patches(target, version=version)
+            publish_port(args, version)
+        build_dir = DATA / 'builds' / f'{version}-{recipe_hash()}-{job.name}'
+        build_dir.mkdir(parents=True)
+        destination = build_dir / stock_root.path.name
+        shutil.move(str(stock_root.path), destination)
+        record = {'stock': stock_fingerprint, 'version': version, 'commit': target,
+                  'recipe': recipe_hash() if ported else recipe,
+                  'build': str(destination), 'connect': len(config) == len(PUBLIC_CONFIG),
+                  'builtAt': time.strftime('%Y-%m-%dT%H:%M:%S')}
+    prune()
+    shutil.rmtree(job, ignore_errors=True)
+    say(f'\nBuilt the customized T3 Code {version}; it installs once no thread works.')
+    return record
+
+
+def stock_archive(version):
+    return STOCK_ARCHIVES / f'{version}.zip'
+
+
+def zip_app(source, target):
+    """Zip an app bundle (or copy a zip) to target through a .partial file, so a stopped run never
+    leaves a half archive under the final name."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_name(target.name + '.partial')
+    if Path(source).suffix == '.zip':
+        shutil.copyfile(source, partial)
+    else:
+        run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(source), str(partial)])
+    os.replace(partial, target)
+    return target
+
+
+def keep_stock_archive(source, version):
+    """Keep T3's own app for version (a download zip, or the installed app while it is T3's) once."""
+    target = stock_archive(version)
+    return target if target.exists() else zip_app(source, target)
+
+
+def prune_stock_archives():
+    """Drop T3's own apps no build needs: kept are the installed copy's nightly (a rebuild starts
+    from it) and the one waiting to install. Runs after every signed run, also one that stopped."""
+    keep = {load(SIGNED_PENDING, {}).get('version')}
+    with contextlib.suppress(PlatformError):
+        keep.add((signed_marker(installed_app().path) or {}).get('version'))
+    for archive in STOCK_ARCHIVES.glob('*.zip*') if STOCK_ARCHIVES.exists() else ():
+        if archive.name.split('.zip')[0] not in keep or archive.name.endswith('.partial'):
+            archive.unlink()
+
+
+def build_signed_from(args, archive, version):
+    """Build the signed copy from T3's own app in archive; save it as the one waiting to install."""
+    ensure_free_space(CACHE, SPACE_FACTOR_BUILD * zip_size(archive), 'build the customized T3 Code')
+    job = CACHE / 'prebuild' / version
+    shutil.rmtree(job, ignore_errors=True)
+    job.mkdir(parents=True)
+    try:
+        run(['ditto', '-x', '-k', str(archive), str(job)])
+        bundles = list(job.glob('*.app'))
+        if len(bundles) != 1:
+            raise Stop(f'{archive.name} holds no single app.')
+        stock = InstalledApp.inspect(bundles[0], SYSTEM)
+        if bundle_version(stock.path) != version:
+            raise Stop(f'{archive.name} holds T3 Code {bundle_version(stock.path)}, not {version}.')
+        build_args = argparse.Namespace(app=None, fix=getattr(args, 'fix', None), resume=getattr(args, 'resume', False),
+                                        skip_checks=getattr(args, 'skip_checks', False), force=False, no_pull=True,
+                                        background=getattr(args, 'background', False))
+        record = signed_record(build_signed_copy(build_args, stock), archive)
+    finally:
+        shutil.rmtree(job, ignore_errors=True)
+    save(SIGNED_PENDING, record)
+    return record
+
+
+def signed_record(record, archive):
+    return {key: record[key] for key in BUILD_RECORD} | {'route': 'signed', 'stockArchive': str(archive)}
+
+
+def build_signed(args, app, stock=None):
+    """cmd_build on the signed route. With stock (a download, see prebuild): build it and return the
+    record. Else for the installed nightly: rebuild when the patches changed (or --force), then
+    install whatever waits."""
+    if stock:
+        return build_signed_copy(args, stock)
+    # No identity (the MacBook Air): stop before a zip of T3's app is kept for a build that cannot sign.
+    signing_identity()
+    marker = signed_marker(app.path)
+    version = bundle_version(app.path)
+    state, pending = load(STATE, {}), load(SIGNED_PENDING, {})
+    current = bool(marker) and on_signed_route(state) and state.get('recipe') == recipe_hash()
+    waiting = (pending.get('recipe') == recipe_hash() and Path(pending.get('build', '/-')).exists()
+               and (nightly_key(pending.get('version')) or ()) >= (nightly_key(version) or ()))
+    if not (args.force or args.resume) and (current or waiting):
+        install_signed_pending(background=getattr(args, 'background', False))
+        say('\nAlready up to date.' if current else f"\nThe customized T3 Code {pending['version']} waits to install.")
+        return False
+    if not marker:
+        archive = keep_stock_archive(app.path, version)
+    elif stock_archive(version).exists():
+        archive = stock_archive(version)
+    else:
+        raise Stop(f"No copy of T3's own {version} is kept to rebuild from. The next nightly T3 downloads"
+                   ' rebuilds the customization; until then this one stays.')
+    build_signed_from(args, archive, version)
+    install_signed_pending(background=getattr(args, 'background', False))
+    return True
+
+
+def install_decision(pending_version, installed_version, running, busy):
+    """What to do with a signed copy waiting to install: 'discard' it when it is older than the
+    installed app, 'install' while T3 Code is closed, 'quit' it first when no thread works, else 'wait'."""
+    if (nightly_key(pending_version) or ()) < (nightly_key(installed_version) or ()):
+        return 'discard'
+    if not running:
+        return 'install'
+    return 'wait' if busy else 'quit'
+
+
+def desktop_busy_threads():
+    """busy_threads for the desktop app's own server (~/.t3/userdata/statev2.sqlite, the file the
+    running app holds open). Called only while T3 Code runs, so a missing or unreadable projection
+    counts as busy: never quit an app whose threads cannot be checked."""
+    return busy_threads(server=True)
+
+
+def app_processes(app_path):
+    """(pid, ppid, command) of every process running from inside the app bundle."""
+    listing = subprocess.run(['ps', '-axo', 'pid=,ppid=,command='], capture_output=True, text=True).stdout
+    found = []
+    for line in listing.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[2].startswith(str(app_path) + '/Contents/'):
+            found.append((int(parts[0]), int(parts[1]), parts[2]))
+    return found
+
+
+def main_app_pids(app_path):
+    """The app itself, as opened from Finder, the Dock or `open` (its parent is launchd)."""
+    executable = str(app_path / 'Contents/MacOS' / app_path.stem)
+    return [pid for pid, ppid, command in app_processes(app_path)
+            if ppid == 1 and (command == executable or command.startswith(executable + ' '))]
+
+
+def wait_for_exit(app_path, seconds):
+    deadline = time.time() + seconds
+    while main_app_pids(app_path):
+        if time.time() >= deadline:
+            return False
+        time.sleep(1)
+    return True
+
+
+def quit_app(app_path, busy=desktop_busy_threads):
+    """Quit T3 Code as Cmd+Q does and wait until it and its helpers exit. Asks the app through Apple
+    Events first; SIGTERM (Electron quits on it too) only when that did not end it in time. Returns
+    the method that worked: 'osascript', 'SIGTERM' or 'SIGKILL'."""
+    method = 'osascript'
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+        # A first Apple Event to the app may wait on an Automation prompt nobody answers; the timeout ends it.
+        subprocess.run(['osascript', '-e', f'tell application id "{MAC_BUNDLE_ID}" to quit'],
+                       stdin=subprocess.DEVNULL, capture_output=True, timeout=QUIT_ASK_TIMEOUT)
+    if not wait_for_exit(app_path, QUIT_TIMEOUT):
+        method = 'SIGTERM'
+        signal_pids(main_app_pids(app_path), signal.SIGTERM)
+        if not wait_for_exit(app_path, QUIT_TIMEOUT):
+            method = 'SIGKILL'
+            kill_hung_app(app_path, busy)
+    # Its helpers and backend end with it; give them a moment.
+    for _ in range(15):
+        if not app_processes(app_path):
+            break
+        time.sleep(1)
+    return method
+
+
+def signal_pids(pids, sig):
+    for pid in pids:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, sig)
+
+
+def kill_hung_app(app_path, busy):
+    """End a T3 Code whose main thread answers neither the Apple Event nor SIGTERM. Seen on the
+    MacBook Pro: a newly signed copy blocks its main thread on the keychain prompt for "t3code Safe
+    Storage" until someone answers it, and both quit routes need that thread. Only while no thread
+    works, asked again here. The main process holds no state database (only the backend has
+    statev2.sqlite open), so the backend first gets SIGTERM and closes it itself; SQLite's WAL
+    survives a killed process anyway (a commit is in the WAL, an unfinished one rolls back)."""
+    if busy():
+        raise Stop(f'T3 Code did not quit within {2 * QUIT_TIMEOUT} s and threads work now; '
+                   'the customized app waits for the next run.')
+    main = main_app_pids(app_path)
+    signal_pids([pid for pid, _, _ in app_processes(app_path) if pid not in main], signal.SIGTERM)
+    deadline = time.time() + QUIT_TIMEOUT
+    while any(pid not in main for pid, _, _ in app_processes(app_path)) and time.time() < deadline:
+        time.sleep(1)
+    signal_pids(main, signal.SIGKILL)
+    if not wait_for_exit(app_path, QUIT_TIMEOUT):
+        raise Stop('T3 Code did not end even after SIGKILL; the customized app waits for the next run.')
+    time.sleep(5)  # helpers notice their parent is gone
+    signal_pids([pid for pid, _, _ in app_processes(app_path)], signal.SIGKILL)
+
+
+def install_signed_pending(background=False, busy=None):
+    """Install the signed copy that waits (signed-pending.json) once no thread works. True if it did.
+    The copy is verified and staged next to the app first; whether threads work is asked again right
+    before T3 Code quits, so a thread that started meanwhile is never cut off."""
+    busy = busy or desktop_busy_threads
+    pending = load(SIGNED_PENDING, {})
+    if not pending:
+        return False
+    build = Path(pending.get('build', '/-'))
+    app = installed_app()
+    if not build.exists() or install_decision(pending.get('version'), bundle_version(app.path), False, False) == 'discard':
+        SIGNED_PENDING.unlink(missing_ok=True)
+        return False
+    waiting = f"The customized T3 Code {pending['version']} waits to install: threads still work. The next run tries again."
+    if main_app_pids(app.path) and busy():
+        say(waiting)
+        return False
+    ensure_free_space(app.path.parent, SPACE_FACTOR_INSTALL * tree_size(build), 'install the customized T3 Code')
+    (CACHE / 'logs').mkdir(parents=True, exist_ok=True)
+    with (CACHE / 'logs/signed-install.log').open('a') as log:
+        verify_signed(build, log)
+        if not signed_marker(app.path) and not any(ROLLBACK.glob('*.zip')):
+            step(f"Keeping T3's own app in {ROLLBACK} (ditto -x -k <zip> /Applications puts it back)...")
+            zip_app(app.path, ROLLBACK / f'{bundle_version(app.path)}.zip')
+        staged = stage_mac_app(build, app.path, log)
+    quit_method = None
+    try:
+        running = bool(main_app_pids(app.path))
+        decision = install_decision(pending.get('version'), bundle_version(app.path), running, busy() if running else [])
+        if decision == 'wait':
+            say(waiting)
+            return False
+        if decision == 'quit':
+            step('No thread works: quitting T3 Code to install its customized version...')
+            quit_method = quit_app(app.path, busy)
+            say(f'    T3 Code quit ({quit_method}).')
+        swap_mac_app(staged, app.path)
+    finally:
+        shutil.rmtree(staged, ignore_errors=True)
+        if quit_method:
+            # Whatever happened after the quit, T3 Code opens again: the new copy, or the app it had.
+            recover_mac_app(app.path)
+            subprocess.run(['open', str(app.path)], check=False)
+    # Only now: a stock update Squirrel staged would replace the copy on its next quit.
+    SHIPIT_STATE.unlink(missing_ok=True)
+    if build.parent.parent == DATA / 'builds':
+        shutil.rmtree(build.parent, ignore_errors=True)
+    fingerprint = installed_app(str(app.path)).fingerprint()
+    save(STATE, {'stock': fingerprint, **{key: pending.get(key) for key in BUILD_RECORD},
+                 'build': str(app.path), 'route': 'signed', 'stockArchive': pending.get('stockArchive')})
+    SIGNED_PENDING.unlink(missing_ok=True)
+    # The launcher route's records: T3's updater must never hand a download to Squirrel again.
+    PREBUILT.unlink(missing_ok=True)
+    for launcher in dict.fromkeys((MAC_LAUNCHER, MAC_LEGACY_LAUNCHER)):
+        shutil.rmtree(launcher, ignore_errors=True)
+    prune_stock_archives()
+    message = f"T3 Code {pending['version']} with the customization is installed" + (
+        f' and reopened (quit via {quit_method}).' if quit_method else '; open it as usual.') + (
+        # A new signature: macOS asks before the app reads its key, and the app hangs until answered.
+        ' If macOS asks for the login keychain password for "t3code Safe Storage", enter it and choose Always Allow.')
+    if background:
+        notify(LAUNCHER_NAME, message)
+    else:
+        say(message)
+    return True
+
+
+def staged_app(installed):
+    return installed.with_name('.' + installed.name + '.new')
+
+
+def previous_app(installed):
+    return installed.with_name('.' + installed.name + '.old')
+
+
+def stage_mac_app(new, installed, log):
+    """Copy the new app next to the installed one (same volume, so the swap is two renames) and verify it there."""
+    staged = staged_app(installed)
+    shutil.rmtree(staged, ignore_errors=True)
+    try:
+        run(['ditto', str(new), str(staged)], log=log)
+        verify_signed(staged, log)
+    except BaseException:
+        shutil.rmtree(staged, ignore_errors=True)
+        raise
+    return staged
+
+
+def swap_mac_app(staged, installed):
+    """Put the staged app in place with two renames. T3 Code is missing only between them; a run
+    killed there leaves the previous app as .old, and recover_mac_app puts it back."""
+    old = previous_app(installed)
+    shutil.rmtree(old, ignore_errors=True)
+    os.rename(installed, old)
+    try:
+        os.rename(staged, installed)
+    except BaseException:
+        if installed.exists():
+            shutil.rmtree(installed, ignore_errors=True)
+        os.rename(old, installed)
+        raise
+    shutil.rmtree(old, ignore_errors=True)
+    subprocess.run(['/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister',
+                    '-f', str(installed)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def recover_mac_app(installed):
+    """Undo a swap a run did not finish: the previous app back when T3 Code is missing, leftovers removed."""
+    installed = Path(installed)
+    old = previous_app(installed)
+    if not installed.exists() and old.exists():
+        os.rename(old, installed)
+        say(f'Put back {installed.name}: a previous run stopped while it replaced the app.')
+    shutil.rmtree(old, ignore_errors=True)
+    shutil.rmtree(staged_app(installed), ignore_errors=True)
+
+
+def recover_mac_apps():
+    """recover_mac_app for every place T3 Code may be installed; at the start of each locked run."""
+    configured = load(CONFIG / 'config.json', {}).get('app')
+    for path in dict.fromkeys(([Path(configured)] if configured else []) + app_candidates(HOME, 'darwin')):
+        recover_mac_app(path)
+
+
+def on_signed_route(state=None):
+    """True on macOS once this Mac runs this tool's signed copy (state.json, written by its install)."""
+    return MAC and (load(STATE, {}) if state is None else state).get('route') == 'signed'
+
+
+def signed_status(app):
+    """status lines for a Mac on the signed route."""
+    state, pending = load(STATE, {}), load(SIGNED_PENDING, {})
+    say('Installed T3 Code:  ' + f'{app.path} ({bundle_version(app.path)}, customized copy signed on this Mac)')
+    say('Customized build:   ' + (f"{state.get('version')} (built {state.get('builtAt')})" if on_signed_route(state)
+                                  else 'unknown (no record)')
+        + ('; patches changed since, the next update rebuilds it' if state.get('recipe') not in (None, recipe_hash()) else ''))
+    if pending:
+        say(f"Waiting to install: {pending.get('version')} (installs once no thread works)")
+    say('Background updates: ' + ('on' if AUTOUPDATE_PLIST.exists() else f'off ({NAME} autoupdate on)'))
+    ios_state = load(IOS_STATE)
+    if ios_state:
+        say(ios_status_line(ios_state, bundle_version(app.path), None))
+
+
 def prebuild(args):
     """Build the customization for the nightly T3's updater downloaded, before it is installed, and
     name it in prebuilt.json. True if it built one; a failure raises and names nothing."""
@@ -3520,6 +4175,11 @@ def prebuild(args):
     # The same run may have rebuilt an older installed nightly with the patch set of its day
     # (use_older_recipe); a downloaded nightly is always newer, so it takes this repo's.
     use_recipe(REPO)
+    pending = load(SIGNED_PENDING, {})
+    if (pending.get('version') == version and pending.get('recipe') == recipe_hash()
+            and Path(pending.get('build', '/-')).exists()):
+        install_signed_pending(background=getattr(args, 'background', False))
+        return False
     done = load(PREBUILT, {})
     if (done.get('version') == version and done.get('recipe') == recipe_hash()
             and done.get('build') and Path(done['build']).exists()):
@@ -3540,10 +4200,20 @@ def prebuild(args):
             raise Stop(f'The downloaded update is {release["version"]}, not {version}.')
         build_args = argparse.Namespace(app=None, fix=getattr(args, 'fix', None), resume=False, skip_checks=False,
                                         force=False, no_pull=True, background=getattr(args, 'background', False))
+        # Fork: T3's updater must not hand this download to Squirrel, so no prebuilt.json for it.
+        signed = signed_route(stock)
+        if signed:
+            signing_identity()  # before a zip of T3's app is kept for a build that cannot sign
+        kept = keep_stock_archive(archive, version) if signed else None
         record = cmd_build(build_args, stock=stock)
-        save(PREBUILT, {key: record[key] for key in BUILD_RECORD} | {'identity': release})
+        if signed:
+            save(SIGNED_PENDING, signed_record(record, kept))
+        else:
+            save(PREBUILT, {key: record[key] for key in BUILD_RECORD} | {'identity': release})
     finally:
         shutil.rmtree(job, ignore_errors=True)
+    if signed:
+        install_signed_pending(background=getattr(args, 'background', False))
     return True
 
 
@@ -3562,6 +4232,12 @@ def prebuild_quietly(args):
         notify(LAUNCHER_NAME, f'The downloaded T3 Code update waits: its customization did not build ({first}).'
                ' T3 Code stays as it is.')
         return False
+    if on_signed_route() or (MAC and SIGNED_PENDING.exists()):
+        # The signed route installs it itself (install_signed_pending says so) or waits for idle threads.
+        if SIGNED_PENDING.exists():
+            notify(LAUNCHER_NAME, f"T3 Code {load(SIGNED_PENDING, {}).get('version')} is built with the"
+                   ' customization. It installs once no thread works.')
+        return True
     notify(LAUNCHER_NAME, f"T3 Code {load(PREBUILT, {}).get('version')} is ready with the customization."
            ' It installs when you quit T3 Code.')
     return True
@@ -3616,7 +4292,7 @@ def cmd_update(args):
     try:
         if MAC and args.background and not app_settled(installed_app(args.app)):
             raise Stop('T3 Code kept changing for 15 minutes; the next check tries again.')
-        if cmd_build(args) and args.background:
+        if cmd_build(args) and args.background and not on_signed_route() and not SIGNED_PENDING.exists():
             # An unattended port already said where its PR is (publish_port).
             ported = uncommitted_patches() and not getattr(args, 'agent_ported', False)
             notify(LAUNCHER_NAME, 'Rebuilt for ' + load(STATE, {}).get('version', 'the latest Nightly')
@@ -3644,7 +4320,13 @@ def cmd_update(args):
         if args.background:
             first = str(stop).strip().splitlines()[0]
             notify(LAUNCHER_NAME, f'Update failed: {first} Run {NAME} in a terminal.')
+        # Fork: an install that stopped after the swap still changed the installed nightly; iOS follows it.
+        if MAC and args.background and args.ios and on_signed_route():
+            update_ios(args)
         raise
+    finally:
+        if MAC:
+            prune_stock_archives()
 
 
 def ios_behind(ios_state, version):
@@ -3654,9 +4336,18 @@ def ios_behind(ios_state, version):
     return ios_state.get('version') != version or ios_state.get('recipe') != ios_recipe_hash()
 
 
+def ios_version():
+    """The nightly the iOS app follows: the customized desktop build. On the signed route that is the
+    app installed now, never a copy that waits to install."""
+    if on_signed_route():
+        with contextlib.suppress(PlatformError):
+            return bundle_version(installed_app().path)
+    return load(STATE, {}).get('version')
+
+
 def ios_needs_build():
     """True when the iOS app lags the customized desktop build: its nightly or its patch set."""
-    built = load(STATE, {}).get('version')
+    built = ios_version()
     return bool(built) and IOS_CONFIG.exists() and ios_behind(load(IOS_STATE, {}), built)
 
 
@@ -3667,7 +4358,7 @@ def update_ios(args):
         return
     # One upload per nightly and patch set: cmd_ios records the attempt once its build worked, so an
     # upload that fails notifies once, not every hour; a build that fails before that tries again.
-    version = load(STATE, {}).get('version')
+    version = ios_version()
     attempt = load(IOS_ATTEMPT, {})
     if attempt.get('version') == version and attempt.get('recipe') == ios_recipe_hash():
         return
@@ -3793,6 +4484,8 @@ def _status():
             return  # A headless server without a desktop app.
         say()
     app = installed_app()
+    if MAC and signed_marker(app.path):
+        return signed_status(app)
     state = load(STATE, {})
     target, notice = launch_target()
     say('Installed T3 Code:  ' + str(app.path) + (f' ({bundle_version(app.path)})' if MAC else ''))
@@ -3907,12 +4600,25 @@ def report_open_prs(run=subprocess.run):
         say(f'Open PRs: skipped ({error.__class__.__name__}: {error}).')
 
 
+def refuse_on_signed_route(command):
+    """on/off switch between the launcher's build and T3's own app; the signed copy has no such switch."""
+    if on_signed_route():
+        archives = sorted(ROLLBACK.glob('*.zip')) if ROLLBACK.exists() else []
+        back = (f'quit it and run: ditto -x -k "{archives[-1]}" /Applications' if archives
+                else "reinstall T3 Code Nightly from t3.codes")
+        raise Stop(f'{NAME} {command} does nothing on this Mac: T3 Code in /Applications is the customized copy'
+                   f' signed here, with no stock app beside it to switch to. For T3\'s own app, {back}'
+                   f' and run {NAME} autoupdate off.')
+
+
 def cmd_on(args):
+    refuse_on_signed_route('on')
     DISABLED.unlink(missing_ok=True)
     say('Customization on. Quit T3 Code fully and reopen it.')
 
 
 def cmd_off(args):
+    refuse_on_signed_route('off')
     DATA.mkdir(parents=True, exist_ok=True)
     DISABLED.touch()
     say('Stock T3 Code on the next launch. Quit it fully and reopen it.')
@@ -4835,6 +5541,8 @@ def main():
         lock.flush()
         global CHECKOUT_LOCK
         CHECKOUT_LOCK = lock
+        if MAC:
+            recover_mac_apps()  # fork: a signed install killed between its two renames
         if args.command not in ('build', 'update', 'server', 'port'):
             return handler(args)
         try:

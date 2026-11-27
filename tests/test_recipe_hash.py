@@ -77,6 +77,8 @@ REVIEWED_REACHED = {
     'publish_port': 'commits and opens the port PR',
     'publish_cover': 'moves covered-nightly.txt on main after a clean apply; touches no build input',
     'keychain_reachable': 'stops an iOS build early in a session that cannot sign; produces nothing',
+    'install_signed_pending': 'installs a finished, verified signed macOS app while no thread works; builds nothing',
+    'prune_stock_archives': "deletes zips of T3's own app that no build or install still needs; builds nothing",
 }
 
 
