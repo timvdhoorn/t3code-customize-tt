@@ -36,7 +36,9 @@ run the same patches.
   ("Unattended updates" in [fork-changes.md](fork-changes.md)).
 - **Never interrupt a running thread.** The Mac app is quit and reopened only to install the own
   signed app ("Own signed macOS app" in [fork-changes.md](fork-changes.md)), and only while
-  `busy_threads` finds no work; otherwise the build waits in `signed-pending.json` for a later run. A
+  `busy_threads` finds no work in the desktop's `~/.t3/userdata/statev2.sqlite`, asked again right
+  before the quit (missing or unreadable counts as busy while the app runs); otherwise the build
+  waits in `signed-pending.json` for a later run. A
   T3 server restarts only in `server` and `server-off`, once per run, and only while it is idle:
   `busy_threads` finds no live work in `~/.t3/userdata/statev2.sqlite`, by the rules the server
   itself uses to recover work after a restart: a run in `orchestration_v2_projection_runs` that is
@@ -91,7 +93,7 @@ run the same patches.
     updated; `install_mac_launcher` removes it, and none may remain.
   - Mac on the own signed app (nightly 5332 and later, whose inspector fuse is off): the updater
     still downloads to `pending/`, and the same run builds from the zip, signs the result and installs
-    it itself while no thread works (quit, replace, reopen), then builds iOS on the MacBook Pro. No
+    it itself while no thread works (quit via Apple Events, swap by two renames, reopen), then builds iOS on the MacBook Pro for the nightly actually installed. `on` and `off` refuse on this route; `launch` opens the installed copy. No
     `prebuilt.json` is written, so Squirrel never installs T3's stock app over it. A Mac without a
     "Developer ID Application" identity in its login keychain stops with a message and stays on
     its current app.

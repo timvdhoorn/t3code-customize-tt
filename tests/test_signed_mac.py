@@ -184,12 +184,14 @@ class SignedFlowTest(unittest.TestCase):
                    patch.object(customize, 'installed_app', side_effect=self.current_app),
                    patch.object(customize, 'signed_route', return_value=True),
                    patch.object(customize, 'verify_signed'),
+                   patch.object(customize, 'signing_identity', return_value=(DEV_ID, 'Developer ID Application: X')),
                    patch.object(customize, 'recipe_hash', return_value='recipe'),
                    patch.object(customize, 'say'), patch.object(customize, 'notify'), patch.object(customize, 'step')]
         for item in patches:
             item.start()
             self.addCleanup(item.stop)
         self.running, self.busy, self.opened, self.quits = False, [], [], []
+        self.fail_stage = False
 
     def current_app(self, explicit=None):
         return customize.InstalledApp.inspect(self.installed.path, 'darwin')
@@ -200,6 +202,11 @@ class SignedFlowTest(unittest.TestCase):
             zipfile.ZipFile(command[3]).extractall(command[4])
         elif command[:3] == ['ditto', '-c', '-k']:
             Path(command[-1]).write_bytes(b'zip of ' + command[-2].encode())
+        elif command[0] == 'ditto' and len(command) == 3:
+            if self.fail_stage:
+                Path(command[2], 'Contents').mkdir(parents=True)  # a half copy
+                raise customize.Stop('ditto failed')
+            shutil.copytree(command[1], command[2], symlinks=True)
         elif command[:2] == ['open', str(self.installed.path)]:
             self.opened.append(command[1])
 
@@ -235,6 +242,7 @@ class SignedFlowTest(unittest.TestCase):
     def quit(self, app_path):
         self.quits.append(app_path)
         self.running = False
+        return 'osascript'
 
     def release(self):
         return make_app(self.tmp / 'release', NEXT, contents=b'{"v":2}', executable=b'exe2')
@@ -283,6 +291,163 @@ class SignedFlowTest(unittest.TestCase):
         self.assertEqual(self.quits, [self.installed.path])
         self.assertEqual(self.opened, [str(self.installed.path)])
         self.assertFalse(customize.SHIPIT_STATE.exists())
+
+    # --- install safety (fix round on PR #158) ---
+
+    def pending(self):
+        """A signed copy of the next nightly waiting to install, as prebuild leaves it."""
+        archive = download(self.caches, self.release())
+        stock = customize.InstalledApp.inspect(self.tmp / 'release' / APP, 'darwin')
+        record = customize.signed_record(self.built(None, stock), archive)
+        customize.save(customize.SIGNED_PENDING, record)
+        return record
+
+    def install_now(self, busy=None, rename=None):
+        with patch.object(customize, 'run', side_effect=self.mac_tools), \
+                patch.object(customize.subprocess, 'run', side_effect=self.mac_tools), \
+                patch.object(customize, 'main_app_pids', side_effect=lambda app: [42] if self.running else []), \
+                patch.object(customize, 'quit_app', side_effect=self.quit), \
+                patch.object(customize.os, 'rename', side_effect=rename or customize.os.rename):
+            return customize.install_signed_pending(busy=busy)
+
+    def leftovers(self):
+        return sorted(p.name for p in self.installed.path.parent.iterdir() if p.name.startswith('.'))
+
+    def test_a_running_app_without_a_projection_to_check_counts_as_busy(self):
+        self.pending()
+        self.running = True
+        with patch.object(customize, 'STATE_DB', self.tmp / 'missing/statev2.sqlite'):
+            self.assertTrue(customize.desktop_busy_threads())
+            self.assertFalse(self.install_now())
+        self.assertEqual((self.quits, customize.bundle_version(self.installed.path)), ([], CURRENT))
+        self.assertTrue(customize.SIGNED_PENDING.exists())
+
+    def test_a_thread_that_starts_while_the_copy_is_staged_stops_the_quit(self):
+        self.pending()
+        self.running = True
+        answers = iter([[], ['A thread that just started']])
+        self.assertFalse(self.install_now(busy=lambda: next(answers)))
+        self.assertEqual((self.quits, customize.bundle_version(self.installed.path)), ([], CURRENT))
+        self.assertTrue(customize.SIGNED_PENDING.exists())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_failed_staging_leaves_the_app_untouched(self):
+        self.pending()
+        self.fail_stage = True
+        with self.assertRaises(customize.Stop):
+            self.install_now()
+        self.assertEqual(customize.bundle_version(self.installed.path), CURRENT)
+        self.assertEqual(self.leftovers(), [])
+
+    def failing_second_rename(self):
+        real, calls = customize.os.rename, []
+
+        def rename(source, target):
+            calls.append(source)
+            if len(calls) == 2:
+                Path(target, 'Contents').mkdir(parents=True)  # what a half move would leave
+                raise OSError('rename failed')
+            return real(source, target)
+        return rename
+
+    def test_a_failed_swap_puts_the_previous_app_back(self):
+        self.pending()
+        with self.assertRaises(OSError):
+            self.install_now(rename=self.failing_second_rename())
+        self.assertEqual(customize.bundle_version(self.installed.path), CURRENT)
+        self.assertEqual(self.leftovers(), [])
+        self.assertTrue(customize.SIGNED_PENDING.exists())
+
+    def test_a_failure_after_the_quit_reopens_the_app_and_keeps_shipit_state(self):
+        self.pending()
+        self.running = True
+        self.caches.joinpath('ShipIt').mkdir(parents=True)
+        customize.SHIPIT_STATE.write_text('{}')
+        with self.assertRaises(OSError):
+            self.install_now(busy=lambda: [], rename=self.failing_second_rename())
+        self.assertEqual(self.quits, [self.installed.path])
+        self.assertEqual(self.opened, [str(self.installed.path)])
+        self.assertEqual(customize.bundle_version(self.installed.path), CURRENT)
+        self.assertTrue(customize.SHIPIT_STATE.exists())
+
+    def test_a_run_killed_between_the_two_renames_is_recovered_by_the_next(self):
+        old = customize.previous_app(self.installed.path)
+        staged = customize.staged_app(self.installed.path)
+        staged.mkdir()
+        self.installed.path.rename(old)
+        with patch.object(customize, 'CONFIG', self.tmp / 'config'), \
+                patch.object(customize, 'app_candidates', return_value=[self.installed.path]):
+            customize.recover_mac_apps()
+        self.assertEqual(customize.bundle_version(self.installed.path), CURRENT)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_quits_through_apple_events_and_falls_back_to_sigterm(self):
+        commands, killed = [], []
+        with patch.object(customize.subprocess, 'run', side_effect=lambda command, **kw: commands.append(command)), \
+                patch.object(customize, 'app_processes', return_value=[]), \
+                patch.object(customize.time, 'sleep'), patch.object(customize, 'QUIT_TIMEOUT', 0):
+            with patch.object(customize, 'main_app_pids', side_effect=[[], []]):
+                self.assertEqual(customize.quit_app(self.installed.path), 'osascript')
+            self.assertEqual(commands[0][:2], ['osascript', '-e'])
+            self.assertIn('com.t3tools.t3code', commands[0][2])
+            with patch.object(customize, 'main_app_pids', side_effect=[[42], [42], []]), \
+                    patch.object(customize.os, 'kill', side_effect=lambda pid, sig: killed.append((pid, sig))):
+                self.assertEqual(customize.quit_app(self.installed.path), 'SIGTERM')
+        self.assertEqual(killed, [(42, customize.signal.SIGTERM)])
+
+    def test_without_a_signing_identity_no_zip_of_t3s_app_is_kept(self):
+        download(self.caches, self.release())
+        stale = self.data / 'stock' / '0.1.0-nightly.20260101.1.zip'
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(b'old')
+        with patch.object(customize, 'signing_identity', side_effect=customize.Stop('no identity')), \
+                patch.object(customize, 'run', side_effect=self.mac_tools):
+            with self.assertRaises(customize.Stop):
+                customize.prebuild(argparse.Namespace(app=None, fix=None, background=True))
+        self.assertFalse(customize.stock_archive(NEXT).exists())
+        customize.prune_stock_archives()
+        self.assertEqual(list((self.data / 'stock').iterdir()), [])
+
+    def test_prune_keeps_the_installed_and_the_waiting_nightly(self):
+        self.pending()
+        for version in (CURRENT, NEXT, '0.1.0-nightly.20260101.1'):
+            customize.stock_archive(version).parent.mkdir(parents=True, exist_ok=True)
+            customize.stock_archive(version).write_bytes(b'zip')
+        customize.prune_stock_archives()
+        self.assertEqual(sorted(p.name for p in (self.data / 'stock').iterdir()), [NEXT + '.zip'])
+
+    def test_on_and_off_refuse_and_launch_opens_the_copy_on_the_signed_route(self):
+        self.data.mkdir(parents=True)
+        customize.save(customize.STATE, {'route': 'signed', 'version': CURRENT})
+        with patch.object(customize, 'DISABLED', self.data / 'disabled'):
+            for command in (customize.cmd_on, customize.cmd_off):
+                with self.assertRaises(customize.Stop) as stop:
+                    command(argparse.Namespace())
+                self.assertIn('customized copy', str(stop.exception))
+            self.assertFalse((self.data / 'disabled').exists())
+        commands = []
+        with patch.object(customize.subprocess, 'run', side_effect=lambda command, **kw: commands.append(command)):
+            customize.cmd_launch(argparse.Namespace(rest=['--', 'x']))
+        self.assertEqual(commands, [['open', '-a', str(self.installed.path), '--args', 'x']])
+
+    def test_ios_follows_the_installed_nightly_not_the_waiting_one(self):
+        self.pending()
+        customize.save(customize.STATE, {'route': 'signed', 'version': CURRENT})
+        self.assertEqual(customize.ios_version(), CURRENT)
+
+    def test_ios_still_builds_after_an_install_stopped_past_the_swap(self):
+        self.data.mkdir(parents=True, exist_ok=True)
+        customize.save(customize.STATE, {'route': 'signed', 'version': CURRENT})
+        shutil.rmtree(self.installed.path)
+        self.installed = make_app(self.tmp / 'Applications', NEXT, contents=b'{"v":2}', executable=b'exe2')
+        args = argparse.Namespace(app=None, fix=None, background=True, ios=True)
+        with patch.object(customize, 'app_settled', return_value=True), \
+                patch.object(customize, 'cmd_build', side_effect=customize.Stop('quit failed')), \
+                patch.object(customize, 'update_ios') as update_ios:
+            with self.assertRaises(customize.Stop):
+                customize.cmd_update(args)
+        update_ios.assert_called_once_with(args)
+        self.assertEqual(customize.ios_version(), NEXT)
 
 
 if __name__ == '__main__':
