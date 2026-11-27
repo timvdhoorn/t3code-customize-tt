@@ -18,4 +18,3 @@ What is live, what is in progress and what is open. Finished work leaves this pa
 
 ## Open
 - Issue #152: choose a new macOS hook (own signed build, re-signed app, or wait for upstream).
-- Upstream closed pingdotgg/t3code#16699 unmerged; keeping the child-threads patch waits for Tim's confirmation.
