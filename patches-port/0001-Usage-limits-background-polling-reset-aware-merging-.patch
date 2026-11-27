@@ -27,10 +27,10 @@ Subject: [PATCH 1/2] Usage limits: background polling, reset-aware merging and
  19 files changed, 1841 insertions(+), 102 deletions(-)
 
 diff --git a/apps/server/src/provider/CodexProvider.ts b/apps/server/src/provider/CodexProvider.ts
-index 63154f4e99..bd32a81ba2 100644
+index 83d8a7649e..7e943c48db 100644
 --- a/apps/server/src/provider/CodexProvider.ts
 +++ b/apps/server/src/provider/CodexProvider.ts
-@@ -63,6 +63,7 @@ const isCodexAppServerSpawnError = Schema.is(CodexErrors.CodexAppServerSpawnErro
+@@ -67,6 +67,7 @@ const isCodexAppServerSpawnError = Schema.is(CodexErrors.CodexAppServerSpawnErro
  
  type CodexRateLimitsProbe =
    | {
@@ -38,7 +38,7 @@ index 63154f4e99..bd32a81ba2 100644
        readonly snapshot: CodexRateLimitSnapshot;
        readonly rateLimitsByLimitId?:
          | Readonly<Record<string, CodexRateLimitSnapshot>>
-@@ -709,15 +710,20 @@ const readCodexRateLimits = (
+@@ -713,15 +714,20 @@ const readCodexRateLimits = (
    deadlineMs: number,
  ) =>
    withCodexDiscoveryDeadline(client.request("account/rateLimits/read", null), deadlineMs).pipe(
@@ -68,7 +68,7 @@ index 63154f4e99..bd32a81ba2 100644
      ),
      Effect.catch((error) =>
        Effect.logDebug("Codex rate-limit read failed.", { cause: error }).pipe(
-@@ -1145,7 +1151,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
+@@ -1162,7 +1168,7 @@ export const checkCodexProviderStatus = Effect.fn("checkCodexProviderStatus")(fu
              snapshot: snapshot.rateLimits.snapshot,
              rateLimitsByLimitId: snapshot.rateLimits.rateLimitsByLimitId,
              resetCredits: snapshot.rateLimits.resetCredits,
@@ -78,10 +78,10 @@ index 63154f4e99..bd32a81ba2 100644
  
    return buildServerProvider({
 diff --git a/apps/server/src/provider/Drivers/ClaudeDriver.ts b/apps/server/src/provider/Drivers/ClaudeDriver.ts
-index 83a63f0439..a05a160a93 100644
+index e97a99881c..95a2a278d5 100644
 --- a/apps/server/src/provider/Drivers/ClaudeDriver.ts
 +++ b/apps/server/src/provider/Drivers/ClaudeDriver.ts
-@@ -158,6 +158,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
+@@ -160,6 +160,11 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
      });
  
      const scopedLimitNames = yield* makeClaudeScopedLimitNames;
@@ -93,7 +93,7 @@ index 83a63f0439..a05a160a93 100644
      // The SDK's user source is the host's home, not a custom one; same rule as the adapter.
      const customHome =
        effectiveConfig.homePath.trim().length > 0 ||
-@@ -287,11 +292,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
+@@ -289,11 +294,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
                catalog,
                scopedLimitNames,
                (version) =>
@@ -106,7 +106,7 @@ index 83a63f0439..a05a160a93 100644
              ),
            ),
            Effect.tap((provider) =>
-@@ -322,6 +323,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
+@@ -324,6 +325,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
          ),
        checkProvider,
        invalidateUsageCache: Cache.invalidateAll(capabilitiesProbeCache),
@@ -168,7 +168,7 @@ index 2b2842c080..34462787b0 100644
          resolveMaintenance().pipe(
            Effect.flatMap((maintenanceCapabilities) =>
 diff --git a/apps/server/src/provider/ProviderRegistry.test.ts b/apps/server/src/provider/ProviderRegistry.test.ts
-index 31ce877de6..70fca330cb 100644
+index e6b47bcf72..f2ce09ceea 100644
 --- a/apps/server/src/provider/ProviderRegistry.test.ts
 +++ b/apps/server/src/provider/ProviderRegistry.test.ts
 @@ -670,7 +670,11 @@ it.layer(
@@ -1545,7 +1545,7 @@ index 5268523320..3dee33a461 100644
    return windows.reduce<string | null>(
      (latest, window) =>
 diff --git a/apps/server/src/usage/cliproxyApi.ts b/apps/server/src/usage/cliproxyApi.ts
-index 6393da96d1..b0396f40fc 100644
+index 3d5cc0ea0f..6ad29e5431 100644
 --- a/apps/server/src/usage/cliproxyApi.ts
 +++ b/apps/server/src/usage/cliproxyApi.ts
 @@ -322,6 +322,7 @@ const HUB_PROVIDERS = new Map<string, HubProvider>([
@@ -1557,7 +1557,7 @@ index 6393da96d1..b0396f40fc 100644
            }).limits,
          };
 diff --git a/packages/contracts/src/providerUsageLimits.ts b/packages/contracts/src/providerUsageLimits.ts
-index 342aa2660c..e252269966 100644
+index d8c7d6feeb..da9d2a582e 100644
 --- a/packages/contracts/src/providerUsageLimits.ts
 +++ b/packages/contracts/src/providerUsageLimits.ts
 @@ -17,8 +17,18 @@ export const ServerProviderUsageWindow = Schema.Struct({
@@ -1580,10 +1580,10 @@ index 342aa2660c..e252269966 100644
  });
  export type ServerProviderUsageWindow = typeof ServerProviderUsageWindow.Type;
 diff --git a/packages/provider-core/src/server/managedProvider.test.ts b/packages/provider-core/src/server/managedProvider.test.ts
-index 0eccada27c..e8b026488e 100644
+index 953548303f..dad3a5d1b3 100644
 --- a/packages/provider-core/src/server/managedProvider.test.ts
 +++ b/packages/provider-core/src/server/managedProvider.test.ts
-@@ -128,6 +128,7 @@ function layerProviderHost(input: {
+@@ -129,6 +129,7 @@ function layerProviderHost(input: {
  }
  
  const layerAlwaysRunTest = layerProviderHost({ runBackgroundWork: true });
@@ -1591,7 +1591,7 @@ index 0eccada27c..e8b026488e 100644
  
  const enrichedSnapshotSecond: ServerProvider = {
    ...refreshedSnapshotSecond,
-@@ -777,12 +778,19 @@ describe("makeManagedServerProvider", () => {
+@@ -827,12 +828,19 @@ describe("makeManagedServerProvider", () => {
          assert.deepStrictEqual(update?.usageLimits, {
            checkedAt: "2026-04-10T00:05:00.000Z",
            windows: [
@@ -1612,7 +1612,7 @@ index 0eccada27c..e8b026488e 100644
                resetsAt: "2026-04-17T00:00:00.000Z",
              },
            ],
-@@ -871,12 +879,16 @@ describe("makeManagedServerProvider", () => {
+@@ -921,12 +929,16 @@ describe("makeManagedServerProvider", () => {
            Effect.map((chunk) => Array.from(chunk)[0]!),
          );
          assert.deepStrictEqual(enriched.models, enrichedSnapshot.models);
@@ -1631,7 +1631,7 @@ index 0eccada27c..e8b026488e 100644
          assert.strictEqual(refreshed.auth.workspaceId, "ws-a");
          assert.strictEqual(refreshed.auth.label, clearPlan ? undefined : "tier-2");
  
-@@ -967,7 +979,13 @@ describe("makeManagedServerProvider", () => {
+@@ -1017,7 +1029,13 @@ describe("makeManagedServerProvider", () => {
          assert.strictEqual((yield* provider.getSnapshot).auth.label, undefined);
          const refreshed = yield* provider.refresh;
          assert.strictEqual(refreshed.auth.label, undefined);
@@ -1646,7 +1646,7 @@ index 0eccada27c..e8b026488e 100644
        }),
      ).pipe(Effect.provide(layerAlwaysRunTest)),
    );
-@@ -1008,15 +1026,21 @@ describe("makeManagedServerProvider", () => {
+@@ -1058,15 +1076,21 @@ describe("makeManagedServerProvider", () => {
          const partial = yield* provider.getSnapshot;
          assert.deepStrictEqual(partial.usageLimits, {
            checkedAt: "2026-04-10T00:00:02.000Z",
@@ -1671,7 +1671,7 @@ index 0eccada27c..e8b026488e 100644
  
          const completeLimits = {
            checkedAt: "2026-04-10T00:00:04.000Z",
-@@ -1026,8 +1050,236 @@ describe("makeManagedServerProvider", () => {
+@@ -1076,8 +1100,236 @@ describe("makeManagedServerProvider", () => {
            ],
          } as const;
          yield* Ref.set(probeSnapshot, { ...refreshedSnapshot, usageLimits: completeLimits });
@@ -1910,7 +1910,7 @@ index 0eccada27c..e8b026488e 100644
 +  ).pipe(Effect.provide(layerAlwaysRunTest)),
 +);
 diff --git a/packages/provider-core/src/server/managedProvider.ts b/packages/provider-core/src/server/managedProvider.ts
-index 2762930b5e..48b68dcc1e 100644
+index 852f7773d2..c74a329a4f 100644
 --- a/packages/provider-core/src/server/managedProvider.ts
 +++ b/packages/provider-core/src/server/managedProvider.ts
 @@ -4,8 +4,10 @@ import {
@@ -1940,7 +1940,7 @@ index 2762930b5e..48b68dcc1e 100644
  }
  
  function withUsageLimits(
-@@ -64,6 +68,9 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
+@@ -78,6 +82,9 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
    readonly checkProvider: Effect.Effect<ServerProvider, ServerSettingsError>;
    readonly checkUsageLimits?: Effect.Effect<ServerProvider["usageLimits"]>;
    readonly invalidateUsageCache?: Effect.Effect<void>;
@@ -1950,7 +1950,7 @@ index 2762930b5e..48b68dcc1e 100644
    readonly enrichSnapshot?: (input: {
      readonly settings: Settings;
      readonly snapshot: ServerProvider;
-@@ -264,7 +271,13 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
+@@ -281,7 +288,13 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
        const snapshotToPublish = yield* Ref.modify(snapshotStateRef, (state) => {
          const complete = update.complete && update.windows.length > 0;
          const usageLimits = complete
@@ -1965,7 +1965,7 @@ index 2762930b5e..48b68dcc1e 100644
            : applyUsageLimitsUpdate({
                previous: state.snapshot.usageLimits,
                update,
-@@ -275,6 +288,7 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
+@@ -292,6 +305,7 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
          const relabel =
            (label !== undefined || (complete && state.usageAuthLabel !== undefined)) &&
            label !== auth.label;
@@ -1973,7 +1973,7 @@ index 2762930b5e..48b68dcc1e 100644
          if (usageLimits === state.snapshot.usageLimits && !relabel) {
            return [null, state] as const;
          }
-@@ -282,12 +296,36 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
+@@ -299,12 +313,36 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
            relabel ? { ...state.snapshot, auth: { ...auth, label } } : state.snapshot,
            usageLimits,
          );
@@ -2011,7 +2011,7 @@ index 2762930b5e..48b68dcc1e 100644
            },
          ] as const;
        });
-@@ -386,6 +424,43 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
+@@ -403,6 +441,43 @@ export const makeManagedServerProvider = Effect.fn("makeManagedServerProvider")(
      return genericDemand || instanceDemand;
    });
  

@@ -1,19 +1,25 @@
 # Current port
 
 > Source: `patches-port/base.txt`, `covered-nightly.txt`, `skip-shared.json`; `./t3code-customize status`
-> Updated: 2026-11-26
+> Updated: 2026-11-27
 
 Which nightly the patches cover and what a port of them has to watch for. The port loop itself is in [docs/porting.md](../../docs/porting.md).
 
 ## Coverage
-- Shared patches: `patches-port/` targets nightly 0.1.13-nightly.20261125.5258 (`bf961f8121c6`).
+- Shared patches: `patches-port/` targets nightly 0.1.14-nightly.20261127.5332 (`958c26f0bfc3`).
 - `patches/` is upstream's and stays untouched.
 - Own patches: `patches-tt/` (16) and `patches-ios/` (11); a port applies 2 shared commits (`patches-port/`, minus the skips) + 16 + 11 = 29 commits.
-- `covered-nightly.txt`: 0.1.13-nightly.20261125.5258.
+- `covered-nightly.txt`: 0.1.14-nightly.20261127.5332.
 - Left out (`skip-shared.json`): desktop stats line and throughput, compaction settings, subscription switch.
 - Their bundle markers are replaced by `markers` in the same file.
 
 ## Gotchas
+- 5332: upstream's shared tooltip (#42671) replaced `Tooltip`/`TooltipProvider` with `SharedTooltipTrigger` (`label`) and `ThreadHoverCardTrigger`.
+- 5332: the sidebar's `delay={150}` providers are gone; re-indent conflicts apply with `git apply --ignore-whitespace --reject`, then `vp fmt` the patch's files.
+- 5332: tests that mock `ui/tooltip` also need a `ui/shared-tooltip` mock (`ThreadRelationshipsControl.kind.browser.test.tsx`).
+- 5332: upstream made mobile fonts configurable (#43840); `patches-ios/0002` adds `jetbrains-sans`/`jetbrains-mono` as the iOS defaults.
+- 5332: mobile theme tests mock `react-native`, since `mobileThemeRuntime` imports `fontFamilies`.
+- 5332: the settled "Show more" label clamps to the page size upstream (`threadListV2ShowMoreAccessibilityLabel`); `patches-ios/0004` uses its own `threadListV2ShowMoreFamiliesAccessibilityLabel` for whole families.
 - `git-guard` blocks `git add -A`/`git add .`, also inside a port worktree; stage each resolved file by name.
 - A blocked command runs nothing at all: check for conflict markers (`rg -n '^(<<<<<<<|>>>>>>>) '`) before `continue`.
 - `git checkout --merge <file>` re-creates a conflict; a misaligned conflict in a test file is easiest to resolve from the nightly's file plus the patch's added hunks, then compare the `+`/`-` lines with the patch.
@@ -22,7 +28,7 @@ Which nightly the patches cover and what a port of them has to watch for. The po
 - `port --resume` writes the patch folders and `covered-nightly.txt` here but opens no PR.
 - Commit them as `chore: port patches to nightly <version>` on a branch and open the PR yourself.
 - 4749 conflict: upstream sized the swipe actions from the measured row (`compactActions`, `rowHeight`, label constants) in `thread-swipe-actions.tsx`; `patches-ios/0004` keeps both and adds `iconOnlyActions`.
-- Upstream PRs named in `docs/fork-changes.md`: #16699 is open, so the child-threads patch stays.
+- Upstream PRs named in `docs/fork-changes.md`: #16699 closed unmerged 2026-11-27 and upstream has no opener provenance; the child-threads patch stays.
 - 4838: upstream dropped `resolveSidebarRowThreadId`; `patches-tt/0002` keeps `resolveSidebarRowThreadKey`, iOS keeps `resolveThreadListV2RowKey` over upstream's `useSidebarRowThreadKey`.
 - 4838: upstream refreshes the update check before a download (#37476, `downloadAvailableUpdate(refresh)`); the automatic covered download in `patches-tt/0005` passes `false` so it never fetches an uncovered nightly.
 - 5009: upstream translated the app with gt-react (#37893); the `no-untranslated-copy` lint in `checks` fails on bare copy.
